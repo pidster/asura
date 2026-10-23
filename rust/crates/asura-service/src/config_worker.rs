@@ -23,6 +23,8 @@ pub(crate) struct Worker {
     mutation: bool,
     audit_event: Option<asura_storage::audit::Event>,
     journal_quota: Option<u64>,
+    /// The applied execution setting after a persisted `execution` set.
+    execution: Option<asura_storage::config::ExecutionChange>,
     completion: crate::completion::Completion,
 }
 impl Worker {
@@ -53,6 +55,7 @@ impl Worker {
             mutation,
             audit_event: None,
             journal_quota: None,
+            execution: None,
             completion,
         })
     }
@@ -82,6 +85,12 @@ impl Worker {
     /// caller forwards it to the journal writer. Taken once.
     pub(crate) fn take_journal_quota(&mut self) -> Option<u64> {
         self.journal_quota.take()
+    }
+    /// The execution setting after a persisted set of an `execution` key
+    /// (EX11): the owner applies it, revokes and audits. Taken once. An
+    /// unconfirmed or failed set changes nothing in memory (ES-09).
+    pub(crate) fn take_execution(&mut self) -> Option<asura_storage::config::ExecutionChange> {
+        self.execution.take()
     }
     pub(crate) fn poll(&mut self) -> Option<pb::Envelope> {
         let done = self.task.as_ref().is_some_and(JoinHandle::is_finished);
@@ -123,6 +132,7 @@ impl Worker {
             }
             if let Ok(reply) = result {
                 self.journal_quota = reply.journal_quota;
+                self.execution.clone_from(&reply.execution);
             }
         }
         if self.replied {
@@ -194,6 +204,7 @@ mod tests {
                 mutation,
                 audit_event: None,
                 journal_quota: None,
+                execution: None,
                 completion: Default::default(),
             },
             send,
@@ -402,6 +413,7 @@ mod reactor_tests {
                         mutation: true,
                         audit_event: None,
                         journal_quota: None,
+                        execution: None,
                         completion,
                     })
                 },

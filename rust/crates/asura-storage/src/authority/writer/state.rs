@@ -380,32 +380,42 @@ impl State {
             let calls = state.range(&lo, &hi, false, MAX_TOOL_CALL_ORDINAL as usize, store)?;
             let mut tools = Vec::with_capacity(calls.len());
             for (_, value) in calls {
-                let Entry::Call {
-                    intent,
-                    settled,
-                    result,
-                    ..
-                } = Entry::decode(Tag::Call, &value)?
-                else {
+                let Entry::Call { intent, result, .. } = Entry::decode(Tag::Call, &value)? else {
                     return Err(ReplayError::Corrupt);
                 };
-                let mut read =
-                    |at: Locator| -> std::result::Result<Option<(Locator, Record)>, ReplayError> {
-                        if at.is_none() {
-                            Ok(None)
-                        } else {
-                            Ok(Some((at, store.frame(&at)?)))
+                let intent = (intent, store.frame(&intent)?);
+                // A `run` exec_cmd call's kind 26, found through its job.
+                let job_intent = match &intent.1 {
+                    Record::ToolCall(call)
+                        if call.decision == ToolDecision::Run
+                            && call.tool_operation == Some(ToolOperation::ExecCmd) =>
+                    {
+                        match state.job_state(
+                            exec_cmd_job_id(call.operation, call.generation, call.ordinal),
+                            store,
+                        )? {
+                            Some(JobState::Unsettled(job)) => Some(job.intent),
+                            Some(JobState::Settled(job)) => Some(job.intent),
+                            None => None,
                         }
-                    };
-                let intent = read(intent)?.ok_or(ReplayError::Corrupt)?;
-                let settled = read(settled)?;
-                let result = read(result)?;
+                    }
+                    _ => None,
+                };
+                let follow = match job_intent {
+                    Some(at) => Some((at, store.frame(&at)?)),
+                    None => None,
+                };
+                let result = if result.is_none() {
+                    None
+                } else {
+                    Some((result, store.frame(&result)?))
+                };
                 tools.push(tool_from_frames(
                     state.installation_id,
                     binding,
                     project,
                     intent,
-                    settled,
+                    follow,
                     result,
                 )?);
             }
@@ -1113,6 +1123,42 @@ impl State {
                 reply.payload_facts = facts;
                 return Ok(reply);
             }
+            Command::Jobs {
+                scope,
+                before,
+                limit,
+            } => {
+                let (jobs, before_found) = self.read(|state, store| {
+                    let found = match before {
+                        Some(sequence) => state.job_at(scope, sequence, store)?,
+                        None => false,
+                    };
+                    Ok((state.jobs(scope, before, limit, store)?, found))
+                })?;
+                let mut reply = self.reply();
+                reply.jobs = jobs;
+                reply.before_found = before_found;
+                return Ok(reply);
+            }
+            Command::JobFacts { job } => {
+                let records = self.read(|state, store| state.job_records(job, store))?;
+                let mut reply = self.reply();
+                reply.job_records = records.map(Box::new);
+                return Ok(reply);
+            }
+            Command::Settlements {
+                conversation,
+                after,
+                through,
+                limit,
+            } => {
+                let jobs = self.read(|state, store| {
+                    state.job_settlements(conversation, after, through, limit, store)
+                })?;
+                let mut reply = self.reply();
+                reply.jobs = jobs;
+                return Ok(reply);
+            }
             Command::Inputs { project, input } => {
                 self.find_project(project)?;
                 let state = self.state()?.clone();
@@ -1492,8 +1538,12 @@ impl State {
                 record.text_offset = start;
                 record.text = text;
                 let tools = self.tools(operation)?;
+                let terminal = terminal_frame.sequence;
+                let outlived =
+                    self.read(|state, store| state.outlived_jobs(&tools, terminal, store))?;
                 let mut reply = self.reply();
                 reply.response_bytes = Some(length);
+                reply.outlived = Some(outlived);
                 reply.record = Some(Record::TurnTerminal(record));
                 reply.tools = Some(tools);
                 reply.thinking = Some(ThinkingWindow {
@@ -1787,6 +1837,15 @@ impl State {
                 } else {
                     None
                 };
+                // The kind 30 append-time bounds (16 notes, 64 records per
+                // job); replay does not count them.
+                if let Record::JobRetention(retention) = &record {
+                    let summary = self
+                        .read(|state, store| state.job_retention_summary(retention.job, store))?;
+                    if !summary.has_room(retention.action) {
+                        return Err(Error::Limit);
+                    }
+                }
                 self.append(record)?;
                 if let Some(held) = held {
                     held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
@@ -1869,38 +1928,19 @@ impl State {
         entries.truncate(limit);
         Ok((entries, has_more, Some(found.generation)))
     }
-    /// The journal facts of one retained exec_cmd payload.
+    /// The journal facts of one retained job payload: an unsettled job from
+    /// the live state, or a settled one from its `X` entry, with the pin
+    /// and delete state of its `E` entries.
     fn payload_fact(&mut self, payload: Id) -> Result<Option<PayloadFact>> {
         let state = self.state()?.clone();
-        // The active and delta operations hold their calls in memory.
-        for (operation, op) in &state.operations {
-            for tool in &op.tools {
-                // A job-mode call's payloads are the job's (below).
-                if let Some(exec) = tool.exec_cmd.as_deref()
-                    && exec.job_intent.is_none()
-                    && (exec.stdout_payload == payload || exec.stderr_payload == payload)
-                {
-                    return Ok(Some(PayloadFact {
-                        payload,
-                        call: exec.job,
-                        operation: *operation,
-                        payloads: [exec.stdout_payload, exec.stderr_payload],
-                        intent_sequence: exec.intent_sequence,
-                        settled: exec
-                            .settled
-                            .as_ref()
-                            .map(|s| (s.state, s.sequence, s.streams)),
-                        active: state.active_operation == Some(*operation),
-                    }));
-                }
-            }
-        }
         // An unsettled job (live state or checkpoint) is still live.
         if let Some(job) = state
             .jobs
             .values()
             .find(|job| job.payloads.contains(&payload))
         {
+            let retention =
+                self.read(|state, store| state.job_retention_summary(job.job, store))?;
             return Ok(Some(job_fact(
                 payload,
                 job.origin,
@@ -1908,6 +1948,7 @@ impl State {
                 job.payloads,
                 job.intent,
                 None,
+                retention,
             )?));
         }
         let entry =
@@ -1930,6 +1971,7 @@ impl State {
             if job_id(&p.origin) != job || settlement.job != job || !payloads.contains(&payload) {
                 return Err(Error::RepairRequired);
             }
+            let retention = self.read(|state, store| state.job_retention_summary(job, store))?;
             // `interrupted` maps to no settlement: an unverified prefix, as
             // for a missing kind 28 (TJ-Q5).
             let settled = settlement.capture_state.capture().map(|capture| {
@@ -1940,57 +1982,20 @@ impl State {
                         .map(|s| (s.capture.stored_bytes, s.capture.digest)),
                 )
             });
-            let mut fact = job_fact(payload, p.origin, job, payloads, intent, settled)?;
+            let mut fact = job_fact(payload, p.origin, job, payloads, intent, settled, retention)?;
             fact.active = false;
             return Ok(Some(fact));
         }
-        let Some(Entry::Payload {
-            operation,
-            generation,
-            ordinal,
-            intent,
-            settled,
-            ..
-        }) = entry
-        else {
-            return Ok(None);
-        };
-        let call = match self.record(intent)? {
-            Record::ToolCall(call) => call,
-            _ => return Err(Error::RepairRequired),
-        };
-        if call.operation != operation || call.generation != generation || call.ordinal != ordinal {
-            return Err(Error::RepairRequired);
+        match entry {
+            None => Ok(None),
+            Some(_) => Err(Error::RepairRequired),
         }
-        let exec = exec_cmd_call(state.installation_id, &call, intent.sequence);
-        if exec.stdout_payload != payload && exec.stderr_payload != payload {
-            return Err(Error::RepairRequired);
-        }
-        let settled = if settled.is_none() {
-            None
-        } else {
-            match self.record(settled)? {
-                Record::CaptureSettled(p) => {
-                    let s = settlement(&p, settled);
-                    Some((s.state, s.sequence, s.streams))
-                }
-                _ => return Err(Error::RepairRequired),
-            }
-        };
-        Ok(Some(PayloadFact {
-            payload,
-            call: exec.job,
-            operation,
-            payloads: [exec.stdout_payload, exec.stderr_payload],
-            intent_sequence: exec.intent_sequence,
-            settled,
-            active: false,
-        }))
     }
 }
 /// The `PayloadFacts` job form: `call` is the job ID, `operation` the model
-/// origin's operation, `intent_sequence` the kind 26 sequence and `settled`
-/// the kind 28 capture facts. An unsettled job is `active`.
+/// origin's operation, `intent_sequence` the kind 26 sequence, `settled`
+/// the kind 28 capture facts and the pin and delete state. An unsettled job
+/// is `active`.
 fn job_fact(
     payload: Id,
     origin: JobOrigin,
@@ -1998,6 +2003,7 @@ fn job_fact(
     payloads: [Id; 2],
     intent: Locator,
     settled: Option<Settlement>,
+    retention: JobRetentionSummary,
 ) -> Result<PayloadFact> {
     // Person origin replays only after P2.
     let JobOrigin::Model { operation, .. } = origin else {
@@ -2011,5 +2017,7 @@ fn job_fact(
         intent_sequence: intent.sequence,
         settled,
         active: true,
+        pinned: retention.pinned,
+        deleted: retention.deleted,
     })
 }

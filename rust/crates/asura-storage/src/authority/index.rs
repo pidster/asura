@@ -23,6 +23,8 @@ pub enum Tag {
     Call = b'C',
     /// Project identity: device and inode, 0.
     Identity = b'D',
+    /// Job retention: job ID, kind 30 sequence (J4).
+    Retention = b'E',
     /// Generated ID: installation, graph, task, operation, input or dispatch request.
     Generated = b'G',
     /// Thinking piece: operation, start offset (thinking-level.md).
@@ -33,6 +35,10 @@ pub enum Tag {
     Project = b'J',
     /// Project conversation: project, creation sequence.
     ProjectConversation = b'K',
+    /// Conversation job: conversation, kind 26 sequence (J4).
+    ConversationJob = b'L',
+    /// Project job: project, kind 26 sequence (J4).
+    ProjectJob = b'M',
     /// Project name: project, name revision.
     Name = b'N',
     /// Terminal operation.
@@ -45,32 +51,42 @@ pub enum Tag {
     Segment = b'S',
     /// Turn: conversation, generation.
     Turn = b'T',
+    /// Conversation settlement: conversation, kind 28 sequence (J4, J5).
+    Settlement = b'U',
     /// Conversation.
     Conversation = b'V',
     /// Settled job: job ID, 0 (J2).
     Job = b'W',
-    /// Retained payload: payload ID, 0. Form 1 a J1 exec_cmd call, form 2 a job.
+    /// Retained payload of a job: payload ID, 0. The value's form byte is 2;
+    /// form 1 (a J1 exec_cmd call) is retired with kind 23.
     Payload = b'X',
+    /// Every job: the zero ID, kind 26 sequence (J4).
+    AllJobs = b'Y',
 }
 impl Tag {
-    pub const ALL: [Tag; 17] = [
+    pub const ALL: [Tag; 22] = [
         Tag::Activity,
         Tag::Call,
         Tag::Identity,
+        Tag::Retention,
         Tag::Generated,
         Tag::Thinking,
         Tag::Input,
         Tag::Project,
         Tag::ProjectConversation,
+        Tag::ConversationJob,
+        Tag::ProjectJob,
         Tag::Name,
         Tag::Operation,
         Tag::Piece,
         Tag::Request,
         Tag::Segment,
         Tag::Turn,
+        Tag::Settlement,
         Tag::Conversation,
         Tag::Job,
         Tag::Payload,
+        Tag::AllJobs,
     ];
     pub fn from_byte(byte: u8) -> Option<Self> {
         Self::ALL.into_iter().find(|tag| *tag as u8 == byte)
@@ -176,10 +192,11 @@ pub enum Entry {
         kept: u64,
         frame: Locator,
     },
+    /// `C`: a tool call's decision, kind 14 and result record (kind 15 or
+    /// kind 29; `Locator::NONE` while absent).
     Call {
         decision: u8,
         intent: Locator,
-        settled: Locator,
         result: Locator,
     },
     Turn {
@@ -193,15 +210,6 @@ pub enum Entry {
         queued: Locator,
         promoted: Locator,
         operation: Id,
-    },
-    /// `X` form 1: a payload of a J1-mode exec_cmd call (kinds 14 and 23).
-    Payload {
-        operation: Id,
-        generation: u64,
-        ordinal: u32,
-        intent: Locator,
-        settled: Locator,
-        last_use: u64,
     },
     /// `X` form 2: a payload of a job (kinds 26 and 28). The last use is the
     /// kind 28 sequence.
@@ -218,6 +226,31 @@ pub enum Entry {
         intent: Locator,
         cancel: Locator,
         settled: Locator,
+    },
+    /// `L`: a settled job of a conversation, keyed by its kind 26 sequence.
+    ConversationJob {
+        job: Id,
+    },
+    /// `M`: a settled job of a project, keyed by its kind 26 sequence.
+    ProjectJob {
+        job: Id,
+        conversation: Id,
+    },
+    /// `Y`: a settled job of any project, keyed by its kind 26 sequence.
+    AllJobs {
+        job: Id,
+        project: Id,
+    },
+    /// `U`: a job settlement of a conversation, keyed by its kind 28
+    /// sequence.
+    Settlement {
+        job: Id,
+    },
+    /// `E`: one kind 30 of a job, keyed by its sequence.
+    Retention {
+        action: u8,
+        author: u8,
+        frame: Locator,
     },
     Segment {
         last: u64,
@@ -339,8 +372,13 @@ impl Entry {
             Self::Call { .. } => Tag::Call,
             Self::Turn { .. } => Tag::Turn,
             Self::Input { .. } => Tag::Input,
-            Self::Payload { .. } | Self::JobPayload { .. } => Tag::Payload,
+            Self::JobPayload { .. } => Tag::Payload,
             Self::Job { .. } => Tag::Job,
+            Self::ConversationJob { .. } => Tag::ConversationJob,
+            Self::ProjectJob { .. } => Tag::ProjectJob,
+            Self::AllJobs { .. } => Tag::AllJobs,
+            Self::Settlement { .. } => Tag::Settlement,
+            Self::Retention { .. } => Tag::Retention,
             Self::Segment { .. } => Tag::Segment,
             Self::Project { .. } => Tag::Project,
             Self::Name { .. } => Tag::Name,
@@ -383,12 +421,10 @@ impl Entry {
             Self::Call {
                 decision,
                 intent,
-                settled,
                 result,
             } => {
                 out.put(&[*decision]);
                 out.locator(intent);
-                out.locator(settled);
                 out.locator(result);
             }
             Self::Turn {
@@ -412,22 +448,6 @@ impl Entry {
                 out.locator(queued);
                 out.locator(promoted);
                 out.put(operation);
-            }
-            Self::Payload {
-                operation,
-                generation,
-                ordinal,
-                intent,
-                settled,
-                last_use,
-            } => {
-                out.put(&[1]);
-                out.put(operation);
-                out.u64(*generation);
-                out.u32(*ordinal);
-                out.locator(intent);
-                out.locator(settled);
-                out.u64(*last_use);
             }
             Self::JobPayload {
                 job,
@@ -453,6 +473,23 @@ impl Entry {
                 out.locator(intent);
                 out.locator(cancel);
                 out.locator(settled);
+            }
+            Self::ConversationJob { job } | Self::Settlement { job } => out.put(job),
+            Self::ProjectJob { job, conversation } => {
+                out.put(job);
+                out.put(conversation);
+            }
+            Self::AllJobs { job, project } => {
+                out.put(job);
+                out.put(project);
+            }
+            Self::Retention {
+                action,
+                author,
+                frame,
+            } => {
+                out.put(&[*action, *author]);
+                out.locator(frame);
             }
             Self::Segment {
                 last,
@@ -533,7 +570,6 @@ impl Entry {
             Tag::Call => Self::Call {
                 decision: r.byte(),
                 intent: r.locator(),
-                settled: r.locator(),
                 result: r.locator(),
             },
             Tag::Turn => Self::Turn {
@@ -549,14 +585,6 @@ impl Entry {
                 operation: r.id(),
             },
             Tag::Payload => match r.byte() {
-                1 => Self::Payload {
-                    operation: r.id(),
-                    generation: r.u64(),
-                    ordinal: r.u32(),
-                    intent: r.locator(),
-                    settled: r.locator(),
-                    last_use: r.u64(),
-                },
                 2 => Self::JobPayload {
                     job: r.id(),
                     intent: r.locator(),
@@ -571,6 +599,21 @@ impl Entry {
                 intent: r.locator(),
                 cancel: r.locator(),
                 settled: r.locator(),
+            },
+            Tag::ConversationJob => Self::ConversationJob { job: r.id() },
+            Tag::ProjectJob => Self::ProjectJob {
+                job: r.id(),
+                conversation: r.id(),
+            },
+            Tag::AllJobs => Self::AllJobs {
+                job: r.id(),
+                project: r.id(),
+            },
+            Tag::Settlement => Self::Settlement { job: r.id() },
+            Tag::Retention => Self::Retention {
+                action: r.byte(),
+                author: r.byte(),
+                frame: r.locator(),
             },
             Tag::Segment => Self::Segment {
                 last: r.u64(),
@@ -621,10 +664,24 @@ mod tests {
             Key::new(Tag::Call, [1; 16], 1),
             Key::new(Tag::Call, [1; 16], 2),
             Key::new(Tag::Call, [2; 16], 0),
+            Key::new(Tag::Identity, [0; 16], 0),
+            Key::new(Tag::Retention, [0; 16], 0),
+            Key::new(Tag::ProjectConversation, [0; 16], 0),
+            Key::new(Tag::ConversationJob, [0; 16], 0),
+            Key::new(Tag::ProjectJob, [0; 16], 0),
+            Key::new(Tag::Name, [0; 16], 0),
+            Key::new(Tag::Turn, [0; 16], 0),
+            Key::new(Tag::Settlement, [0; 16], 0),
             Key::new(Tag::Conversation, [0xff; 16], 0),
             Key::new(Tag::Job, [0; 16], 0),
             Key::new(Tag::Payload, [0; 16], 0),
+            Key::new(Tag::AllJobs, [0; 16], 0),
         ];
+        // Tag::ALL is in byte order with no gaps in the encoding check.
+        for pair in Tag::ALL.windows(2) {
+            assert!((pair[0] as u8) < (pair[1] as u8));
+        }
+
         for pair in keys.windows(2) {
             assert!(pair[0] < pair[1]);
             assert!(pair[0].encode() < pair[1].encode());
@@ -673,7 +730,6 @@ mod tests {
             Entry::Call {
                 decision: 1,
                 intent: locator(9),
-                settled: Locator::NONE,
                 result: locator(10),
             },
             Entry::Turn {
@@ -688,14 +744,6 @@ mod tests {
                 promoted: Locator::NONE,
                 operation: [0; 16],
             },
-            Entry::Payload {
-                operation: [3; 16],
-                generation: 2,
-                ordinal: 200,
-                intent: locator(13),
-                settled: locator(14),
-                last_use: 14,
-            },
             Entry::JobPayload {
                 job: [4; 16],
                 intent: locator(19),
@@ -708,6 +756,21 @@ mod tests {
                 intent: locator(19),
                 cancel: Locator::NONE,
                 settled: locator(20),
+            },
+            Entry::ConversationJob { job: [11; 16] },
+            Entry::ProjectJob {
+                job: [12; 16],
+                conversation: [13; 16],
+            },
+            Entry::AllJobs {
+                job: [14; 16],
+                project: [15; 16],
+            },
+            Entry::Settlement { job: [16; 16] },
+            Entry::Retention {
+                action: 4,
+                author: 2,
+                frame: locator(21),
             },
             Entry::Segment {
                 last: 32_768,
@@ -735,17 +798,17 @@ mod tests {
                 generation: 4,
             },
         ];
-        // `X` form byte: 1 a J1 call, 2 a job; any other is Corrupt.
-        for (entry, form) in [(&entries[8], 1), (&entries[9], 2)] {
-            assert_eq!(entry.encode()[0], form);
-            for other in [0, 3, 0xff] {
-                let mut value = entry.encode();
-                value[0] = other;
-                assert_eq!(
-                    Entry::decode(Tag::Payload, &value),
-                    Err(ReplayError::Corrupt)
-                );
-            }
+        // `X` form byte: 2 a job; form 1 (a J1 call) is retired and, like
+        // any other, Corrupt.
+        let job_payload = &entries[8];
+        assert_eq!(job_payload.encode()[0], 2);
+        for other in [0, 1, 3, 0xff] {
+            let mut value = job_payload.encode();
+            value[0] = other;
+            assert_eq!(
+                Entry::decode(Tag::Payload, &value),
+                Err(ReplayError::Corrupt)
+            );
         }
         for entry in entries {
             let value = entry.encode();

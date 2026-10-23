@@ -463,11 +463,13 @@ fn decode(bytes: &[u8], range: std::ops::Range<usize>) -> Result<journal::Record
     )
     .map_err(|e| format!("decode: {e:?}"))?)
 }
-/// One call as the journal holds it: kind 14, and kind 15 when it ran.
+/// One call as the journal holds it: kind 14, and kind 15 when it ran
+/// (codes 1-9), or kind 29 for a job-mode call (codes 10-16, JR11).
 struct Recorded {
     call: journal::ToolCall,
     frame: usize,
     result: Option<journal::ToolResult>,
+    job_result: Option<journal::JobResult>,
     tool: journal::ToolRecord,
 }
 fn calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Recorded>> {
@@ -481,17 +483,19 @@ fn calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Recorded>> {
         let journal::Record::ToolCall(call) = decode(&bytes, tool.intent_frame.range())? else {
             return Err("kind 14 expected".into());
         };
-        let result = match &tool.result_frame {
+        let (result, job_result) = match &tool.result_frame {
             Some(frame) => match decode(&bytes, frame.range())? {
-                journal::Record::ToolResult(result) => Some(result),
-                _ => return Err("kind 15 expected".into()),
+                journal::Record::ToolResult(result) => (Some(result), None),
+                journal::Record::JobResult(result) => (None, Some(*result)),
+                _ => return Err("kind 15 or kind 29 expected".into()),
             },
-            None => None,
+            None => (None, None),
         };
         out.push(Recorded {
             call: *call,
             frame: tool.intent_frame.length as usize,
             result,
+            job_result,
             tool: tool.clone(),
         });
     }
@@ -698,10 +702,29 @@ fn exec_cmd_secret() -> Result<()> {
     assert!(!record.arguments.contains(&secret));
     assert_eq!(record.number_kinds, vec![journal::SecretKind::GithubToken]);
     println!("PASS TCR-I02 kind 14 holds the SL3 placeholder in command; number 1 is github-token");
-    let result = recorded[0].result.as_ref().ok_or("kind 15")?;
-    assert!(result.text.contains("$ASURA_SECRET_1"), "{}", result.text);
-    assert!(!result.text.contains(&secret));
+    // The call ran as a job (J3): kind 29 holds references and counts only
+    // (PC12); the model's result is the handle delivery, no output text.
+    assert!(recorded[0].result.is_none(), "no kind 15 for code 10");
+    let result = recorded[0].job_result.as_ref().ok_or("kind 29")?;
+    assert_eq!(
+        (result.outcome, result.status),
+        (journal::JobResultOutcome::Ok, 1)
+    );
+    let delivered = model.tool_messages();
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert!(delivered[0].starts_with("job: "), "{}", delivered[0]);
+    assert!(delivered[0].contains("state: settled"), "{}", delivered[0]);
+    assert!(delivered[0].contains("result: exit 0"), "{}", delivered[0]);
+    assert!(!delivered[0].contains("GITHUB_TOKEN"), "no output text");
+    assert!(
+        !delivered[0].contains(&secret),
+        "the delivered result holds no secret"
+    );
     let progress = &event.tools[0];
+    assert!(
+        progress.job_id.is_some(),
+        "J4T-09: the activity names the job"
+    );
     assert_eq!(progress.name.as_deref(), Some("exec_cmd"));
     let shown = format!(
         "{} {}",
@@ -715,7 +738,7 @@ fn exec_cmd_secret() -> Result<()> {
     }
     assert!(recorded[0].frame <= 65_050);
     println!(
-        "TCR-P2 E02: kind 14 frame {} bytes, kind 15 frame {} bytes, {:.6}% of the 8 MiB journal",
+        "TCR-P2 E02: kind 14 frame {} bytes, kind 29 frame {} bytes, {:.6}% of the 8 MiB journal",
         recorded[0].frame,
         recorded[0]
             .tool
@@ -728,7 +751,7 @@ fn exec_cmd_secret() -> Result<()> {
     fixture.stop()?;
     sweep(&fixture.home, &[&secret])?;
     println!(
-        "PASS TCR-E02 service part: kind 14, kind 15, activity and model input hold only placeholders; raw-byte sweep clean"
+        "PASS TCR-E02 service part: kind 14, kind 29, activity and model input hold only placeholders; raw-byte sweep clean"
     );
     Ok(())
 }
@@ -872,11 +895,11 @@ fn restarts() -> Result<()> {
     })?;
     restart(&mut fixture)?;
     std::fs::remove_file(fixture.home.join("exec-cmd-hold-setup"))?;
-    // E03: a running exec_cmd, then a crash.
+    // E03: a running exec_cmd in its yield window, then a crash.
     model.script(&[
         call(
             "exec_cmd",
-            json!({"command": "printf x >> e03.txt; sleep 60"}),
+            json!({"command": "printf x >> e03.txt; sleep 60", "yield_seconds": 30}),
         ),
         Step::Final,
     ]);
@@ -905,7 +928,13 @@ fn restarts() -> Result<()> {
         assert_eq!(op.tools.len(), 1, "{label}: no new tool record");
         assert!(
             op.tools[0].result_frame.is_none(),
-            "{label}: no kind 15 written"
+            "{label}: no kind 29 written"
+        );
+        // The job settled `interrupted` at the start (J2-E5).
+        let job = journal::exec_cmd_job_id(operation, op.generation, 1);
+        assert!(
+            replay.unsettled_jobs().iter().all(|u| u.job != job),
+            "{label}: the job settled at the restart"
         );
         let event = fixture.attach()?.observe_conversation(operation, 0, 0)?;
         assert_eq!(event.kind, Some(6), "{label} {event:?}");
@@ -921,7 +950,7 @@ fn restarts() -> Result<()> {
         );
     }
     println!(
-        "PASS TCR-I04 restart after run kind 14 before kind 15: interrupted, no rerun, no new tool record"
+        "PASS TCR-I04 restart after run kind 14 before kind 29: interrupted, the job settled interrupted, no rerun, no new tool record"
     );
     println!(
         "PASS TCR-E03 service part: restart during a running exec_cmd shows the call interrupted with name and arguments; nothing ran again"

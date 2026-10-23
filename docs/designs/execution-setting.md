@@ -14,9 +14,12 @@ Implementation state, 2026-10-22: packet J34-G is merged on `main` (`09eaa67`,
 Reason 19 in the journal codec is implemented by J34-S on the J3 integration
 branch, not merged. On the same branch J34-K implements the controller's
 revocation scope and the check at slot grant, J3-R the refusal reason and
-J4-T the TUI. The owner's state, revocation wiring and audit emission and the
-64 KiB configuration file bound are not implemented; they land with J34-E on
-the J3 integration branch ([code packets](#code-packets)).
+J4-T the TUI. J34-E implements the owner's state, the per-call grant, the
+revocation wiring, one `execution.changed` per changed entry and the 64 KiB
+configuration file bound on the same branch (2026-10-23,
+[J3 and J4 evidence](tool-job-controller.md#j3-and-j4-evidence)): ES-02
+(file bound), ES-04, ES-05, ES-07, ES-10, ES-11 and ES-12 pass at the
+integration layer and J34E-14 through the TUI.
 
 ## Owner decision
 
@@ -279,8 +282,9 @@ sequenceDiagram
     U->>W: ConfigSet execution.projects.ID = off
     W->>W: Validate, write and sync the file
     alt Persisted
-        W-->>R: Persisted
-        R->>O: execution_changed(enabled, overrides)
+        W-->>R: Persisted, with the file's setting before and after the write
+        R->>O: execution_changed(previous, current)
+        O->>O: Old value: owner's value, or previous before the start-time read
         O->>O: Projects turned off: {ID}
         O->>K: revoke(ID, model origin, execution_off)
         K->>G: T on each live model job
@@ -294,6 +298,14 @@ sequenceDiagram
     end
     Note over O,K: Later exec_cmd calls in ID get kind 14 denied, execution_off
 ```
+
+The configuration worker reads the file's effective setting before it applies
+the set, and returns both values with the persisted reply. The owner compares
+`current` against its own value. Before the start-time read (TJ-F5) the owner
+has no value, so it takes `previous` as the old value: a change made while the
+service starts is audited against what the file held, never against defaults.
+The start-time read then keeps the owner's value, because the persisted change
+is at least as new as the file the read saw.
 
 ### ES-F1: decision for one model exec_cmd call
 
@@ -473,8 +485,8 @@ harness with a scripted loopback model.
 | ES-07 | Off to on | Nothing revoked; next call runs | Call after `/execution on` runs | — |
 | ES-08 | Person jobs unaffected (ES-R5) | Revoke scope excludes person origin | Shared with the person-command packets: a `!` job continues | Deferred to the person-command packets |
 | ES-09 | Unconfirmed set | No in-memory change | Writer fault injected: memory and jobs unchanged | — |
-| ES-10 | Yield window | Revocation during the yield gives the starting call status `cancelled` | Real job in its yield window | — |
-| ES-11 | Audit | `execution.changed` fields; no command text; a whole-mapping set gives one event per changed entry, global first, then projects in ID order, with `revoked_projects` summing to the revoked projects; a set that changes nothing gives none; a leaf set's `config.changed` names `execution.projects` | Real emitter order: `config.changed`, `job.cancel_requested`, `execution.changed`, `job.settled` | — |
+| ES-10 | Yield window | Revocation during the yield ends the window at kind 28: the starting call reports the job settled with status 1 and outcome `cancelled` in its state block (the J3 yield rules) | Real job in its yield window | — |
+| ES-11 | Audit | `execution.changed` fields; no command text; a whole-mapping set gives one event per changed entry, global first, then projects in ID order, with `revoked_projects` summing to the revoked projects; a set that changes nothing gives none; a leaf set's `config.changed` names `execution.projects` | Real emitter order: `config.changed`, `execution.changed`, `job.cancel_requested` (emitted when kind 27 commits), `job.settled` | — |
 | ES-12 | Status indicator | `exec off` from `execution_enabled` | Change from a second attachment returns the parked `JobList` | PTY: second TUI shows `exec off` |
 | ES-13 | Responsiveness | — | Revocation with 16 live jobs: Inspect within 100 ms | Typing within 100 ms while jobs stop |
 

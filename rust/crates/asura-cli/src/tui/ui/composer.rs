@@ -557,12 +557,22 @@ impl App {
         if self.overlay.is_some() {
             return "Esc close · arrows navigate · Enter confirm".into();
         }
+        if let Some(hint) = self.jobs_hint() {
+            return hint;
+        }
         if let Some(hint) = self.help_hint() {
             return hint;
         }
-        if self.response_selection.is_some() {
-            return "↑↓ responses · Enter activity · t thinking · PgUp/PgDn scroll · Esc input"
-                .into();
+        if let Some(selected) = self.response_selection {
+            let job = self.jobs.supported != Some(false)
+                && self
+                    .activity
+                    .get(selected)
+                    .is_some_and(|a| !a.job_ids().is_empty());
+            return format!(
+                "↑↓ responses · Enter activity · t thinking{} · PgUp/PgDn scroll · Esc input",
+                if job { " · j job" } else { "" }
+            );
         }
         if self.history_focus {
             let below = if self.queue_focus_ids().is_empty() {

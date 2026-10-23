@@ -917,9 +917,18 @@ pub struct Reply {
     /// The new effective `journal.quotaBytes` after a persisted set of
     /// `journal` or `journal.quotaBytes`, which applies at once; else `None`.
     pub journal_quota: Option<u64>,
-    /// The new effective execution setting after a persisted set of any
-    /// `execution` key, which applies at once (EX11); else `None`.
-    pub execution: Option<ExecutionSetting>,
+    /// The effective execution setting before and after a persisted set of
+    /// any `execution` key, which applies at once (EX11); else `None`.
+    pub execution: Option<ExecutionChange>,
+}
+
+/// A persisted execution change: the file's effective setting before the
+/// write and after it. The owner compares against `previous` when it has
+/// not yet read the setting (ES-Q1), so an early change is still audited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionChange {
+    pub previous: ExecutionSetting,
+    pub current: ExecutionSetting,
 }
 
 pub fn execute(
@@ -967,6 +976,7 @@ pub fn execute(
     let mut journal_quota = None;
     let mut execution = None;
     if let Some(value) = value {
+        let previous = config.execution.setting();
         config.set(key, value)?;
         let serialized = yaml(&config)?;
         snapshot
@@ -976,7 +986,10 @@ pub fn execute(
             journal_quota = Some(config.journal.quota_bytes);
         }
         if key == "execution" || key.starts_with("execution.") {
-            execution = Some(config.execution.setting());
+            execution = Some(ExecutionChange {
+                previous,
+                current: config.execution.setting(),
+            });
         }
     } else if cancel.load(Ordering::Acquire) {
         return Err("config_cancelled");
@@ -2342,7 +2355,10 @@ mod tests {
             Ok(Reply {
                 value_yaml: "off\n".into(),
                 journal_quota: None,
-                execution: Some(off.clone())
+                execution: Some(ExecutionChange {
+                    previous: ExecutionSetting::default(),
+                    current: off.clone(),
+                })
             })
         );
         let file = root.0.join(".asura/config.yaml");
@@ -2351,11 +2367,15 @@ mod tests {
         )));
         assert_eq!(execution_setting(runtime.clone(), &cancel), Ok(off.clone()));
         let reply = call("execution.enabled", Some("false")).unwrap();
+        let disabled = ExecutionSetting {
+            enabled: false,
+            ..off.clone()
+        };
         assert_eq!(
             reply.execution,
-            Some(ExecutionSetting {
-                enabled: false,
-                ..off.clone()
+            Some(ExecutionChange {
+                previous: off.clone(),
+                current: disabled.clone(),
             })
         );
         let reply = call(
@@ -2365,16 +2385,23 @@ mod tests {
             )),
         )
         .unwrap();
+        let project_b = ExecutionSetting {
+            enabled: true,
+            projects: BTreeMap::from([(id(PROJECT_B), true)]),
+        };
         assert_eq!(
             reply.execution,
-            Some(ExecutionSetting {
-                enabled: true,
-                projects: BTreeMap::from([(id(PROJECT_B), true)]),
+            Some(ExecutionChange {
+                previous: disabled,
+                current: project_b.clone(),
             })
         );
         assert_eq!(
             call("execution.projects", Some("{}")).unwrap().execution,
-            Some(ExecutionSetting::default())
+            Some(ExecutionChange {
+                previous: project_b,
+                current: ExecutionSetting::default(),
+            })
         );
         assert!(
             !std::fs::read_to_string(&file)
@@ -2417,5 +2444,99 @@ mod tests {
         assert_eq!(std::fs::read(&file).unwrap(), invalid);
         let cancelled = AtomicBool::new(true);
         assert!(execution_setting(runtime.clone(), &cancelled).is_err());
+    }
+    /// ES-02 file bound (execution-setting.md, configuration; ES-E6): 1,024
+    /// leaf sets persist and read back under the 64 KiB file bound, and a
+    /// write that would pass the bound gives `config_too_large` and changes
+    /// nothing.
+    #[test]
+    fn es_02_file_bound_holds_1024_overrides_and_refuses_a_larger_file() {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Scratch(
+            format!(
+                "/private/tmp/asura-bound-{:x}",
+                u128::from_ne_bytes(asura_platform::random_id())
+            )
+            .into(),
+        );
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root.0)
+            .unwrap();
+        let runtime = RuntimeDirectory::scratch(&root.0, true).unwrap();
+        let cancel = AtomicBool::new(false);
+        let file = root.0.join(".asura/config.yaml");
+        assert_eq!(asura_platform::CONFIG_FILE_LIMIT, 65_536);
+        // 1,024 leaf sets, alternating on and off, each a whole-file write.
+        for index in 1..=EXECUTION_MAX_PROJECTS {
+            let value = if index % 2 == 0 { "on" } else { "off" };
+            execute(
+                runtime.clone(),
+                &format!("execution.projects.{index:032x}"),
+                Some(value),
+                &cancel,
+            )
+            .unwrap();
+        }
+        let size = std::fs::metadata(&file).unwrap().len();
+        assert!(
+            size > 16 * 1024 && size <= asura_platform::CONFIG_FILE_LIMIT as u64,
+            "{size}"
+        );
+        let setting = execution_setting(runtime.clone(), &cancel).unwrap();
+        assert_eq!(setting.projects.len(), EXECUTION_MAX_PROJECTS);
+        for index in 1..=EXECUTION_MAX_PROJECTS {
+            let mut project = [0u8; 16];
+            project.copy_from_slice(&(index as u128).to_be_bytes());
+            assert_eq!(setting.projects.get(&project), Some(&(index % 2 == 0)));
+        }
+        // Fill the file close to the bound with 64 MLX models of long
+        // names, then grow it past the bound with a long `model` value.
+        let base = std::fs::read_to_string(&file).unwrap();
+        let config = |length: usize, model: &str| {
+            let mut text = format!("model: {model}\n{base}");
+            text.push_str("providers:\n  mlx:\n    models:\n");
+            for index in 0..MAPPING_ENTRIES {
+                let name = format!("{index:02}{}", "m".repeat(length - 2));
+                text.push_str(&format!(
+                    "      {name}: {{capabilities: [toolCalling, guidedGeneration, reasoning, vision]}}\n"
+                ));
+            }
+            text
+        };
+        let size = |text: String| yaml(&Config::read(text.as_bytes()).unwrap()).unwrap().len();
+        let long = "x".repeat(1024);
+        let limit = asura_platform::CONFIG_FILE_LIMIT;
+        let length = (3..=256)
+            .find(|length| {
+                size(config(*length, "small")) <= limit && size(config(*length, &long)) > limit
+            })
+            .unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).truncate(true).mode(0o600);
+        std::io::Write::write_all(
+            &mut options.open(&file).unwrap(),
+            config(length, "seed").as_bytes(),
+        )
+        .unwrap();
+        // A set within the bound succeeds; one past it changes nothing.
+        execute(runtime.clone(), "model", Some("small"), &cancel).unwrap();
+        let before = std::fs::read(&file).unwrap();
+        assert!(before.len() <= limit);
+        assert_eq!(
+            execute(runtime.clone(), "model", Some(&long), &cancel).err(),
+            Some("config_too_large")
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        assert_eq!(
+            execution_setting(runtime, &cancel).unwrap().projects.len(),
+            EXECUTION_MAX_PROJECTS
+        );
     }
 }

@@ -7,7 +7,10 @@ use std::time::Instant;
 
 mod parse;
 use asura_storage::authority::conversation as journal;
-pub use parse::{Parsed, parse_call};
+pub use parse::{
+    DEFAULT_YIELD_SECONDS, MAX_COMMAND_BYTES, MAX_WAIT_SECONDS, MAX_YIELD_SECONDS, Parsed,
+    job_handle, parse_call,
+};
 
 /// Calls that may be recorded per turn; the next ordinal is only the
 /// over-limit `limit` record (TCR-D6, TCR-D9; owner, 2026-10-18).
@@ -59,13 +62,40 @@ const OPERATIONS: &[Definition] = &[
     },
     Definition {
         name: "exec_cmd",
-        description: "Run one bounded /bin/sh -c command line in the admitted project; returns output and exit status.",
+        description: EXEC_CMD_DESCRIPTION,
     },
     Definition {
         name: "memory_create_note",
         description: "Create an immutable note in the admitted project, optionally citing one project note.",
     },
+    Definition {
+        name: "job_list",
+        description: "List up to 8 jobs of this conversation, newest first.",
+    },
+    Definition {
+        name: "job_status",
+        description: "Show one job's state.",
+    },
+    Definition {
+        name: "job_read",
+        description: "Read one page of a job's stdout or stderr as untrusted tool output.",
+    },
+    Definition {
+        name: "job_wait",
+        description: "Wait for a job to settle or produce new output.",
+    },
+    Definition {
+        name: "job_cancel",
+        description: "Request cancellation of a job you started.",
+    },
+    Definition {
+        name: "job_note",
+        description: "Record a note on a job.",
+    },
 ];
+/// The exec_cmd registry text (tool-job-controller.md, helper tool
+/// definitions).
+const EXEC_CMD_DESCRIPTION: &str = "Run one /bin/sh -c command line in the admitted project as a job; returns its handle, state and byte counts, never output text.";
 
 /// Public model-facing inventory. Typed commands retain separate operation policy.
 /// Names come from the storage registry that replay uses (TCR-D24).
@@ -84,17 +114,23 @@ pub const REGISTRY: &[Definition] = &[
     },
     Definition {
         name: journal::TOOL_NAMES[3],
-        description: "Run one bounded /bin/sh -c command line in the admitted project; returns output and exit status.",
+        description: EXEC_CMD_DESCRIPTION,
+    },
+    // The grouped job tool (J3-E2), registry position 4.
+    Definition {
+        name: journal::TOOL_NAMES[4],
+        description: "Job commands: list(before?), status(job), read(job, stream, offset?, limit?), wait(job, seconds?), cancel(job), note(job, text).",
     },
 ];
 
 /// The status and text sent for a call that does not run, rendered from the
 /// kind 14 codes alone (TCR-D12). The text never holds model text, so it can
 /// never repeat a secret. Replay and views render it again from the record.
+/// `reason` is kind 14 field 10, the decision reason (J3-E3).
 pub fn not_run_result(
     decision: journal::ToolDecision,
     fault: Option<journal::ToolFault>,
-    busy: Option<journal::ExecCmdBusyReason>,
+    reason: Option<journal::ToolDecisionReason>,
     refusal: Option<journal::ExecCmdRefusal>,
 ) -> Option<(u8, String)> {
     use journal::ToolDecision as D;
@@ -115,13 +151,37 @@ pub fn not_run_result(
             .to_string(),
             None => "refused: secret_detection_unavailable".into(),
         },
-        D::Busy => format!(
-            "exec_cmd_busy: {}",
-            busy.map_or("unknown", journal::ExecCmdBusyReason::as_str)
-        ),
-        D::Denied | D::Limit | D::Cancelled => decision.as_str().into(),
+        D::Busy | D::Denied => match reason.map(|r| (r, decision_reason_text(r))) {
+            Some((reason, text)) => {
+                format!("{}: {}: {text}", decision_prefix(decision), reason.as_str())
+            }
+            None if decision == D::Busy => "exec_cmd_busy: unknown".into(),
+            None => decision.as_str().into(),
+        },
+        D::Limit | D::Cancelled => decision.as_str().into(),
     };
     Some((status, text))
+}
+
+/// The first word of a `busy` or `denied` result with a reason.
+fn decision_prefix(decision: journal::ToolDecision) -> &'static str {
+    match decision {
+        journal::ToolDecision::Busy => "exec_cmd_busy",
+        _ => decision.as_str(),
+    }
+}
+/// The fixed text after a decision reason's name (tool-job-controller.md,
+/// J3 kind 14 changes).
+fn decision_reason_text(reason: journal::ToolDecisionReason) -> &'static str {
+    use journal::ToolDecisionReason as R;
+    match reason {
+        R::QueueFull => {
+            "this agent's job queue is full; wait for a job to settle or cancel one with job cancel"
+        }
+        R::JobsFull => "the service has 64 unsettled jobs; wait for one to settle",
+        R::Closed => "the service is stopping",
+        R::ExecutionOff => "the person turned command execution off for this project; do not retry",
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,10 +190,15 @@ pub enum Arguments {
         body: String,
         source_version: Option<String>,
     },
+    /// An exec_cmd call; it runs as a job (J3).
     ExecCmd {
         command: String,
         cwd: String,
+        /// The yield window, 0-30 seconds; 10 when absent.
+        yield_seconds: u32,
     },
+    /// A `job` tool command (codes 11-16).
+    Job(JobArguments),
     ReadAudit {
         limit: u32,
     },
@@ -159,6 +224,80 @@ pub enum Arguments {
     ListDirectory {
         path: String,
     },
+}
+/// The typed `job` tool commands (tool-job-controller.md, the job tool).
+/// The parser has checked every bound; a handle is never all zero.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JobArguments {
+    /// Code 11. `before` is a kind 26 frame sequence, at least 1.
+    List { before: Option<u64> },
+    /// Code 12.
+    Status { job: journal::Id },
+    /// Code 13. `offset` absent means the turn cursor (J3-E4); `limit`
+    /// 1-8,192 source bytes.
+    Read {
+        job: journal::Id,
+        stream: journal::OutputStream,
+        offset: Option<u64>,
+        limit: u32,
+    },
+    /// Code 14. `seconds` 1-3,600; absent means only events end the wait.
+    Wait {
+        job: journal::Id,
+        seconds: Option<u32>,
+    },
+    /// Code 15.
+    Cancel { job: journal::Id },
+    /// Code 16. `text` 1-2,048 UTF-8 bytes, no NUL.
+    Note { job: journal::Id, text: String },
+}
+impl JobArguments {
+    /// The kind 14 operation code of this command.
+    pub fn operation(&self) -> journal::ToolOperation {
+        use journal::ToolOperation as O;
+        match self {
+            Self::List { .. } => O::JobList,
+            Self::Status { .. } => O::JobStatus,
+            Self::Read { .. } => O::JobRead,
+            Self::Wait { .. } => O::JobWait,
+            Self::Cancel { .. } => O::JobCancel,
+            Self::Note { .. } => O::JobNote,
+        }
+    }
+    /// The job the command names; `None` for `list`.
+    pub fn job(&self) -> Option<journal::Id> {
+        match self {
+            Self::List { .. } => None,
+            Self::Status { job }
+            | Self::Read { job, .. }
+            | Self::Wait { job, .. }
+            | Self::Cancel { job }
+            | Self::Note { job, .. } => Some(*job),
+        }
+    }
+    fn valid(&self) -> bool {
+        match self {
+            Self::List { before } => before.is_none_or(|b| b >= 1),
+            Self::Read {
+                job, offset, limit, ..
+            } => {
+                *job != [0; 16]
+                    && offset.is_none_or(|o| o <= i64::MAX as u64)
+                    && (1..=journal::MAX_JOB_PAGE).contains(limit)
+            }
+            Self::Wait { job, seconds } => {
+                *job != [0; 16]
+                    && seconds.is_none_or(|s| (1..=MAX_WAIT_SECONDS).contains(&u64::from(s)))
+            }
+            Self::Note { job, text } => {
+                *job != [0; 16]
+                    && !text.is_empty()
+                    && text.len() <= journal::MAX_JOB_NOTE
+                    && !text.contains('\0')
+            }
+            Self::Status { job } | Self::Cancel { job } => *job != [0; 16],
+        }
+    }
 }
 impl Arguments {
     pub fn is_memory_create(&self) -> bool {
@@ -193,6 +332,10 @@ impl Arguments {
             Self::ListTools => &OPERATIONS[6],
             Self::ReadAudit { .. } => &OPERATIONS[7],
             Self::ExecCmd { .. } => &OPERATIONS[8],
+            Self::Job(job) => {
+                &OPERATIONS
+                    [10 + (job.operation() as usize - journal::ToolOperation::JobList as usize)]
+            }
             Self::MemoryListNotes { .. } => &OPERATIONS[3],
             Self::MemoryGetNote { .. } => &OPERATIONS[4],
             Self::MemoryNoteSources { .. } => &OPERATIONS[5],
@@ -218,10 +361,24 @@ impl Arguments {
                 };
             }
             Self::ObserveStatus | Self::ListTools => return Ok(()),
-            Self::ExecCmd { command, cwd } => {
+            Self::Job(job) => {
+                return if job.valid() {
+                    Ok(())
+                } else {
+                    Err(Rejection::InvalidArguments)
+                };
+            }
+            Self::ExecCmd {
+                command,
+                cwd,
+                yield_seconds,
+            } => {
                 return if !command.is_empty()
-                    && command.len() <= 8192
-                    && !command.contains('\0')
+                    && command.len() <= MAX_COMMAND_BYTES
+                    && !command
+                        .chars()
+                        .any(|c| c.is_control() && c != '\t' && c != '\n')
+                    && u64::from(*yield_seconds) <= MAX_YIELD_SECONDS
                     && !cwd.is_empty()
                     && cwd.len() <= 1024
                     && !cwd.contains('\0')
@@ -369,11 +526,35 @@ pub struct Grant {
 pub enum Rejection {
     Stale,
     Denied,
+    /// An exec_cmd call while the project's effective execution setting is
+    /// off (`execute_authorized` false, EX11): decision `denied` with
+    /// reason 1 `execution_off`.
+    ExecutionOff,
     InvalidArguments,
     Limit,
     Busy,
     Cancelled,
     IdentityConflict,
+}
+
+impl Rejection {
+    /// The kind 14 decision and field 10 reason (J3-E3) of a call that
+    /// authority refuses: `denied`, with `execution_off` only for an
+    /// exec_cmd call refused by the execution setting; the over-limit
+    /// ordinal is `limit`.
+    pub fn decision(self) -> (journal::ToolDecision, Option<journal::ToolDecisionReason>) {
+        use journal::{ToolDecision as D, ToolDecisionReason as R};
+        match self {
+            Self::ExecutionOff => (D::Denied, Some(R::ExecutionOff)),
+            Self::Limit => (D::Limit, None),
+            Self::Cancelled => (D::Cancelled, None),
+            Self::Stale
+            | Self::Denied
+            | Self::InvalidArguments
+            | Self::Busy
+            | Self::IdentityConflict => (D::Denied, None),
+        }
+    }
 }
 
 pub fn validate(call: &Call, grant: &Grant, destination: &Destination) -> Result<(), Rejection> {
@@ -392,21 +573,29 @@ pub fn validate_authority(
     {
         return Err(Rejection::Stale);
     }
-    if grant.project == [0; 16]
-        || if matches!(call.arguments, Arguments::ExecCmd { .. }) {
-            !grant.execute_authorized
-        } else if call.arguments.is_memory_create() {
-            !grant.memory_write_authorized
-        } else {
-            !grant.read_authorized
-        }
-    {
+    if grant.project == [0; 16] {
         return Err(Rejection::Denied);
     }
+    // `execute_authorized` is the project's effective execution setting
+    // (EX11). Job commands need only `read_authorized`: `cancel` and `note`
+    // stay allowed while execution is off (ES-E3).
+    if matches!(call.arguments, Arguments::ExecCmd { .. }) {
+        if !grant.execute_authorized {
+            return Err(Rejection::ExecutionOff);
+        }
+    } else if if call.arguments.is_memory_create() {
+        !grant.memory_write_authorized
+    } else {
+        !grant.read_authorized
+    } {
+        return Err(Rejection::Denied);
+    }
+    // Job output and states never go to a remote destination, like the
+    // exec_cmd result itself.
     if (call.arguments.is_memory()
         || matches!(
             call.arguments,
-            Arguments::ReadAudit { .. } | Arguments::ExecCmd { .. }
+            Arguments::ReadAudit { .. } | Arguments::ExecCmd { .. } | Arguments::Job(_)
         ))
         && matches!(destination, Destination::Remote(_))
     {
@@ -495,11 +684,21 @@ mod tests {
             arguments: Arguments::ExecCmd {
                 command: "printf hello".into(),
                 cwd: ".".into(),
+                yield_seconds: 10,
             },
         };
+        // J3T-14 (unit): execution off is `denied` with reason 1
+        // `execution_off` and its fixed text (EX11).
+        let refused = validate(&call, &grant, &Destination::Local);
+        assert_eq!(refused, Err(Rejection::ExecutionOff));
+        let (decision, reason) = refused.unwrap_err().decision();
         assert_eq!(
-            validate(&call, &grant, &Destination::Local),
-            Err(Rejection::Denied)
+            not_run_result(decision, None, reason, None),
+            Some((
+                2,
+                "denied: execution_off: the person turned command execution off for this project; do not retry"
+                    .into()
+            ))
         );
         grant.execute_authorized = true;
         grant.read_authorized = false;
@@ -508,17 +707,139 @@ mod tests {
             validate(&call, &grant, &Destination::Remote("approved".into())),
             Err(Rejection::Denied)
         );
-        for (command, cwd) in [("", "."), ("a\0b", "."), ("echo", "../x"), ("echo", "/tmp")] {
+        for (command, cwd, yield_seconds) in [
+            ("", ".", 10),
+            ("a\0b", ".", 10),
+            ("a\rb", ".", 10),
+            ("echo", "../x", 10),
+            ("echo", "/tmp", 10),
+            ("echo", ".", 31),
+        ] {
             let mut invalid = call.clone();
             invalid.arguments = Arguments::ExecCmd {
                 command: command.into(),
                 cwd: cwd.into(),
+                yield_seconds,
             };
             assert_eq!(
                 validate(&invalid, &grant, &Destination::Local),
                 Err(Rejection::InvalidArguments)
             );
         }
+    }
+    /// The job tool: every command needs `read_authorized` only, so
+    /// `cancel` and `note` stay allowed while execution is off (ES-E3); job
+    /// state and output never go to a remote destination; the project
+    /// executor never runs a job command.
+    #[test]
+    fn job_commands_need_read_authority_only_and_never_go_remote() {
+        let (mut call, mut grant) = fixture();
+        grant.execute_authorized = false;
+        grant.remote_destination = Some("approved".into());
+        let job = [7; 16];
+        let commands = [
+            JobArguments::List { before: Some(1) },
+            JobArguments::Status { job },
+            JobArguments::Read {
+                job,
+                stream: journal::OutputStream::Stdout,
+                offset: None,
+                limit: 8192,
+            },
+            JobArguments::Wait {
+                job,
+                seconds: Some(3600),
+            },
+            JobArguments::Cancel { job },
+            JobArguments::Note {
+                job,
+                text: "n".into(),
+            },
+        ];
+        for (index, command) in commands.into_iter().enumerate() {
+            assert_eq!(
+                Arguments::Job(command.clone()).definition().name,
+                [
+                    "job_list",
+                    "job_status",
+                    "job_read",
+                    "job_wait",
+                    "job_cancel",
+                    "job_note"
+                ][index]
+            );
+            call.arguments = Arguments::Job(command);
+            grant.read_authorized = true;
+            assert_eq!(validate(&call, &grant, &Destination::Local), Ok(()));
+            assert_eq!(
+                validate(&call, &grant, &Destination::Remote("approved".into())),
+                Err(Rejection::Denied)
+            );
+            grant.read_authorized = false;
+            assert_eq!(
+                validate(&call, &grant, &Destination::Local),
+                Err(Rejection::Denied)
+            );
+        }
+        for invalid in [
+            JobArguments::Status { job: [0; 16] },
+            JobArguments::List { before: Some(0) },
+            JobArguments::Read {
+                job,
+                stream: journal::OutputStream::Stderr,
+                offset: Some(u64::MAX),
+                limit: 1,
+            },
+            JobArguments::Read {
+                job,
+                stream: journal::OutputStream::Stderr,
+                offset: None,
+                limit: 8193,
+            },
+            JobArguments::Wait {
+                job,
+                seconds: Some(0),
+            },
+            JobArguments::Note {
+                job,
+                text: String::new(),
+            },
+            JobArguments::Note {
+                job,
+                text: "a\0".into(),
+            },
+        ] {
+            assert_eq!(
+                Arguments::Job(invalid).validate(),
+                Err(Rejection::InvalidArguments)
+            );
+        }
+        grant.read_authorized = true;
+        call.arguments = Arguments::Job(JobArguments::Status { job });
+        assert_eq!(
+            Executor::default().start(
+                call,
+                grant,
+                Destination::Local,
+                ExecutionScope {
+                    project: [2; 16],
+                    path: "/does-not-exist".into(),
+                    device: 0,
+                    inode: 0,
+                    boundary: asura_platform::StateBoundary::detached_for_test(),
+                },
+            ),
+            Err(ExecutionError::Rejected(Rejection::Denied))
+        );
+        // The decision of each authority refusal (J3-E3).
+        use journal::{ToolDecision as D, ToolDecisionReason as R};
+        assert_eq!(
+            Rejection::ExecutionOff.decision(),
+            (D::Denied, Some(R::ExecutionOff))
+        );
+        assert_eq!(Rejection::Denied.decision(), (D::Denied, None));
+        assert_eq!(Rejection::Stale.decision(), (D::Denied, None));
+        assert_eq!(Rejection::Limit.decision(), (D::Limit, None));
     }
     /// TCR-D9, TCR-U18: every recorded call consumes one ordinal 1-200
     /// whether or not it runs; the over-limit ordinal 201 is never counted and
@@ -809,7 +1130,7 @@ mod tests {
     /// TCR-D12: rendered text of calls that do not run holds only codes.
     #[test]
     fn not_run_text_is_rendered_from_codes_only() {
-        use journal::{ExecCmdBusyReason as B, ToolDecision as D, ToolFault as F};
+        use journal::{ToolDecision as D, ToolDecisionReason as R, ToolFault as F};
         assert_eq!(
             not_run_result(D::InvalidArguments, Some(F::MissingField), None, None),
             Some((3, "invalid_arguments: missing_field".into()))
@@ -830,10 +1151,40 @@ mod tests {
         let (status, text) = not_run_result(D::Refused, None, None, Some(refusal)).unwrap();
         assert_eq!(status, 3);
         assert!(text.starts_with("Command refused: a `github-token` secret in word 2"));
-        assert_eq!(
-            not_run_result(D::Busy, None, Some(B::Quota), None),
-            Some((4, "exec_cmd_busy: quota".into()))
-        );
+        // J3T-14 (unit, rendered texts): busy codes 1-3 and `denied`
+        // reason 1; the J1 busy codes are retired.
+        for (decision, reason, status, text) in [
+            (
+                D::Busy,
+                R::QueueFull,
+                4,
+                "exec_cmd_busy: queue_full: this agent's job queue is full; wait for a job to settle or cancel one with job cancel",
+            ),
+            (
+                D::Busy,
+                R::JobsFull,
+                4,
+                "exec_cmd_busy: jobs_full: the service has 64 unsettled jobs; wait for one to settle",
+            ),
+            (
+                D::Busy,
+                R::Closed,
+                4,
+                "exec_cmd_busy: closed: the service is stopping",
+            ),
+            (
+                D::Denied,
+                R::ExecutionOff,
+                2,
+                "denied: execution_off: the person turned command execution off for this project; do not retry",
+            ),
+        ] {
+            assert_eq!(reason.decision(), decision);
+            assert_eq!(
+                not_run_result(decision, None, Some(reason), None),
+                Some((status, text.into()))
+            );
+        }
         assert_eq!(
             not_run_result(D::Denied, None, None, None),
             Some((2, "denied".into()))
@@ -864,6 +1215,9 @@ pub struct ExecutionScope {
 pub enum Output {
     File(asura_platform::ProjectPage),
     Directory(asura_platform::ProjectListing),
+    /// The project identity recheck alone (a `job` command): the project
+    /// is the one the turn was admitted for.
+    Checked,
 }
 #[derive(Debug, Eq, PartialEq)]
 pub enum ExecutionError {
@@ -914,6 +1268,7 @@ impl Executor {
                 | Arguments::ListTools
                 | Arguments::ReadAudit { .. }
                 | Arguments::ExecCmd { .. }
+                | Arguments::Job(_)
         ) || call.arguments.is_memory()
         {
             return Err(ExecutionError::Rejected(Rejection::Denied));
@@ -938,6 +1293,7 @@ impl Executor {
                 | Arguments::ListTools
                 | Arguments::ReadAudit { .. }
                 | Arguments::ExecCmd { .. }
+                | Arguments::Job(_)
                 | Arguments::MemoryListNotes { .. }
                 | Arguments::MemoryGetNote { .. }
                 | Arguments::MemoryNoteSources { .. }
@@ -957,6 +1313,39 @@ impl Executor {
                     .map(Output::Directory)
                     .map_err(ExecutionError::Host),
             }
+        })
+    }
+    /// The project identity recheck that every `job` command runs first
+    /// (tool-job-controller.md, the job tool): the same open and compare as
+    /// a project read, on the same worker, with no read. `Changed` means
+    /// the project was replaced. The conversation owner must commit the
+    /// call's kind 14 first.
+    pub fn recheck(
+        &mut self,
+        call: Call,
+        grant: Grant,
+        destination: Destination,
+        scope: ExecutionScope,
+    ) -> Result<(), ExecutionError> {
+        if self.work.is_some() {
+            return Err(ExecutionError::Rejected(Rejection::Busy));
+        }
+        validate(&call, &grant, &destination).map_err(ExecutionError::Rejected)?;
+        if !matches!(call.arguments, Arguments::Job(_)) || scope.project != grant.project {
+            return Err(ExecutionError::Rejected(Rejection::Denied));
+        }
+        self.spawn(move |cancelled| {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(ExecutionError::Rejected(Rejection::Cancelled));
+            }
+            let project = asura_platform::ProjectIdentity::open(&scope.path, &scope.boundary)
+                .map_err(|_| ExecutionError::Host(asura_platform::ProjectReadError::UnsafePath))?;
+            if project.device != scope.device || project.inode != scope.inode {
+                return Err(ExecutionError::Host(
+                    asura_platform::ProjectReadError::Changed,
+                ));
+            }
+            Ok(Output::Checked)
         })
     }
     fn spawn(
@@ -1101,7 +1490,16 @@ mod inventory_tests {
     fn inventory_uses_exact_registry_metadata_and_rejects_overflow() {
         assert_eq!(
             REGISTRY.iter().map(|tool| tool.name).collect::<Vec<_>>(),
-            ["project", "memory", "service", "exec_cmd"]
+            ["project", "memory", "service", "exec_cmd", "job"]
+        );
+        // The J3 registry texts (helper tool definitions).
+        assert_eq!(
+            REGISTRY[3].description,
+            "Run one /bin/sh -c command line in the admitted project as a job; returns its handle, state and byte counts, never output text."
+        );
+        assert_eq!(
+            REGISTRY[4].description,
+            "Job commands: list(before?), status(job), read(job, stream, offset?, limit?), wait(job, seconds?), cancel(job), note(job, text)."
         );
         let text = inventory_text().unwrap();
         assert_eq!(text.lines().count(), REGISTRY.len());

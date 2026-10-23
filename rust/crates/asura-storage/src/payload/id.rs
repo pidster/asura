@@ -17,8 +17,9 @@ pub enum ObjectKind {
 
 /// The first 16 bytes of SHA-256 over ASCII `asura.payload`, one zero byte,
 /// the installation ID, the job ID and the object kind byte. An all-zero
-/// result becomes 1 in its final byte. Every job origin, and a J1-mode
-/// exec_cmd call through its model-origin job ID, uses this derivation.
+/// result becomes 1 in its final byte. Every job origin uses this
+/// derivation; a model exec_cmd call reaches it through its model-origin
+/// job ID.
 pub fn payload_id(installation: Id, job: Id, kind: ObjectKind) -> Id {
     let mut hash = Sha256::new();
     hash.update(b"asura.payload\0");
@@ -128,11 +129,11 @@ mod tests {
         assert_eq!(truncated(&low)[15], 7);
     }
 
-    /// J2T-04 (payload): a J1-mode exec_cmd call uses the same derivation
+    /// J2T-04 (payload): a model exec_cmd call uses the job derivation
     /// through its model-origin job ID; the operation, generation and
     /// ordinal enter only through the job ID.
     #[test]
-    fn j2t_04_j1_calls_use_the_job_derivation() {
+    fn j2t_04_exec_cmd_calls_use_the_job_derivation() {
         let job = crate::authority::conversation::exec_cmd_job_id([1; 16], 1, 1);
         assert_eq!(
             job,

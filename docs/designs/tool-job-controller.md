@@ -3680,13 +3680,11 @@ queues (AQ1) and no output text in results (PC12). Mechanisms marked "selected
 (engineering)" are engineering choices under the
 [iteration rules](../design-process.md#iteration-and-escalation). Protocol
 numbering remains `0.1`; journal format remains `1`. Implementation state on
-2026-10-22: on the J3 integration branch, not merged, J34-S (storage
-records), J3-H (helper), J34-C (payload store), J3-D (retirement of the J1
-path), J34-K (controller extensions, `c63d7ca`) and J3-R (parsing and result
-text, `840f28d`) are implemented. The follow-up steps J34-K2, J34-C2 and
-J3-D2 and the integration J34-E are not
-([branch order](#tj-p3-j3-and-j4-packet-order-and-enablement)). Until J34-E,
-a model `exec_cmd` call on the branch is recorded `denied` and runs nothing.
+2026-10-23: on the J3 integration branch, not merged, every J3 and J4
+packet is implemented, including the integration J34-E (`586b133` to
+`3692467`, [evidence](#j3-and-j4-evidence)); the gate and the merge remain
+([branch order](#tj-p3-j3-and-j4-packet-order-and-enablement)). A model
+`exec_cmd` call on the branch runs as a job.
 
 ### J3 scope
 
@@ -3861,7 +3859,7 @@ An out-of-range integer is 9 `out_of_range`; a wrong JSON type is 8 `wrong_type`
 | Code | Command | Behavior | Ends on |
 | --- | --- | --- | --- |
 | 11 | `list` | Up to 8 jobs of the turn's conversation, any origin, newest first by kind 26 sequence, from before `before` when given. Each entry: handle, origin, command excerpt, state or outcome, bytes per stream and unread bytes | The journal worker's reply |
-| 12 | `status` | One job's [state block](#model-result-text) | At once for a live job; the journal reply for a settled one |
+| 12 | `status` | One job's [state block](#model-result-text) | The journal's `JobFacts` reply (as for codes 13–16: it supplies the conversation scope, origin, stored command, SL7 flag and retention counts), then at once for a live job; for a settled one the same reply carries kind 28 |
 | 13 | `read` | One text page of at most `limit` source bytes from `offset`, under the page contract; moves the turn cursor to the page's end | The page reply; turn cancel discards it |
 | 14 | `wait` | Returns at once if the job is settled. Otherwise waits for kind 28, for either stream's stored bytes to pass their values at the call, or for `seconds` | Those events, or turn cancel |
 | 15 | `cancel` | Requests cancellation of a model-origin job with requester model, reason 1 `model_cancel`; returns the state after the request. It never claims that the process stopped | At once |
@@ -3874,7 +3872,9 @@ job exists elsewhere. `cancel` of a person-origin job gives `not_permitted`
 (PC10). Each command needs the turn's `read_authorized` grant and runs the tool
 executor's existing project identity recheck first; a mismatch revokes the
 project's jobs with `identity_changed` (J2-E10) and the call gets `not_found`.
-`cancel` and `note` are allowed while execution is off (ES-E3). A `job` call
+`cancel` and `note` are allowed while execution is off (ES-E3). Codes 12–16
+first read the job's `JobFacts` from the journal worker; the scope check and
+`not_found` use that reply, so no job fact is kept twice in service memory. A `job` call
 for a remote destination is `denied`, as exec_cmd, memory and audit calls
 are: job state and output never go to a remote destination (recorded
 2026-10-22 from the J3-R report).
@@ -4403,14 +4403,12 @@ pub(crate) struct JobView { pub job: Id, pub origin: Origin, pub agent: AgentKey
     pub project: Id, pub sequence: Option<u64>, // kind 26 frame sequence once committed
     pub intent_ms: u64, pub snapshot: JobSnapshot, // the kind 29 state block
     pub text: Option<String>, pub cancel: Option<JobReason>, pub outcome: Option<Outcome> }
-pub(crate) struct Outlived { pub count: u32, pub jobs: Vec<Id> } // at most 8 IDs (EX12)
 impl JobController {
     pub fn revision(&self) -> u64;
     pub fn bump_revision(&mut self);
     pub fn view(&self, job: Id, now: Instant) -> Option<JobView>;
     pub fn live_views(&self, scope: Option<JobScope>, now: Instant) -> Vec<JobView>;
     pub fn live_count(&self, scope: Option<JobScope>) -> u32;
-    pub fn outlived(&self, operation: Id) -> Outlived;
 }
 // job_controller/waits.rs
 pub(crate) enum WaitKey { Agent(AgentKey), Client(u64) }
@@ -4668,7 +4666,8 @@ store, J4-T the TUI and J4-R the control handler (`5b7f55b`). The J4-R
 report found five gaps, which this section now designs: the storage step
 J34-S2, the platform step J34-A and the handler step J4-R2
 ([TJ-P3](#tj-p3-j3-and-j4-packet-order-and-enablement)). The service wiring
-(J34-E) is not implemented, so no J4 request is served yet.
+(J34-E) is implemented on the branch (2026-10-23): the service serves the J4
+requests and lists `CAPABILITY_JOBS` ([evidence](#j3-and-j4-evidence)).
 
 ### J4 scope
 
@@ -5085,8 +5084,10 @@ for live-only rows.
   discarded (WB1).
 - **Cancel.** `JobCancel` on a model-origin job calls `cancel` with requester
   client, reason 3 `client_cancel`. On a person-origin job it uses requester
-  person, reason 4 `person_stop`, or 5 `person_kill` with `kill`. A settled job
-  replies `requested: false`. A repeated request is idempotent (J2).
+  person, reason 4 `person_stop`, or 5 `person_kill` with `kill`. A job settled
+  before the request replies `requested: false`; a request that the controller
+  accepts replies `true`, even when the job then settles at once (a queued
+  start). A repeated request is idempotent (J2).
 - **Retain.** The handler validates, redacts a person note, appends kind 30 and
   replies after the commit. A held journal makes the request wait for room; the
   person's cancel ends the wait with `outcome_unconfirmed` (J1-0 client rule).
@@ -5137,8 +5138,9 @@ branch). These choices settle details that the rules above leave open:
   most 3 times. Then it replies `requested: true` with the live entry.
 - **Writer busy.** A journal writer `Busy` gives `unavailable` for
   `JobCancel` and `JobRetain`.
-- **Live list without the journal.** Entries come from memory, with an empty
-  `command` and no retention fields.
+- **Live list without the journal.** Entries come from memory, with the
+  command excerpt that `JobView.excerpt` holds (built at admission from the
+  stored, redacted command) and no retention fields.
 - **Pages without a read.** For an `expired`, `missing`, `corrupt` or
   `deleted` page, the reply holds the kind 28 totals and an empty page. A
   stale cursor gives an empty page at the total. An unspawned job gives an
@@ -5445,6 +5447,74 @@ real guardians. End-to-end cases are in
 - The viewer renders text pages only; raw pages remain later (R5).
 - Expiry by class and age, and the model reference hold, wait for J6.
 
+### J3 and J4 evidence
+
+Verified behavior, 2026-10-23, packet J34-E on the J3 integration branch
+(`586b133` to `3692467`), macOS 27 development host with `sandbox-exec`, a
+scratch installation per case and the helper rebuilt from the branch (it
+declares the `job` tool, J3-H). Integration cases run the real service,
+helper, guardians, journal and payload store with a scripted loopback model;
+each that handles a secret ends with the raw-byte sweep.
+
+| Suite | Cases and IDs |
+| --- | --- |
+| `tests/job_tool_flow.rs` | `reads`: J3T-04 (settled inside the window, `running` with `yield_seconds` 0), J3T-06, J3T-08 (both streams from 0), J3T-09 (wait ends on new output), J3T-11, J3T-13 (kind 30 before its kind 29), J3T-17 and J3T-20 (one `tool.finished` per job call, no output or note text in the journal or audit log); `queue`: J3T-07 (`queued (waiting: 2 of 2 jobs running for this agent)`), J3T-10 (one kind 27, `model_cancel`), J3T-12 (`not_found`), J3T-14 (`queue_full`); `execution`: ES-04, ES-05, ES-07, ES-10, ES-11; `identity`: a replaced project revokes its job (`identity_changed`) and the job call gets `not_found`; `j21`: J3T-21; `limits`: TJ-F5 through a `test-support` gate file |
+| `tests/job_control_flow.rs` | `follow`: J4T-04 (a page reply alone completes a `JobRead`; an observe ends on new output), J4T-05, J4T-07, J4T-09, ES-12 (a parked `JobList` returns on the revision), EX12 outlived count; `retain`: J4T-06 (pin, unchanged pin, unpin, delete removes both files and pages report `deleted`), J4T-13 (a person note redacted to `$ASURA_SECRET_0` with a typed `$ASURA_SECRET_3` kept, and the model note, both in `JobInspect` by author) |
+| `tests/capture_flow.rs` | All 8 J1T cases on the job path (J1T cases after J3-D); the 65 s command returns `running` at its window and outlives its turn (EX12) |
+| `tests/tool_call_flow.rs` | `secret` and `restart` on the job path |
+| `tests/capture_worker.rs` | `stored`: J3T-22, a flood of 64 chunks ends with a wake and `Ledger::stored` equal to the bytes written |
+| `tests/job_controller_flow.rs` | Unchanged J2 cases, green |
+| `asura-cli/tests/lifecycle.rs` | PTY journeys `--exec-cmd-capture` (SDE-06 shown again), `--tool-call-records`, `--jobs` (J34E-03, 05, 06, 08, 09), `--job-viewer` (J34E-04, 11), `--job-retention` (J34E-10), `--execution-setting` (J34E-14) |
+| `conversation_flow` native | `--native-exec-cmd-tools`: EQ-1 to EQ-4 and EQ-3b, EQ-4b pass on the system model on the job path, one run (J34E-17 asks for 5 runs per provider); `--native-tools` and `--native-ollama-tools` (Ollama `qwen3:4b-q4_K_M`) pass |
+
+Unit layers added with the integration: J3T-20 and J4T-10 (audit mapping),
+TJ-Q9 measurement and the deletion queue, TJ-F5 pacing and shutdown, SD-S2
+warm spawn retry, ES-11 per-entry events, the 64 KiB ES-02 cases, the page
+wake and the reserved page worker, and J4T-11 for the TUI request slot.
+
+Findings fixed while running the journeys: the TUI job worker's request
+reply could wait for an unrelated event, because its three slots share one
+router source with the queue observer (the reply is now read from a slot
+filled before the notice); a client cancel of a queued start that settles
+at once reported `requested: false` (now `true`, because the request made
+the cancel); and `ToolProgress.exit_code` from controller memory differed
+after a restart (now absent; the viewer and `job status` show the exit).
+
+Not proven by this packet: J34E-07 and the J2T-09 extension (a constrained
+APFS image with a file deleted outside Asura), J34E-13 through the TUI,
+J34E-15, J3T-18 and J4T-12 (typing and Inspect within 100 ms under 8
+followers or a 16-job flood), J2T-18 and J2T-19 measurements, SDI-13 through
+a gated warm thread, J34E-02 and J34E-12 on a native model, and EX10's 5
+runs per provider.
+
+Deviations found by the packet and settled (2026-10-23):
+
+- The outlived count of a terminal read after a service restart was absent,
+  because the owner kept it in memory for the last 64 terminals. This breaks
+  the derivation rule above and the restore rule of the EX12 notice. Packet
+  J34-E2 derives it from the records at each terminal read: the journal
+  worker's `ReadResponse` returns `Reply.outlived: Option<OutlivedJobs>` from
+  `Replay::outlived_jobs` (at most 8 IDs, `MAX_OUTLIVED_JOB_IDS`), and the
+  controller keeps no copy. J4T-08's unit layer is in storage
+  (`authority_conversation.rs`); its integration case `outlived` in
+  `job_control_flow.rs` reads the count again after a restart.
+- With no job controller (the controller failed to start or is stopping),
+  every J4 request gets `unavailable`, including lists of settled jobs. This
+  is the intended rule: settled-job reads need the controller's view of
+  retention and live state, and a partial list would misstate them.
+- TJ-F5's integration case cannot use an invalid `config.yaml`, because that
+  also blocks turn preparation. The case uses a `test-support` gate file read
+  only in `test-support` builds.
+- `JobView.excerpt` needs `StartRequest.stored_command` and retired jobs keep
+  their kind 28 (`settled_facts`) in `job_controller*`, beyond the J34-E row's
+  `port.rs`. The change is accepted under the J34-E row.
+- The audit codec (`asura-control/src/audit_query.rs`) accepted tool codes
+  1–10 only and now accepts 1–16, so the control contract's audit range follows
+  [the audit job values](#audit-of-job-tool-calls).
+- `ToolProgress.exit_code` is absent for job-mode `exec_cmd` calls: a value
+  from controller memory differed after a restart, and a tool-record view does
+  not read kind 28. The viewer and `job status` show the exit.
+
 ## J3 and J4 code packets
 
 Selected plan for the code of J3, J4 and the [execution setting](execution-setting.md).
@@ -5473,7 +5543,7 @@ primary agent integrates and inspects each result.
 | J34-A Secret rule set readiness and note redaction | `asura-platform/src/secrets.rs`, `secrets/rewrite.rs`, `secrets/tests.rs` | — | `secrets::compiled()`; `secrets::note_redacted`; `rewrite_exec_cmd_call_with(rules: &'static RuleSet, command, cwd)` made public, so a reactor caller passes the ready set; SDU-18, SDU-19 ([rule set readiness](secret-detection.md#rule-set-readiness), [person note redaction](secret-detection.md#person-note-redaction)) |
 | J4-R2 Handler follow-ups | `asura-service/src/job_control.rs`, `job_control/tests.rs` | J34-S2, J34-A | `Ctx.rules`, `Wait::Rules`, `waiting_for_rules()`; note redaction with `note_redacted`, deleting `unnumbered`; lists from `JobListing.excerpt` without `JobFacts` reads, deleting `command_excerpt`; `invalid_cursor` from `before_found`, deleting the extra cursor read; model notes in `JobDetail` ([J4 control handler](#j4-control-handler)); unit parts of J4T-13 |
 | J4-T TUI (implemented on the J3 integration branch, `f7f50c3`) | `asura-cli/src/tui/jobs.rs` (new); `asura-cli/src/tui/{ui,mod,config}.rs`; `asura-cli/src/tui/ui/*.rs`; `asura-cli/tests/tui_pty.py` (job journeys) | J34-W | Job worker, list, viewer, commands, EX12 notice, status row, exit count, `/execution`; J4T-11 and the PTY journeys |
-| J34-E Integration | `asura-service/src/conversation.rs`; `asura-service/src/conversation/*.rs` (including new `job_tool.rs`, `audit_tools.rs`, and `jobs.rs` for the limits read retry); `asura-service/src/{lib,payload_owner,audit,config_worker,test_support}.rs`; `asura-service/src/secret_rules.rs` (new); for the capture reason texts, the SL7 test port and the switch to the storage `exec_cmd_command`, `asura-service/src/job_text.rs`; for the default body of `PayloadPort::stored` only, `asura-service/src/job_controller/port.rs`; `asura-service/tests/{job_tool_flow,job_control_flow}.rs` (new); the J3T-22 stored-signal case in `asura-service/tests/capture_worker.rs`; and the ports in `asura-service/tests/{capture_flow,tool_call_flow,job_controller_flow}.rs`; `asura-platform/src/config.rs` and its tests, and the ES-02 file-bound case in `asura-storage/src/config.rs`, for the [configuration file bound](execution-setting.md#configuration); the six job values in `asura-storage/src/audit/{types,tests}.rs`; the reserved-worker and wake parameters of `PagePool::start` in `asura-storage/src/payload/pages.rs` and their callers in `asura-service/tests/capture_worker.rs` and `asura-storage/tests/payload_store.rs` and the stale J1-mode comments in `asura-storage/src/payload/id.rs`; for the `JOB_COMMANDS` merge only, `asura-cli/src/tui/ui.rs`; `asura-cli/tests/lifecycle.rs`; `docs/user/{commands,guide,keys}.md`; the J3, J4 and EX11 evidence in the designs | All above | The exec_cmd switch, the 64 KiB configuration file bound, kind 29 append, yield window wiring, `job` dispatch, job request routing and capability, execution setting state and revocation, audit emission, job events in the audit read; the [audit of job calls](#audit-of-job-tool-calls); the maintenance worker with its deletion queue of 8 and the [disk-space measurement](#disk-space-recheck); `jobs.modelReservedPageReads` applied; the [limits read retry](#start-time-limits-read-failure); `filtered_line` removed from `exec_cmd_call.rs`; the `commands.md` rows for `/jobs`, `/job` and `/execution` with `JOB_COMMANDS` merged into `LOCAL_COMMANDS`; the four job PTY modes in `lifecycle.rs`; the [J1T ports](#j1t-cases-after-j3-d); the identity detectors through real turns; `PayloadPort::stored` in `payload_owner.rs` from `Ledger::stored`, with the trait's default body removed from `job_controller/port.rs`; the [capture reason texts](#model-result-text) in `asura-service/src/job_text.rs` with the J3T-16 golden texts; `Rejection::decision()` at the `validate_authority` call in `conversation.rs`, so a refusal records `execution_off`; a poll of the controller before each view taken for kind 29 or a reply; a code 10 kind 29 held until the job's kind 26 commits ([writing job records](#writing-job-records)); the [rule set readiness](secret-detection.md#rule-set-readiness) wiring: the `asura-secret-rules` warm thread spawned at start in `secret_rules.rs`, its wake, the spawn retry when a turn start or `JobControl::waiting_for_rules()` needs the set, `Ctx.rules` filled from `secrets::compiled()`, no model turn sent to the helper while the set is not ready, `compiled()` and `rewrite_exec_cmd_call_with` at the tool call decision in `conversation.rs` in place of `detection()`, and the warm call removed from the payload recovery thread; the `WakeSender` passed to `PagePool::start` and `JobControl::poll` on its wake ([page wake](#j4-control-handler)); `job_text::exec_cmd_command` replaced by the storage function; a `test-support`-gated entry in `test_support.rs` that starts a capture worker on a real store with a test wake and exposes `take_stored`, and the `tests/capture_worker.rs` case with it: a real flood of 64 chunks, then one wake after the last append, and `Ledger::stored` equal to the bytes written (J3T-22); integration parts of every J3T, J4T and ES case, SDI-13 and J2T-09, J2T-18 and J2T-19 |
+| J34-E Integration (implemented on the J3 integration branch, `586b133` to `3692467`) | `asura-service/src/conversation.rs`; `asura-service/src/conversation/*.rs` (including new `job_tool.rs`, `audit_tools.rs`, and `jobs.rs` for the limits read retry); `asura-service/src/{lib,payload_owner,audit,config_worker,test_support}.rs`; `asura-service/src/secret_rules.rs` (new); for the capture reason texts, the SL7 test port and the switch to the storage `exec_cmd_command`, `asura-service/src/job_text.rs`; for the default body of `PayloadPort::stored` only, `asura-service/src/job_controller/port.rs`; `asura-service/tests/{job_tool_flow,job_control_flow}.rs` (new); the J3T-22 stored-signal case in `asura-service/tests/capture_worker.rs`; and the ports in `asura-service/tests/{capture_flow,tool_call_flow,job_controller_flow}.rs`; `asura-platform/src/config.rs` and its tests, and the ES-02 file-bound case in `asura-storage/src/config.rs`, for the [configuration file bound](execution-setting.md#configuration); the six job values in `asura-storage/src/audit/{types,tests}.rs`; the reserved-worker and wake parameters of `PagePool::start` in `asura-storage/src/payload/pages.rs` and their callers in `asura-service/tests/capture_worker.rs` and `asura-storage/tests/payload_store.rs` and the stale J1-mode comments in `asura-storage/src/payload/id.rs`; for the `JOB_COMMANDS` merge only, `asura-cli/src/tui/ui.rs`; `asura-cli/tests/lifecycle.rs`; `docs/user/{commands,guide,keys}.md`; the J3, J4 and EX11 evidence in the designs | All above | The exec_cmd switch, the 64 KiB configuration file bound, kind 29 append, yield window wiring, `job` dispatch, job request routing and capability, execution setting state and revocation, audit emission, job events in the audit read; the [audit of job calls](#audit-of-job-tool-calls); the maintenance worker with its deletion queue of 8 and the [disk-space measurement](#disk-space-recheck); `jobs.modelReservedPageReads` applied; the [limits read retry](#start-time-limits-read-failure); `filtered_line` removed from `exec_cmd_call.rs`; the `commands.md` rows for `/jobs`, `/job` and `/execution` with `JOB_COMMANDS` merged into `LOCAL_COMMANDS`; the four job PTY modes in `lifecycle.rs`; the [J1T ports](#j1t-cases-after-j3-d); the identity detectors through real turns; `PayloadPort::stored` in `payload_owner.rs` from `Ledger::stored`, with the trait's default body removed from `job_controller/port.rs`; the [capture reason texts](#model-result-text) in `asura-service/src/job_text.rs` with the J3T-16 golden texts; `Rejection::decision()` at the `validate_authority` call in `conversation.rs`, so a refusal records `execution_off`; a poll of the controller before each view taken for kind 29 or a reply; a code 10 kind 29 held until the job's kind 26 commits ([writing job records](#writing-job-records)); the [rule set readiness](secret-detection.md#rule-set-readiness) wiring: the `asura-secret-rules` warm thread spawned at start in `secret_rules.rs`, its wake, the spawn retry when a turn start or `JobControl::waiting_for_rules()` needs the set, `Ctx.rules` filled from `secrets::compiled()`, no model turn sent to the helper while the set is not ready, `compiled()` and `rewrite_exec_cmd_call_with` at the tool call decision in `conversation.rs` in place of `detection()`, and the warm call removed from the payload recovery thread; the `WakeSender` passed to `PagePool::start` and `JobControl::poll` on its wake ([page wake](#j4-control-handler)); `job_text::exec_cmd_command` replaced by the storage function; a `test-support`-gated entry in `test_support.rs` that starts a capture worker on a real store with a test wake and exposes `take_stored`, and the `tests/capture_worker.rs` case with it: a real flood of 64 chunks, then one wake after the last append, and `Ledger::stored` equal to the bytes written (J3T-22); integration parts of every J3T, J4T and ES case, SDI-13 and J2T-09, J2T-18 and J2T-19 |
 
 ##### TJ-P3: J3 and J4 packet order and enablement
 
@@ -5534,7 +5604,7 @@ step; a packet hands over only when they pass.
    follow-ups, after both: `cargo test -p asura-service`.
 9. **J4-T** TUI (done, `f7f50c3`): `cargo test -p asura-cli`. It needs only
    J34-W, so it may run at any point on the branch.
-10. **J34-E** integration, after J4-R2: the full workspace `cargo test`,
+10. **J34-E** integration, after J4-R2 (done, `586b133` to `3692467`): the full workspace `cargo test`,
     `swift test`, the J3T, J4T, ES and SDI-13 integration cases and the
     [joint end-to-end cases](#j3-and-j4-end-to-end-validation).
 11. **Gate**, then one merge of the branch to `main`, then EN1.
@@ -5559,7 +5629,7 @@ flowchart TD
         A["8 J34-A rule set readiness and note redaction"]
         R2["8 J4-R2 handler follow-ups"]
         T["9 J4-T TUI (done)"]
-        E["10 J34-E integration"]
+        E["10 J34-E integration (done)"]
         S --> C
         C --> D
         D --> K

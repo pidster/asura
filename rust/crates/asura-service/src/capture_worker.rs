@@ -1,12 +1,11 @@
-//! One retained capture worker per admitted exec_cmd call (J1, SL3) or job
-//! slot (J2). The store keys its reservation and staging by the job ID.
+//! One retained capture worker per exec_cmd job slot (J2, SL3). The store keys its reservation and staging by the job ID.
 //!
 //! The reactor side ([`Sink`]) receives raw pipe bytes from the platform
 //! `ExecCmdJob` and moves them to the worker through a bounded transfer queue
 //! of 8 chunks of at most 64 KiB and 512 KiB in total, counting the bytes
 //! that wait on the reactor to form a chunk. It never blocks: `try_send`
-//! only. The worker scans each chunk, stages the redacted bytes, hashes them
-//! and keeps the last 8 KiB as the tail. Raw bytes live only in zeroizing
+//! only. The worker scans each chunk, stages the redacted bytes, and hashes
+//! them. Raw bytes live only in zeroizing
 //! buffers and the scanner's carry; nothing raw reaches staging, records,
 //! logs or the model.
 use asura_platform::events::WakeSender;
@@ -34,8 +33,6 @@ use zeroize::Zeroizing;
 pub(crate) const QUEUE_CHUNKS: usize = 8;
 pub(crate) const CHUNK_BYTES: usize = 64 * 1024;
 pub(crate) const QUEUE_BYTES: usize = 512 * 1024;
-/// Redacted tail kept per stream in memory (L13 until J3).
-pub(crate) const TAIL_BYTES: usize = 8192;
 /// Messages from one worker to the reactor.
 pub(crate) const MESSAGES: usize = 8;
 
@@ -92,10 +89,8 @@ pub(crate) struct StreamReport {
     pub eof: bool,
     /// Newline bytes (0x0A) in the stored, redacted bytes (kind 28, TJ-20).
     pub lines: u64,
-    /// The last 8 KiB of stored (redacted) bytes.
-    pub tail: Vec<u8>,
 }
-/// The sealed report: everything kind 23 and the kind 15 tails need. It
+/// The sealed report: everything kind 28 needs. It
 /// holds no value: only redacted bytes, counts and digests of stored bytes.
 #[derive(Clone, Debug)]
 pub(crate) struct Report {
@@ -138,8 +133,7 @@ impl Report {
             eof: s.eof,
         }
     }
-    /// The kind 28 stream block: the kind 23 block and the line count.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The kind 28 stream block: the capture block and the line count.
     pub(crate) fn job_stream(&self, stream: usize) -> JobStream {
         JobStream {
             capture: self.stream(stream),
@@ -197,10 +191,27 @@ struct Shared {
     queued_bytes: AtomicUsize,
     queued_chunks: AtomicUsize,
     backpressured: AtomicBool,
+    /// The stored signal (TJ-Q10): set after a write that stored at least
+    /// one byte, cleared by [`Handle::take_stored`]. At most one signal is
+    /// outstanding per worker.
+    stored: AtomicBool,
     control: Mutex<Control>,
     changed: Condvar,
 }
 impl Shared {
+    /// The stored signal (TJ-Q10), after a staging write that has already
+    /// raised the watermark. A write of no byte signals nothing. The reactor
+    /// wakes only when no signal was outstanding; the signal ends nothing.
+    /// Returns whether it woke the reactor.
+    fn signal_stored(&self, written: usize, wake: Option<&WakeSender>) -> bool {
+        if written == 0 || self.stored.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        if let Some(wake) = wake {
+            let _ = wake.notify();
+        }
+        true
+    }
     fn control(&self) -> std::sync::MutexGuard<'_, Control> {
         self.control.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -359,7 +370,7 @@ impl OutputSink for Sink {
 pub(crate) struct Start {
     pub store: Arc<PayloadStore>,
     /// The job ID: the store keys the reservation and staging by it and by
-    /// its derived payload IDs (J2-E6). A J1-mode call passes its job ID.
+    /// its derived payload IDs (J2-E6).
     pub job: Id,
     pub victims: Vec<Victim>,
     pub redaction: JobRedaction,
@@ -375,7 +386,6 @@ pub(crate) struct Handle {
     messages: Receiver<Message>,
     thread: JoinHandle<()>,
     pub sink: SinkHandle,
-    pub paused: bool,
     pub exited: bool,
     pub install_pending: bool,
 }
@@ -392,32 +402,41 @@ impl Handle {
             c.abandon = true;
         });
     }
-    /// After kind 23 (J1) or kind 28 (J2) commits: install both payloads
+    /// After kind 28 commits: install both payloads
     /// and exit.
     pub(crate) fn install(&self) {
         self.shared.set(|c| c.install = true);
     }
     /// J2: the job settles `not_started`. After sealing, the worker removes
     /// its staging files instead of installing them, and exits.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn discard(&self) {
         self.shared.set(|c| c.discard = true);
     }
     /// J2: the leader exited (`Draining`). A paused worker retries at once;
     /// from now on a quota or space short does not pause: the worker sends
     /// `Fault(Quota)` or `Fault(Enospc)` and discards later bytes.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn leader_exited(&self) {
         self.shared.set(|c| c.draining = true);
     }
     /// J2: a cancel trigger in `Draining` (TJ-S1): the worker discards and
     /// counts every chunk it has not yet staged; staged bytes are kept.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn discard_output(&self) {
         self.shared.set(|c| {
             c.cancel = true;
             c.drop_output = true;
         });
+    }
+    /// Clears the stored signal (TJ-Q10) and returns whether one was
+    /// outstanding. The slot calls it at the start of every step, before the
+    /// controller reads the ledger, so stored bytes written after the clear
+    /// signal again.
+    pub(crate) fn take_stored(&self) -> bool {
+        self.shared.stored.swap(false, Ordering::AcqRel)
+    }
+    /// Whether a stored signal is outstanding, without clearing it.
+    #[cfg(test)]
+    pub(crate) fn stored_pending(&self) -> bool {
+        self.shared.stored.load(Ordering::Acquire)
     }
     /// Drains messages without blocking. The thread's own exit also counts.
     pub(crate) fn drain(&mut self) -> Vec<Message> {
@@ -426,8 +445,6 @@ impl Handle {
             match self.messages.try_recv() {
                 Ok(message) => {
                     match &message {
-                        Message::Paused(_) => self.paused = true,
-                        Message::Resumed => self.paused = false,
                         Message::Installed | Message::Abandoned => self.exited = true,
                         Message::InstallPending => {
                             self.exited = true;
@@ -440,7 +457,6 @@ impl Handle {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.exited = true;
-                    self.paused = false;
                     break;
                 }
             }
@@ -451,7 +467,6 @@ impl Handle {
                 out.push(message);
             }
             self.exited = true;
-            self.paused = false;
         }
         out
     }
@@ -479,6 +494,7 @@ pub(crate) fn start(spec: Start) -> std::io::Result<Handle> {
         queued_bytes: AtomicUsize::new(0),
         queued_chunks: AtomicUsize::new(0),
         backpressured: AtomicBool::new(false),
+        stored: AtomicBool::new(false),
         control: Mutex::new(Control::default()),
         changed: Condvar::new(),
     });
@@ -509,7 +525,6 @@ pub(crate) fn start(spec: Start) -> std::io::Result<Handle> {
         messages,
         thread,
         sink,
-        paused: false,
         exited: false,
         install_pending: false,
     })
@@ -600,7 +615,6 @@ struct Worker {
     eof: [bool; 2],
     degraded: [bool; 2],
     lines: [u64; 2],
-    tails: [VecDeque<u8>; 2],
     fault: Option<CaptureReason>,
     cancelled_while_paused: Option<PauseReason>,
     received: bool,
@@ -637,7 +651,6 @@ impl Worker {
             eof: [false; 2],
             degraded: [false; 2],
             lines: [0; 2],
-            tails: [VecDeque::new(), VecDeque::new()],
             fault: None,
             cancelled_while_paused: None,
             received: false,
@@ -907,6 +920,8 @@ impl Worker {
         }
         let capture = self.capture.as_mut().ok_or(Step::Fault)?;
         let (n, result) = capture.append(store_index(stream), redacted, *written);
+        // `append` has raised the watermark: signal the stored bytes.
+        self.shared.signal_stored(n, self.wake.as_ref());
         self.lines[index(stream)] += newlines(&redacted.as_bytes()[*written..*written + n]);
         *written += n;
         match result {
@@ -921,16 +936,13 @@ impl Worker {
             match self.try_write(stream, redacted, &mut written) {
                 Ok(()) => {
                     self.leave_pause();
-                    self.keep_tail(stream, redacted.as_bytes());
                     return Written::Ok;
                 }
                 Err(Step::Fault) => {
-                    self.keep_tail(stream, &redacted.as_bytes()[..written]);
                     self.fault(CaptureReason::StorageFault);
                     return Written::Fault;
                 }
                 Err(Step::Short(reason)) if self.draining() => {
-                    self.keep_tail(stream, &redacted.as_bytes()[..written]);
                     self.short_while_draining(reason);
                     return Written::Fault;
                 }
@@ -939,7 +951,6 @@ impl Worker {
                     match self.wait_retry() {
                         Wake::Abandon => return Written::Abandoned,
                         Wake::Cancel => {
-                            self.keep_tail(stream, &redacted.as_bytes()[..written]);
                             self.end_pause_cancelled();
                             // Queued chunks and later bytes are discarded.
                             self.discarding = [true; 2];
@@ -951,13 +962,6 @@ impl Worker {
                 }
             }
         }
-    }
-    fn keep_tail(&mut self, stream: Stream, bytes: &[u8]) {
-        let tail = &mut self.tails[index(stream)];
-        let keep = &bytes[bytes.len().saturating_sub(TAIL_BYTES)..];
-        tail.extend(keep.iter().copied());
-        let excess = tail.len().saturating_sub(TAIL_BYTES);
-        tail.drain(..excess);
     }
 
     /// Flushing: the scanner's final bytes are staged, staging is synced,
@@ -1025,7 +1029,6 @@ impl Worker {
                 discarded: self.discarded[i],
                 eof: self.eof[i],
                 lines: if not_started { 0 } else { self.lines[i] },
-                tail: self.tails[i].iter().copied().collect(),
             }
         });
         let (state, reason) = if not_started {
@@ -1101,7 +1104,7 @@ impl Worker {
         if !self.send(Message::Sealed(Box::new(report))) {
             return;
         }
-        // Installing: wait for kind 23 or kind 28 to commit, a not_started
+        // Installing: wait for kind 28 to commit, a not_started
         // discard, or abandonment.
         let (install, discard) = {
             let mut control = self.shared.control();

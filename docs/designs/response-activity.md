@@ -296,7 +296,8 @@ work; no new output store, context composer or scheduler is introduced here.
 
 ToolProgress adds optional arguments (192 UTF-8 bytes), policy_decision (1 service
 admitted, 2 access denied, 3 rejected arguments), elapsed_ms, result_bytes,
-preview (128 UTF-8 bytes), truncated and exit_code. Rejected note content and
+preview (128 UTF-8 bytes), truncated and exit_code (absent for an `exec_cmd` call
+that runs as a job; see [J3 and J4 evidence](tool-job-controller.md#j3-and-j4-evidence)). Rejected note content and
 large note bodies are not exposed; show version/body size references. Values
 come from typed service intents and committed results, not model assertions.
 Current-owner timing uses monotonic instants; replay can recover arguments and

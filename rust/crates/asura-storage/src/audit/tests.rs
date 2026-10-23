@@ -350,6 +350,28 @@ fn exec_cmd_tool_label_round_trips_with_value_9() {
     assert_eq!(Tool::ExecCmd as u32, 9);
 }
 
+/// J3T-20 (unit): the six `job` tool values round trip by name with their
+/// operation codes 11-16; a `tool.finished` row holds no text field.
+#[test]
+fn j3t_20_job_tool_values_round_trip_with_codes_11_to_16() {
+    for (tool, name, code) in [
+        (Tool::JobList, "job_list", 11),
+        (Tool::JobStatus, "job_status", 12),
+        (Tool::JobRead, "job_read", 13),
+        (Tool::JobWait, "job_wait", 14),
+        (Tool::JobCancel, "job_cancel", 15),
+        (Tool::JobNote, "job_note", 16),
+    ] {
+        assert_eq!(serde_json::to_string(&tool).unwrap(), format!("\"{name}\""));
+        assert_eq!(
+            serde_json::from_str::<Tool>(&format!("\"{name}\"")).unwrap(),
+            tool
+        );
+        assert_eq!(tool as u32, code);
+    }
+    assert!(serde_json::from_str::<Tool>("\"job\"").is_err());
+}
+
 fn job_record(event: Event) -> Record {
     Record { event, ..record(1) }
 }

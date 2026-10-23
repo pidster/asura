@@ -1,15 +1,18 @@
 //! Serialized admission in the existing reactor; filesystem effects belong to storage.
 mod audit_tools;
 mod exec_cmd_call;
+mod execution;
+mod job_tool;
 mod jobs;
 mod memory_create;
 mod memory_tools;
 mod response;
 use crate::model_owner::{ModelOwner, PackageIdentity};
-use crate::{sensors, tools};
+use crate::{job_control, job_text, sensors, tools};
 use asura_control::{model::pb as mp, pb};
 use asura_platform::RuntimeDirectory;
 use asura_storage::authority::{conversation as journal, writer};
+use asura_storage::config::ExecutionSetting;
 use asura_storage::sensors as sensor_record;
 use pb::envelope::Body;
 use sha2::{Digest, Sha256};
@@ -83,20 +86,6 @@ fn error(request: pb::Envelope, message: &str) -> pb::Envelope {
     };
     reply(request, body)
 }
-/// The scratch home whose files drive the test-support capture gates.
-fn gate_home(runtime: &RuntimeDirectory) -> Option<std::path::PathBuf> {
-    #[cfg(feature = "test-support")]
-    {
-        runtime
-            .scratch_home_for_test()
-            .map(std::path::Path::to_path_buf)
-    }
-    #[cfg(not(feature = "test-support"))]
-    {
-        let _ = runtime;
-        None
-    }
-}
 fn storage_error(error: writer::Error) -> &'static str {
     match error {
         writer::Error::Busy => "conversation_busy",
@@ -138,7 +127,7 @@ pub(crate) fn handles(request: &pb::Envelope) -> bool {
                 | Body::ConversationQueueList(_)
                 | Body::ConversationQueueDecision(_)
         )
-    )
+    ) || request.body.as_ref().is_some_and(job_control::handles)
 }
 /// A stale project keeps the existing reply; only an overlap names its reason.
 fn listed_error(failure: Option<writer::Error>) -> Option<String> {
@@ -191,11 +180,20 @@ fn wait_step(active: &Active) -> Option<pb::ConversationWaitStep> {
 }
 /// A terminal event with one response window (response-text-transfer.md):
 /// `turn` holds the window as its text and `text_offset`.
-fn terminal_event(turn: &journal::TurnTerminal, text_bytes: u64) -> pb::ConversationEvent {
+fn terminal_event(
+    turn: &journal::TurnTerminal,
+    text_bytes: u64,
+    outlived: Option<&journal::OutlivedJobs>,
+) -> pb::ConversationEvent {
+    let outlived = outlived.filter(|o| o.count > 0);
     pb::ConversationEvent {
-        // The conversation owner derives the outlived jobs (J4, EX12).
-        outlived_jobs: None,
-        outlived_job_ids: Vec::new(),
+        // The model jobs of the operation that outlived its turn (EX12):
+        // kind 26 committed and no kind 28 before the terminal frame,
+        // derived from the records at this read.
+        outlived_jobs: outlived.map(|o| o.count),
+        outlived_job_ids: outlived
+            .map(|o| o.jobs.iter().map(|id| id.to_vec()).collect())
+            .unwrap_or_default(),
         // A terminal turn waits on nothing; steps are never journaled.
         waiting_step: None,
         operation_id: Some(turn.operation.to_vec()),
@@ -252,14 +250,23 @@ fn terminal_accounting(started: bool, tools_enabled: bool, reported: Option<u64>
         None => (false, 0),
     }
 }
+/// The turn's grant. `execute_authorized` is the project's effective
+/// execution setting at the call (EX11); [`tool_grant_with`] sets it.
 fn tool_grant(turn: &journal::TurnAccepted, foreground_user: bool) -> tools::Grant {
+    tool_grant_with(turn, foreground_user, true)
+}
+fn tool_grant_with(
+    turn: &journal::TurnAccepted,
+    foreground_user: bool,
+    execute: bool,
+) -> tools::Grant {
     tools::Grant {
         operation: turn.operation,
         generation: turn.generation,
         project: turn.project,
         read_authorized: true,
         memory_write_authorized: foreground_user,
-        execute_authorized: true,
+        execute_authorized: execute,
         remote_destination: None,
     }
 }
@@ -305,6 +312,7 @@ fn tool_result(
             result.text = list.names.join("\n");
             result.truncated = list.truncated;
         }
+        Ok(tools::Output::Checked) => {}
         Err(error) => {
             result.status = match error {
                 tools::ExecutionError::Host(H::Cancelled)
@@ -333,6 +341,164 @@ fn tool_wire_result(value: &journal::ToolResult) -> mp::ToolResult {
     }
 }
 
+/// The owner's project registry and execution setting, as the job control
+/// handler reads them: in-memory lookups only.
+struct OwnerProjects<'a> {
+    replay: Option<&'a journal::Replay>,
+    known: &'a VecDeque<journal::ProjectRegistered>,
+    execution: &'a std::sync::Mutex<Option<ExecutionSetting>>,
+}
+impl OwnerProjects<'_> {
+    fn registration(&self, project: journal::Id) -> Option<&journal::ProjectRegistered> {
+        self.replay
+            .and_then(|r| r.projects.get(&project).map(|p| &p.registration))
+            .or_else(|| self.known.iter().find(|p| p.project == project))
+    }
+}
+impl job_control::Projects for OwnerProjects<'_> {
+    fn registered(&self, project: journal::Id) -> Option<bool> {
+        // Unknown in memory: the handler reads `Project` from the journal.
+        self.registration(project).map(|_| true)
+    }
+    fn location(&self, project: journal::Id) -> Option<String> {
+        self.registration(project).map(|p| p.location.clone())
+    }
+    fn execution_enabled(&self, project: journal::Id) -> bool {
+        self.execution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_none_or(|s| s.effective(&project))
+    }
+}
+
+/// Runs `f` with the job control handler and its context, when the
+/// controller exists. Field borrows only, so the owner may call it while it
+/// holds other fields.
+#[allow(clippy::too_many_arguments)]
+fn with_control<R>(
+    jobs: &mut jobs::Jobs,
+    payloads: &crate::payload_owner::Payloads,
+    replay: Option<&journal::Replay>,
+    known: &VecDeque<journal::ProjectRegistered>,
+    execution: &std::sync::Mutex<Option<ExecutionSetting>>,
+    writer: Option<&writer::WriterHandle>,
+    now: Instant,
+    f: impl FnOnce(&mut job_control::JobControl, &mut job_control::Ctx) -> R,
+) -> Option<R> {
+    let (controller, control) = jobs.parts()?;
+    let projects = OwnerProjects {
+        replay,
+        known,
+        execution,
+    };
+    let pages = payloads.pages().map(|p| p as &dyn job_control::PagePort);
+    let mut ctx = job_control::Ctx {
+        jobs: controller,
+        pages,
+        projects: &projects,
+        installation: replay.map_or_else(|| payloads.installation(), |r| r.installation_id),
+        journal_held: writer.is_some_and(|w| w.status().held.is_some()),
+        rules: asura_platform::secrets::compiled(),
+        now,
+    };
+    Some(f(control, &mut ctx))
+}
+
+/// J3 call flow steps 2 and 3 for one model exec_cmd call, in the reactor
+/// step that appends its kind 14: the execution setting (EX11), then the
+/// controller's `submit`. `Accepted` keeps `run` and starts the job-mode
+/// call; `Busy` records `busy` with its reason (J3-E3). The SL3 rewrite and
+/// secrets move into the `StartRequest`; the record keeps the stored
+/// command, its only copy (G8).
+fn submit_exec(
+    tool: &mut LiveTool,
+    turn: &journal::TurnAccepted,
+    controller: &mut crate::job_controller::JobController,
+    execution: bool,
+    registration: Option<journal::ProjectRegistered>,
+    boundary: asura_platform::StateBoundary,
+    now: Instant,
+) {
+    use crate::job_controller::{Admission, AgentKey, BusyReason, Origin, StartRequest};
+    use journal::{ToolDecision as D, ToolDecisionReason as R};
+    let refuse = |tool: &mut LiveTool, decision: D, reason: Option<R>| {
+        let record = &mut tool.record;
+        record.decision = decision;
+        record.reason = reason;
+        record.refusal = None;
+        record.command_cut = false;
+        record.whole_command = false;
+        tool.exec = None;
+        tool.call = None;
+    };
+    if !execution {
+        // ES-F1: nothing reaches the controller.
+        return refuse(tool, D::Denied, Some(R::ExecutionOff));
+    }
+    let (Some(registration), Some(rules)) = (
+        registration,
+        asura_platform::secrets::compiled().and_then(Result::ok),
+    ) else {
+        return refuse(tool, D::Denied, None);
+    };
+    let Some(mut exec) = tool.exec.take() else {
+        return;
+    };
+    let stored_command = journal::exec_cmd_command(&tool.record).unwrap_or_default();
+    let redaction = exec.secrets.redaction(rules);
+    let (secrets, secret_command) = exec.secrets.request();
+    let agent = AgentKey {
+        conversation: turn.conversation,
+        agent: 0,
+    };
+    let request = StartRequest {
+        origin: Origin::Model {
+            operation: turn.operation,
+            generation: turn.generation,
+            ordinal: tool.ordinal,
+        },
+        agent,
+        scope: tools::ExecutionScope {
+            project: registration.project,
+            path: registration.location,
+            device: registration.device,
+            inode: registration.inode,
+            boundary,
+        },
+        profile: crate::job_controller::Profile::Model1,
+        command: exec.command,
+        cwd: exec.cwd,
+        secrets,
+        secret_command,
+        redaction,
+        duplicate_digest: tool.digest,
+        stored_command: stored_command.clone(),
+    };
+    match controller.submit(request, now) {
+        Admission::Accepted { job } | Admission::Existing { job } => {
+            tool.job = Some(job_tool::JobCall::exec(
+                tool.ordinal,
+                job,
+                agent,
+                exec.yield_seconds,
+                stored_command,
+                tool.record.whole_command,
+            ));
+        }
+        Admission::Busy(reason) => refuse(
+            tool,
+            D::Busy,
+            Some(match reason {
+                BusyReason::QueueFull => R::QueueFull,
+                BusyReason::JobsFull => R::JobsFull,
+                BusyReason::Closed => R::Closed,
+            }),
+        ),
+        Admission::Conflict => refuse(tool, D::Denied, None),
+    }
+}
+
 /// One call from its decision to its completion. The kind 14 record is
 /// decided before it is appended; a call that does not run is complete when
 /// that record commits (tool-call-records.md, record lifecycle).
@@ -346,12 +512,15 @@ struct LiveTool {
     /// rewrite, so the raw command is never retained (G8).
     call: Option<tools::Call>,
     create: Option<memory_create::Mutation>,
-    /// A `run` exec_cmd call (J1): secret variables, kind 23 and capture.
-    exec_cmd: Option<Box<exec_cmd_call::ExecCmdLive>>,
     memory_ticket: Option<writer::Ticket>,
     intent_committed: bool,
     dispatched: bool,
     result: Option<journal::ToolResult>,
+    /// A `run` exec_cmd call before its submit (made with the kind 14
+    /// append, J3 call flow steps 3 and 4).
+    exec: Option<exec_cmd_call::ExecStart>,
+    /// A job-mode call (codes 10-16) from its kind 14 to its kind 29.
+    job: Option<job_tool::JobCall>,
 }
 impl LiveTool {
     /// TCR-D8: a call not yet appended when cancel or turn end occurs is
@@ -360,16 +529,14 @@ impl LiveTool {
         let record = &mut self.record;
         record.decision = journal::ToolDecision::Cancelled;
         record.fault = None;
-        record.busy = None;
+        record.reason = None;
         record.refusal = None;
         record.command_cut = false;
         record.whole_command = false;
-        if let Some(exec_cmd) = &mut self.exec_cmd {
-            exec_cmd.release_admission();
-        }
-        self.exec_cmd = None;
         self.create = None;
         self.call = None;
+        self.exec = None;
+        self.job = None;
     }
 }
 /// Current-owner measurements. Restart leaves these absent rather than inventing history.
@@ -471,11 +638,13 @@ struct Active {
     tool: Option<LiveTool>,
     tool_budget: tools::Budget,
     tool_executor: tools::Executor,
-    exec_cmd_worker: crate::exec_cmd_worker::Worker,
     /// Completed calls by ordinal: the received digest and the result sent.
     tool_cache: Vec<(u32, [u8; 32], mp::ToolResult)>,
     /// Per-turn key for the received-call digest; dropped at turn end.
     secret_key: zeroize::Zeroizing<[u8; 32]>,
+    /// The model's read cursors of this turn (J3-E4), from its kind 29
+    /// page results.
+    cursors: job_text::TurnCursors,
 }
 impl Active {
     /// Revoke pending database submission at the lifecycle event's entry point.
@@ -536,7 +705,6 @@ enum Job {
     Cancel,
     Finish,
     ToolIntent,
-    CaptureSettled,
     ToolResult,
     /// One kind 24 response segment (response-text-transfer.md).
     ResponseText,
@@ -556,6 +724,14 @@ enum Job {
     SensorReconcile(journal::Id),
     /// One job record from the controller's outbox (kinds 26 to 28).
     Controller(journal::Id),
+    /// A journal read of the active job-mode call (`Jobs`, `JobFacts`).
+    CallRead,
+    /// The active `job note` call's kind 30.
+    CallNote,
+    /// The active job-mode call's kind 29.
+    CallResult,
+    /// Journal work of the job control handler, by request key.
+    Control(u64),
     /// A worker-layer harness record or command (`test-support` only).
     #[cfg(feature = "test-support")]
     Fixture,
@@ -607,8 +783,14 @@ pub(crate) struct Owner {
     journal_status: Option<writer::JournalStatus>,
     /// Registrations from recent project pages, newest last; at most 256.
     known_projects: VecDeque<journal::ProjectRegistered>,
-    /// The job controller and its wiring (J2).
+    /// The job controller and its wiring (J2), and the job control handler
+    /// (J4).
     jobs: jobs::Jobs,
+    /// The person's execution setting (EX11): `None` until the start-time
+    /// read. The one copy; the controller's slot-grant check reads it.
+    execution: Arc<std::sync::Mutex<Option<ExecutionSetting>>>,
+    /// The secret rule set's warm thread (SD-S2).
+    rules: crate::secret_rules::Warmer,
     /// The reply to the last harness record or command.
     #[cfg(feature = "test-support")]
     fixture: Option<writer::Result<writer::Reply>>,
@@ -655,6 +837,8 @@ impl Owner {
             journal_quota: None,
             journal_status: None,
             jobs: jobs::Jobs::default(),
+            execution: Default::default(),
+            rules: Default::default(),
             #[cfg(feature = "test-support")]
             fixture: None,
         }
@@ -1226,11 +1410,7 @@ impl Owner {
         let mut interests = self
             .active
             .as_ref()
-            .map(|active| {
-                let mut interests = active.model.interests();
-                interests.extend(active.exec_cmd_worker.interests());
-                interests
-            })
+            .map(|active| active.model.interests())
             .unwrap_or_default();
         self.jobs.interests(&mut interests);
         interests
@@ -1249,11 +1429,6 @@ impl Owner {
             .then_some(now + std::time::Duration::from_millis(10));
         model
             .into_iter()
-            .chain(
-                self.active
-                    .as_ref()
-                    .and_then(|a| a.exec_cmd_worker.next_deadline(now)),
-            )
             .chain((!self.foreground.is_empty() && self.pending.is_none()).then_some(now))
             .chain(
                 (!self.sensor_seeded
@@ -1297,7 +1472,11 @@ impl Owner {
     pub(crate) fn open(&mut self) {
         if !self.started && !self.closing {
             self.started = true;
-            // The job limits are read once at start, off the reactor.
+            // The secret rule set compiles on its warm thread, never on
+            // the reactor (SD-S2).
+            self.rules.start(self.wake.as_ref());
+            // The job limits and the execution setting are read at start,
+            // off the reactor; a failure retries on the pacing (TJ-F5).
             self.jobs.start(&self.runtime, self.wake.as_ref());
             if let Err(e) = self.submit(writer::Command::Open, Job::Open) {
                 self.unavailable = Some(storage_error(e));
@@ -1362,6 +1541,9 @@ impl Owner {
     }
     fn request_inner(&mut self, request: pb::Envelope, now: Instant) -> Option<pb::Envelope> {
         if self.closing {
+            if request.body.as_ref().is_some_and(job_control::handles) {
+                return Some(job_control::draining_reply(request));
+            }
             return Some(error(request, "service_draining"));
         }
         if !self.started || matches!(self.pending, Some((_, Job::Open | Job::AutoInitialize))) {
@@ -1369,6 +1551,9 @@ impl Owner {
         }
         if let Some(reason) = self.unavailable {
             return Some(error(request, reason));
+        }
+        if request.body.as_ref().is_some_and(job_control::handles) {
+            return self.job_request(request, now);
         }
         if let Some(Body::AuditRead(query)) = request.body.as_ref() {
             let project = id(&query.project_id);
@@ -1993,13 +2178,6 @@ impl Owner {
             tool: None,
             tool_budget: tools::Budget::cancellation_driven(),
             tool_executor,
-            exec_cmd_worker: {
-                let mut worker = crate::exec_cmd_worker::Worker::default();
-                if let Some(wake) = &self.wake {
-                    worker.register(wake.clone());
-                }
-                worker
-            },
             tool_cache: Vec::new(),
             secret_key: zeroize::Zeroizing::new({
                 let mut key = [0u8; 32];
@@ -2007,6 +2185,7 @@ impl Owner {
                 key[16..].copy_from_slice(&asura_platform::random_id());
                 key
             }),
+            cursors: Default::default(),
         });
         Ok(())
     }
@@ -2057,6 +2236,50 @@ impl Owner {
                         tracing::warn!(reason = message, "sensor_write_unconfirmed");
                     }
                     Job::Open => self.unavailable = Some(message),
+                    // A failed read of a job-mode call: `unavailable`.
+                    Job::CallRead => {
+                        if let Some(job) = self.job_call() {
+                            job.journal_done(Err(cause));
+                        }
+                    }
+                    // Kinds 29 and 30 are normal records: at the journal
+                    // quota they wait and the turn shows the paused step.
+                    Job::CallNote | Job::CallResult
+                        if matches!(
+                            cause,
+                            writer::Error::JournalQuota | writer::Error::JournalDiskSpace
+                        ) =>
+                    {
+                        if let Some(active) = &mut self.active {
+                            if let Some(job) = active.tool.as_mut().and_then(|t| t.job.as_mut()) {
+                                job.append_refused();
+                            }
+                            active.journal_held = Some(message);
+                            active.model.set_output_paused(true);
+                            tracing::warn!(reason = message, "journal_turn_paused");
+                        }
+                        self.publish_step(now);
+                    }
+                    Job::Control(key) => {
+                        with_control(
+                            &mut self.jobs,
+                            &self.payloads,
+                            self.replay.as_deref(),
+                            &self.known_projects,
+                            &self.execution,
+                            self.writer.as_ref(),
+                            now,
+                            |control, ctx| control.journal_done(key, Err(cause), ctx),
+                        );
+                        if matches!(
+                            cause,
+                            writer::Error::OutcomeUnconfirmed
+                                | writer::Error::RepairRequired
+                                | writer::Error::Unavailable
+                        ) {
+                            self.unavailable = Some(message);
+                        }
+                    }
                     Job::Controller(job) => {
                         // A held kind 26 waits for the hold to end; any other
                         // writer error makes the journal unavailable.
@@ -2204,11 +2427,38 @@ impl Owner {
                 return;
             }
         };
-        self.replay = value.replay;
+        self.replay = value.replay.clone();
         match job {
             Job::Controller(job) => {
                 let sequence = self.replay.as_ref().map_or(0, |r| r.sequence);
                 self.jobs.record_done(job, Ok(sequence));
+            }
+            Job::CallRead => {
+                if let Some(job) = self.job_call() {
+                    job.journal_done(Ok(value));
+                }
+            }
+            Job::CallNote => {
+                // A kind 30 changes the job's retention state (revision).
+                if let Some(controller) = self.jobs.controller() {
+                    controller.bump_revision();
+                }
+                if let Some(job) = self.job_call() {
+                    job.note_done(Ok(()));
+                }
+            }
+            Job::CallResult => self.job_result_committed(now),
+            Job::Control(key) => {
+                with_control(
+                    &mut self.jobs,
+                    &self.payloads,
+                    self.replay.as_deref(),
+                    &self.known_projects,
+                    &self.execution,
+                    self.writer.as_ref(),
+                    now,
+                    |control, ctx| control.journal_done(key, Ok(value), ctx),
+                );
             }
             #[cfg(feature = "test-support")]
             Job::Fixture => {
@@ -2488,6 +2738,9 @@ impl Owner {
                 let active = self.active.as_mut().expect("active tool intent");
                 let tool = active.tool.as_mut().expect("pending tool");
                 tool.intent_committed = true;
+                if let Some(job) = &mut tool.job {
+                    job.committed();
+                }
                 active.measurements.tool_start[tool.ordinal as usize - 1] = Some(now);
                 active.cursor += 1;
                 // A call that does not run is complete when its kind 14
@@ -2496,7 +2749,7 @@ impl Owner {
                 if let Some((status, text)) = tools::not_run_result(
                     record.decision,
                     record.fault,
-                    record.busy,
+                    record.reason,
                     record.refusal,
                 ) {
                     let tool = active.tool.take().expect("pending tool");
@@ -2504,13 +2757,14 @@ impl Owner {
                     active.measurements.tool_ms[index] = Some(0);
                     if let (Some(emitter), Some(operation)) =
                         (&self.audit_emitter, tool.record.tool_operation)
-                    {
-                        let _ = emitter.try_emit(audit_tools::tool_finished(
+                        && let Some(event) = audit_tools::tool_finished(
                             &active.turn,
                             tool.ordinal,
                             operation,
                             status,
-                        ));
+                        )
+                    {
+                        let _ = emitter.try_emit(event);
                     }
                     let wire = mp::ToolResult {
                         ordinal: Some(tool.ordinal),
@@ -2535,37 +2789,6 @@ impl Owner {
                     }
                 }
             }
-            Job::CaptureSettled => {
-                let active = self.active.as_mut().expect("active capture settlement");
-                let tool = active.tool.as_mut().expect("pending tool");
-                let exec_cmd = tool.exec_cmd.as_mut().expect("exec_cmd call");
-                let settled = exec_cmd.settled.as_ref().expect("settled capture");
-                exec_cmd.settled_committed = true;
-                let sequence = self.replay.as_ref().map_or(0, |r| r.sequence);
-                if let Some(store) = &exec_cmd.store {
-                    if settled.state == journal::CaptureState::NotStarted {
-                        store.release(exec_cmd.run.job);
-                    } else {
-                        store.settle(
-                            exec_cmd.run.job,
-                            settled.state,
-                            [
-                                (settled.stdout.stored_bytes, settled.stdout.digest),
-                                (settled.stderr.stored_bytes, settled.stderr.digest),
-                            ],
-                            sequence,
-                            exec_cmd.capture.is_some(),
-                        );
-                    }
-                }
-                // The worker installs after kind 23; the turn never waits.
-                if let Some(capture) = exec_cmd.capture.take() {
-                    if settled.state != journal::CaptureState::Unconfirmed {
-                        capture.install();
-                    }
-                    self.payloads.push_pending(capture);
-                }
-            }
             Job::ToolResult => {
                 let active = self.active.as_mut().expect("active tool result");
                 let tool = active.tool.take().expect("pending tool");
@@ -2580,13 +2803,14 @@ impl Owner {
                     });
                 if let (Some(emitter), Some(operation)) =
                     (&self.audit_emitter, tool.record.tool_operation)
-                {
-                    let _ = emitter.try_emit(audit_tools::tool_finished(
+                    && let Some(event) = audit_tools::tool_finished(
                         &active.turn,
                         call.ordinal,
                         operation,
                         result.status,
-                    ));
+                    )
+                {
+                    let _ = emitter.try_emit(event);
                 }
                 let mut wire = tool_wire_result(&result);
                 // TCR-D1: a created note's text is rendered from its derived
@@ -2829,8 +3053,11 @@ impl Owner {
             Job::Read(request) => {
                 self.out.push_back(match value.record {
                     Some(journal::Record::TurnTerminal(terminal)) => {
-                        let mut event =
-                            terminal_event(&terminal, value.response_bytes.unwrap_or(0));
+                        let mut event = terminal_event(
+                            &terminal,
+                            value.response_bytes.unwrap_or(0),
+                            value.outlived.as_ref(),
+                        );
                         if let Some(thinking) = value.thinking {
                             event.thinking_level = Some(i32::from(thinking.level));
                             event.thinking_request = Some(i32::from(thinking.request));
@@ -2919,8 +3146,8 @@ impl Owner {
         active: &mut Active,
         value: mp::ToolCall,
         now: Instant,
-        payloads: &crate::payload_owner::Payloads,
         replay: Option<&journal::Replay>,
+        execution: bool,
     ) {
         let ordinal = value.ordinal.unwrap_or(0);
         let digest = received_digest(&active.secret_key, &value);
@@ -2946,8 +3173,10 @@ impl Owner {
             Self::failed(active, "model_protocol_fault", now);
             return;
         }
-        let rules = asura_platform::secrets::detection();
-        let tool = Self::decide(active, &value, digest, payloads, replay, rules);
+        // The reactor reads the rule set only (SD-S2): a turn starts only
+        // once it is ready, so `None` is rare and fails closed here.
+        let rules = asura_platform::secrets::compiled();
+        let tool = Self::decide(active, &value, digest, replay, rules, execution);
         if ordinal <= tools::MAX_CALLS && active.tool_budget.record(ordinal).is_err() {
             Self::failed(active, "model_protocol_fault", now);
             return;
@@ -2957,17 +3186,20 @@ impl Owner {
     /// Redacts, parses and decides one received call (decision table,
     /// TCR-D8..D12). Only a `run` decision carries a typed call. The raw name
     /// and text are borrowed from the frame and dropped with it; the redacted
-    /// copy in the record is the only one kept.
+    /// copy in the record is the only one kept. `execution` is the turn
+    /// project's effective execution setting now (EX11).
     fn decide(
         active: &Active,
         value: &mp::ToolCall,
         digest: [u8; 32],
-        payloads: &crate::payload_owner::Payloads,
         replay: Option<&journal::Replay>,
-        rules: Result<
-            &'static asura_platform::secrets::RuleSet,
-            asura_platform::secrets::SelfCheckError,
+        rules: Option<
+            Result<
+                &'static asura_platform::secrets::RuleSet,
+                asura_platform::secrets::SelfCheckError,
+            >,
         >,
+        execution: bool,
     ) -> LiveTool {
         use asura_platform::secrets::{self, ArgumentsInput, ExecCmdCommand};
         use journal::{ArgumentForm, NotRetainedReason, ToolDecision as D, ToolFault as F};
@@ -2988,7 +3220,7 @@ impl Owner {
             tool_operation: None,
             decision: D::Refused,
             fault: None,
-            busy: None,
+            reason: None,
             form: ArgumentForm::NotRetained(NotRetainedReason::DetectionUnavailable),
             arguments_bytes: text.map_or(value.arguments_bytes.unwrap_or(0), |t| t.len() as u32),
             arguments: String::new(),
@@ -3006,15 +3238,18 @@ impl Owner {
             record: record.clone(),
             call: None,
             create: None,
-            exec_cmd: None,
             memory_ticket: None,
             intent_committed: false,
             dispatched: false,
             result: None,
+            exec: None,
+            job: None,
         };
         let cancelled = active.cancel.is_some() || active.terminal.is_some();
-        // Fail closed: without a rule set nothing is retained (TCR-R3).
-        let Ok(rules) = rules else {
+        // Fail closed: without a ready rule set nothing is retained
+        // (TCR-R3); an exec_cmd call is never planned
+        // (`secret_detection_unavailable`, recorded without fields).
+        let Some(Ok(rules)) = rules else {
             record.decision = if cancelled {
                 D::Cancelled
             } else if ordinal > tools::MAX_CALLS {
@@ -3031,8 +3266,8 @@ impl Owner {
         // SL3, SL7: the exec_cmd command is rewritten, or planned for the
         // whole-command variable, before the record.
         let rewrite = match &parsed.arguments {
-            Ok(tools::Arguments::ExecCmd { command, cwd }) => {
-                Some(secrets::rewrite_exec_cmd_call(command, cwd))
+            Ok(tools::Arguments::ExecCmd { command, cwd, .. }) => {
+                Some(secrets::rewrite_exec_cmd_call_with(rules, command, cwd))
             }
             _ => None,
         };
@@ -3115,16 +3350,19 @@ impl Owner {
                 ordinal,
                 arguments,
             };
-            let grant = tool_grant(&active.turn, active.foreground_user);
+            let grant = tool_grant_with(&active.turn, active.foreground_user, execution);
             // No result-byte total limits a call (owner, 2026-10-18); only
-            // the over-limit ordinal is `limit` (TCR-D9).
-            record.decision = if !active.tools_enabled
-                || tools::validate_authority(&call, &grant, &tools::Destination::Local).is_err()
+            // the over-limit ordinal is `limit` (TCR-D9). A refusal records
+            // its decision and reason: `execution_off` for an exec_cmd call
+            // while the project's execution setting is off (EX11, J3-E3).
+            record.decision = D::Run;
+            if !active.tools_enabled {
+                record.decision = D::Denied;
+            } else if let Err(rejection) =
+                tools::validate_authority(&call, &grant, &tools::Destination::Local)
             {
-                D::Denied
-            } else {
-                D::Run
-            };
+                (record.decision, record.reason) = rejection.decision();
+            }
             if record.decision == D::Run && call.arguments.is_memory_create() {
                 match replay
                     .ok_or(tools::Rejection::Denied)
@@ -3143,63 +3381,53 @@ impl Owner {
                         record.refusal = Some(exec_cmd_call::refusal(&refusal));
                         record.command_cut = command_cut;
                     }
+                    // The call runs as a job (J3): the owner submits it to
+                    // the controller when it appends kind 14, where a full
+                    // queue turns the decision to `busy`. The SL7 bit and
+                    // fallback reason are written only on `run`.
                     Ok(plan) => {
-                        if let tools::Arguments::ExecCmd { command, .. } = &mut call.arguments {
-                            *command = plan.command().to_owned();
+                        let command = plan.command().to_owned();
+                        // G8: the typed call keeps the rewrite, never the
+                        // raw command.
+                        if let tools::Arguments::ExecCmd { command: raw, .. } = &mut call.arguments
+                        {
+                            raw.clone_from(&command);
                         }
-                        let live = exec_cmd_call::LiveSecrets::from(plan);
-                        let run = replay.and_then(|r| {
-                            crate::exec_cmd_worker::ExecCmdRun::derive(r.installation_id, &call)
-                                .map(|run| live.filter(run))
-                        });
-                        let admission = run.as_ref().ok_or(None).and_then(|run| {
-                            payloads
-                                .admission(active.exec_cmd_worker.capture_paused())
-                                .and_then(|store| {
-                                    store
-                                        .admit(
-                                            replay.map_or([0; 16], |r| r.installation_id),
-                                            run.job,
-                                            call.operation,
-                                        )
-                                        .map(|victims| (store, victims))
-                                        .map_err(|_| journal::ExecCmdBusyReason::Quota)
-                                })
-                                .map_err(Some)
-                        });
-                        match (run, admission) {
-                            (Some(run), Ok((store, victims))) => {
-                                // SL7: field 20 bit 1 and the fallback reason
-                                // only on the admitted `run`.
-                                if let Some(reason) = &live.reason {
-                                    record.whole_command = true;
-                                    record.refusal = Some(exec_cmd_call::refusal(reason));
-                                    record.command_cut = command_cut;
-                                }
-                                tool.exec_cmd = Some(Box::new(exec_cmd_call::ExecCmdLive {
-                                    run,
-                                    secrets: live.variables,
-                                    secret_command: live.command,
-                                    victims,
-                                    store: Some(store),
-                                    settled: None,
-                                    settled_committed: false,
-                                    capture: None,
-                                }));
-                            }
-                            (_, Err(Some(reason))) => {
-                                record.decision = D::Busy;
-                                record.busy = Some(reason);
-                            }
-                            _ => record.decision = D::Denied,
+                        let secrets = exec_cmd_call::LiveSecrets::from(plan);
+                        if let Some(reason) = &secrets.reason {
+                            record.whole_command = true;
+                            record.refusal = Some(exec_cmd_call::refusal(reason));
+                            record.command_cut = command_cut;
+                        }
+                        if let tools::Arguments::ExecCmd {
+                            cwd, yield_seconds, ..
+                        } = &call.arguments
+                        {
+                            tool.exec = Some(exec_cmd_call::ExecStart {
+                                command,
+                                cwd: cwd.clone(),
+                                yield_seconds: *yield_seconds,
+                                secrets,
+                            });
                         }
                     }
                 }
             }
             if record.decision == D::Run {
+                if let tools::Arguments::Job(args) = &call.arguments {
+                    tool.job = Some(job_tool::JobCall::command(
+                        ordinal,
+                        args.clone(),
+                        crate::job_controller::AgentKey {
+                            conversation: active.turn.conversation,
+                            agent: 0,
+                        },
+                    ));
+                }
                 tool.call = Some(call);
             } else {
                 tool.create = None;
+                tool.exec = None;
             }
         }
         tool.record = record;
@@ -3247,9 +3475,6 @@ impl Owner {
         {
             active.model.cancel(4, now);
             active.tool_executor.cancel();
-            active
-                .exec_cmd_worker
-                .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
             active.tool_budget.cancel();
             return;
         }
@@ -3271,9 +3496,6 @@ impl Owner {
         });
         active.model.cancel(4, now);
         active.tool_executor.cancel();
-        active
-            .exec_cmd_worker
-            .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
         active.tool_budget.cancel();
     }
     pub(crate) fn retain_observers(&mut self, attachments: &[[u8; 16]]) {
@@ -3282,6 +3504,17 @@ impl Owner {
                 .iter()
                 .any(|id| request.attachment_id.as_deref() == Some(id.as_slice()))
         });
+        // A detached job request is dropped; closing never cancels a job.
+        with_control(
+            &mut self.jobs,
+            &self.payloads,
+            self.replay.as_deref(),
+            &self.known_projects,
+            &self.execution,
+            self.writer.as_ref(),
+            Instant::now(),
+            |control, ctx| control.retain(attachments, ctx),
+        );
     }
     fn terminal_read_wait(&self, operation: journal::Id) -> Option<u64> {
         if self.pending.is_none()
@@ -3398,6 +3631,11 @@ impl Owner {
             .as_mut()
             .map(|active| active.model.poll(now))
             .unwrap_or_default();
+        // EX11: the effective value of the turn's project at each call.
+        let execution = self
+            .active
+            .as_ref()
+            .is_none_or(|active| self.execution_on(active.turn.project));
         for event in events {
             use crate::model_owner::ModelEvent;
             let active = self.active.as_mut().expect("active model");
@@ -3545,7 +3783,7 @@ impl Owner {
                     if !active.tools_enabled || !active.start_committed {
                         Self::failed(active, "model_protocol_fault", now);
                     } else {
-                        Self::tool_call(active, call, now, &self.payloads, self.replay.as_deref());
+                        Self::tool_call(active, call, now, self.replay.as_deref(), execution);
                     }
                 }
                 ModelEvent::Terminal {
@@ -3565,6 +3803,29 @@ impl Owner {
             }
         }
         if let Some(active) = &mut self.active
+            && let Some(tool) = active.tool.as_mut().filter(|t| t.job.is_some())
+            && let Some(outcome) = active.tool_executor.poll()
+            && let Some(job) = &mut tool.job
+        {
+            use asura_platform::ProjectReadError as H;
+            // A `job` command's identity recheck (the job tool, TJ-F3).
+            job.recheck_done(match outcome {
+                Ok(_) => job_tool::Recheck::Same,
+                Err(tools::ExecutionError::Host(H::Changed)) => {
+                    // The project was replaced: its jobs are revoked
+                    // (J2-E10) and the call gets `not_found`.
+                    self.jobs.identity_changed(active.turn.project);
+                    job_tool::Recheck::Changed
+                }
+                Err(
+                    tools::ExecutionError::Host(H::Cancelled)
+                    | tools::ExecutionError::Rejected(tools::Rejection::Cancelled),
+                ) => job_tool::Recheck::Cancelled,
+                Err(_) => job_tool::Recheck::Failed,
+            });
+        }
+        if let Some(active) = &mut self.active
+            && active.tool.as_ref().is_none_or(|t| t.job.is_none())
             && let Some(outcome) = active.tool_executor.poll()
             && let Some(tool) = &mut active.tool
             && let Some(call) = &tool.call
@@ -3602,23 +3863,6 @@ impl Owner {
             }
             tool.result = Some(result);
         }
-        if let Some(active) = &mut self.active
-            && let Some(output) = active.exec_cmd_worker.poll(now)
-        {
-            let mut result = output.result;
-            if result.text.len() > active.tool_budget.result_capacity() {
-                result.status = 7;
-                result.text.clear();
-                result.truncated = false;
-            }
-            if let Some(tool) = &mut active.tool {
-                tool.result = Some(result);
-                if let Some(exec_cmd) = &mut tool.exec_cmd {
-                    exec_cmd.settled = Some(output.settled);
-                    exec_cmd.capture = output.capture;
-                }
-            }
-        }
         self.payloads.poll();
         self.payloads.ensure_recovery(
             &self.runtime,
@@ -3627,13 +3871,8 @@ impl Owner {
             self.wake.as_ref(),
         );
         self.poll_jobs(now);
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|a| a.exec_cmd_worker.settlement_expired())
-        {
-            self.unavailable = Some("authority_repair_required");
-        }
+        self.advance_job_call(now);
+        self.poll_job_control(now);
         self.capture_memory_create();
         self.capture_memory_tool();
         self.capture_sensor_tool(now);
@@ -3643,6 +3882,7 @@ impl Owner {
         // closure records and kind 26, then new foreground commands.
         self.drive(now);
         self.drive_jobs();
+        self.drive_job_control();
         self.dispatch_foreground(now);
         self.capture_sensor_tool(now);
         self.capture_audit_tool();
@@ -3712,27 +3952,17 @@ impl Owner {
         }
         if active.terminal.is_some() {
             active.tool_executor.cancel();
-            active
-                .exec_cmd_worker
-                .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
         }
         if active.cancel.is_some() {
             active.tool_budget.cancel();
             active.tool_executor.cancel();
-            active
-                .exec_cmd_worker
-                .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
             active.model.cancel(if self.closing { 3 } else { 1 }, now);
         }
         if self.unavailable.is_some() {
             active.model.cancel(3, now);
             active.tool_executor.cancel();
-            active
-                .exec_cmd_worker
-                .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
             if active.model.is_settled()
                 && active.tool_executor.is_settled()
-                && active.exec_cmd_worker.is_settled()
                 && active
                     .tool
                     .as_ref()
@@ -3744,11 +3974,6 @@ impl Owner {
                     .and_then(|tool| tool.create.as_ref())
                     .is_none_or(memory_create::Mutation::settled)
             {
-                if let Some(exec_cmd) = active.tool.as_mut().and_then(|t| t.exec_cmd.as_mut())
-                    && !exec_cmd.settled_committed
-                {
-                    exec_cmd.release_admission();
-                }
                 self.active = None;
             }
             return;
@@ -3778,7 +4003,10 @@ impl Owner {
                 }
                 return;
             }
-            if active.ready {
+            // No turn reaches the helper before the secret rule set is
+            // ready (SD-S2); the warm wake resumes it, and a failed warm
+            // spawn is tried again here.
+            if active.ready && self.rules.need(self.wake.as_ref()).is_some() {
                 active.ready = false;
                 let record = journal::Record::TurnAccepted(Box::new(active.turn.clone()));
                 let fence = writer::AdmissionFence {
@@ -3897,10 +4125,105 @@ impl Owner {
                     && tool.record.decision != journal::ToolDecision::Cancelled
                 {
                     tool.cancel_before_commit();
+                } else if tool.exec.is_some() {
+                    // J3 call flow steps 2 and 3, in the reactor step that
+                    // appends kind 14, so kind 14 always precedes kind 26.
+                    // Without a controller the call waits before its
+                    // decision (TJ-F5); a turn cancel records `cancelled`.
+                    let Some(controller) = self.jobs.controller() else {
+                        return;
+                    };
+                    let execution = self
+                        .execution
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .is_none_or(|s| s.effective(&active.turn.project));
+                    let registration = self.replay.as_ref().and_then(|r| {
+                        r.projects
+                            .get(&active.turn.project)
+                            .map(|p| p.registration.clone())
+                    });
+                    submit_exec(
+                        tool,
+                        &active.turn,
+                        controller,
+                        execution,
+                        registration,
+                        self.runtime.state_boundary(),
+                        now,
+                    );
                 }
                 let record = journal::Record::ToolCall(Box::new(tool.record.clone()));
                 if let Err(e) = self.append(record, Job::ToolIntent, None) {
                     self.unavailable = Some(storage_error(e));
+                }
+                return;
+            } else if tool.job.is_some() {
+                // A job-mode call: its recheck, journal reads, kind 30 and
+                // kind 29 (codes 10-16). Appends wait while the journal
+                // holds normal records (SJ-D19).
+                let held = self
+                    .writer
+                    .as_ref()
+                    .is_some_and(|w| w.status().held.is_some());
+                let job = tool.job.as_mut().expect("job call");
+                if held && job.next_is_append() {
+                    return;
+                }
+                match job.action(self.jobs.controller_ref()) {
+                    Some(job_tool::Action::Recheck) => {
+                        let started = match (
+                            tool.call.clone(),
+                            self.replay.as_ref().and_then(|r| {
+                                r.projects
+                                    .get(&active.turn.project)
+                                    .map(|p| &p.registration)
+                            }),
+                        ) {
+                            (Some(call), Some(project)) => active
+                                .tool_executor
+                                .recheck(
+                                    call,
+                                    tool_grant(&active.turn, active.foreground_user),
+                                    tools::Destination::Local,
+                                    tools::ExecutionScope {
+                                        project: project.project,
+                                        path: project.location.clone(),
+                                        device: project.device,
+                                        inode: project.inode,
+                                        boundary: self.runtime.state_boundary(),
+                                    },
+                                )
+                                .is_ok(),
+                            _ => false,
+                        };
+                        if !started && let Some(job) = &mut tool.job {
+                            job.recheck_not_started();
+                        }
+                    }
+                    Some(job_tool::Action::Read(command)) => {
+                        if let Err(e) = self.submit(command, Job::CallRead)
+                            && let Some(job) = self
+                                .active
+                                .as_mut()
+                                .and_then(|a| a.tool.as_mut())
+                                .and_then(|t| t.job.as_mut())
+                        {
+                            job.journal_done(Err(e));
+                        }
+                    }
+                    Some(job_tool::Action::Note(record)) => {
+                        if let Err(e) = self.append(record, Job::CallNote, None) {
+                            self.unavailable = Some(storage_error(e));
+                        }
+                    }
+                    Some(job_tool::Action::Result(record)) => {
+                        if let Err(e) = self.append(record, Job::CallResult, None) {
+                            self.unavailable = Some(storage_error(e));
+                        }
+                    }
+                    None => {}
                 }
                 return;
             } else {
@@ -3915,73 +4238,6 @@ impl Owner {
                             &call,
                             Err(tools::ExecutionError::Rejected(tools::Rejection::Cancelled)),
                         ));
-                        // Turn cancelled after kind 14, before spawn (J1).
-                        if let Some(exec_cmd) = &mut tool.exec_cmd {
-                            exec_cmd.release_admission();
-                            exec_cmd.settled = Some(exec_cmd_call::not_started(&exec_cmd.run));
-                        }
-                    } else if let Some(exec_cmd) = &mut tool.exec_cmd {
-                        let outcome = tools::validate(
-                            &call,
-                            &tool_grant(&active.turn, active.foreground_user),
-                            &tools::Destination::Local,
-                        )
-                        .map_err(tools::ExecutionError::Rejected)
-                        .and_then(|()| {
-                            let project = self
-                                .replay
-                                .as_ref()
-                                .and_then(|r| {
-                                    r.projects
-                                        .get(&active.turn.project)
-                                        .map(|p| &p.registration)
-                                })
-                                .ok_or(tools::ExecutionError::Rejected(tools::Rejection::Denied))?;
-                            let store = exec_cmd
-                                .store
-                                .clone()
-                                .ok_or(tools::ExecutionError::Rejected(tools::Rejection::Denied))?;
-                            let rules = asura_platform::secrets::detection().map_err(|_| {
-                                tools::ExecutionError::Rejected(tools::Rejection::Denied)
-                            })?;
-                            let redaction = asura_platform::secrets::JobRedaction::new(
-                                rules,
-                                &exec_cmd.secrets,
-                            );
-                            let (secrets, secret_command) =
-                                exec_cmd_call::request_secrets(exec_cmd);
-                            let wake = active.exec_cmd_worker.wake();
-                            active
-                                .exec_cmd_worker
-                                .start(crate::exec_cmd_worker::Dispatch {
-                                    runtime: self.runtime.clone(),
-                                    scope: tools::ExecutionScope {
-                                        project: project.project,
-                                        path: project.location.clone(),
-                                        device: project.device,
-                                        inode: project.inode,
-                                        boundary: self.runtime.state_boundary(),
-                                    },
-                                    call: call.clone(),
-                                    intent: exec_cmd.run.clone(),
-                                    secrets,
-                                    secret_command,
-                                    capture: crate::capture_worker::Start {
-                                        store,
-                                        job: exec_cmd.run.job,
-                                        victims: std::mem::take(&mut exec_cmd.victims),
-                                        redaction,
-                                        wake,
-                                        gate_home: gate_home(&self.runtime),
-                                    },
-                                })
-                        });
-                        if let Err(error) = outcome {
-                            // Never started: `not_started` before the result.
-                            tool.result = Some(tool_result(&call, Err(error)));
-                            exec_cmd.release_admission();
-                            exec_cmd.settled = Some(exec_cmd_call::not_started(&exec_cmd.run));
-                        }
                     } else if call.arguments.is_memory_create() {
                         let authorized = active.foreground_user
                             && active.tools_enabled
@@ -4076,24 +4332,8 @@ impl Owner {
                         }
                     }
                 }
-                // Settle, then install (R2): kind 23 commits before kind 15.
-                if let Some(exec_cmd) = &tool.exec_cmd
-                    && !exec_cmd.settled_committed
-                {
-                    if let Some(settled) = &exec_cmd.settled
-                        && tool.result.is_some()
-                        && active.exec_cmd_worker.is_settled()
-                    {
-                        let record = journal::Record::CaptureSettled(Box::new(settled.clone()));
-                        if let Err(e) = self.append(record, Job::CaptureSettled, None) {
-                            self.unavailable = Some(storage_error(e));
-                        }
-                    }
-                    return;
-                }
                 if let Some(result) = &tool.result
                     && active.tool_executor.is_settled()
-                    && active.exec_cmd_worker.is_settled()
                     && tool
                         .memory_ticket
                         .as_ref()
@@ -4113,7 +4353,6 @@ impl Owner {
         }
         if active.model.is_settled()
             && active.tool_executor.is_settled()
-            && active.exec_cmd_worker.is_settled()
             && active
                 .tool
                 .as_ref()
@@ -4191,11 +4430,12 @@ impl Owner {
             .skip(first)
             .map(|(index, tool)| {
                 let rendered =
-                    tools::not_run_result(tool.decision, tool.fault, tool.busy, tool.refusal);
+                    tools::not_run_result(tool.decision, tool.fault, tool.reason, tool.refusal);
+                let job = self.progress_job(operation, index as u32 + 1, tool);
                 pb::ToolProgress {
                     ordinal: Some(index as u32 + 1),
-                    // J4T-09: wired by the integration packet.
-                    job_id: None,
+                    // J4T-09: the job an exec_cmd or job call names.
+                    job_id: job.map(|id| id.to_vec()),
                     name: Some(prefix(&tool.name, 64)),
                     state: Some(match (&rendered, tool.result_status) {
                         (Some(_), _) | (None, Some(2..)) => 3,
@@ -4236,7 +4476,11 @@ impl Owner {
                         .map(|(_, text)| prefix(&text, 128))
                         .or_else(|| tool.preview.clone()),
                     truncated: tool.truncated,
-                    exit_code: tool.exit_code,
+                    // The exit facts are the job's kind 28, which a view of
+                    // tool records does not read; a value from memory would
+                    // differ after a restart, so none is shown (the job
+                    // viewer and `job status` show them).
+                    exit_code: None,
                 }
             })
             .collect()
@@ -4381,6 +4625,22 @@ impl Owner {
         self.closing = true;
         self.payloads.shutdown(Instant::now());
         self.jobs.close(Instant::now());
+        // Parked and pending job requests answer `Draining` (AE-06).
+        with_control(
+            &mut self.jobs,
+            &self.payloads,
+            self.replay.as_deref(),
+            &self.known_projects,
+            &self.execution,
+            self.writer.as_ref(),
+            Instant::now(),
+            |control, ctx| control.close(ctx),
+        );
+        let mut replies = Vec::new();
+        if let Some((_, control)) = self.jobs.parts() {
+            control.drain_replies(&mut replies);
+        }
+        self.out.extend(replies);
         if let Some(active) = &self.active {
             active.revoke_create();
         }
@@ -4397,6 +4657,329 @@ impl Owner {
             && self.payloads.settled(Instant::now())
             && self.jobs.settled(Instant::now())
             && self.writer.as_mut().is_none_or(|writer| writer.settled())
+    }
+    /// The project's effective execution setting (EX11); on until the
+    /// start-time read.
+    fn execution_on(&self, project: journal::Id) -> bool {
+        self.execution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_none_or(|s| s.effective(&project))
+    }
+    /// A persisted change of the execution setting (EX11, ES-Q1): in this
+    /// reactor step, the projects turned from on to off get a model-origin
+    /// revocation with `execution_off`; the values are replaced; one
+    /// `execution.changed` event per changed entry; the job revision
+    /// moves so a parked `JobList` returns.
+    pub(crate) fn set_execution(&mut self, change: asura_storage::config::ExecutionChange) {
+        let change = self.apply_execution(change);
+        self.emit_execution(change);
+    }
+    /// The start-time read's persisted value (TJ-F5) becomes the owner's
+    /// value, unless a persisted change already set it: that change is newer
+    /// than or equal to what the read saw.
+    fn execution_read(&mut self, persisted: ExecutionSetting) {
+        self.execution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(persisted);
+    }
+    /// Revokes, replaces and bumps the revision for a persisted change;
+    /// returns the change whose events are due. Before the start-time read
+    /// the owner has no value, so the change compares against the file's
+    /// setting before the write, never against defaults (ES-Q1).
+    fn apply_execution(
+        &mut self,
+        persisted: asura_storage::config::ExecutionChange,
+    ) -> execution::Change {
+        let setting = persisted.current;
+        let old = self
+            .execution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(persisted.previous)
+            .clone();
+        let registered: Vec<journal::Id> = self
+            .replay
+            .as_ref()
+            .map(|r| r.projects.keys().copied().collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .chain(self.known_projects.iter().map(|p| p.project))
+            .collect();
+        let change = execution::change(&old, &setting, registered);
+        if let Some(controller) = self.jobs.controller() {
+            for project in &change.revoked {
+                controller.revoke(
+                    Some(*project),
+                    crate::job_controller::OriginFilter::Model,
+                    journal::JobReason::ExecutionOff,
+                );
+            }
+        }
+        *self.execution.lock().unwrap_or_else(|e| e.into_inner()) = Some(setting);
+        if let Some(controller) = self.jobs.controller() {
+            controller.bump_revision();
+        }
+        change
+    }
+    fn emit_execution(&self, change: execution::Change) {
+        if let Some(emitter) = &self.audit_emitter {
+            for event in change.events {
+                let _ = emitter.try_emit(event);
+            }
+        }
+    }
+    /// The active turn's job-mode call.
+    fn job_call(&mut self) -> Option<&mut job_tool::JobCall> {
+        self.active.as_mut()?.tool.as_mut()?.job.as_mut()
+    }
+    /// The job an exec_cmd or job call names (`ToolProgress.job_id`,
+    /// J4T-09): from its kind 29, or the live call before it.
+    fn progress_job(
+        &self,
+        operation: journal::Id,
+        ordinal: u32,
+        tool: &journal::ToolRecord,
+    ) -> Option<journal::Id> {
+        use journal::ToolOperation as T;
+        let code = tool.tool_operation?;
+        if tool.decision != journal::ToolDecision::Run || !code.job_result() || code == T::JobList {
+            return None;
+        }
+        let recorded = tool.job_result.as_ref().and_then(|r| {
+            if code == T::ExecCmd {
+                Some(journal::exec_cmd_job_id(
+                    r.operation,
+                    r.generation,
+                    r.ordinal,
+                ))
+            } else {
+                (r.job != [0; 16]).then_some(r.job)
+            }
+        });
+        recorded.or_else(|| {
+            let active = self.active.as_ref()?;
+            let live = active.tool.as_ref()?;
+            (active.turn.operation == operation && live.ordinal == ordinal)
+                .then(|| live.job.as_ref()?.job())
+                .flatten()
+        })
+    }
+    /// Routes the controller's ended waits, ends a parked wait of an ended
+    /// turn, and advances the active job-mode call after the controller's
+    /// poll (poll before a snapshot).
+    fn advance_job_call(&mut self, now: Instant) {
+        let mut client = Vec::new();
+        for done in self.jobs.take_waits() {
+            match done.key {
+                crate::job_controller::WaitKey::Agent(_) => {
+                    if let Some(job) = self.job_call() {
+                        job.wait_done(done.end);
+                    }
+                }
+                crate::job_controller::WaitKey::Client(_) => client.push(done),
+            }
+        }
+        if !client.is_empty() {
+            with_control(
+                &mut self.jobs,
+                &self.payloads,
+                self.replay.as_deref(),
+                &self.known_projects,
+                &self.execution,
+                self.writer.as_ref(),
+                now,
+                |control, ctx| {
+                    for done in client {
+                        control.wait_done(done, ctx);
+                    }
+                },
+            );
+        }
+        let closing = self.closing;
+        let Some(active) = &mut self.active else {
+            return;
+        };
+        let Some(job) = active.tool.as_mut().and_then(|t| t.job.as_mut()) else {
+            return;
+        };
+        let ended = closing || active.cancel.is_some() || active.terminal.is_some();
+        let mut env = job_tool::Env {
+            jobs: self.jobs.controller(),
+            pages: self.payloads.pages(),
+            installation: self
+                .replay
+                .as_ref()
+                .map_or_else(|| self.payloads.installation(), |r| r.installation_id),
+            cursors: &active.cursors,
+            operation: active.turn.operation,
+            generation: active.turn.generation,
+            conversation: active.turn.conversation,
+            now,
+        };
+        if ended {
+            job.turn_ended();
+            if job.parked() {
+                // A yield window cancels its job (TJ-04); a `job wait`
+                // ends and its job continues (TJ-03).
+                let agent = crate::job_controller::AgentKey {
+                    conversation: active.turn.conversation,
+                    agent: 0,
+                };
+                if let Some(jobs) = env.jobs.as_deref_mut() {
+                    jobs.end_turn_wait(agent);
+                }
+                job.turn_wait_ended(&mut env);
+            }
+        }
+        job.advance(&mut env);
+    }
+    /// Kind 29 committed: the result text goes to the helper, unless the
+    /// turn ended (TCR-D8); `tool.finished` follows the commit (J3T-20).
+    fn job_result_committed(&mut self, now: Instant) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        let Some(mut tool) = active.tool.take() else {
+            return;
+        };
+        let Some(mut job) = tool.job.take() else {
+            return;
+        };
+        job.result_done(true);
+        let Some((result, text)) = job.result().map(|(r, t)| (r.clone(), t.to_owned())) else {
+            return;
+        };
+        active.cursors.apply(&result);
+        let index = tool.ordinal as usize - 1;
+        active.measurements.tool_ms[index] = active.measurements.tool_start[index].map(|start| {
+            now.saturating_duration_since(start)
+                .as_millis()
+                .min(u64::MAX as u128) as u64
+        });
+        if let (Some(emitter), Some(operation)) = (&self.audit_emitter, tool.record.tool_operation)
+            && let Some(event) =
+                audit_tools::tool_finished(&active.turn, tool.ordinal, operation, result.status)
+        {
+            let _ = emitter.try_emit(event);
+        }
+        let wire = mp::ToolResult {
+            ordinal: Some(tool.ordinal),
+            status: Some(i32::from(result.status)),
+            text: Some(text),
+            next_offset: None,
+            truncated: Some(false),
+        };
+        let sent = wire.text.as_deref().map_or(0, str::len);
+        if active.tool_budget.settle(sent).is_err() {
+            Self::failed(active, "model_protocol_fault", now);
+            return;
+        }
+        active
+            .tool_cache
+            .push((tool.ordinal, tool.digest, wire.clone()));
+        active.cursor += 1;
+        if self.closing {
+            active.revoke_create();
+            active.cancel.get_or_insert(journal::Cause::ServiceShutdown);
+        }
+        if active.cancel.is_none()
+            && active.terminal.is_none()
+            && let Err(message) = active.model.tool_result(wire)
+        {
+            Self::failed(active, message, now);
+        }
+    }
+    /// The job control handler's reactor step: page replies, held appends
+    /// and rule-set waits, then its replies and committed effects. A note
+    /// waiting for the rule set retries a failed warm spawn (SD-S2).
+    fn poll_job_control(&mut self, now: Instant) {
+        with_control(
+            &mut self.jobs,
+            &self.payloads,
+            self.replay.as_deref(),
+            &self.known_projects,
+            &self.execution,
+            self.writer.as_ref(),
+            now,
+            |control, ctx| control.poll(ctx),
+        );
+        let mut replies = Vec::new();
+        let mut retained = Vec::new();
+        let mut learned = Vec::new();
+        let mut rules = false;
+        if let Some((_, control)) = self.jobs.parts() {
+            control.drain_replies(&mut replies);
+            control.drain_retained(&mut retained);
+            control.drain_learned(&mut learned);
+            rules = control.waiting_for_rules();
+        }
+        self.out.extend(replies);
+        for effect in retained {
+            self.payloads.retained(effect.job, effect.action);
+        }
+        for registration in learned {
+            self.learn_project(&registration);
+        }
+        if rules {
+            self.rules.need(self.wake.as_ref());
+        }
+    }
+    /// Submits the job control handler's next journal work when the
+    /// serialized ticket is free (after the turn's and the controller's
+    /// records). Returns whether it took the ticket.
+    fn drive_job_control(&mut self) -> bool {
+        if self.pending.is_some() || self.unavailable.is_some() || self.replay.is_none() {
+            return false;
+        }
+        let Some((key, work)) = self.jobs.parts().and_then(|(_, c)| c.next_journal()) else {
+            return false;
+        };
+        let submitted = match work {
+            job_control::JournalWork::Read(command) => self.submit(command, Job::Control(key)),
+            job_control::JournalWork::Append(record) => {
+                self.append(record, Job::Control(key), None)
+            }
+        };
+        if let Err(e) = submitted {
+            with_control(
+                &mut self.jobs,
+                &self.payloads,
+                self.replay.as_deref(),
+                &self.known_projects,
+                &self.execution,
+                self.writer.as_ref(),
+                Instant::now(),
+                |control, ctx| control.journal_done(key, Err(e), ctx),
+            );
+            return false;
+        }
+        true
+    }
+    /// One client job request (J4 control handler). Without the controller
+    /// (TJ-F5) or while the owner is unavailable it replies `unavailable`.
+    fn job_request(&mut self, request: pb::Envelope, now: Instant) -> Option<pb::Envelope> {
+        if self.unavailable.is_some() {
+            return Some(job_control::unavailable_reply(request));
+        }
+        let mut request = Some(request);
+        let reply = with_control(
+            &mut self.jobs,
+            &self.payloads,
+            self.replay.as_deref(),
+            &self.known_projects,
+            &self.execution,
+            self.writer.as_ref(),
+            now,
+            |control, ctx| control.request(request.take().expect("one request"), ctx),
+        );
+        match (reply, request) {
+            (Some(reply), _) => reply,
+            (None, Some(request)) => Some(job_control::unavailable_reply(request)),
+            (None, None) => None,
+        }
     }
     /// The job controller's reactor step: the writer's hold state, the
     /// journal outage, then the controller's poll with the payload port.
@@ -4422,6 +5005,22 @@ impl Owner {
             self.audit_emitter.as_ref(),
             &mut self.payloads,
         );
+        // The start-time read built the controller: the execution setting
+        // it read becomes the owner's value unless a persisted change set it
+        // first; the controller's slot-grant check reads the result.
+        if let Some(setting) = self.jobs.take_execution() {
+            self.execution_read(setting);
+            let execution = self.execution.clone();
+            if let Some(controller) = self.jobs.controller() {
+                controller.set_execution(Box::new(move |project| {
+                    execution
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .is_none_or(|s| s.effective(&project))
+                }));
+            }
+        }
     }
     /// Appends the controller's next record when the ticket is free:
     /// closure records (kinds 28 and 27) before kind 26. Returns whether a

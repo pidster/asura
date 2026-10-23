@@ -1,7 +1,10 @@
-//! J1 worker-layer qualification: real processes, the real guardian and
-//! sandbox, real capture workers and the real payload store in private
-//! scratch homes. Each case ends with the raw-byte sweep.
+//! Capture worker-layer qualification (the J1T capture cases, on the job
+//! slot since J3 retired the J1 call path): real processes, the real
+//! guardian and sandbox, real slot and capture workers and the real payload
+//! store in private scratch homes. Each case ends with the raw-byte sweep.
+//! The J1 result tails are retired (PC12); results carry no output text.
 use asura_platform::RuntimeDirectory;
+use asura_platform::exec_cmd::Exit;
 use asura_platform::secrets::{SecretVariable, rewrite_exec_cmd_call};
 use asura_service::test_support::{Job, Outcome, run_jobs};
 use asura_storage::authority::conversation::{CaptureReason, CaptureState, Id, LossReason};
@@ -158,7 +161,8 @@ fn full_capture() -> Result<()> {
         "{:?}",
         outcome.settled
     );
-    assert_eq!(outcome.result.status, 1);
+    assert!(!outcome.stopped);
+    assert_eq!(outcome.exit, Some(Exit::Exited(0)));
     let mut expected_out = String::new();
     let mut expected_err = String::new();
     for i in 0..3000 {
@@ -174,10 +178,8 @@ fn full_capture() -> Result<()> {
     );
     assert!(outcome.settled.stdout.eof && outcome.settled.stderr.eof);
     check_digests(&home, &outcome)?;
-    // The model tail is the last 6,144 bytes of the redacted stream.
-    assert!(outcome.result.text.contains("capture=complete"));
-    assert!(outcome.result.text.contains("out-002999-"));
-    assert!(outcome.result.truncated);
+    // Kind 28's line counts of the stored streams (TJ-20).
+    assert_eq!(outcome.settled.lines, [3000, 3000]);
     println!(
         "PASS J1T-19 full capture: {} + {} bytes stored whole",
         expected_out.len(),
@@ -220,7 +222,6 @@ fn split_secret() -> Result<()> {
     let text = String::from_utf8_lossy(&stored);
     assert!(text.contains("before\n") && text.contains("after\n"));
     assert!(text.contains("$ASURA_SECRET_1"), "{text}");
-    assert!(!outcome.result.text.contains(&secret));
     sweep(&home.path, &[&secret])?;
     println!("PASS J1T-12 split secret: {live} live pages, no piece shown");
     Ok(())
@@ -299,7 +300,6 @@ fn command_secrets() -> Result<()> {
     assert_eq!(numbers[0].number, 1);
     assert!(outcome.settled.stdout.literal_replacements >= 1);
     assert!(outcome.settled.stderr.literal_replacements >= 1);
-    assert!(!outcome.result.text.contains(&secret));
     sweep(&home.path, &[&secret])?;
     println!("PASS J1T-16/J1T-17 set and both-stream echoes store $ASURA_SECRET_1");
     Ok(())
@@ -404,7 +404,8 @@ fn gated_scanner() -> Result<()> {
     let outcomes = runner.join().unwrap()?;
     let outcome = &outcomes[0];
     assert_eq!(outcome.settled.state, CaptureState::Complete);
-    assert_eq!(outcome.result.status, 1, "not cancelled");
+    assert!(!outcome.stopped, "not cancelled");
+    assert_eq!(outcome.exit, Some(Exit::Exited(0)));
     assert_eq!(outcome.settled.stdout.stored_bytes, 4000 * 201);
     assert_eq!(outcome.settled.stdout.discarded_bytes, 0);
     println!(
@@ -419,7 +420,7 @@ fn throttled_scanner() -> Result<()> {
     fs::write(home.path.join("capture-throttle-scan"), b"3000")?;
     let outcome = home.one(FLOOD)?;
     assert_eq!(outcome.settled.state, CaptureState::Complete);
-    assert_eq!(outcome.result.status, 1);
+    assert!(!outcome.stopped);
     assert_eq!(outcome.settled.stdout.stored_bytes, 4000 * 201);
     println!(
         "PASS J1T-15 throttled scanner: complete after {:?}",
@@ -437,7 +438,12 @@ fn partial_capture() -> Result<()> {
     let outcome = home.one("printf first; sleep 30")?;
     assert_eq!(outcome.settled.state, CaptureState::Incomplete);
     assert_eq!(outcome.settled.reason, CaptureReason::StorageFault);
-    assert_eq!(outcome.result.status, 6, "the fault stopped the job");
+    assert!(outcome.stopped, "the fault is a cancel trigger");
+    assert_eq!(
+        outcome.exit,
+        Some(Exit::Signalled(15)),
+        "the fault stopped the job"
+    );
     assert!(outcome.elapsed < Duration::from_secs(10));
     fs::remove_file(home.path.join("payload-fault-write"))?;
     println!("PASS J1T-20 write fault: incomplete storage_fault, job stopped");
@@ -453,7 +459,7 @@ fn partial_capture() -> Result<()> {
     )?;
     fs::remove_file(home.path.join("capture-throttle-scan"))?;
     let outcome = &outcomes[0];
-    assert_eq!(outcome.result.status, 6);
+    assert!(outcome.stopped);
     match outcome.settled.state {
         CaptureState::Incomplete => {
             assert_eq!(outcome.settled.reason, CaptureReason::DiscardedAfterCancel);
@@ -480,8 +486,7 @@ fn overload() -> Result<()> {
     assert_eq!(outcome.settled.state, CaptureState::Unconfirmed);
     assert_eq!(outcome.settled.reason, CaptureReason::SettlementUnconfirmed);
     assert!(outcome.settled.stdout.digest.is_none());
-    assert_eq!(outcome.result.status, 6);
-    assert!(outcome.result.text.contains("capture=unconfirmed"));
+    assert!(outcome.stopped);
     let elapsed = outcome.elapsed;
     assert!(elapsed >= Duration::from_millis(3000 + 2400), "{elapsed:?}");
     println!(
@@ -685,7 +690,7 @@ fn pages() -> Result<()> {
     assert_eq!(before_install.text, after.text);
     assert_eq!(after.state, PageState::Complete);
     assert_eq!(after.digest, outcome.settled.stdout.digest);
-    let pool = PagePool::start(home.store.clone())?;
+    let pool = PagePool::start(home.store.clone(), 1, None)?;
     pool.hold_for_test(true);
     let request = PageRequest {
         payload: outcome.payloads[0],
@@ -867,6 +872,70 @@ fn disk_image() -> Result<()> {
     Ok(())
 }
 
+/// J3T-22 (TJ-Q10, integration): a real flood of 64 chunks through a
+/// capture worker on a real store with a test wake, read as the reactor
+/// reads it (clear the signal, then read `Ledger::stored`, then wait for a
+/// wake). After the last append a wake arrives and the stored bytes equal
+/// the bytes written: no stored advance is lost.
+fn stored_signal() -> Result<()> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, BorrowedFd};
+    const CHUNKS: usize = 64;
+    const CHUNK: usize = 4096;
+    let home = Home::new("stored")?;
+    let (reader, wake) = asura_platform::events::wake_pair()?;
+    // SAFETY: `reader` owns the descriptor and outlives this borrow.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(reader.as_raw_fd()) };
+    let mut wakes = std::os::unix::net::UnixStream::from(borrowed.try_clone_to_owned()?);
+    let mut take_wake = || {
+        let mut bytes = [0u8; 64];
+        matches!(wakes.read(&mut bytes), Ok(n) if n > 0)
+    };
+    let (_, mut probe) = asura_service::test_support::StoredProbe::start(
+        home.store.clone(),
+        home.installation,
+        wake,
+    )?;
+    let mut line = vec![b'a'; CHUNK - 1];
+    line.push(b'\n');
+    let expected = (CHUNKS * CHUNK) as u64;
+    let end = Instant::now() + Duration::from_secs(60);
+    let mut sent = 0;
+    while sent < CHUNKS {
+        if probe.room(CHUNK) {
+            probe.append_stdout(&line);
+            sent += 1;
+        } else {
+            take_wake();
+            probe.turn();
+            if Instant::now() >= end {
+                return Err("no room".into());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    // Every chunk is accepted: the reactor now waits only for a wake.
+    let mut seen = probe.turn();
+    let mut woken = 0;
+    while seen < expected {
+        if Instant::now() >= end {
+            return Err(format!("stored {seen} of {expected} with no further wake").into());
+        }
+        if take_wake() {
+            woken += 1;
+            seen = probe.turn();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(seen, expected, "Ledger::stored equals the bytes written");
+    probe.finish();
+    println!(
+        "PASS J3T-22 flood of {CHUNKS} chunks: {woken} wake(s) after the last append, Ledger::stored {seen} equals the bytes written"
+    );
+    Ok(())
+}
+
 type Case = (&'static str, fn() -> Result<()>);
 
 fn main() {
@@ -881,7 +950,7 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 14] = [
+    let cases: [Case; 15] = [
         ("full", full_capture),
         ("split", split_secret),
         ("klb", key_long_binary),
@@ -896,6 +965,7 @@ fn main() {
         ("quota", quota_expiry),
         ("pages", pages),
         ("disk", disk_image),
+        ("stored", stored_signal),
     ];
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {

@@ -305,7 +305,7 @@ pub fn job_id(origin: &JobOrigin) -> Id {
     derived_id(hash)
 }
 /// The job ID of one model exec_cmd call: [`job_id`] with the model origin.
-/// A J1-mode call and a job-mode call use the same derivation.
+/// Every exec_cmd call is a job (J3-E9).
 pub fn exec_cmd_job_id(operation: Id, generation: u64, ordinal: u32) -> Id {
     job_id(&JobOrigin::Model {
         operation,
@@ -557,8 +557,6 @@ const MAX_CAPTURE_SPANS: u64 = 64;
 const MAX_CAPTURE_NUMBER: u16 = 16_384;
 const MAX_CAPTURE_NUMBERS: usize = 256;
 const MIB: u64 = 1024 * 1024;
-/// Maximum kind 23 payload (`tool-job-controller.md`, J1 records; TCR-D3).
-pub(crate) const MAX_CAPTURE_SETTLED_PAYLOAD: usize = 4_066;
 /// Kind 14: 98 bytes of fixed fields, a 512-byte name, 256 number kinds and
 /// 64,000 bytes of arguments (tool-call-records.md, TCR-U03).
 pub(crate) const MAX_TOOL_CALL_PAYLOAD: usize = 64_866;
@@ -573,16 +571,7 @@ fn source_from(code: u8) -> Result<ToolCallSource> {
         _ => return Err(ReplayError::Corrupt),
     })
 }
-fn busy_from(code: u8) -> Result<Option<ExecCmdBusyReason>> {
-    Ok(match code {
-        0 => None,
-        1 => Some(ExecCmdBusyReason::Quota),
-        2 => Some(ExecCmdBusyReason::CapturePaused),
-        3 => Some(ExecCmdBusyReason::PendingFull),
-        4 => Some(ExecCmdBusyReason::PayloadUnavailable),
-        _ => return Err(ReplayError::Corrupt),
-    })
-}
+
 fn form_from(form: u8, reason: u8) -> Result<ArgumentForm> {
     Ok(match (form, reason) {
         (1, 0) => ArgumentForm::Verbatim,
@@ -659,9 +648,11 @@ impl ToolCall {
                             RegisteredTool::Project
                                 | RegisteredTool::Memory
                                 | RegisteredTool::Service
+                                | RegisteredTool::Job
                         )
                     )
             }
+            Some(F::InvalidJobId) => tool == Some(RegisteredTool::Job),
             Some(
                 F::MissingField
                 | F::UnexpectedField
@@ -709,12 +700,22 @@ impl ToolCall {
             }
             ArgumentForm::NotRetained(R::Oversized) => decision != D::Run,
             _ => true,
-        } && self.busy.is_some() == (decision == D::Busy)
-            && (named
-                || matches!(
-                    decision,
-                    D::InvalidArguments | D::Refused | D::Limit | D::Cancelled
-                ));
+        } && match self.reason {
+            // J3-E3: every `busy` names its reason; `denied` names
+            // `execution_off` only for a parsed exec_cmd call. The codec
+            // pairs each code with its decision.
+            None => decision != D::Busy,
+            Some(reason) => {
+                reason.decision() == decision
+                    && exec
+                    && self.form == ArgumentForm::Canonical
+                    && rules
+            }
+        } && (named
+            || matches!(
+                decision,
+                D::InvalidArguments | D::Refused | D::Limit | D::Cancelled
+            ));
         // Rule set: revision 0 only when the self-check failed; then nothing
         // is retained or numbered.
         let rule_set = (self.rule_set_digest == [0; 32]) == !rules
@@ -783,7 +784,7 @@ fn tool_call_fields(w: &mut Writer, p: &ToolCall) {
     w.byte(p.tool_operation.map_or(0, |op| op as u8));
     w.byte(p.decision as u8);
     w.byte(p.fault.map_or(0, |f| f as u8));
-    w.byte(p.busy.map_or(0, |b| b as u8));
+    w.byte(p.reason.map_or(0, ToolDecisionReason::code));
     w.byte(p.form.code());
     w.byte(p.form.not_retained().map_or(0, |r| r as u8));
     w.u32(p.arguments_bytes);
@@ -817,7 +818,7 @@ fn read_tool_call(r: &mut Reader<'_>) -> Result<ToolCall> {
         0 => None,
         code => Some(ToolFault::from_code(code).ok_or(ReplayError::Corrupt)?),
     };
-    let busy = busy_from(r.byte()?)?;
+    let reason = ToolDecisionReason::from_code(decision, r.byte()?).ok_or(ReplayError::Corrupt)?;
     let form = r.byte()?;
     let form = form_from(form, r.byte()?)?;
     let arguments_bytes = r.u32()?;
@@ -864,7 +865,7 @@ fn read_tool_call(r: &mut Reader<'_>) -> Result<ToolCall> {
         tool_operation,
         decision,
         fault,
-        busy,
+        reason,
         form,
         arguments_bytes,
         arguments,
@@ -892,7 +893,8 @@ fn valid_stream(s: &CaptureStream) -> bool {
             .iter()
             .all(|span| span.stored_offset <= s.stored_bytes)
 }
-/// The capture facts that kinds 23 and 28 share, borrowed for validation.
+/// The capture facts of kind 28 (the rules of the retired kind 23),
+/// borrowed for validation.
 struct CaptureFacts<'a> {
     state: CaptureState,
     reason: CaptureReason,
@@ -903,8 +905,8 @@ struct CaptureFacts<'a> {
     numbers: &'a [CaptureNumber],
     final_reservation: u64,
 }
-/// The kind 23 field rules for capture states 1 to 4; kind 28 applies them
-/// unchanged (tool-job-controller.md, kind 28).
+/// The capture field rules for kind 28 capture states 1 to 4, unchanged
+/// from the retired kind 23 (tool-job-controller.md, kind 28).
 fn valid_capture(c: &CaptureFacts<'_>) -> bool {
     let streams = c.streams;
     let digests = streams.iter().all(|s| s.digest.is_some());
@@ -949,27 +951,6 @@ fn valid_exit(kind: u8, value: u32) -> bool {
         1 => value <= 255,
         2 => (1..=127).contains(&value),
         _ => false,
-    }
-}
-impl CaptureSettled {
-    /// Every kind 23 field rule that the record alone determines. Replay adds
-    /// the pending `run` exec_cmd kind 14 that it settles.
-    pub(crate) fn validate(&self) -> Result<()> {
-        require(
-            self.operation != [0; 16]
-                && self.generation >= 1
-                && (1..=MAX_RECORDED_CALLS).contains(&self.ordinal)
-                && valid_capture(&CaptureFacts {
-                    state: self.state,
-                    reason: self.reason,
-                    exit_kind: self.exit_kind,
-                    exit_value: self.exit_value,
-                    streams: [&self.stdout, &self.stderr],
-                    distinct_numbers: self.distinct_numbers,
-                    numbers: &self.numbers,
-                    final_reservation: self.final_reservation,
-                }),
-        )
     }
 }
 
@@ -1315,81 +1296,268 @@ fn read_stream(r: &mut Reader<'_>) -> Result<CaptureStream> {
         eof: r.flag()?,
     })
 }
-fn write_capture_settled(w: &mut Writer, p: &CaptureSettled) -> Result<()> {
-    p.validate()?;
-    capture_settled_fields(w, p);
-    Ok(())
+// ----- J3 kind 29 and J4 kind 30. -----
+
+impl JobSnapshot {
+    /// State block rules: the reason numbers the state allows; elapsed 0
+    /// before spawn and when settled; zero bytes when settled.
+    fn valid(&self) -> bool {
+        self.state.allows_numbers(self.numbers)
+            && (!self.state.before_spawn() || self.elapsed_ms == 0)
+            && (self.state != JobRunState::Settled
+                || (self.elapsed_ms == 0 && self.stdout_bytes == 0 && self.stderr_bytes == 0))
+    }
 }
-/// Kind 23 field order. Callers validate first; tests use it to build invalid bytes.
-fn capture_settled_fields(w: &mut Writer, p: &CaptureSettled) {
+impl JobListEntry {
+    /// A list entry follows the state block rules for state, reason and
+    /// numbers; a settled entry stores zero bytes.
+    fn valid(&self) -> bool {
+        self.job != [0; 16]
+            && self.state.allows_numbers(self.numbers)
+            && (self.state != JobRunState::Settled
+                || (self.stdout_bytes == 0 && self.stderr_bytes == 0))
+    }
+}
+impl JobPage {
+    /// Page block rules: at most 8,192 source bytes; none for states 5 to
+    /// 8; a digest exactly when bytes were read; the bytes lie within the
+    /// stored stream.
+    fn valid(&self) -> bool {
+        self.source_len <= MAX_JOB_PAGE
+            && (self.state.readable() || self.source_len == 0)
+            && (self.digest == [0; 32]) == (self.source_len == 0)
+            && (self.source_len == 0
+                || self
+                    .start
+                    .checked_add(u64::from(self.source_len))
+                    .is_some_and(|end| end <= self.total))
+    }
+}
+impl JobResult {
+    /// Every kind 29 rule that the record alone determines: the status
+    /// fixed by the outcome, the body forms an outcome allows, and each
+    /// block's rules. Replay adds JR11 to JR16 with the operation code.
+    pub(crate) fn validate(&self) -> Result<()> {
+        use JobResultOutcome as O;
+        let body = match &self.body {
+            JobResultBody::None => true,
+            JobResultBody::State(s) => matches!(self.outcome, O::Ok | O::Cancelled) && s.valid(),
+            JobResultBody::Wait(s, end) => {
+                self.outcome == O::Ok
+                    && s.valid()
+                    && (!matches!(end, WaitEnd::Settled | WaitEnd::AlreadySettled)
+                        || s.state == JobRunState::Settled)
+            }
+            JobResultBody::Page(p) => self.outcome == O::Ok && p.valid(),
+            JobResultBody::List { more, entries } => {
+                let mut jobs: Vec<Id> = entries.iter().map(|e| e.job).collect();
+                jobs.sort_unstable();
+                jobs.dedup();
+                self.outcome == O::Ok
+                    && self.job == [0; 16]
+                    && entries.len() <= MAX_JOB_LIST_ENTRIES
+                    && (!more || entries.len() == MAX_JOB_LIST_ENTRIES)
+                    && jobs.len() == entries.len()
+                    && entries.iter().all(JobListEntry::valid)
+            }
+        };
+        require(
+            self.operation != [0; 16]
+                && self.generation >= 1
+                && (1..=MAX_RECORDED_CALLS).contains(&self.ordinal)
+                && self.status == self.outcome.status()
+                && (self.outcome != O::NotFound || self.job == [0; 16])
+                && body,
+        )
+    }
+}
+fn write_snapshot(w: &mut Writer, s: &JobSnapshot) {
+    w.byte(s.state.code());
+    w.byte(s.state.reason_code());
+    w.bytes(&s.numbers);
+    w.u64(s.elapsed_ms);
+    w.u64(s.stdout_bytes);
+    w.u64(s.stderr_bytes);
+}
+fn read_run_state(r: &mut Reader<'_>) -> Result<JobRunState> {
+    let state = r.byte()?;
+    JobRunState::from_codes(state, r.byte()?).ok_or(ReplayError::Corrupt)
+}
+fn read_snapshot(r: &mut Reader<'_>) -> Result<JobSnapshot> {
+    Ok(JobSnapshot {
+        state: read_run_state(r)?,
+        numbers: r.array()?,
+        elapsed_ms: r.u64()?,
+        stdout_bytes: r.u64()?,
+        stderr_bytes: r.u64()?,
+    })
+}
+/// Kind 29 field order. Callers validate first; tests use it to build
+/// invalid bytes.
+fn job_result_fields(w: &mut Writer, p: &JobResult) {
     w.bytes(&p.operation);
     w.u64(p.generation);
     w.u32(p.ordinal);
-    w.byte(p.state as u8);
-    w.byte(p.reason as u8);
-    w.byte(p.exit_kind);
-    w.u32(p.exit_value);
-    // Field 8, redaction ran: always 1 (SD9). The rule set is kind 14's
-    // fields 18-19 (TCR-D3).
-    w.byte(1);
-    write_stream(w, &p.stdout);
-    write_stream(w, &p.stderr);
-    w.u32(p.distinct_numbers);
-    w.u16(p.numbers.len() as u16);
-    for n in &p.numbers {
-        w.u16(n.number);
-        w.byte(kind_code(n.kind));
-        w.byte(origin_code(n.origin));
+    w.byte(p.status);
+    w.byte(p.outcome as u8);
+    w.bytes(&p.job);
+    match &p.body {
+        JobResultBody::None => {}
+        JobResultBody::State(s) => write_snapshot(w, s),
+        JobResultBody::Wait(s, end) => {
+            write_snapshot(w, s);
+            w.byte(*end as u8);
+        }
+        JobResultBody::Page(page) => {
+            w.byte(page.stream as u8);
+            w.u64(page.start);
+            w.u32(page.source_len);
+            w.u64(page.total);
+            w.byte(page.state as u8);
+            w.bytes(&page.digest);
+        }
+        JobResultBody::List { more, entries } => {
+            w.byte(entries.len() as u8);
+            w.byte(u8::from(*more));
+            for e in entries {
+                w.bytes(&e.job);
+                w.byte(e.state.code());
+                w.byte(e.state.reason_code());
+                w.bytes(&e.numbers);
+                w.u64(e.stdout_bytes);
+                w.u64(e.stderr_bytes);
+            }
+        }
     }
-    w.u32(p.pause_count);
-    w.u64(p.first_pause_ms);
-    w.u64(p.paused_ms);
-    w.u64(p.final_reservation);
 }
-fn read_capture_settled(r: &mut Reader<'_>) -> Result<CaptureSettled> {
+fn read_job_result(r: &mut Reader<'_>) -> Result<JobResult> {
     let operation = r.array()?;
     let generation = r.u64()?;
     let ordinal = r.u32()?;
-    let state = match r.byte()? {
-        1 => CaptureState::Complete,
-        2 => CaptureState::Incomplete,
-        3 => CaptureState::Unconfirmed,
-        4 => CaptureState::NotStarted,
-        _ => return Err(ReplayError::Corrupt),
+    let status = r.byte()?;
+    let outcome = JobResultOutcome::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
+    let job = r.array()?;
+    // The body form is read by its size; the sizes are distinct.
+    let body = match r.bytes.len() - r.offset {
+        0 => JobResultBody::None,
+        JOB_STATE_BLOCK => JobResultBody::State(read_snapshot(r)?),
+        JOB_WAIT_BLOCK => {
+            let snapshot = read_snapshot(r)?;
+            JobResultBody::Wait(
+                snapshot,
+                WaitEnd::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?,
+            )
+        }
+        JOB_PAGE_BLOCK => JobResultBody::Page(JobPage {
+            stream: OutputStream::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?,
+            start: r.u64()?,
+            source_len: r.u32()?,
+            total: r.u64()?,
+            state: JobPageState::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?,
+            digest: r.array()?,
+        }),
+        size => {
+            let count = r.byte()? as usize;
+            require(count <= MAX_JOB_LIST_ENTRIES && size == 2 + count * JOB_LIST_ENTRY)?;
+            let more = r.flag()?;
+            let mut entries = Vec::with_capacity(count);
+            for _ in 0..count {
+                entries.push(JobListEntry {
+                    job: r.array()?,
+                    state: read_run_state(r)?,
+                    numbers: r.array()?,
+                    stdout_bytes: r.u64()?,
+                    stderr_bytes: r.u64()?,
+                });
+            }
+            JobResultBody::List { more, entries }
+        }
     };
-    let reason = capture_reason_from(r.byte()?)?;
-    let exit_kind = r.byte()?;
-    let exit_value = r.u32()?;
-    require(r.byte()? == 1)?;
-    let stdout = read_stream(r)?;
-    let stderr = read_stream(r)?;
-    let distinct_numbers = r.u32()?;
-    let count = r.u16()? as usize;
-    require(count <= MAX_CAPTURE_NUMBERS)?;
-    let mut numbers = Vec::with_capacity(count);
-    for _ in 0..count {
-        numbers.push(CaptureNumber {
-            number: r.u16()?,
-            kind: kind_from(r.byte()?)?,
-            origin: origin_from(r.byte()?)?,
-        });
-    }
-    let value = CaptureSettled {
+    let value = JobResult {
         operation,
         generation,
         ordinal,
-        state,
-        reason,
-        exit_kind,
-        exit_value,
-        stdout,
-        stderr,
-        distinct_numbers,
-        numbers,
-        pause_count: r.u32()?,
-        first_pause_ms: r.u64()?,
-        paused_ms: r.u64()?,
-        final_reservation: r.u64()?,
+        status,
+        outcome,
+        job,
+        body,
+    };
+    value.validate()?;
+    Ok(value)
+}
+impl JobRetention {
+    /// Every kind 30 field rule that the record alone determines. Replay
+    /// adds the job, the model reference and the pin and delete state.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let author = match self.author {
+            RetentionAuthor::Person { request } => {
+                request != [0; 16]
+                    && if self.action == RetentionAction::Note {
+                        (1..=MAX_JOB_NOTE).contains(&self.note.len())
+                    } else {
+                        self.note.is_empty()
+                    }
+            }
+            // The model writes only `note`; its text is its kind 14's.
+            RetentionAuthor::Model {
+                operation,
+                generation,
+                ordinal,
+            } => {
+                self.action == RetentionAction::Note
+                    && self.note.is_empty()
+                    && operation != [0; 16]
+                    && generation >= 1
+                    && (1..=MAX_RECORDED_CALLS).contains(&ordinal)
+            }
+        };
+        require(self.job != [0; 16] && author)
+    }
+}
+/// Kind 30 field order. Callers validate first; tests use it to build
+/// invalid bytes.
+fn job_retention_fields(w: &mut Writer, p: &JobRetention) {
+    w.bytes(&p.job);
+    w.byte(p.action as u8);
+    w.byte(p.author.code());
+    w.u64(p.time);
+    match p.author {
+        RetentionAuthor::Person { request } => w.bytes(&request),
+        RetentionAuthor::Model {
+            operation,
+            generation,
+            ordinal,
+        } => {
+            w.bytes(&operation);
+            w.u64(generation);
+            w.u32(ordinal);
+        }
+    }
+    w.u32(p.note.len() as u32);
+    w.bytes(p.note.as_bytes());
+}
+fn read_job_retention(r: &mut Reader<'_>) -> Result<JobRetention> {
+    let job = r.array()?;
+    let action = RetentionAction::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
+    let author = r.byte()?;
+    let time = r.u64()?;
+    let author = match author {
+        1 => RetentionAuthor::Person {
+            request: r.array()?,
+        },
+        2 => RetentionAuthor::Model {
+            operation: r.array()?,
+            generation: r.u64()?,
+            ordinal: r.u32()?,
+        },
+        _ => return Err(ReplayError::Corrupt),
+    };
+    let value = JobRetention {
+        job,
+        action,
+        author,
+        time,
+        note: r.bounded_string(MAX_JOB_NOTE)?,
     };
     value.validate()?;
     Ok(value)
@@ -1546,7 +1714,7 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.u64(p.text_offset);
             w.string(&p.text, MAX_TEXT)?;
         }
-        Record::CaptureSettled(p) => write_capture_settled(&mut w, p)?,
+
         Record::JobIntent(p) => {
             p.validate()?;
             job_intent_fields(&mut w, p);
@@ -1558,6 +1726,17 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
         Record::JobSettled(p) => {
             p.validate()?;
             job_settled_fields(&mut w, p);
+        }
+        Record::JobResult(p) => {
+            p.validate()?;
+            job_result_fields(&mut w, p);
+        }
+        Record::JobRetention(p) => {
+            if p.note.len() > MAX_JOB_NOTE {
+                return Err(ReplayError::Limit);
+            }
+            p.validate()?;
+            job_retention_fields(&mut w, p);
         }
         Record::ResponseText(p) | Record::ThinkingText(p) => {
             require(!p.text.is_empty() || p.offset > 0)?;
@@ -1818,12 +1997,9 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             valid_tool_result(&value)?;
             Record::ToolResult(value)
         }
-        // Kinds 17 and 22 are retired (TCR-O2); like any unknown kind they
-        // are UnsupportedFormat.
-        23 => {
-            require(payload.len() <= MAX_CAPTURE_SETTLED_PAYLOAD)?;
-            Record::CaptureSettled(Box::new(read_capture_settled(&mut r)?))
-        }
+        // Kinds 17 and 22 are retired (TCR-O2), and kind 23 with the J1
+        // exec_cmd path (J3-E9, JR17); like any unknown kind they are
+        // UnsupportedFormat.
         26 => {
             require(payload.len() <= MAX_JOB_INTENT_PAYLOAD)?;
             Record::JobIntent(read_job_intent(&mut r)?)
@@ -1836,6 +2012,15 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             require(payload.len() <= MAX_JOB_SETTLED_PAYLOAD)?;
             Record::JobSettled(Box::new(read_job_settled(&mut r)?))
         }
+        29 => {
+            require(payload.len() <= MAX_JOB_RESULT_PAYLOAD)?;
+            Record::JobResult(Box::new(read_job_result(&mut r)?))
+        }
+        30 => {
+            require(payload.len() <= MAX_JOB_RETENTION_PAYLOAD)?;
+            Record::JobRetention(Box::new(read_job_retention(&mut r)?))
+        }
+
         _ => return Err(ReplayError::UnsupportedFormat),
     };
     if r.offset != payload.len() {
@@ -2039,7 +2224,7 @@ mod tests {
             tool_operation: Some(ToolOperation::ExecCmd),
             decision: ToolDecision::Run,
             fault: None,
-            busy: None,
+            reason: None,
             form: ArgumentForm::Canonical,
             arguments_bytes: 48,
             arguments: "{\"command\":\"printf \\\"$ASURA_SECRET_1\\\"\"}".into(),
@@ -2209,7 +2394,7 @@ mod tests {
         };
         round14(long.clone());
         // Every decision with a consistent shape.
-        for (decision, fault, busy) in [
+        for (decision, fault, reason) in [
             (
                 ToolDecision::InvalidArguments,
                 Some(ToolFault::WrongType),
@@ -2222,22 +2407,58 @@ mod tests {
             round14(ToolCall {
                 decision,
                 fault,
-                busy,
+                reason,
                 ..run14()
             });
         }
-        for busy in [
-            ExecCmdBusyReason::Quota,
-            ExecCmdBusyReason::CapturePaused,
-            ExecCmdBusyReason::PendingFull,
-            ExecCmdBusyReason::PayloadUnavailable,
+        // J3T-14: field 10, the decision reason (J3-E3).
+        for (decision, reason, code) in [
+            (ToolDecision::Busy, ToolDecisionReason::QueueFull, 1),
+            (ToolDecision::Busy, ToolDecisionReason::JobsFull, 2),
+            (ToolDecision::Busy, ToolDecisionReason::Closed, 3),
+            (ToolDecision::Denied, ToolDecisionReason::ExecutionOff, 1),
         ] {
             let bytes = round14(ToolCall {
-                decision: ToolDecision::Busy,
-                busy: Some(busy),
+                decision,
+                reason: Some(reason),
                 ..run14()
             });
-            assert_eq!(bytes[48], busy as u8);
+            assert_eq!(bytes[48], code);
+        }
+        // The `job` tool and fault 16 (J3T-01, J3-E2).
+        for op in [
+            ToolOperation::JobList,
+            ToolOperation::JobStatus,
+            ToolOperation::JobRead,
+            ToolOperation::JobWait,
+            ToolOperation::JobCancel,
+            ToolOperation::JobNote,
+        ] {
+            let bytes = round14(ToolCall {
+                name: "job".into(),
+                name_bytes: 3,
+                tool_operation: Some(op),
+                form: ArgumentForm::Verbatim,
+                arguments: "{\"command\":\"list\"}".into(),
+                arguments_bytes: 18,
+                number_kinds: vec![],
+                ..run14()
+            });
+            assert_eq!(bytes[40], op as u8);
+        }
+        for fault in [ToolFault::InvalidJobId, ToolFault::UnknownCommand] {
+            round14(ToolCall {
+                name: "job".into(),
+                name_bytes: 3,
+                tool_operation: None,
+                decision: ToolDecision::InvalidArguments,
+                fault: Some(fault),
+                form: ArgumentForm::Verbatim,
+                arguments: "{\"command\":\"status\",\"job\":\"0\"}".into(),
+                arguments_bytes: 30,
+                number_kinds: vec![],
+                ..run14()
+            });
         }
         // Every form and not-retained reason.
         for form in [
@@ -2419,9 +2640,15 @@ mod tests {
                 fault: Some(F::NameOverLimit),
                 ..invalid14()
             },
-            // Busy reason only with busy, and busy only for exec_cmd.
+            // Field 10: a busy reason only with busy, `execution_off` only
+            // with denied, both only for a parsed exec_cmd call; busy always
+            // names its reason (J3-E3).
             ToolCall {
-                busy: Some(ExecCmdBusyReason::Quota),
+                reason: Some(ToolDecisionReason::QueueFull),
+                ..run14()
+            },
+            ToolCall {
+                reason: Some(ToolDecisionReason::ExecutionOff),
                 ..run14()
             },
             ToolCall {
@@ -2429,9 +2656,37 @@ mod tests {
                 ..run14()
             },
             ToolCall {
+                decision: D::Denied,
+                reason: Some(ToolDecisionReason::Closed),
+                ..run14()
+            },
+            ToolCall {
                 decision: D::Busy,
-                busy: Some(ExecCmdBusyReason::Quota),
+                reason: Some(ToolDecisionReason::QueueFull),
                 ..invalid14()
+            },
+            ToolCall {
+                decision: D::Denied,
+                reason: Some(ToolDecisionReason::ExecutionOff),
+                ..invalid14()
+            },
+            ToolCall {
+                decision: D::Denied,
+                reason: Some(ToolDecisionReason::ExecutionOff),
+                name: "job".into(),
+                name_bytes: 3,
+                tool_operation: Some(ToolOperation::JobList),
+                ..run14()
+            },
+            // Fault 16 only for the `job` tool.
+            ToolCall {
+                fault: Some(F::InvalidJobId),
+                ..invalid14()
+            },
+            // A job operation code needs the `job` name.
+            ToolCall {
+                tool_operation: Some(ToolOperation::JobList),
+                ..run14()
             },
             // Form 4 holds no text; forms 1-3 at most 64,000 bytes.
             ToolCall {
@@ -2491,7 +2746,7 @@ mod tests {
             },
             ToolCall {
                 decision: ToolDecision::Busy,
-                busy: Some(ExecCmdBusyReason::Quota),
+                reason: Some(ToolDecisionReason::QueueFull),
                 ..whole14()
             },
             ToolCall {
@@ -2717,11 +2972,77 @@ mod tests {
             eof: true,
         }
     }
+    /// The capture facts of the retired kind 23 (J3-E9), kept as a test
+    /// builder: kind 28 applies the same capture rules, so each case below
+    /// is encoded and checked as a kind 28 through [`as28`].
+    #[derive(Clone, Debug)]
+    struct CaptureSettled {
+        state: CaptureState,
+        reason: CaptureReason,
+        exit_kind: u8,
+        exit_value: u32,
+        stdout: CaptureStream,
+        stderr: CaptureStream,
+        distinct_numbers: u32,
+        numbers: Vec<CaptureNumber>,
+        pause_count: u32,
+        first_pause_ms: u64,
+        paused_ms: u64,
+        final_reservation: u64,
+    }
+    /// The kind 28 with these capture facts: `not_started` (reason
+    /// `spawn_failed`) for capture state 4; otherwise `exited`, or
+    /// `signalled` for exit kind 2, with cleanup confirmed.
+    fn as28(p: &CaptureSettled) -> JobSettled {
+        let started = p.state != CaptureState::NotStarted;
+        JobSettled {
+            job: [3; 16],
+            outcome: match (started, p.exit_kind) {
+                (false, _) => JobOutcome::NotStarted,
+                (true, 2) => JobOutcome::Signalled,
+                (true, _) => JobOutcome::Exited,
+            },
+            reason: if started {
+                JobReason::None
+            } else {
+                JobReason::SpawnFailed
+            },
+            exit_kind: p.exit_kind,
+            exit_value: p.exit_value,
+            cleanup: if started {
+                JobCleanup::Confirmed
+            } else {
+                JobCleanup::None
+            },
+            unconfirmed_reason: 0,
+            escapees: 0,
+            elapsed_ms: if started { 5 } else { 0 },
+            capture_state: match p.state {
+                CaptureState::Complete => JobCaptureState::Complete,
+                CaptureState::Incomplete => JobCaptureState::Incomplete,
+                CaptureState::Unconfirmed => JobCaptureState::Unconfirmed,
+                CaptureState::NotStarted => JobCaptureState::NotStarted,
+            },
+            capture_reason: p.reason,
+            stdout: JobStream {
+                capture: p.stdout.clone(),
+                lines: 0,
+            },
+            stderr: JobStream {
+                capture: p.stderr.clone(),
+                lines: 0,
+            },
+            distinct_numbers: p.distinct_numbers,
+            numbers: p.numbers.clone(),
+            pause_count: p.pause_count,
+            first_pause_ms: p.first_pause_ms,
+            paused_ms: p.paused_ms,
+            final_reservation: p.final_reservation,
+            settled_time: 1_760_000_000_002,
+        }
+    }
     fn settled() -> CaptureSettled {
         CaptureSettled {
-            operation: [1; 16],
-            generation: 1,
-            ordinal: 1,
             state: CaptureState::Complete,
             reason: CaptureReason::None,
             exit_kind: 1,
@@ -2747,23 +3068,37 @@ mod tests {
     }
     fn raw23(p: &CaptureSettled) -> Vec<u8> {
         let mut w = Writer(Vec::new());
-        capture_settled_fields(&mut w, p);
+        job_settled_fields(&mut w, &as28(p));
         w.0
     }
     fn round23(p: CaptureSettled) -> Vec<u8> {
-        let record = Record::CaptureSettled(Box::new(p));
+        let record = Record::JobSettled(Box::new(as28(&p)));
         let bytes = payload(&record).unwrap();
-        assert_eq!(decode_record(23, &bytes).unwrap(), record);
+        assert_eq!(decode_record(28, &bytes).unwrap(), record);
         bytes
     }
     fn invalid23(p: CaptureSettled) {
-        let record = Record::CaptureSettled(Box::new(p.clone()));
+        let record = Record::JobSettled(Box::new(as28(&p)));
         assert_eq!(payload(&record), Err(ReplayError::Corrupt), "{p:?}");
         assert_eq!(
-            decode_record(23, &raw23(&p)),
+            decode_record(28, &raw23(&p)),
             Err(ReplayError::Corrupt),
             "{p:?}"
         );
+    }
+    /// Kind 28 offsets: capture state 37, capture reason 38, redaction 39,
+    /// stdout block 40.
+    const CAPTURE_AT: usize = 37;
+    const STDOUT_AT: usize = 40;
+    #[test]
+    fn j3t_03_jr17_kind_23_is_unsupported() {
+        // Kind 23 is retired with the J1 path: its bytes, or any payload, are
+        // UnsupportedFormat like the other retired kinds.
+        assert_eq!(
+            decode_record(23, &raw23(&settled())),
+            Err(ReplayError::UnsupportedFormat)
+        );
+        assert_eq!(decode_record(23, &[]), Err(ReplayError::UnsupportedFormat));
     }
     fn full_stream() -> CaptureStream {
         CaptureStream {
@@ -2793,11 +3128,9 @@ mod tests {
         }
     }
     #[test]
-    fn j1t_01_kind_23_round_trips_every_bound_and_maximum_size() {
+    fn j2t_01_kind_28_capture_fields_round_trip_every_bound_and_maximum_size() {
         let origins = [NumberOrigin::Command, NumberOrigin::Output];
         let max = CaptureSettled {
-            generation: u64::MAX,
-            ordinal: 8,
             exit_kind: 2,
             exit_value: 127,
             stdout: full_stream(),
@@ -2817,11 +3150,12 @@ mod tests {
             ..settled()
         };
         let bytes = round23(max.clone());
-        assert_eq!(bytes.len(), 4_066);
-        assert_eq!(bytes.len(), MAX_CAPTURE_SETTLED_PAYLOAD);
-        let frame = encode_frame(&context(), &Record::CaptureSettled(Box::new(max))).unwrap();
-        assert_eq!(frame.len(), 4_250);
-        // Minimum: no kinds, spans or numbers; 36 + 2 × 101 + 6 + 20 + 8.
+        assert_eq!(bytes.len(), 4_094);
+        assert_eq!(bytes.len(), MAX_JOB_SETTLED_PAYLOAD);
+        let frame = encode_frame(&context(), &Record::JobSettled(Box::new(as28(&max)))).unwrap();
+        assert_eq!(frame.len(), 4_278);
+        // Minimum: no kinds, spans or numbers; 40 + 2 × (101 + 8) + 6 + 20
+        // + 8 + 8.
         let min = CaptureSettled {
             stdout: CaptureStream {
                 kinds: vec![],
@@ -2834,7 +3168,7 @@ mod tests {
             final_reservation: 0,
             ..settled()
         };
-        assert_eq!(round23(min).len(), 272);
+        assert_eq!(round23(min).len(), 300);
         let without_digests = |s: CaptureStream| CaptureStream { digest: None, ..s };
         for (state, reason) in [
             (CaptureState::Complete, CaptureReason::None),
@@ -2876,16 +3210,22 @@ mod tests {
                 p.stderr.discarded_bytes = u64::MAX;
             }
             let bytes = round23(p);
-            assert_eq!(bytes[28], state as u8);
-            assert_eq!(bytes[29], reason as u8);
+            assert_eq!(bytes[CAPTURE_AT], state as u8);
+            assert_eq!(bytes[CAPTURE_AT + 1], reason as u8);
         }
-        for (exit_kind, exit_value) in [(0, 0), (1, 0), (1, 255), (2, 1), (2, 127)] {
+        for (exit_kind, exit_value) in [(1, 0), (1, 255), (2, 1), (2, 127)] {
             round23(CaptureSettled {
                 exit_kind,
                 exit_value,
                 ..settled()
             });
         }
+        // Kind 28 has no unknown exit for a process that ran.
+        invalid23(CaptureSettled {
+            exit_kind: 0,
+            exit_value: 0,
+            ..settled()
+        });
         for spans in [0, 1, 63, 64, 65, 1000] {
             let count = spans.min(64) as usize;
             round23(CaptureSettled {
@@ -2916,12 +3256,12 @@ mod tests {
         }
         let digest = round23(settled());
         // The stdout digest field is the SHA-256 of stored bytes, present flag 1.
-        assert_eq!(digest[36 + 16], 1);
-        assert_eq!(&digest[36 + 17..36 + 49], &[6; 32]);
-        assert_eq!(digest[35], 1, "redaction ran");
+        assert_eq!(digest[STDOUT_AT + 16], 1);
+        assert_eq!(&digest[STDOUT_AT + 17..STDOUT_AT + 49], &[6; 32]);
+        assert_eq!(digest[STDOUT_AT - 1], 1, "redaction ran");
     }
     #[test]
-    fn j1t_01_kind_23_rejects_each_invalid_field() {
+    fn j2t_01_kind_28_capture_fields_reject_each_invalid_value() {
         let s = settled;
         let none = |p: CaptureSettled| CaptureSettled {
             stdout: CaptureStream {
@@ -2967,19 +3307,6 @@ mod tests {
             reason: LossReason::DetectorError,
         };
         for p in [
-            CaptureSettled {
-                operation: [0; 16],
-                ..s()
-            },
-            CaptureSettled {
-                generation: 0,
-                ..s()
-            },
-            CaptureSettled { ordinal: 0, ..s() },
-            CaptureSettled {
-                ordinal: MAX_RECORDED_CALLS + 1,
-                ..s()
-            },
             CaptureSettled {
                 reason: CaptureReason::StorageFault,
                 ..s()
@@ -3236,19 +3563,20 @@ mod tests {
         ] {
             invalid23(p);
         }
-        // Wire-only values in the default record. stdout starts at 36 and has
-        // one kind entry (110 bytes): kind count +73, loss count +83, span
-        // count +99, degraded +100, discarded +101, EOF +109. stderr starts at
-        // 146 with no entries: EOF +100. Numbers follow at 247.
-        let stdout = 36;
-        let stderr = 146;
-        let numbers_at = stderr + 101;
+        // Wire-only values in the default record. stdout starts at 40 and has
+        // one kind entry (110 bytes and an 8-byte line count): kind count
+        // +73, loss count +83, span count +99, degraded +100, discarded +101,
+        // EOF +109. stderr starts at 158 with no entries: EOF +100. Numbers
+        // follow at 267.
+        let stdout = STDOUT_AT;
+        let stderr = stdout + 110 + 8;
+        let numbers_at = stderr + 101 + 8;
         let wire: [(usize, u8); 20] = [
-            (28, 0),
-            (28, 5),
-            (29, 7),
-            (35, 0),
-            (35, 2),
+            (CAPTURE_AT, 0),
+            (CAPTURE_AT, 6),
+            (CAPTURE_AT + 1, 8),
+            (CAPTURE_AT + 2, 0),
+            (CAPTURE_AT + 2, 2),
             (stdout + 16, 2),
             (stderr + 16, 0),
             (stdout + 73, 34),
@@ -3266,13 +3594,13 @@ mod tests {
             (numbers_at + 6 + 3, 3),
         ];
         let base = raw23(&s());
-        assert!(decode_record(23, &base).is_ok());
+        assert!(decode_record(28, &base).is_ok());
         for (offset, value) in wire {
             let mut bytes = base.clone();
             assert_ne!(bytes[offset], value, "{offset}");
             bytes[offset] = value;
             assert_eq!(
-                decode_record(23, &bytes),
+                decode_record(28, &bytes),
                 Err(ReplayError::Corrupt),
                 "{offset} {value}"
             );
@@ -3283,9 +3611,9 @@ mod tests {
             reason: CaptureReason::SettlementUnconfirmed,
             ..s()
         }));
-        assert!(decode_record(23, &bytes).is_ok());
+        assert!(decode_record(28, &bytes).is_ok());
         bytes[stdout + 17] = 1;
-        assert_eq!(decode_record(23, &bytes), Err(ReplayError::Corrupt));
+        assert_eq!(decode_record(28, &bytes), Err(ReplayError::Corrupt));
         let with_span = CaptureSettled {
             stdout: CaptureStream {
                 loss_span_count: 1,
@@ -3296,19 +3624,19 @@ mod tests {
         };
         for reason in [0, 4] {
             let mut bytes = raw23(&with_span);
-            assert!(decode_record(23, &bytes).is_ok());
+            assert!(decode_record(28, &bytes).is_ok());
             // The first span starts after the span count, at stdout + 100.
             assert_eq!(bytes[stdout + 100 + 16], 3);
             bytes[stdout + 100 + 16] = 1;
-            assert!(decode_record(23, &bytes).is_ok());
+            assert!(decode_record(28, &bytes).is_ok());
             bytes[stdout + 100 + 16] = reason;
-            assert_eq!(decode_record(23, &bytes), Err(ReplayError::Corrupt));
+            assert_eq!(decode_record(28, &bytes), Err(ReplayError::Corrupt));
         }
         let mut bytes = base.clone();
         bytes.push(0);
-        assert_eq!(decode_record(23, &bytes), Err(ReplayError::Corrupt));
+        assert_eq!(decode_record(28, &bytes), Err(ReplayError::Corrupt));
         assert_eq!(
-            decode_record(23, &base[..base.len() - 1]),
+            decode_record(28, &base[..base.len() - 1]),
             Err(ReplayError::Corrupt)
         );
     }
@@ -3462,13 +3790,26 @@ mod tests {
             "note_sources",
             "create_note",
             "exec_cmd",
+            "list",
+            "status",
+            "read",
+            "wait",
+            "cancel",
+            "note",
         ];
         for (index, name) in operations.iter().enumerate() {
             let op = ToolOperation::from_code(index as u8 + 1).unwrap();
             assert_eq!((op as u8, op.as_str()), (index as u8 + 1, *name));
+            // JR11: codes 10 to 16 resolve with kind 29.
+            assert_eq!(op.job_result(), index >= 9);
+            assert_eq!(
+                op.tool() == RegisteredTool::Job,
+                index >= 10,
+                "{name} belongs to the job tool"
+            );
         }
         assert_eq!(ToolOperation::from_code(0), None);
-        assert_eq!(ToolOperation::from_code(11), None);
+        assert_eq!(ToolOperation::from_code(17), None);
         let decisions = [
             ("run", None),
             ("invalid_arguments", Some(3)),
@@ -3503,12 +3844,42 @@ mod tests {
             "name_over_limit",
             "invalid_text",
             "unregistered_name",
+            "invalid_job_id",
         ];
         for (index, name) in faults.iter().enumerate() {
             let f = ToolFault::from_code(index as u8 + 1).unwrap();
             assert_eq!((f as u8, f.as_str()), (index as u8 + 1, *name));
         }
-        assert_eq!(ToolFault::from_code(16), None);
+        assert_eq!(ToolFault::from_code(17), None);
+        // Field 10 (J3-E3): the codes per decision; the J1 busy codes 4 and
+        // the reasons of other decisions are retired.
+        for (decision, code, reason) in [
+            (ToolDecision::Busy, 1, "queue_full"),
+            (ToolDecision::Busy, 2, "jobs_full"),
+            (ToolDecision::Busy, 3, "closed"),
+            (ToolDecision::Denied, 1, "execution_off"),
+        ] {
+            let r = ToolDecisionReason::from_code(decision, code)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (r.code(), r.as_str(), r.decision()),
+                (code, reason, decision)
+            );
+        }
+        for decision in ToolDecision::ALL {
+            assert_eq!(ToolDecisionReason::from_code(decision, 0), Some(None));
+        }
+        for (decision, code) in [
+            (ToolDecision::Busy, 4),
+            (ToolDecision::Busy, 0xff),
+            (ToolDecision::Denied, 2),
+            (ToolDecision::Run, 1),
+            (ToolDecision::Refused, 1),
+            (ToolDecision::Cancelled, 1),
+        ] {
+            assert_eq!(ToolDecisionReason::from_code(decision, code), None);
+        }
         for (code, reason) in [
             (1, NotRetainedReason::Oversized),
             (2, NotRetainedReason::DetectionUnavailable),
@@ -3522,7 +3893,11 @@ mod tests {
         }
         assert_eq!(ToolCallSource::GeneratedContent as u8, 1);
         assert_eq!(ToolCallSource::ProviderJson as u8, 2);
-        assert_eq!(TOOL_NAMES, ["project", "memory", "service", "exec_cmd"]);
+        assert_eq!(
+            TOOL_NAMES,
+            ["project", "memory", "service", "exec_cmd", "job"]
+        );
+        assert_eq!(RegisteredTool::lookup("job"), Some(RegisteredTool::Job));
     }
     #[test]
     fn j1t_01_records_hold_no_value_or_value_digest() {
@@ -3550,9 +3925,12 @@ mod tests {
             let digest = kinds + count + 8;
             assert_eq!(&bytes[digest..digest + 32], &[5; 32]);
         }
-        // Kind 23 has no string field: its size depends only on entry counts.
+        // Kind 28 has no string field: its size depends only on entry counts.
         let bytes = round23(settled());
-        assert_eq!(bytes.len(), 36 + (101 + 9) + 101 + 6 + 4 + 20 + 8);
+        assert_eq!(
+            bytes.len(),
+            40 + (101 + 9 + 8) + (101 + 8) + 6 + 4 + 20 + 8 + 8
+        );
     }
 
     // J2T-01 (unit): kinds 26, 27 and 28 (tool-job-controller.md, J2 records).
@@ -3672,6 +4050,8 @@ mod tests {
             Record::JobIntent(p) => job_intent_fields(&mut w, p),
             Record::JobCancelRequested(p) => job_cancel_fields(&mut w, p),
             Record::JobSettled(p) => job_settled_fields(&mut w, p),
+            Record::JobResult(p) => job_result_fields(&mut w, p),
+            Record::JobRetention(p) => job_retention_fields(&mut w, p),
             _ => unreachable!(),
         }
         w.0
@@ -3800,7 +4180,9 @@ mod tests {
                 pairs += 1;
             }
         }
-        assert_eq!(pairs, 2 + 7 * 4 + 3 + 2 * 2 + 1 + 7);
+        // Reasons 0 to 18, then 19 `execution_off` (ESCN) and 20
+        // `outside_sandbox_off` (N).
+        assert_eq!(pairs, 2 + 7 * 4 + 3 + 2 * 2 + 1 + 7 + 4 + 1);
         // Exit and cleanup bounds.
         for (exit_kind, exit_value) in [(1, 0), (1, 255)] {
             round_job(r28(JobSettled {
@@ -3932,7 +4314,7 @@ mod tests {
             ..cancel27(JobReason::ModelCancel)
         }));
         let good = raw(&Record::JobCancelRequested(cancel27(JobReason::Shutdown)));
-        for (at, value) in [(16, 0), (16, 5), (17, 19), (17, 0xff), (18, 2)] {
+        for (at, value) in [(16, 0), (16, 5), (17, 20), (17, 21), (17, 0xff), (18, 2)] {
             let mut bytes = good.clone();
             bytes[at] = value;
             assert_eq!(decode_record(27, &bytes), Err(ReplayError::Corrupt));
@@ -4174,7 +4556,7 @@ mod tests {
         for (at, value) in [
             (16, 0),
             (16, 6),
-            (17, 19),
+            (17, 21),
             (23, 3),
             (37, 0),
             (37, 6),
@@ -4224,12 +4606,14 @@ mod tests {
             "capture_unavailable",
             "protocol_fault",
             "setup_failed",
+            "execution_off",
+            "outside_sandbox_off",
         ];
         for (code, name) in names.iter().enumerate() {
             let reason = JobReason::from_code(code as u8).unwrap();
             assert_eq!((reason as u8, reason.as_str()), (code as u8, *name));
         }
-        assert_eq!(JobReason::from_code(19), None);
+        assert_eq!(JobReason::from_code(21), None);
         use JobRequester::*;
         let requesters = [
             None,
@@ -4251,7 +4635,10 @@ mod tests {
             None,
             None,
             None,
+            Some(Service),
+            None,
         ];
+        assert_eq!(requesters.len(), JobReason::ALL.len());
         for (reason, requester) in JobReason::ALL.into_iter().zip(requesters) {
             assert_eq!(reason.requester(), requester, "{reason:?}");
         }
@@ -4262,9 +4649,9 @@ mod tests {
         assert_eq!(JobRequester::from_code(0), None);
         assert_eq!(JobRequester::from_code(5), None);
         // The outcome column of the reason table: E S C N I.
-        let table: [&str; 19] = [
+        let table: [&str; 21] = [
             "ES", "ESCN", "ESCN", "ESCN", "ESCN", "ESCN", "ESCN", "ESCN", "ESC", "ES", "ES", "I",
-            "N", "N", "N", "N", "N", "N", "N",
+            "N", "N", "N", "N", "N", "N", "N", "ESCN", "N",
         ];
         for (reason, allowed) in JobReason::ALL.into_iter().zip(table) {
             for (outcome, letter) in JobOutcome::ALL.into_iter().zip(['E', 'S', 'C', 'N', 'I']) {
@@ -4347,5 +4734,738 @@ mod tests {
             round_job(r28(JobSettled::interrupted([3; 16], 1_760_000_000_001))).len(),
             37 + 3 + 2 * 109 + 6 + 20 + 8 + 8
         );
+    }
+
+    // J3T-02 (unit): kind 29 JobResult (tool-job-controller.md, kind 29).
+    fn snapshot29(state: JobRunState) -> JobSnapshot {
+        JobSnapshot {
+            state,
+            numbers: [0; 3],
+            elapsed_ms: 0,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+        }
+    }
+    fn result29(outcome: JobResultOutcome, job: Id, body: JobResultBody) -> JobResult {
+        JobResult {
+            operation: [1; 16],
+            generation: 1,
+            ordinal: 1,
+            status: outcome.status(),
+            outcome,
+            job,
+            body,
+        }
+    }
+    fn r29(p: JobResult) -> Record {
+        Record::JobResult(Box::new(p))
+    }
+    fn entry29(n: u8, state: JobRunState) -> JobListEntry {
+        JobListEntry {
+            job: [n; 16],
+            state,
+            numbers: [0; 3],
+            stdout_bytes: if state == JobRunState::Settled {
+                0
+            } else {
+                u64::MAX
+            },
+            stderr_bytes: 0,
+        }
+    }
+    fn page29(state: JobPageState, source_len: u32) -> JobPage {
+        JobPage {
+            stream: OutputStream::Stderr,
+            start: 7,
+            source_len,
+            total: 7 + u64::from(source_len),
+            state,
+            digest: if source_len == 0 { [0; 32] } else { [4; 32] },
+        }
+    }
+    #[test]
+    fn j3t_02_kind_29_round_trips_every_bound_and_maximum_size() {
+        use JobResultOutcome as O;
+        // Every outcome with no body, at the field bounds.
+        for outcome in O::ALL {
+            for (generation, ordinal) in [(1, 1), (u64::MAX, MAX_RECORDED_CALLS)] {
+                let job = if outcome == O::NotFound {
+                    [0; 16]
+                } else {
+                    [0xff; 16]
+                };
+                let bytes = round_job(r29(JobResult {
+                    generation,
+                    ordinal,
+                    ..result29(outcome, job, JobResultBody::None)
+                }));
+                assert_eq!(bytes.len(), JOB_RESULT_FIXED);
+                assert_eq!((bytes[28], bytes[29]), (outcome.status(), outcome as u8));
+            }
+        }
+        // The state block: every state and reason, the reason numbers and
+        // the elapsed and byte bounds.
+        let mut states = vec![
+            JobRunState::Starting,
+            JobRunState::Running,
+            JobRunState::Stopping,
+            JobRunState::Draining,
+            JobRunState::CleanupUnconfirmed,
+            JobRunState::Finalizing,
+            JobRunState::Settled,
+            JobRunState::CapturePaused(JobPauseReason::Quota),
+            JobRunState::CapturePaused(JobPauseReason::DiskSpace),
+        ];
+        states.extend(JobBlockReason::ALL.map(JobRunState::Queued));
+        for state in states {
+            let spawned = !state.before_spawn() && state != JobRunState::Settled;
+            let snapshot = JobSnapshot {
+                numbers: match state {
+                    JobRunState::Queued(
+                        JobBlockReason::AgentSlots | JobBlockReason::ServiceSlots,
+                    ) => [255, 255, 255],
+                    JobRunState::Queued(JobBlockReason::PendingInstalls) => [4, 0, 0],
+                    _ => [0; 3],
+                },
+                elapsed_ms: if spawned { u64::MAX } else { 0 },
+                stdout_bytes: if state == JobRunState::Settled {
+                    0
+                } else {
+                    u64::MAX
+                },
+                stderr_bytes: if state == JobRunState::Settled {
+                    0
+                } else {
+                    u64::MAX
+                },
+                ..snapshot29(state)
+            };
+            for outcome in [O::Ok, O::Cancelled] {
+                let bytes = round_job(r29(result29(
+                    outcome,
+                    [0; 16],
+                    JobResultBody::State(snapshot),
+                )));
+                assert_eq!(bytes.len(), JOB_RESULT_FIXED + JOB_STATE_BLOCK);
+                assert_eq!((bytes[46], bytes[47]), (state.code(), state.reason_code()));
+            }
+            for end in [WaitEnd::NewOutput, WaitEnd::Time] {
+                let bytes = round_job(r29(result29(
+                    O::Ok,
+                    [3; 16],
+                    JobResultBody::Wait(snapshot, end),
+                )));
+                assert_eq!(bytes.len(), JOB_RESULT_FIXED + JOB_WAIT_BLOCK);
+                assert_eq!(bytes[bytes.len() - 1], end as u8);
+            }
+        }
+        for end in [WaitEnd::Settled, WaitEnd::AlreadySettled] {
+            round_job(r29(result29(
+                O::Ok,
+                [3; 16],
+                JobResultBody::Wait(snapshot29(JobRunState::Settled), end),
+            )));
+        }
+        // The page block: every page state, both streams, 0 and 8,192
+        // source bytes.
+        for state in JobPageState::ALL {
+            let lengths: &[u32] = if state.readable() {
+                &[0, 1, 8192]
+            } else {
+                &[0]
+            };
+            for &length in lengths {
+                for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+                    let page = JobPage {
+                        stream,
+                        ..page29(state, length)
+                    };
+                    let bytes = round_job(r29(result29(O::Ok, [3; 16], JobResultBody::Page(page))));
+                    assert_eq!(bytes.len(), JOB_RESULT_FIXED + JOB_PAGE_BLOCK);
+                    assert_eq!(page.next_offset(), 7 + u64::from(length));
+                }
+            }
+        }
+        // A page at the end of a live stream: no bytes, at the total.
+        round_job(r29(result29(
+            O::Ok,
+            [3; 16],
+            JobResultBody::Page(JobPage {
+                start: 100,
+                total: 50,
+                ..page29(JobPageState::Live, 0)
+            }),
+        )));
+        // The list block: 0 to 8 entries; `more` only with 8; the maximum.
+        for count in 0..=MAX_JOB_LIST_ENTRIES as u8 {
+            let entries: Vec<_> = (1..=count)
+                .map(|n| entry29(n, JobRunState::Running))
+                .collect();
+            for more in [false, true] {
+                let record = r29(result29(
+                    O::Ok,
+                    [0; 16],
+                    JobResultBody::List {
+                        more,
+                        entries: entries.clone(),
+                    },
+                ));
+                if more && usize::from(count) < MAX_JOB_LIST_ENTRIES {
+                    invalid_job(record);
+                } else {
+                    let bytes = round_job(record);
+                    assert_eq!(
+                        bytes.len(),
+                        JOB_RESULT_FIXED + 2 + usize::from(count) * JOB_LIST_ENTRY
+                    );
+                }
+            }
+        }
+        let max = r29(result29(
+            O::Ok,
+            [0; 16],
+            JobResultBody::List {
+                more: true,
+                entries: (1..=8)
+                    .map(|n| JobListEntry {
+                        numbers: [255, 255, 255],
+                        ..entry29(n, JobRunState::Queued(JobBlockReason::ServiceSlots))
+                    })
+                    .collect(),
+            },
+        ));
+        let bytes = round_job(max.clone());
+        assert_eq!(bytes.len(), MAX_JOB_RESULT_PAYLOAD);
+        assert_eq!(MAX_JOB_RESULT_PAYLOAD, 344);
+        assert_eq!(encode_frame(&context(), &max).unwrap().len(), 528);
+        // The outcome and status table (field 4 is fixed by field 5).
+        let table = [
+            (O::Ok, 1, "ok"),
+            (O::NotFound, 3, "not_found"),
+            (O::NotPermitted, 2, "not_permitted"),
+            (O::Busy, 4, "busy"),
+            (O::Cancelled, 6, "cancelled"),
+            (O::Unavailable, 4, "unavailable"),
+            (O::Limit, 7, "limit"),
+        ];
+        for (index, (outcome, status, name)) in table.into_iter().enumerate() {
+            assert_eq!(O::from_code(index as u8 + 1), Some(outcome));
+            assert_eq!((outcome.status(), outcome.as_str()), (status, name));
+        }
+        assert_eq!(O::from_code(0), None);
+        assert_eq!(O::from_code(8), None);
+        // Allowed codes per outcome (the outcome table).
+        use ToolOperation as T;
+        let codes = [
+            T::ExecCmd,
+            T::JobList,
+            T::JobStatus,
+            T::JobRead,
+            T::JobWait,
+            T::JobCancel,
+            T::JobNote,
+        ];
+        let allowed = |outcome: O| {
+            codes
+                .iter()
+                .filter(|c| outcome.allows(**c))
+                .map(|c| *c as u8)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(allowed(O::Ok), vec![10, 11, 12, 13, 14, 15, 16]);
+        assert_eq!(allowed(O::NotFound), vec![12, 13, 14, 15, 16]);
+        assert_eq!(allowed(O::NotPermitted), vec![15]);
+        assert_eq!(allowed(O::Busy), vec![13]);
+        assert_eq!(allowed(O::Cancelled), vec![10, 11, 12, 13, 14, 16]);
+        assert_eq!(allowed(O::Unavailable), vec![11, 12, 13, 14, 15, 16]);
+        assert_eq!(allowed(O::Limit), vec![16]);
+        for outcome in O::ALL {
+            assert!(!outcome.allows(T::ReadFile) && !outcome.allows(T::CreateNote));
+        }
+    }
+    #[test]
+    fn j3t_02_kind_29_rejects_each_invalid_field() {
+        use JobResultOutcome as O;
+        let state = |s| JobResultBody::State(snapshot29(s));
+        let list = |more, entries| JobResultBody::List { more, entries };
+        for p in [
+            JobResult {
+                operation: [0; 16],
+                ..result29(O::Ok, [0; 16], JobResultBody::None)
+            },
+            JobResult {
+                generation: 0,
+                ..result29(O::Ok, [0; 16], JobResultBody::None)
+            },
+            JobResult {
+                ordinal: 0,
+                ..result29(O::Ok, [0; 16], JobResultBody::None)
+            },
+            JobResult {
+                ordinal: MAX_RECORDED_CALLS + 1,
+                ..result29(O::Ok, [0; 16], JobResultBody::None)
+            },
+            // Status fixed by the outcome.
+            JobResult {
+                status: 2,
+                ..result29(O::Ok, [0; 16], JobResultBody::None)
+            },
+            JobResult {
+                status: 4,
+                ..result29(O::NotFound, [0; 16], JobResultBody::None)
+            },
+            // not_found names no job.
+            result29(O::NotFound, [1; 16], JobResultBody::None),
+            // Bodies only with the outcomes that carry them.
+            result29(O::Busy, [1; 16], state(JobRunState::Running)),
+            result29(
+                O::Cancelled,
+                [1; 16],
+                JobResultBody::Wait(snapshot29(JobRunState::Running), WaitEnd::Time),
+            ),
+            result29(
+                O::Unavailable,
+                [1; 16],
+                JobResultBody::Page(page29(JobPageState::Live, 1)),
+            ),
+            result29(O::Limit, [0; 16], list(false, vec![])),
+            // State block rules.
+            result29(
+                O::Ok,
+                [0; 16],
+                JobResultBody::State(JobSnapshot {
+                    elapsed_ms: 1,
+                    ..snapshot29(JobRunState::Queued(JobBlockReason::Quota))
+                }),
+            ),
+            result29(
+                O::Ok,
+                [0; 16],
+                JobResultBody::State(JobSnapshot {
+                    elapsed_ms: 1,
+                    ..snapshot29(JobRunState::Starting)
+                }),
+            ),
+            result29(
+                O::Ok,
+                [0; 16],
+                JobResultBody::State(JobSnapshot {
+                    elapsed_ms: 1,
+                    ..snapshot29(JobRunState::Settled)
+                }),
+            ),
+            result29(
+                O::Ok,
+                [0; 16],
+                JobResultBody::State(JobSnapshot {
+                    stdout_bytes: 1,
+                    ..snapshot29(JobRunState::Settled)
+                }),
+            ),
+            result29(
+                O::Ok,
+                [0; 16],
+                JobResultBody::State(JobSnapshot {
+                    stderr_bytes: 1,
+                    ..snapshot29(JobRunState::Settled)
+                }),
+            ),
+            result29(
+                O::Ok,
+                [0; 16],
+                JobResultBody::State(JobSnapshot {
+                    numbers: [1, 0, 0],
+                    ..snapshot29(JobRunState::Running)
+                }),
+            ),
+            result29(
+                O::Ok,
+                [0; 16],
+                JobResultBody::State(JobSnapshot {
+                    numbers: [4, 1, 0],
+                    ..snapshot29(JobRunState::Queued(JobBlockReason::PendingInstalls))
+                }),
+            ),
+            result29(
+                O::Ok,
+                [0; 16],
+                JobResultBody::State(JobSnapshot {
+                    numbers: [0, 0, 1],
+                    ..snapshot29(JobRunState::Queued(JobBlockReason::Quota))
+                }),
+            ),
+            // A wait that ended on settlement reports state 9.
+            result29(
+                O::Ok,
+                [3; 16],
+                JobResultBody::Wait(snapshot29(JobRunState::Running), WaitEnd::Settled),
+            ),
+            result29(
+                O::Ok,
+                [3; 16],
+                JobResultBody::Wait(snapshot29(JobRunState::Running), WaitEnd::AlreadySettled),
+            ),
+            // Page block rules.
+            result29(
+                O::Ok,
+                [3; 16],
+                JobResultBody::Page(page29(JobPageState::Live, 8193)),
+            ),
+            result29(
+                O::Ok,
+                [3; 16],
+                JobResultBody::Page(JobPage {
+                    total: 7,
+                    ..page29(JobPageState::Complete, 1)
+                }),
+            ),
+            result29(
+                O::Ok,
+                [3; 16],
+                JobResultBody::Page(JobPage {
+                    start: u64::MAX,
+                    total: u64::MAX,
+                    ..page29(JobPageState::Live, 1)
+                }),
+            ),
+            result29(
+                O::Ok,
+                [3; 16],
+                JobResultBody::Page(JobPage {
+                    digest: [0; 32],
+                    ..page29(JobPageState::Live, 1)
+                }),
+            ),
+            result29(
+                O::Ok,
+                [3; 16],
+                JobResultBody::Page(JobPage {
+                    digest: [4; 32],
+                    ..page29(JobPageState::Live, 0)
+                }),
+            ),
+            // List block rules.
+            result29(O::Ok, [1; 16], list(false, vec![])),
+            result29(
+                O::Ok,
+                [0; 16],
+                list(
+                    false,
+                    vec![
+                        entry29(1, JobRunState::Running),
+                        entry29(1, JobRunState::Starting),
+                    ],
+                ),
+            ),
+            result29(
+                O::Ok,
+                [0; 16],
+                list(false, vec![entry29(0, JobRunState::Running)]),
+            ),
+            result29(
+                O::Ok,
+                [0; 16],
+                list(
+                    false,
+                    vec![JobListEntry {
+                        stdout_bytes: 1,
+                        ..entry29(1, JobRunState::Settled)
+                    }],
+                ),
+            ),
+            result29(
+                O::Ok,
+                [0; 16],
+                list(
+                    false,
+                    vec![JobListEntry {
+                        numbers: [0, 1, 0],
+                        ..entry29(1, JobRunState::Running)
+                    }],
+                ),
+            ),
+            result29(
+                O::Ok,
+                [0; 16],
+                list(true, vec![entry29(1, JobRunState::Running)]),
+            ),
+        ] {
+            invalid_job(r29(p));
+        }
+        // Nine entries cannot be encoded as a valid list.
+        assert_eq!(
+            payload(&r29(result29(
+                O::Ok,
+                [0; 16],
+                list(
+                    false,
+                    (1..=9).map(|n| entry29(n, JobRunState::Running)).collect()
+                ),
+            ))),
+            Err(ReplayError::Corrupt)
+        );
+        // Wire-only values: unknown codes and sizes of no body form.
+        let good = raw(&r29(result29(
+            O::Ok,
+            [3; 16],
+            JobResultBody::Wait(snapshot29(JobRunState::Running), WaitEnd::Time),
+        )));
+        for (at, value) in [
+            (29, 0),
+            (29, 8),
+            (46, 0),
+            (46, 10),
+            (47, 1),
+            (75, 0),
+            (75, 5),
+        ] {
+            let mut bytes = good.clone();
+            bytes[at] = value;
+            assert_eq!(decode_record(29, &bytes), Err(ReplayError::Corrupt), "{at}");
+        }
+        let page = raw(&r29(result29(
+            O::Ok,
+            [3; 16],
+            JobResultBody::Page(page29(JobPageState::Live, 1)),
+        )));
+        for (at, value) in [(46, 0), (46, 3), (67, 0), (67, 9)] {
+            let mut bytes = page.clone();
+            bytes[at] = value;
+            assert_eq!(decode_record(29, &bytes), Err(ReplayError::Corrupt), "{at}");
+        }
+        let listed = raw(&r29(result29(
+            O::Ok,
+            [0; 16],
+            list(false, vec![entry29(1, JobRunState::Running)]),
+        )));
+        for (at, value) in [(46, 2), (46, 0), (47, 2)] {
+            let mut bytes = listed.clone();
+            bytes[at] = value;
+            assert_eq!(decode_record(29, &bytes), Err(ReplayError::Corrupt), "{at}");
+        }
+        for len in [
+            JOB_RESULT_FIXED - 1,
+            JOB_RESULT_FIXED + 1,
+            JOB_RESULT_FIXED + 31,
+        ] {
+            let mut bytes = good.clone();
+            bytes.resize(len, 0);
+            assert_eq!(
+                decode_record(29, &bytes),
+                Err(ReplayError::Corrupt),
+                "{len}"
+            );
+        }
+        let mut bytes = raw(&r29(result29(
+            O::Ok,
+            [0; 16],
+            JobResultBody::List {
+                more: true,
+                entries: (1..=8).map(|n| entry29(n, JobRunState::Running)).collect(),
+            },
+        )));
+        bytes.push(0);
+        assert_eq!(decode_record(29, &bytes), Err(ReplayError::Corrupt));
+    }
+    /// TJ-26, J3T-17: kind 29 has no text field; its size depends only on
+    /// the body form and the entry count.
+    #[test]
+    fn j3t_02_kind_29_holds_no_text() {
+        use JobResultOutcome as O;
+        for body in [
+            JobResultBody::None,
+            JobResultBody::State(snapshot29(JobRunState::Running)),
+            JobResultBody::Page(page29(JobPageState::Complete, 8192)),
+            JobResultBody::Wait(snapshot29(JobRunState::Settled), WaitEnd::Settled),
+        ] {
+            let size = match &body {
+                JobResultBody::None => 0,
+                JobResultBody::State(_) => 29,
+                JobResultBody::Page(_) => 54,
+                _ => 30,
+            };
+            let bytes = round_job(r29(result29(O::Ok, [3; 16], body)));
+            assert_eq!(bytes.len(), 46 + size);
+        }
+    }
+
+    // J4T-02 (unit): kind 30 JobRetention.
+    fn person30(action: RetentionAction, note: &str) -> JobRetention {
+        JobRetention {
+            job: [3; 16],
+            action,
+            author: RetentionAuthor::Person { request: [4; 16] },
+            time: 1_760_000_000_003,
+            note: note.into(),
+        }
+    }
+    fn model30() -> JobRetention {
+        JobRetention {
+            job: [3; 16],
+            action: RetentionAction::Note,
+            author: RetentionAuthor::Model {
+                operation: [5; 16],
+                generation: 1,
+                ordinal: 1,
+            },
+            time: 1_760_000_000_004,
+            note: String::new(),
+        }
+    }
+    fn r30(p: JobRetention) -> Record {
+        Record::JobRetention(Box::new(p))
+    }
+    #[test]
+    fn j4t_02_kind_30_round_trips_every_bound_and_maximum_size() {
+        use RetentionAction::*;
+        for action in [Pin, Unpin, Delete] {
+            let bytes = round_job(r30(person30(action, "")));
+            assert_eq!(bytes.len(), 16 + 1 + 1 + 8 + 16 + 4);
+            assert_eq!((bytes[16], bytes[17]), (action as u8, 1));
+        }
+        // A person note after display redaction: the unnumbered placeholder
+        // only, 1 to 2,048 bytes.
+        for note in [
+            "x".to_owned(),
+            "rotate $ASURA_SECRET_0 before release".to_owned(),
+            "é".repeat(MAX_JOB_NOTE / 2),
+        ] {
+            let bytes = round_job(r30(person30(Note, &note)));
+            assert_eq!(bytes.len(), 46 + note.len());
+            assert!(bytes.ends_with(note.as_bytes()));
+        }
+        let max = r30(person30(Note, &"n".repeat(MAX_JOB_NOTE)));
+        assert_eq!(round_job(max.clone()).len(), MAX_JOB_RETENTION_PAYLOAD);
+        assert_eq!(MAX_JOB_RETENTION_PAYLOAD, 2_094);
+        assert_eq!(encode_frame(&context(), &max).unwrap().len(), 2_278);
+        // A model note cites its kind 14 and holds no text (TCR-O5).
+        let model = r30(model30());
+        let bytes = round_job(model.clone());
+        assert_eq!(bytes.len(), MODEL_NOTE_PAYLOAD);
+        assert_eq!(MODEL_NOTE_PAYLOAD, 58);
+        assert_eq!(encode_frame(&context(), &model).unwrap().len(), 242);
+        assert_eq!((bytes[16], bytes[17]), (4, 2));
+        round_job(r30(JobRetention {
+            author: RetentionAuthor::Model {
+                operation: [0xff; 16],
+                generation: u64::MAX,
+                ordinal: MAX_RECORDED_CALLS,
+            },
+            ..model30()
+        }));
+        for (code, name) in [(1, "pin"), (2, "unpin"), (3, "delete"), (4, "note")] {
+            let action = RetentionAction::from_code(code).unwrap();
+            assert_eq!((action as u8, action.as_str()), (code, name));
+        }
+        assert_eq!(RetentionAction::from_code(0), None);
+        assert_eq!(RetentionAction::from_code(5), None);
+    }
+    #[test]
+    fn j4t_02_kind_30_rejects_each_invalid_field() {
+        use RetentionAction::*;
+        let model = |change: fn(&mut JobRetention)| {
+            let mut p = model30();
+            change(&mut p);
+            p
+        };
+        for p in [
+            JobRetention {
+                job: [0; 16],
+                ..person30(Pin, "")
+            },
+            person30(Note, ""),
+            person30(Pin, "text"),
+            person30(Delete, "text"),
+            JobRetention {
+                author: RetentionAuthor::Person { request: [0; 16] },
+                ..person30(Pin, "")
+            },
+            // The model writes only notes, without text.
+            model(|p| p.action = Pin),
+            model(|p| p.action = Delete),
+            model(|p| p.note = "copy".into()),
+            model(|p| {
+                p.author = RetentionAuthor::Model {
+                    operation: [0; 16],
+                    generation: 1,
+                    ordinal: 1,
+                }
+            }),
+            model(|p| {
+                p.author = RetentionAuthor::Model {
+                    operation: [5; 16],
+                    generation: 0,
+                    ordinal: 1,
+                }
+            }),
+            model(|p| {
+                p.author = RetentionAuthor::Model {
+                    operation: [5; 16],
+                    generation: 1,
+                    ordinal: 0,
+                }
+            }),
+            model(|p| {
+                p.author = RetentionAuthor::Model {
+                    operation: [5; 16],
+                    generation: 1,
+                    ordinal: MAX_RECORDED_CALLS + 1,
+                }
+            }),
+        ] {
+            invalid_job(r30(p));
+        }
+        // A note over 2,048 bytes is over the limit to encode and Corrupt to
+        // decode.
+        let long = person30(Note, &"n".repeat(MAX_JOB_NOTE + 1));
+        assert_eq!(payload(&r30(long.clone())), Err(ReplayError::Limit));
+        assert_eq!(
+            decode_record(30, &raw(&r30(long))),
+            Err(ReplayError::Corrupt)
+        );
+        // Wire-only values: action, author and the note length.
+        let good = raw(&r30(person30(Pin, "")));
+        for (at, value) in [(16, 0), (16, 5), (17, 0), (17, 3)] {
+            let mut bytes = good.clone();
+            bytes[at] = value;
+            assert_eq!(decode_record(30, &bytes), Err(ReplayError::Corrupt), "{at}");
+        }
+        let mut bytes = raw(&r30(model30()));
+        bytes[17] = 1;
+        assert_eq!(decode_record(30, &bytes), Err(ReplayError::Corrupt));
+        let mut bytes = good;
+        bytes.push(0);
+        assert_eq!(decode_record(30, &bytes), Err(ReplayError::Corrupt));
+        let mut bytes = raw(&r30(person30(Note, "ab")));
+        bytes.pop();
+        assert_eq!(decode_record(30, &bytes), Err(ReplayError::Corrupt));
+        // Invalid UTF-8 note text.
+        let mut bytes = raw(&r30(person30(Note, "ab")));
+        let last = bytes.len() - 1;
+        bytes[last] = 0xff;
+        assert_eq!(decode_record(30, &bytes), Err(ReplayError::Corrupt));
+    }
+    /// J4T-02: the retention summary rules that replay and the writer apply.
+    #[test]
+    fn j4t_02_retention_summary_rules_and_bounds() {
+        use RetentionAction::*;
+        let mut s = JobRetentionSummary::default();
+        assert!(s.allows(Pin, false) && !s.allows(Unpin, false));
+        assert!(!s.allows(Delete, false) && s.allows(Delete, true));
+        assert!(s.allows(Note, false));
+        s.apply(Pin);
+        assert!(!s.allows(Pin, true) && s.allows(Unpin, true));
+        s.apply(Delete);
+        assert!(!s.allows(Delete, true) && s.allows(Note, true));
+        let mut s = JobRetentionSummary::default();
+        for _ in 0..MAX_JOB_NOTES {
+            assert!(s.has_room(Note));
+            s.apply(Note);
+        }
+        assert!(!s.has_room(Note) && s.has_room(Pin));
+        while (s.records as usize) < MAX_JOB_RETENTION_RECORDS {
+            s.apply(if s.pinned { Unpin } else { Pin });
+        }
+        assert!(!s.has_room(Pin) && !s.has_room(Delete));
     }
 }

@@ -1,7 +1,7 @@
 //! Native process qualification; private guardian dispatch is identical to the CLI.
 use asura_platform::exec_cmd::{
     ExecCmdError, ExecCmdRequest, ExecCmdResult, Exit, OutputSink, PreparedExecCmd, Profile,
-    StopKind, StopReason, Stream, Tails, run_guardian,
+    StopKind, StopReason, Stream, run_guardian,
 };
 use asura_platform::secrets::{RefusalCode, SecretVariable, WHOLE_COMMAND, rewrite_command};
 use asura_platform::{ProjectIdentity, RuntimeDirectory};
@@ -133,15 +133,10 @@ impl std::fmt::Debug for Outcome {
     }
 }
 impl Outcome {
+    /// Everything the job reported: its result facts and both captured
+    /// streams.
     fn render_text(&self) -> String {
-        self.result.render_text(
-            &Tails {
-                stdout: self.stdout.clone(),
-                stderr: self.stderr.clone(),
-                truncated: self.truncated,
-            },
-            "complete",
-        )
+        format!("{self:?}")
     }
 }
 fn prepare(home: &Path, command: &str, timeout: Duration) -> JobGuard {

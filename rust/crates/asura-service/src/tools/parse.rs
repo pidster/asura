@@ -2,11 +2,22 @@
 //! TCR-D11). It reads the received name and argument text into typed
 //! [`Arguments`] or the lowest fault code that applies. It grants nothing;
 //! the conversation owner decides, records and dispatches.
-use super::{Arguments, MAX_PATH_BYTES, MAX_RESULT_BYTES};
+use super::{Arguments, JobArguments, MAX_PATH_BYTES, MAX_RESULT_BYTES};
 use asura_platform::secrets::json::{self, Value};
 use asura_storage::authority::conversation::{
-    MAX_TOOL_ARGUMENTS, RegisteredTool, ToolFault as Fault, ToolOperation as Op,
+    Id, MAX_JOB_NOTE, MAX_JOB_PAGE, MAX_TOOL_ARGUMENTS, OutputStream, RegisteredTool,
+    ToolFault as Fault, ToolOperation as Op,
 };
+
+/// exec_cmd `yield_seconds` (tool-job-controller.md, exec_cmd as a job).
+pub const MAX_YIELD_SECONDS: u64 = 30;
+pub const DEFAULT_YIELD_SECONDS: u64 = 10;
+/// `job wait` `seconds` (the job tool).
+pub const MAX_WAIT_SECONDS: u64 = 3_600;
+/// `job read` `offset` upper bound, 2^63 - 1.
+const MAX_JOB_OFFSET: u64 = i64::MAX as u64;
+/// The exec_cmd `command` bound in UTF-8 bytes.
+pub const MAX_COMMAND_BYTES: usize = 8_192;
 
 /// The parser's reading of one call. `operation` is set when the name and the
 /// text determine an operation, even if a later field is invalid.
@@ -174,6 +185,29 @@ impl<'a, 'f> Members<'a, 'f> {
         }
         Some(value.to_owned())
     }
+    /// An optional integer within `range`; out of it is `out_of_range`.
+    fn bounded(&mut self, key: &str, range: std::ops::RangeInclusive<u64>) -> Option<u64> {
+        let value = self.integer(key)?;
+        if range.contains(&value) {
+            Some(value)
+        } else {
+            self.faults.add(Fault::OutOfRange);
+            None
+        }
+    }
+    /// The `job` handle (J3-E8): 32 lowercase hexadecimal digits, not all
+    /// zero. A malformed string is `invalid_job_id`; another type is
+    /// `wrong_type`.
+    fn job_id(&mut self) -> Option<Id> {
+        let text = self.string("job", true)?;
+        match job_handle(text) {
+            Some(id) => Some(id),
+            None => {
+                self.faults.add(Fault::InvalidJobId);
+                None
+            }
+        }
+    }
     fn fault(&mut self, fault: Fault) {
         self.faults.add(fault);
     }
@@ -209,6 +243,32 @@ fn safe_cwd(cwd: &str) -> bool {
         && !cwd.starts_with('/')
         && !cwd.contains('\0')
         && !cwd.split('/').any(|part| part == "..")
+}
+
+/// Reads a job handle (J3-E8): exactly 32 lowercase hexadecimal digits and
+/// not all zero.
+pub fn job_handle(text: &str) -> Option<Id> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 32
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    {
+        return None;
+    }
+    let mut id = [0; 16];
+    for (i, byte) in id.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    (id != [0; 16]).then_some(id)
+}
+
+/// The exec_cmd `command` text rule: no NUL or control character other
+/// than tab and newline (fault 14).
+fn command_text_valid(command: &str) -> bool {
+    !command
+        .chars()
+        .any(|c| c.is_control() && c != '\t' && c != '\n')
 }
 
 fn command(reader: &mut Members<'_, '_>, commands: &[(&str, Op)]) -> Option<Op> {
@@ -337,9 +397,9 @@ fn read_tool(tool: RegisteredTool, m: &mut Members<'_, '_>) -> (Option<Op>, Opti
         RegisteredTool::ExecCmd => {
             let command = m.string("command", true);
             if let Some(command) = command {
-                if command.contains('\0') {
+                if !command_text_valid(command) {
                     m.fault(Fault::InvalidText);
-                } else if command.is_empty() || command.len() > 8192 {
+                } else if command.is_empty() || command.len() > MAX_COMMAND_BYTES {
                     m.fault(Fault::OutOfRange);
                 }
             }
@@ -347,14 +407,85 @@ fn read_tool(tool: RegisteredTool, m: &mut Members<'_, '_>) -> (Option<Op>, Opti
             if !safe_cwd(cwd) {
                 m.fault(Fault::UnsafePath);
             }
+            let yield_seconds = m.ranged(
+                "yield_seconds",
+                0..=MAX_YIELD_SECONDS,
+                DEFAULT_YIELD_SECONDS,
+            ) as u32;
             // A missing `command` leaves the operation undetermined (TCR-D11).
             (
                 command.map(|_| Op::ExecCmd),
                 command.map(|command| Arguments::ExecCmd {
                     command: command.into(),
                     cwd: cwd.into(),
+                    yield_seconds,
                 }),
             )
+        }
+        // The grouped job tool (tool-job-controller.md, the job tool). A
+        // field the chosen command does not take stays unconsumed and is
+        // `unexpected_field`.
+        RegisteredTool::Job => {
+            let op = command(
+                m,
+                &[
+                    ("list", Op::JobList),
+                    ("status", Op::JobStatus),
+                    ("read", Op::JobRead),
+                    ("wait", Op::JobWait),
+                    ("cancel", Op::JobCancel),
+                    ("note", Op::JobNote),
+                ],
+            );
+            let arguments = match op {
+                Some(Op::JobList) => Some(JobArguments::List {
+                    before: m.bounded("before", 1..=u64::MAX),
+                }),
+                Some(Op::JobStatus) => m.job_id().map(|job| JobArguments::Status { job }),
+                Some(Op::JobRead) => {
+                    let job = m.job_id();
+                    let stream = match m.string("stream", true) {
+                        Some("stdout") => Some(OutputStream::Stdout),
+                        Some("stderr") => Some(OutputStream::Stderr),
+                        Some(_) => {
+                            m.fault(Fault::OutOfRange);
+                            None
+                        }
+                        None => None,
+                    };
+                    let offset = m.bounded("offset", 0..=MAX_JOB_OFFSET);
+                    let limit = m.ranged("limit", 1..=u64::from(MAX_JOB_PAGE), 8_192) as u32;
+                    job.zip(stream).map(|(job, stream)| JobArguments::Read {
+                        job,
+                        stream,
+                        offset,
+                        limit,
+                    })
+                }
+                Some(Op::JobWait) => {
+                    let job = m.job_id();
+                    let seconds = m.bounded("seconds", 1..=MAX_WAIT_SECONDS).map(|s| s as u32);
+                    job.map(|job| JobArguments::Wait { job, seconds })
+                }
+                Some(Op::JobCancel) => m.job_id().map(|job| JobArguments::Cancel { job }),
+                Some(_) => {
+                    let job = m.job_id();
+                    let text = m.string("text", true);
+                    if let Some(text) = text {
+                        if text.contains('\0') {
+                            m.fault(Fault::InvalidText);
+                        } else if text.is_empty() || text.len() > MAX_JOB_NOTE {
+                            m.fault(Fault::OutOfRange);
+                        }
+                    }
+                    job.zip(text).map(|(job, text)| JobArguments::Note {
+                        job,
+                        text: text.into(),
+                    })
+                }
+                None => None,
+            };
+            (op, arguments.map(Arguments::Job))
         }
     }
 }

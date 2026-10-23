@@ -119,7 +119,65 @@ pub(super) fn read(
                     entry.tool = Some(*tool as u32);
                     entry.outcome = Some(*outcome as u32);
                 }
-                _ => continue,
+                // Job events (J4-E8): no command, cwd, note or output text.
+                Event::JobQueued {
+                    conversation,
+                    job,
+                    reason,
+                    ..
+                } => {
+                    entry.kind = Some(4);
+                    entry.conversation = Some(conversation.to_vec());
+                    entry.job = Some(job.to_vec());
+                    entry.reason = Some(*reason as u32 + 1);
+                }
+                Event::JobStarted {
+                    conversation,
+                    job,
+                    operation,
+                    generation,
+                    ordinal,
+                    ..
+                } => {
+                    entry.kind = Some(5);
+                    entry.conversation = Some(conversation.to_vec());
+                    entry.job = Some(job.to_vec());
+                    entry.operation = operation.map(|v| v.to_vec());
+                    entry.generation = *generation;
+                    entry.ordinal = *ordinal;
+                }
+                Event::JobCancelRequested {
+                    conversation,
+                    job,
+                    requester,
+                    reason,
+                    ..
+                } => {
+                    entry.kind = Some(6);
+                    entry.conversation = Some(conversation.to_vec());
+                    entry.job = Some(job.to_vec());
+                    entry.outcome = Some(*requester as u32);
+                    entry.reason = Some(*reason as u32);
+                }
+                Event::JobSettled {
+                    conversation,
+                    job,
+                    outcome,
+                    reason,
+                    ..
+                } => {
+                    entry.kind = Some(7);
+                    entry.conversation = Some(conversation.to_vec());
+                    entry.job = Some(job.to_vec());
+                    entry.outcome = Some(*outcome as u32);
+                    entry.reason = Some(*reason as u32);
+                }
+                // Not project records: they stay out of the project view.
+                Event::ServiceStarted { .. }
+                | Event::ConfigChanged { .. }
+                | Event::ServiceStopping { .. }
+                | Event::JournalGap { .. }
+                | Event::ExecutionChanged { .. } => continue,
             }
             let Ok(line) = std::str::from_utf8(&bytes) else {
                 continue;
@@ -235,13 +293,15 @@ pub(super) fn finished(
 }
 /// One `ToolFinished` event per call with an operation code, run or not
 /// (TCR-D14). It cites the call by operation, generation and ordinal and
-/// never holds argument text.
+/// never holds argument text. A `job` command (codes 11 to 16) has one
+/// `Tool` value per operation; its status is the kind 29 status (audit of
+/// job tool calls).
 pub(super) fn tool_finished(
     turn: &asura_storage::authority::conversation::TurnAccepted,
     ordinal: u32,
     operation: asura_storage::authority::conversation::ToolOperation,
     status: u8,
-) -> Event {
+) -> Option<Event> {
     use asura_storage::audit::{Tool, ToolOutcome as O};
     use asura_storage::authority::conversation::ToolOperation as Op;
     let tool = match operation {
@@ -255,6 +315,12 @@ pub(super) fn tool_finished(
         Op::GetNote => Tool::MemoryGetNote,
         Op::NoteSources => Tool::MemoryNoteSources,
         Op::CreateNote => Tool::MemoryCreateNote,
+        Op::JobList => Tool::JobList,
+        Op::JobStatus => Tool::JobStatus,
+        Op::JobRead => Tool::JobRead,
+        Op::JobWait => Tool::JobWait,
+        Op::JobCancel => Tool::JobCancel,
+        Op::JobNote => Tool::JobNote,
     };
     let outcome = match status {
         1 => O::Success,
@@ -265,14 +331,14 @@ pub(super) fn tool_finished(
         7 => O::Limit,
         _ => O::Unavailable,
     };
-    Event::ToolFinished {
+    Some(Event::ToolFinished {
         project: turn.project,
         operation: turn.operation,
         generation: turn.generation,
         ordinal,
         tool,
         outcome,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -362,5 +428,166 @@ mod tests {
         assert_eq!(reply.entries.len(), 1);
         assert!(text.contains("dropped=3"));
         assert!(text.len() <= 16384);
+    }
+    /// J3T-20 (unit): each `job` operation code maps to its audit `Tool`
+    /// value, and each kind 29 status to its outcome; no text field.
+    #[test]
+    fn j3t_20_job_codes_map_to_tool_values_and_statuses_to_outcomes() {
+        use asura_storage::audit::{Tool, ToolOutcome};
+        use asura_storage::authority::conversation::{self as journal, ToolOperation as Op};
+        let turn = journal::TurnAccepted {
+            request: [1; 16],
+            digest: [0; 32],
+            project: [3; 16],
+            original_conversation: None,
+            expected_generation: 0,
+            conversation: [1; 16],
+            generation: 4,
+            task: [1; 16],
+            operation: [2; 16],
+            model: String::new(),
+            configuration_digest: [0; 32],
+            instructions_digest: [0; 32],
+            input_digest: [0; 32],
+            prior_operations: Vec::new(),
+            prompt: String::new(),
+            event_cursor: 0,
+            composition: Default::default(),
+            thinking_level: 0,
+            thinking_request: 0,
+        };
+        for (op, tool) in [
+            (Op::JobList, Tool::JobList),
+            (Op::JobStatus, Tool::JobStatus),
+            (Op::JobRead, Tool::JobRead),
+            (Op::JobWait, Tool::JobWait),
+            (Op::JobCancel, Tool::JobCancel),
+            (Op::JobNote, Tool::JobNote),
+        ] {
+            for (status, outcome) in [
+                (1, ToolOutcome::Success),
+                (2, ToolOutcome::Denied),
+                (3, ToolOutcome::InvalidArguments),
+                (4, ToolOutcome::Unavailable),
+                (6, ToolOutcome::Cancelled),
+                (7, ToolOutcome::Limit),
+            ] {
+                let event = tool_finished(&turn, 5, op, status).unwrap();
+                let Event::ToolFinished {
+                    project,
+                    operation,
+                    generation,
+                    ordinal,
+                    tool: t,
+                    outcome: o,
+                } = event
+                else {
+                    panic!("not tool.finished");
+                };
+                assert_eq!(
+                    (project, operation, generation, ordinal),
+                    ([3; 16], [2; 16], 4, 5)
+                );
+                assert_eq!((t, o), (tool, outcome));
+            }
+        }
+    }
+    /// J4T-10 (unit): the recent audit read shows job events as kinds 4-7
+    /// with field 16, under the control codec; no command text exists.
+    #[test]
+    fn j4t_10_job_events_map_to_audit_entries_4_to_7() {
+        use asura_storage::audit::{
+            JobBlockReason, JobCaptureState, JobCleanup, JobExitKind, JobOrigin, JobOutcome,
+            JobProfile, JobReason, JobRequester, JobUnconfirmedReason,
+        };
+        let project = [1; 16];
+        let at = |sequence, event| Record {
+            event,
+            ..record(project, sequence)
+        };
+        let records = [
+            at(
+                4,
+                Event::JobSettled {
+                    project,
+                    conversation: [4; 16],
+                    job: [5; 16],
+                    outcome: JobOutcome::Cancelled,
+                    reason: JobReason::ExecutionOff,
+                    exit_kind: JobExitKind::Signalled,
+                    exit_value: 15,
+                    cleanup: JobCleanup::Confirmed,
+                    unconfirmed_reason: JobUnconfirmedReason::None,
+                    escapees: 0,
+                    capture_state: JobCaptureState::Complete,
+                    stdout_bytes: 1,
+                    stderr_bytes: 0,
+                    elapsed_ms: 2,
+                    pause_count: 0,
+                },
+            ),
+            at(
+                3,
+                Event::JobCancelRequested {
+                    project,
+                    conversation: [4; 16],
+                    job: [5; 16],
+                    requester: JobRequester::Service,
+                    reason: JobReason::ExecutionOff,
+                    kill: false,
+                },
+            ),
+            at(
+                2,
+                Event::JobStarted {
+                    project,
+                    conversation: [4; 16],
+                    job: [5; 16],
+                    origin: JobOrigin::Model,
+                    agent: 0,
+                    profile: JobProfile::Model1,
+                    operation: Some([6; 16]),
+                    generation: Some(7),
+                    ordinal: Some(8),
+                    input: None,
+                },
+            ),
+            at(
+                1,
+                Event::JobQueued {
+                    project,
+                    conversation: [4; 16],
+                    job: [5; 16],
+                    origin: JobOrigin::Model,
+                    agent: 0,
+                    reason: JobBlockReason::AgentSlots,
+                },
+            ),
+        ];
+        let (reply, text) = read(&records, &health(), project, 16, None);
+        let kinds: Vec<_> = reply.entries.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, [Some(7), Some(6), Some(5), Some(4)]);
+        assert!(reply.entries.iter().all(|e| e.job == Some(vec![5; 16])));
+        assert_eq!(
+            (reply.entries[0].outcome, reply.entries[0].reason),
+            (Some(3), Some(19))
+        );
+        assert_eq!(
+            (reply.entries[1].outcome, reply.entries[1].reason),
+            (Some(4), Some(19))
+        );
+        assert_eq!(reply.entries[2].ordinal, Some(8));
+        assert_eq!(reply.entries[3].reason, Some(5));
+        assert!(text.contains("job.settled"));
+        let env = pb::Envelope {
+            service_epoch: Some(vec![2; 16]),
+            attachment_id: Some(vec![3; 16]),
+            request_counter: Some(1),
+            body: Some(pb::envelope::Body::AuditReply(reply)),
+        };
+        assert!(
+            asura_control::validate_semantics(&env, asura_control::Direction::ServerToClient)
+                .is_ok()
+        );
     }
 }

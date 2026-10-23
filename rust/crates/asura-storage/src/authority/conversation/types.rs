@@ -320,8 +320,6 @@ pub enum Record {
     /// Kind 14: one model tool call, the only copy of its arguments.
     ToolCall(Box<ToolCall>),
     ToolResult(ToolResult),
-    /// Kind 23 (J1): capture facts of a `run` exec_cmd call, before kind 15.
-    CaptureSettled(Box<CaptureSettled>),
     /// Kind 24: one response text segment.
     ResponseText(ResponseText),
     /// Kind 25: one thinking text segment, the same layout applied to the
@@ -333,6 +331,11 @@ pub enum Record {
     JobCancelRequested(JobCancelRequested),
     /// Kind 28 (J2): a job's settlement, with the capture facts of kind 23.
     JobSettled(Box<JobSettled>),
+    /// Kind 29 (J3): the reference-only result of a `run` call with
+    /// operation code 10 to 16. It holds no output, page or command text.
+    JobResult(Box<JobResult>),
+    /// Kind 30 (J4): one pin, unpin, delete or note of a job.
+    JobRetention(Box<JobRetention>),
 }
 impl Record {
     pub fn kind(&self) -> u16 {
@@ -353,12 +356,13 @@ impl Record {
             Self::ToolCall(_) => 14,
             Self::ToolResult(_) => 15,
             Self::InputPromoted(_) => 16,
-            Self::CaptureSettled(_) => 23,
             Self::ResponseText(_) => 24,
             Self::ThinkingText(_) => 25,
             Self::JobIntent(_) => 26,
             Self::JobCancelRequested(_) => 27,
             Self::JobSettled(_) => 28,
+            Self::JobResult(_) => 29,
+            Self::JobRetention(_) => 30,
         }
     }
 }
@@ -589,9 +593,9 @@ pub struct QueuedInput {
     pub settled: Option<u64>,
 }
 
-/// The four registered model-facing tool names (TCR-D24). Replay looks a
-/// stored name up here; the service registry uses these constants.
-pub const TOOL_NAMES: [&str; 4] = ["project", "memory", "service", "exec_cmd"];
+/// The five registered model-facing tool names (TCR-D24, J3-E2). Replay
+/// looks a stored name up here; the service registry uses these constants.
+pub const TOOL_NAMES: [&str; 5] = ["project", "memory", "service", "exec_cmd", "job"];
 /// Kind 14 bounds (tool-call-records.md, size limits).
 pub const MAX_TOOL_ARGUMENTS: usize = 64_000;
 pub const MAX_TOOL_NAME: usize = 256;
@@ -617,6 +621,8 @@ pub enum RegisteredTool {
     Memory,
     Service,
     ExecCmd,
+    /// The grouped job tool (J3-E2), registry position 4.
+    Job,
 }
 impl RegisteredTool {
     /// The registry lookup. An empty (not retained) name is unregistered.
@@ -625,7 +631,8 @@ impl RegisteredTool {
             0 => Some(Self::Project),
             1 => Some(Self::Memory),
             2 => Some(Self::Service),
-            _ => Some(Self::ExecCmd),
+            3 => Some(Self::ExecCmd),
+            _ => Some(Self::Job),
         }
     }
     pub fn name(self) -> &'static str {
@@ -653,9 +660,16 @@ pub enum ToolOperation {
     NoteSources = 8,
     CreateNote = 9,
     ExecCmd = 10,
+    /// Codes 11 to 16: the `job` tool commands (J3-E2).
+    JobList = 11,
+    JobStatus = 12,
+    JobRead = 13,
+    JobWait = 14,
+    JobCancel = 15,
+    JobNote = 16,
 }
 impl ToolOperation {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 16] = [
         Self::ReadFile,
         Self::ListDirectory,
         Self::Status,
@@ -666,6 +680,12 @@ impl ToolOperation {
         Self::NoteSources,
         Self::CreateNote,
         Self::ExecCmd,
+        Self::JobList,
+        Self::JobStatus,
+        Self::JobRead,
+        Self::JobWait,
+        Self::JobCancel,
+        Self::JobNote,
     ];
     pub fn from_code(code: u8) -> Option<Self> {
         Self::ALL.get(usize::from(code).checked_sub(1)?).copied()
@@ -678,7 +698,18 @@ impl ToolOperation {
                 RegisteredTool::Memory
             }
             Self::ExecCmd => RegisteredTool::ExecCmd,
+            Self::JobList
+            | Self::JobStatus
+            | Self::JobRead
+            | Self::JobWait
+            | Self::JobCancel
+            | Self::JobNote => RegisteredTool::Job,
         }
+    }
+    /// Codes 10 to 16 resolve with kind 29, never kind 15; codes 1 to 9 with
+    /// kind 15, never kind 29 (JR11).
+    pub fn job_result(self) -> bool {
+        self >= Self::ExecCmd
     }
     /// The model-facing command name (exec_cmd has none of its own).
     pub fn as_str(self) -> &'static str {
@@ -693,6 +724,12 @@ impl ToolOperation {
             Self::NoteSources => "note_sources",
             Self::CreateNote => "create_note",
             Self::ExecCmd => "exec_cmd",
+            Self::JobList => "list",
+            Self::JobStatus => "status",
+            Self::JobRead => "read",
+            Self::JobWait => "wait",
+            Self::JobCancel => "cancel",
+            Self::JobNote => "note",
         }
     }
 }
@@ -767,9 +804,12 @@ pub enum ToolFault {
     NameOverLimit = 13,
     InvalidText = 14,
     UnregisteredName = 15,
+    /// A `job` field that is not 32 lowercase hexadecimal digits, or is all
+    /// zero (J3).
+    InvalidJobId = 16,
 }
 impl ToolFault {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::InvalidJson,
         Self::JsonLimit,
         Self::NotObject,
@@ -785,6 +825,7 @@ impl ToolFault {
         Self::NameOverLimit,
         Self::InvalidText,
         Self::UnregisteredName,
+        Self::InvalidJobId,
     ];
     pub fn from_code(code: u8) -> Option<Self> {
         Self::ALL.get(usize::from(code).checked_sub(1)?).copied()
@@ -806,6 +847,7 @@ impl ToolFault {
             Self::NameOverLimit => "name_over_limit",
             Self::InvalidText => "invalid_text",
             Self::UnregisteredName => "unregistered_name",
+            Self::InvalidJobId => "invalid_job_id",
         }
     }
 }
@@ -869,8 +911,9 @@ pub struct ToolCall {
     pub decision: ToolDecision,
     /// Set only with `invalid_arguments` or `unknown_tool`.
     pub fault: Option<ToolFault>,
-    /// Set only with `busy`.
-    pub busy: Option<ExecCmdBusyReason>,
+    /// Field 10, the decision reason (J3-E3): set with every `busy`, and
+    /// with an exec_cmd `denied` for `execution_off`; `None` otherwise.
+    pub reason: Option<ToolDecisionReason>,
     pub form: ArgumentForm,
     /// Received argument size.
     pub arguments_bytes: u32,
@@ -904,25 +947,64 @@ pub struct ToolResult {
     pub next_offset: Option<u64>,
     pub truncated: bool,
 }
-/// Kind 14 field 10, for a `busy` decision.
+/// Kind 14 field 10, the decision reason (J3-E3). The stored code depends
+/// on the decision: `busy` 1 `queue_full`, 2 `jobs_full`, 3 `closed`;
+/// `denied` 1 `execution_off` (EX11). Every other decision stores 0. The J1
+/// busy codes are retired with the J1 path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ExecCmdBusyReason {
-    Quota = 1,
-    CapturePaused = 2,
-    PendingFull = 3,
-    PayloadUnavailable = 4,
+pub enum ToolDecisionReason {
+    /// `busy`: the agent's job queue is full.
+    QueueFull,
+    /// `busy`: the service has 64 unsettled jobs.
+    JobsFull,
+    /// `busy`: the controller is closed for shutdown.
+    Closed,
+    /// `denied`: the project's execution setting is off.
+    ExecutionOff,
 }
-impl ExecCmdBusyReason {
+impl ToolDecisionReason {
+    pub const ALL: [Self; 4] = [
+        Self::QueueFull,
+        Self::JobsFull,
+        Self::Closed,
+        Self::ExecutionOff,
+    ];
+    /// The decision this reason belongs to.
+    pub fn decision(self) -> ToolDecision {
+        match self {
+            Self::QueueFull | Self::JobsFull | Self::Closed => ToolDecision::Busy,
+            Self::ExecutionOff => ToolDecision::Denied,
+        }
+    }
+    /// The stored field 10 code.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::QueueFull | Self::ExecutionOff => 1,
+            Self::JobsFull => 2,
+            Self::Closed => 3,
+        }
+    }
+    /// The reason that `code` names under `decision`: `Some(None)` for code
+    /// 0, `None` for a code that the decision does not allow.
+    pub fn from_code(decision: ToolDecision, code: u8) -> Option<Option<Self>> {
+        if code == 0 {
+            return Some(None);
+        }
+        Self::ALL
+            .into_iter()
+            .find(|r| r.decision() == decision && r.code() == code)
+            .map(Some)
+    }
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Quota => "quota",
-            Self::CapturePaused => "capture_paused",
-            Self::PendingFull => "pending_full",
-            Self::PayloadUnavailable => "payload_unavailable",
+            Self::QueueFull => "queue_full",
+            Self::JobsFull => "jobs_full",
+            Self::Closed => "closed",
+            Self::ExecutionOff => "execution_off",
         }
     }
 }
+
 /// Kind 14 fields 21-23 for a refused exec_cmd call. Never holds a value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecCmdRefusal {
@@ -934,7 +1016,8 @@ pub struct ExecCmdRefusal {
 /// Initial capture reservation of a `run` exec_cmd call: a constant, never
 /// stored (TCR-O5).
 pub const INITIAL_RESERVATION: u64 = 1024 * 1024;
-/// Kind 23 field 4.
+/// The capture states 1 to 4 of kind 28 field 10 (formerly kind 23 field 4,
+/// retired by J3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CaptureState {
@@ -953,7 +1036,7 @@ impl CaptureState {
         }
     }
 }
-/// Kind 23 field 5.
+/// Kind 28 field 11 (the capture reason codes of the retired kind 23).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CaptureReason {
@@ -978,8 +1061,9 @@ impl CaptureReason {
         }
     }
 }
-/// Kind 23 stream block: stored-stream facts, with no value or value digest.
-/// `digest` is SHA-256 over exactly the stored (redacted) bytes.
+/// The capture stream block of kind 28: stored-stream facts, with no value
+/// or value digest. `digest` is SHA-256 over exactly the stored (redacted)
+/// bytes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CaptureStream {
     pub observed_bytes: u64,
@@ -998,36 +1082,16 @@ pub struct CaptureStream {
     pub discarded_bytes: u64,
     pub eof: bool,
 }
-/// Kind 23 field 15 entry. "Propagated" is not an origin (G17).
+/// Kind 28 number entry. "Propagated" is not an origin (G17).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureNumber {
     pub number: u16,
     pub kind: SecretKind,
     pub origin: NumberOrigin,
 }
-/// Kind 23, CaptureSettled (J1).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CaptureSettled {
-    pub operation: Id,
-    pub generation: u64,
-    pub ordinal: u32,
-    pub state: CaptureState,
-    pub reason: CaptureReason,
-    /// 0 unknown, 1 exited, 2 signalled.
-    pub exit_kind: u8,
-    pub exit_value: u32,
-    pub stdout: CaptureStream,
-    pub stderr: CaptureStream,
-    pub distinct_numbers: u32,
-    pub numbers: Vec<CaptureNumber>,
-    pub pause_count: u32,
-    pub first_pause_ms: u64,
-    pub paused_ms: u64,
-    pub final_reservation: u64,
-}
 /// Replay facts of one `run` exec_cmd call: identities derived from the
-/// installation and the call (TCR-D23), settlement and the journal sequence
-/// used as "last use" by the interim expiry (J1-Q2).
+/// installation and the call (TCR-D23) and the kind 14 sequence. Every
+/// `run` exec_cmd call is a job (J3-E9); its settlement is the job's kind 28.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecCmdCall {
     /// Derived (SL7): [`WHOLE_COMMAND`] when field 20 bit 1 is set; `None`
@@ -1042,19 +1106,8 @@ pub struct ExecCmdCall {
     pub stdout_payload: Id,
     pub stderr_payload: Id,
     pub intent_sequence: u64,
-    pub settled: Option<ExecCmdSettlement>,
-    /// The kind 26 frame that made this a job-mode call (J2). A job-mode
-    /// call never has kind 23; its facts are the job's (kinds 26 to 28).
+    /// The call's kind 26 frame, once committed.
     pub job_intent: Option<Locator>,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecCmdSettlement {
-    pub state: CaptureState,
-    pub reason: CaptureReason,
-    pub sequence: u64,
-    /// Stored bytes and digest per stream (stdout, stderr).
-    pub streams: [(u64, Option<Hash>); 2],
-    pub frame: Locator,
 }
 
 /// Replay projection of one kind 14 call and its later records. Bounded
@@ -1068,7 +1121,8 @@ pub struct ToolRecord {
     pub tool_operation: Option<ToolOperation>,
     pub decision: ToolDecision,
     pub fault: Option<ToolFault>,
-    pub busy: Option<ExecCmdBusyReason>,
+    /// Kind 14 field 10, the decision reason.
+    pub reason: Option<ToolDecisionReason>,
     pub refusal: Option<ExecCmdRefusal>,
     /// Field 20 bit 1 (SL7): the command ran from a secret variable; the
     /// arguments show its display text.
@@ -1079,18 +1133,27 @@ pub struct ToolRecord {
     pub arguments: String,
     pub result_status: Option<u8>,
     pub intent_frame: Locator,
+    /// The call's result record: kind 15 for operation codes 1 to 9, kind
+    /// 29 for codes 10 to 16 (JR11).
     pub result_frame: Option<Locator>,
     pub result_bytes: usize,
     pub preview: Option<String>,
     pub truncated: Option<bool>,
-    pub exit_code: Option<i32>,
     /// Derived identity of a `run` create_note call.
     pub create: Option<CreateNoteCall>,
-    /// Derived identities and settlement of a `run` exec_cmd call.
+    /// Derived identities of a `run` exec_cmd call.
     pub exec_cmd: Option<Box<ExecCmdCall>>,
+    /// The kind 29 of a call with operation code 10 to 16, once committed.
+    /// It holds references and counts only; the result text is rendered
+    /// from it and the job records (J3-E1).
+    pub job_result: Option<Box<JobResult>>,
+    /// The kind 30 model note of a `run` `job note` call, once committed:
+    /// its job and frame (JR16).
+    pub note: Option<(Id, Locator)>,
 }
 impl ToolRecord {
-    /// A `run` call whose kind 15 is not yet committed.
+    /// A `run` call whose result record (kind 15 or kind 29) is not yet
+    /// committed.
     pub fn unresolved(&self) -> bool {
         self.decision == ToolDecision::Run && self.result_frame.is_none()
     }
@@ -1250,9 +1313,15 @@ pub enum JobReason {
     CaptureUnavailable = 16,
     ProtocolFault = 17,
     SetupFailed = 18,
+    /// The project's execution setting turned off (EX11): a service
+    /// revocation, or the slot-grant check.
+    ExecutionOff = 19,
+    /// The person `!!` switch was off at slot grant (P2). Only a person
+    /// job of profile `person-outside-1` may record it.
+    OutsideSandboxOff = 20,
 }
 impl JobReason {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 21] = [
         Self::None,
         Self::ModelCancel,
         Self::TurnEnded,
@@ -1272,6 +1341,8 @@ impl JobReason {
         Self::CaptureUnavailable,
         Self::ProtocolFault,
         Self::SetupFailed,
+        Self::ExecutionOff,
+        Self::OutsideSandboxOff,
     ];
     pub fn from_code(code: u8) -> Option<Self> {
         Self::ALL.get(usize::from(code)).copied()
@@ -1297,19 +1368,25 @@ impl JobReason {
             Self::CaptureUnavailable => "capture_unavailable",
             Self::ProtocolFault => "protocol_fault",
             Self::SetupFailed => "setup_failed",
+            Self::ExecutionOff => "execution_off",
+            Self::OutsideSandboxOff => "outside_sandbox_off",
         }
     }
     /// The kind 27 requester of a cancel reason; `None` for a reason that
-    /// is never a cancel trigger (0 and 11 to 18).
+    /// is never a cancel trigger (0, 11 to 18 and 20).
     pub fn requester(self) -> Option<JobRequester> {
         use JobReason::*;
         Some(match self {
             ModelCancel | TurnEnded => JobRequester::Model,
             ClientCancel => JobRequester::Client,
             PersonStop | PersonKill => JobRequester::Person,
-            IdentityChanged | Shutdown | CaptureFault | Quota | Enospc => JobRequester::Service,
+            IdentityChanged | Shutdown | CaptureFault | Quota | Enospc | ExecutionOff => {
+                JobRequester::Service
+            }
             None | Restart | CwdUnavailable | ProjectChanged | SandboxUnavailable | SpawnFailed
-            | CaptureUnavailable | ProtocolFault | SetupFailed => return Option::None,
+            | CaptureUnavailable | ProtocolFault | SetupFailed | OutsideSandboxOff => {
+                return Option::None;
+            }
         })
     }
     /// The kind 28 outcomes that the reason table allows for this reason.
@@ -1319,7 +1396,7 @@ impl JobReason {
         match self {
             None => matches!(outcome, O::Exited | O::Signalled),
             ModelCancel | TurnEnded | ClientCancel | PersonStop | PersonKill | IdentityChanged
-            | Shutdown => matches!(
+            | Shutdown | ExecutionOff => matches!(
                 outcome,
                 O::Exited | O::Signalled | O::Cancelled | O::NotStarted
             ),
@@ -1327,7 +1404,9 @@ impl JobReason {
             Quota | Enospc => matches!(outcome, O::Exited | O::Signalled),
             Restart => outcome == O::Interrupted,
             CwdUnavailable | ProjectChanged | SandboxUnavailable | SpawnFailed
-            | CaptureUnavailable | ProtocolFault | SetupFailed => outcome == O::NotStarted,
+            | CaptureUnavailable | ProtocolFault | SetupFailed | OutsideSandboxOff => {
+                outcome == O::NotStarted
+            }
         }
     }
 }
@@ -1483,9 +1562,595 @@ pub struct SettledJob {
     pub cancel: Locator,
     pub settled: Locator,
 }
+/// Job IDs per terminal event in `outlived_job_ids` (EX12).
+pub const MAX_OUTLIVED_JOB_IDS: usize = 8;
+/// The model jobs of a terminal operation that outlived its turn (EX12):
+/// its kind 26 records with no kind 28 before the terminal frame. Derived
+/// from the records at each terminal read, never stored.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutlivedJobs {
+    pub count: u32,
+    /// At most [`MAX_OUTLIVED_JOB_IDS`], oldest kind 26 first.
+    pub jobs: Vec<Id>,
+}
 /// What replay knows of one job ID.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobState {
     Unsettled(UnsettledJob),
     Settled(SettledJob),
+}
+
+// ----- J3 kind 29 and J4 kind 30 (tool-job-controller.md). -----
+
+/// Kind 29 fixed fields: operation (16), generation (8), ordinal (4),
+/// status (1), outcome (1) and job ID (16).
+pub const JOB_RESULT_FIXED: usize = 46;
+/// List entries per kind 29 list block and per model `list` call.
+pub const MAX_JOB_LIST_ENTRIES: usize = 8;
+/// One list entry: job ID (16), state (1), reason (1), reason numbers (3),
+/// stdout and stderr bytes (8 each).
+pub const JOB_LIST_ENTRY: usize = 37;
+/// The body sizes of kind 29. The body is never tagged: its form follows
+/// from the operation code (JR12), and the sizes are distinct, so the codec
+/// reads it by size.
+pub const JOB_STATE_BLOCK: usize = 29;
+pub const JOB_WAIT_BLOCK: usize = JOB_STATE_BLOCK + 1;
+pub const JOB_PAGE_BLOCK: usize = 54;
+pub const MAX_JOB_LIST_BLOCK: usize = 2 + MAX_JOB_LIST_ENTRIES * JOB_LIST_ENTRY;
+/// Maximum kind 29 payload: the fixed fields and a full list block.
+pub const MAX_JOB_RESULT_PAYLOAD: usize = JOB_RESULT_FIXED + MAX_JOB_LIST_BLOCK;
+/// Source bytes per page, and the delivered text bound (R5).
+pub const MAX_JOB_PAGE: u32 = 8192;
+/// Note text bytes (person notes after display redaction; the model's
+/// `text` argument).
+pub const MAX_JOB_NOTE: usize = 2048;
+/// Notes per job, model and person together; an append-time bound.
+pub const MAX_JOB_NOTES: usize = 16;
+/// Kind 30 records per job; an append-time bound.
+pub const MAX_JOB_RETENTION_RECORDS: usize = 64;
+/// Kind 30 payload of a model note: job ID (16), action (1), author (1),
+/// time (8), operation, generation and ordinal (28), empty text (4).
+pub const MODEL_NOTE_PAYLOAD: usize = 58;
+/// Maximum kind 30 payload: a person note with a 16-byte request ID and
+/// 2,048 bytes of text.
+pub const MAX_JOB_RETENTION_PAYLOAD: usize = 16 + 1 + 1 + 8 + 16 + 4 + MAX_JOB_NOTE;
+
+/// Kind 29 field 5.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum JobResultOutcome {
+    Ok = 1,
+    NotFound = 2,
+    NotPermitted = 3,
+    Busy = 4,
+    Cancelled = 5,
+    Unavailable = 6,
+    Limit = 7,
+}
+impl JobResultOutcome {
+    pub const ALL: [Self; 7] = [
+        Self::Ok,
+        Self::NotFound,
+        Self::NotPermitted,
+        Self::Busy,
+        Self::Cancelled,
+        Self::Unavailable,
+        Self::Limit,
+    ];
+    pub fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code).checked_sub(1)?).copied()
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NotFound => "not_found",
+            Self::NotPermitted => "not_permitted",
+            Self::Busy => "busy",
+            Self::Cancelled => "cancelled",
+            Self::Unavailable => "unavailable",
+            Self::Limit => "limit",
+        }
+    }
+    /// The wire `ToolStatus` that the outcome fixes (kind 29 field 4).
+    pub fn status(self) -> u8 {
+        match self {
+            Self::Ok => 1,
+            Self::NotFound => 3,
+            Self::NotPermitted => 2,
+            Self::Busy | Self::Unavailable => 4,
+            Self::Cancelled => 6,
+            Self::Limit => 7,
+        }
+    }
+    /// The outcome table: whether operation `code` may record this outcome.
+    pub fn allows(self, code: ToolOperation) -> bool {
+        use ToolOperation as T;
+        let job = code.job_result();
+        match self {
+            Self::Ok => job,
+            Self::NotFound => job && !matches!(code, T::ExecCmd | T::JobList),
+            Self::Unavailable => job && code != T::ExecCmd,
+            Self::NotPermitted => code == T::JobCancel,
+            Self::Busy => code == T::JobRead,
+            Self::Cancelled => job && code != T::JobCancel,
+            Self::Limit => code == T::JobNote,
+        }
+    }
+}
+/// J2 start-condition block reasons, in start-condition order (the state
+/// block reason of a `queued` job).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum JobBlockReason {
+    Recovering = 1,
+    JournalUnavailable = 2,
+    JournalHeld = 3,
+    PayloadUnavailable = 4,
+    AgentSlots = 5,
+    ServiceSlots = 6,
+    PendingInstalls = 7,
+    Quota = 8,
+    DiskSpace = 9,
+}
+impl JobBlockReason {
+    pub const ALL: [Self; 9] = [
+        Self::Recovering,
+        Self::JournalUnavailable,
+        Self::JournalHeld,
+        Self::PayloadUnavailable,
+        Self::AgentSlots,
+        Self::ServiceSlots,
+        Self::PendingInstalls,
+        Self::Quota,
+        Self::DiskSpace,
+    ];
+    pub fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code).checked_sub(1)?).copied()
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recovering => "recovering",
+            Self::JournalUnavailable => "journal_unavailable",
+            Self::JournalHeld => "journal_held",
+            Self::PayloadUnavailable => "payload_unavailable",
+            Self::AgentSlots => "agent_slots",
+            Self::ServiceSlots => "service_slots",
+            Self::PendingInstalls => "pending_installs",
+            Self::Quota => "quota",
+            Self::DiskSpace => "disk_space",
+        }
+    }
+}
+/// Why a `capture_paused` job paused (state block reason).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum JobPauseReason {
+    Quota = 1,
+    DiskSpace = 2,
+}
+impl JobPauseReason {
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Quota),
+            2 => Some(Self::DiskSpace),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quota => "quota",
+            Self::DiskSpace => "disk_space",
+        }
+    }
+}
+/// A job's state in a kind 29 state block or list entry, with the reason
+/// that the state carries. The stored state codes are 1 to 9 in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobRunState {
+    Queued(JobBlockReason),
+    Starting,
+    Running,
+    CapturePaused(JobPauseReason),
+    Stopping,
+    Draining,
+    CleanupUnconfirmed,
+    Finalizing,
+    /// Reported only when the job's kind 28 committed before the record
+    /// (J3-E7, JR14); the settled facts are then read from kind 28.
+    Settled,
+}
+impl JobRunState {
+    /// The stored state code (1 to 9).
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Queued(_) => 1,
+            Self::Starting => 2,
+            Self::Running => 3,
+            Self::CapturePaused(_) => 4,
+            Self::Stopping => 5,
+            Self::Draining => 6,
+            Self::CleanupUnconfirmed => 7,
+            Self::Finalizing => 8,
+            Self::Settled => 9,
+        }
+    }
+    /// The stored reason code: the block or pause reason, otherwise 0.
+    pub fn reason_code(self) -> u8 {
+        match self {
+            Self::Queued(reason) => reason as u8,
+            Self::CapturePaused(reason) => reason as u8,
+            _ => 0,
+        }
+    }
+    /// The state and reason that two stored codes name, if valid.
+    pub fn from_codes(state: u8, reason: u8) -> Option<Self> {
+        let plain = |s: Self| (reason == 0).then_some(s);
+        match state {
+            1 => JobBlockReason::from_code(reason).map(Self::Queued),
+            2 => plain(Self::Starting),
+            3 => plain(Self::Running),
+            4 => JobPauseReason::from_code(reason).map(Self::CapturePaused),
+            5 => plain(Self::Stopping),
+            6 => plain(Self::Draining),
+            7 => plain(Self::CleanupUnconfirmed),
+            8 => plain(Self::Finalizing),
+            9 => plain(Self::Settled),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued(_) => "queued",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::CapturePaused(_) => "capture_paused",
+            Self::Stopping => "stopping",
+            Self::Draining => "draining",
+            Self::CleanupUnconfirmed => "cleanup_unconfirmed",
+            Self::Finalizing => "finalizing",
+            Self::Settled => "settled",
+        }
+    }
+    /// Before the spawned notice: the elapsed time is 0.
+    pub fn before_spawn(self) -> bool {
+        matches!(self, Self::Queued(_) | Self::Starting)
+    }
+    /// The reason numbers this state allows: running, limit and awaiting
+    /// cleanup for `agent_slots` and `service_slots`; the count (first
+    /// byte) for `pending_installs`; otherwise zero.
+    pub fn allows_numbers(self, numbers: [u8; 3]) -> bool {
+        match self {
+            Self::Queued(JobBlockReason::AgentSlots | JobBlockReason::ServiceSlots) => true,
+            Self::Queued(JobBlockReason::PendingInstalls) => numbers[1..] == [0, 0],
+            _ => numbers == [0; 3],
+        }
+    }
+}
+/// Kind 29 state block (codes 10, 12, 14 and 15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobSnapshot {
+    pub state: JobRunState,
+    pub numbers: [u8; 3],
+    /// Milliseconds since the spawned notice; 0 before spawn and when
+    /// settled.
+    pub elapsed_ms: u64,
+    /// Stored bytes (the readable watermark) at the snapshot; 0 when
+    /// settled.
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+}
+/// A job output stream (page block field 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OutputStream {
+    Stdout = 1,
+    Stderr = 2,
+}
+impl OutputStream {
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Stdout),
+            2 => Some(Self::Stderr),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+/// Page block field 5.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum JobPageState {
+    Live = 1,
+    Complete = 2,
+    Incomplete = 3,
+    UnverifiedPrefix = 4,
+    Expired = 5,
+    Missing = 6,
+    Corrupt = 7,
+    Deleted = 8,
+}
+impl JobPageState {
+    pub const ALL: [Self; 8] = [
+        Self::Live,
+        Self::Complete,
+        Self::Incomplete,
+        Self::UnverifiedPrefix,
+        Self::Expired,
+        Self::Missing,
+        Self::Corrupt,
+        Self::Deleted,
+    ];
+    pub fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code).checked_sub(1)?).copied()
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
+            Self::UnverifiedPrefix => "unverified_prefix",
+            Self::Expired => "expired",
+            Self::Missing => "missing",
+            Self::Corrupt => "corrupt",
+            Self::Deleted => "deleted",
+        }
+    }
+    /// States 1 to 4 may deliver bytes; states 5 to 8 deliver none.
+    pub fn readable(self) -> bool {
+        (self as u8) <= 4
+    }
+}
+/// Kind 29 page block (code 13). The next offset is `start + source_len`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobPage {
+    pub stream: OutputStream,
+    /// The actual start after the UTF-8 snap (R5).
+    pub start: u64,
+    /// Source bytes read, 0 to 8,192.
+    pub source_len: u32,
+    /// The stream's stored bytes at the read.
+    pub total: u64,
+    pub state: JobPageState,
+    /// SHA-256 of the delivered page text; zero when `source_len` is 0.
+    pub digest: Hash,
+}
+impl JobPage {
+    /// The turn cursor after this page (J3-E4).
+    pub fn next_offset(&self) -> u64 {
+        self.start.saturating_add(u64::from(self.source_len))
+    }
+}
+/// One kind 29 list entry (code 11). A settled entry stores zero bytes;
+/// its facts come from kind 28.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobListEntry {
+    pub job: Id,
+    pub state: JobRunState,
+    pub numbers: [u8; 3],
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+}
+/// Wait block field: why a `job wait` ended (code 14).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WaitEnd {
+    Settled = 1,
+    NewOutput = 2,
+    Time = 3,
+    AlreadySettled = 4,
+}
+impl WaitEnd {
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Settled,
+            2 => Self::NewOutput,
+            3 => Self::Time,
+            4 => Self::AlreadySettled,
+            _ => return None,
+        })
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Settled => "settled",
+            Self::NewOutput => "new_output",
+            Self::Time => "time",
+            Self::AlreadySettled => "already_settled",
+        }
+    }
+}
+/// Kind 29 field 7. The body form follows from the operation code and the
+/// outcome (JR12); it is never stored with a tag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobResultBody {
+    /// Code 16 with `ok`, and every outcome other than `ok` except code 10
+    /// with `cancelled`.
+    None,
+    /// Codes 10, 12 and 15 with `ok`, and code 10 with `cancelled`.
+    State(JobSnapshot),
+    /// Code 13 with `ok`.
+    Page(JobPage),
+    /// Code 11 with `ok`: newest first by kind 26 sequence; `more` when
+    /// further entries exist (then exactly 8 are shown).
+    List {
+        more: bool,
+        entries: Vec<JobListEntry>,
+    },
+    /// Code 14 with `ok`.
+    Wait(JobSnapshot, WaitEnd),
+}
+/// Kind 29, JobResult (R3, J3-E1): the reference-only result of a `run`
+/// call with operation code 10 to 16. It holds no output, page or command
+/// text; the rendered `ToolResult` comes from it, the job records and, for
+/// a page, the retained bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobResult {
+    pub operation: Id,
+    pub generation: u64,
+    /// 1 to 200: the pending `run` kind 14.
+    pub ordinal: u32,
+    /// Wire `ToolStatus`, fixed by `outcome`.
+    pub status: u8,
+    pub outcome: JobResultOutcome,
+    /// Zero for code 10 (derived from the call), for code 11 and with
+    /// `not_found`; otherwise a job of the turn's conversation.
+    pub job: Id,
+    pub body: JobResultBody,
+}
+/// Kind 30 field 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RetentionAction {
+    Pin = 1,
+    Unpin = 2,
+    Delete = 3,
+    Note = 4,
+}
+impl RetentionAction {
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Pin,
+            2 => Self::Unpin,
+            3 => Self::Delete,
+            4 => Self::Note,
+            _ => return None,
+        })
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pin => "pin",
+            Self::Unpin => "unpin",
+            Self::Delete => "delete",
+            Self::Note => "note",
+        }
+    }
+}
+/// Kind 30 fields 3 and 5: the author and the reference that names the
+/// request (person) or the `run` `job note` call (model).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetentionAuthor {
+    /// Author 1: a control request ID.
+    Person { request: Id },
+    /// Author 2: the `run` kind 14 with operation code 16 for this job.
+    Model {
+        operation: Id,
+        generation: u64,
+        ordinal: u32,
+    },
+}
+impl RetentionAuthor {
+    pub fn code(&self) -> u8 {
+        match self {
+            Self::Person { .. } => 1,
+            Self::Model { .. } => 2,
+        }
+    }
+}
+/// Kind 30, JobRetention (S1, J4-E2). A normal record, not a closure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobRetention {
+    pub job: Id,
+    pub action: RetentionAction,
+    pub author: RetentionAuthor,
+    /// Unix milliseconds, as kind 26 field 4; 0 only when the clock read
+    /// failed. Replay never compares wall times.
+    pub time: u64,
+    /// A person note's text, 1 to 2,048 bytes after display redaction (each
+    /// detected secret is `$ASURA_SECRET_0`); empty otherwise. A model
+    /// note's text is the `text` argument of its kind 14 (TCR-O5).
+    pub note: String,
+}
+/// The retention state of one job, from its `E` entries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JobRetentionSummary {
+    pub pinned: bool,
+    pub deleted: bool,
+    /// Notes of either author.
+    pub notes: u32,
+    /// Kind 30 records of every action.
+    pub records: u32,
+}
+impl JobRetentionSummary {
+    /// The state after one more committed kind 30.
+    pub fn apply(&mut self, action: RetentionAction) {
+        self.records = self.records.saturating_add(1);
+        match action {
+            RetentionAction::Pin => self.pinned = true,
+            RetentionAction::Unpin => self.pinned = false,
+            RetentionAction::Delete => self.deleted = true,
+            RetentionAction::Note => self.notes = self.notes.saturating_add(1),
+        }
+    }
+    /// Whether a kind 30 with `action` changes anything (the kind 30 replay
+    /// rules): pin only when unpinned, unpin only when pinned, delete once
+    /// and only after the job's kind 28 (`settled`), a note always.
+    pub fn allows(&self, action: RetentionAction, settled: bool) -> bool {
+        match action {
+            RetentionAction::Pin => !self.pinned,
+            RetentionAction::Unpin => self.pinned,
+            RetentionAction::Delete => settled && !self.deleted,
+            RetentionAction::Note => true,
+        }
+    }
+    /// The append-time bounds of the service: 16 notes and 64 records per
+    /// job (`notes_full`, `retention_full`).
+    pub fn has_room(&self, action: RetentionAction) -> bool {
+        (self.records as usize) < MAX_JOB_RETENTION_RECORDS
+            && (action != RetentionAction::Note || (self.notes as usize) < MAX_JOB_NOTES)
+    }
+}
+/// The scope of a job listing read (J4): `L`, `M` or `Y` entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobScope {
+    Conversation(Id),
+    Project(Id),
+    AllProjects,
+}
+/// Entries per job listing read: 8 shown and one to detect more.
+pub const MAX_JOB_LISTING_READ: usize = MAX_JOB_LIST_ENTRIES + 1;
+/// One job as the listing reads return it: its kind 26, 27 and 28 records,
+/// the command source locator, the command excerpt and the retention
+/// summary. A settled job's facts are read from its kind 28, never stored
+/// twice. At most 4,346 bytes of records and excerpt, so 9 entries fit the
+/// 40 KiB read bound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobListing {
+    pub job: Id,
+    pub conversation: Id,
+    pub project: Id,
+    pub intent: JobIntent,
+    /// The kind 26 frame; its sequence orders listings (J3-E5).
+    pub intent_frame: Locator,
+    pub cancel: Option<JobCancelRequested>,
+    /// `Locator::NONE` without kind 27.
+    pub cancel_frame: Locator,
+    pub settled: Option<Box<JobSettled>>,
+    /// `Locator::NONE` while unsettled.
+    pub settled_frame: Locator,
+    /// The command source: the model call's kind 14 (a person job's kind
+    /// 31 after P2). Command, cwd and excerpt are read from it.
+    pub command: Locator,
+    /// The `JobEntry.command` text from the command source: the first line
+    /// of the stored command, at most 192 bytes (`command_excerpt`);
+    /// empty when the source holds no command.
+    pub excerpt: String,
+    pub retention: JobRetentionSummary,
+}
+/// One job's facts for `JobInspect` and the model's `status` (the
+/// `JobFacts` read): its listing, the kind 14 that holds its command and
+/// cwd, its kind 30 records in order, at most 64, and the text of each
+/// model note, at most 16.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobRecords {
+    pub listing: JobListing,
+    pub command: Box<ToolCall>,
+    pub retention: Vec<(Locator, JobRetention)>,
+    /// For each kind 30 `note` by the model, in kind 30 order: its kind 30
+    /// locator and the `text` argument of the cited kind 14, as stored
+    /// (redacted). Kind 30 holds no second copy (TCR-O5).
+    pub model_notes: Vec<(Locator, String)>,
 }

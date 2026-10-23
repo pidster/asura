@@ -134,6 +134,29 @@ pub enum Command {
     PayloadFacts {
         payloads: Vec<Id>,
     },
+    /// One newest-first page of jobs by kind 26 sequence below `before`,
+    /// merged from the live state, the delta and the runs; `limit` 1 to 9
+    /// (J4 `Jobs` read; the model `list` asks for 9 to see `more`). Each
+    /// entry carries its command excerpt; the reply's `before_found` checks
+    /// the cursor.
+    Jobs {
+        scope: JobScope,
+        before: Option<u64>,
+        limit: usize,
+    },
+    /// One job's records, its kind 14, its kind 30 records and its model
+    /// note texts (J4).
+    JobFacts {
+        job: Id,
+    },
+    /// A conversation's settlements with a kind 28 sequence in
+    /// `after < sequence <= through`, newest first; `limit` 1 to 9 (J5).
+    Settlements {
+        conversation: Id,
+        after: u64,
+        through: u64,
+        limit: usize,
+    },
     /// Usage, quota and hold state; also rechecks free space.
     JournalStatus,
     /// A successful `journal.quotaBytes` set applies at once.
@@ -223,20 +246,28 @@ pub struct OperationView {
     pub terminal: Option<(TerminalKind, Cause)>,
     pub cancel: Option<Cause>,
 }
-/// Kind 23 facts as payload recovery uses them: state, sequence, and stored
-/// bytes and digest per stream.
+/// Kind 28 capture facts as payload recovery uses them: state, sequence,
+/// and stored bytes and digest per stream.
 pub type Settlement = (CaptureState, u64, [(u64, Option<Hash>); 2]);
-/// Journal facts of one retained exec_cmd payload.
+/// Journal facts of one retained job payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayloadFact {
     pub payload: Id,
+    /// The job ID.
     pub call: Id,
+    /// The model origin's operation.
     pub operation: Id,
     pub payloads: [Id; 2],
+    /// The kind 26 sequence.
     pub intent_sequence: u64,
+    /// The kind 28 capture facts; none while unsettled or `interrupted`.
     pub settled: Option<Settlement>,
-    /// The call belongs to the active operation.
+    /// The job is unsettled.
     pub active: bool,
+    /// The person pin hold from the job's `E` entries (J4).
+    pub pinned: bool,
+    /// A committed kind 30 `delete`: recovery completes the deletion (J4).
+    pub deleted: bool,
 }
 #[derive(Debug, Default)]
 pub struct Reply {
@@ -261,6 +292,13 @@ pub struct Reply {
     /// The operation's tool calls, for `ReadResponse`.
     pub tools: Option<Vec<ToolRecord>>,
     pub payload_facts: Vec<PayloadFact>,
+    /// `Jobs` and `Settlements`: newest first.
+    pub jobs: Vec<JobListing>,
+    /// `Jobs` with `before`: a job of the scope has its kind 26 at exactly
+    /// that sequence (the cursor check). False without `before`.
+    pub before_found: bool,
+    /// `JobFacts`: `None` for an ID of no job.
+    pub job_records: Option<Box<JobRecords>>,
     pub status: Option<JournalStatus>,
     pub inputs: Vec<InputView>,
     pub queued: Option<QueuedPreparation>,
@@ -273,6 +311,9 @@ pub struct Reply {
     pub stale_project_name_revision: bool,
     /// The whole response length for `ReadResponse`.
     pub response_bytes: Option<u64>,
+    /// `ReadResponse`: the operation's jobs that outlived its turn (EX12),
+    /// derived from the records at this read.
+    pub outlived: Option<OutlivedJobs>,
     /// The turn's thinking level, request and one thinking window, for
     /// `ReadResponse`.
     pub thinking: Option<ThinkingWindow>,
@@ -654,6 +695,12 @@ impl WriterClient {
         {
             return Err(Error::Invalid);
         }
+        if let Command::Jobs { limit, .. } | Command::Settlements { limit, .. } = &command
+            && !(1..=MAX_JOB_LISTING_READ).contains(limit)
+        {
+            return Err(Error::Invalid);
+        }
+
         let limit = if control { QUEUE_SLOTS } else { ORDINARY_SLOTS };
         self.count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {

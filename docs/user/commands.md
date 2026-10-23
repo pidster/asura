@@ -82,6 +82,74 @@ as each page arrives. Press Ctrl-C to stop it.
 `/tools` take no arguments. Results open in a panel above the input box; Escape
 closes it.
 
+## Job commands
+
+| Command | Action |
+| --- | --- |
+| `/jobs` | List the command jobs of the selected project, newest first; `/jobs all` lists the jobs of every project |
+| `/job ID` | Open the job viewer; `/job cancel`, `pin`, `unpin`, `delete` and `note` act on the job |
+
+The `/job` command has these forms:
+
+| Form | Action |
+| --- | --- |
+| `/job ID` | Open the job viewer at the start of the job's standard output |
+| `/job cancel ID` | Ask the service to stop the job |
+| `/job pin ID` | Keep the job's output from expiring |
+| `/job unpin ID` | Let the job's output expire again |
+| `/job delete ID` | Delete the job's output after you confirm; its summary and notes stay |
+| `/job note ID TEXT` | Add your note to the job; TEXT is the rest of the line |
+
+For a job command, `ID` is the full 32-digit job ID or the start of it. A
+shorter ID must have at least 6 hexadecimal digits and match exactly one job
+that Asura listed in this session. Use `/jobs` first if Asura says
+"Use /jobs to find the job, or give the full handle". If several jobs match,
+Asura lists them and keeps your text.
+
+`/jobs` needs a selected project; `/jobs all` does not. `/job cancel ID` for a
+job of another project asks `Cancel job ID in project NAME? (y/n)` first.
+`/job delete ID` always asks first. The service refuses to delete the output of
+a job that is still running. A note is 1 to 2048 bytes without control
+characters; a job holds at most 16 notes.
+
+If you stop the wait for `/job cancel` with Escape or `/cancel`, the result is
+unknown. Repeating `/job cancel ID` is safe. Check `/job ID` before you repeat
+a note, because the first note may have been added. When the service does not
+support jobs, these commands show "This service does not support jobs". See
+[Command jobs](guide.md#command-jobs).
+
+## Execution setting
+
+| Command | Action |
+| --- | --- |
+| `/execution` | Show whether the model may run commands; `/execution on` or `off` sets the default, `/execution project on`, `off` or `inherit` sets the selected project |
+
+The execution setting controls the model's `exec_cmd` tool. It does not affect
+the other model tools.
+
+| Form | Action |
+| --- | --- |
+| `/execution` | Show the default and the selected project's value with its source |
+| `/execution on` | Let the model run commands in projects without their own value |
+| `/execution off` | Stop the model from running commands in projects without their own value |
+| `/execution project on` | Let the model run commands in the selected project |
+| `/execution project off` | Stop the model from running commands in the selected project |
+| `/execution project inherit` | Remove the selected project's own value; it uses the default again |
+
+`/execution` shows, for example,
+`execution: on (default) · this project: off (project override)`. The default
+is on. A project value wins over the default.
+
+When a change turns execution off for a project, the service refuses new model
+commands there. It also stops the model's queued and running jobs in that
+project. The reply then ends with `/jobs`, where you can see the jobs stop.
+Turning execution on again does not restart stopped jobs. While execution is
+off for the selected project, the status bar shows `exec off`.
+
+The setting changes `execution.enabled` and `execution.projects.ID` in
+`~/.asura/config.yaml`. If Asura cannot confirm the change, it shows
+"Execution setting outcome unconfirmed; read it again with /execution".
+
 ## Job limits
 
 The `jobs` settings limit how many command jobs the service runs and queues.

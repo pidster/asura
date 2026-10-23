@@ -19,8 +19,30 @@ pub(super) struct Activity {
     /// (thinking-level.md). Blocks start folded.
     thinking: String,
     thinking_open: bool,
+    /// Jobs that outlived the turn, from its terminal event (EX12, J4-E6).
+    outlived: Option<u32>,
 }
 impl Activity {
+    /// The EX12 line kept with the response; drawn again from the terminal
+    /// event after a restore.
+    pub(super) fn outlived_notice(&self) -> Option<String> {
+        crate::tui::jobs::outlived_notice(self.outlived?)
+    }
+    /// The jobs the turn's calls name (`ToolProgress.job_id`), in call
+    /// order, at most the chooser's 9.
+    pub(super) fn job_ids(&self) -> Vec<[u8; 16]> {
+        let mut ids: Vec<[u8; 16]> = Vec::new();
+        for id in self
+            .tools
+            .iter()
+            .filter_map(|tool| <[u8; 16]>::try_from(tool.job_id.as_deref()?).ok())
+        {
+            if !ids.contains(&id) && ids.len() < crate::tui::jobs::MAX_CHOOSER {
+                ids.push(id);
+            }
+        }
+        ids
+    }
     pub(super) fn thinking(&self) -> &str {
         &self.thinking
     }
@@ -323,6 +345,8 @@ impl App {
             return None;
         }
         entry.kind = event.kind.unwrap_or(1);
+        // Only a terminal event carries the outlived count.
+        entry.outlived = event.outlived_jobs.filter(|_| entry.kind >= 3);
         entry.waiting_step = event.waiting_step.filter(|_| entry.kind == 1);
         entry.statistics = event.statistics;
         entry.unavailable = false;
@@ -385,6 +409,15 @@ impl App {
                     entry.expanded = !entry.expanded;
                 }
                 self.response_scroll = 0;
+            }
+            // The viewer for the response's job, or a chooser (J4 TUI).
+            KeyCode::Char('j') => {
+                let ids = self
+                    .activity
+                    .get(selected)
+                    .map(Activity::job_ids)
+                    .unwrap_or_default();
+                self.open_response_jobs(ids);
             }
             // Open or fold the thinking block (thinking-level.md).
             KeyCode::Char('t') => {

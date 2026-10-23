@@ -1,8 +1,8 @@
-//! The payload store: quota ledger, catalog, staging captures and the
-//! interim quota-pressure expiry (J1-Q2). Reservations, staging and catalog
-//! entries are keyed by job ID (J2-E6); a J1-mode exec_cmd call is keyed by
-//! its model-origin job ID. The state mutex is held only for arithmetic and
-//! map updates, never across I/O (AE-01).
+//! The payload store: quota ledger, catalog, staging captures, the interim
+//! quota-pressure expiry (J1-Q2) and the person pin hold and delete (J4).
+//! Reservations, staging and catalog entries are keyed by job ID (J2-E6).
+//! The state mutex is held only for arithmetic and map updates, never
+//! across I/O (AE-01).
 use super::id::job_payloads;
 use crate::authority::conversation::{CaptureState, Hash, Id};
 use asura_platform::RuntimeDirectory;
@@ -88,8 +88,8 @@ struct CallEntry {
     reservation: u64,
     /// Bytes counted as retained after settlement or recovery.
     retained: u64,
-    /// Journal sequence of the settlement (kind 23 or kind 28), or of the
-    /// intent (kind 14, or kind 26 for a job) for an unverified prefix.
+    /// Journal sequence of the settlement (kind 28), or of the intent
+    /// (kind 26) for an unverified prefix.
     last_use: u64,
     settled: bool,
     expirable: bool,
@@ -106,6 +106,19 @@ struct CallEntry {
 pub struct Victim {
     pub call: Id,
     pub payloads: [PayloadId; 2],
+}
+
+/// Why a person delete did not run (J4).
+#[derive(Debug)]
+pub enum DeleteError {
+    /// The ledger still holds the job live: its settlement has not reached
+    /// the ledger. The service refuses a live job's delete (`not_settled`)
+    /// before kind 30; the payload owner settles the ledger first.
+    NotSettled,
+    /// A file could not be removed. Its bytes count as retained again; pages
+    /// still answer `deleted`, and recovery completes the deletion from the
+    /// committed kind 30.
+    Payload(PayloadError),
 }
 
 /// Why the ledger could not reserve.
@@ -127,6 +140,13 @@ struct State {
     calls: BTreeMap<Id, CallEntry>,
     payloads: BTreeMap<PayloadId, PayloadEntry>,
     expired: BTreeSet<PayloadId>,
+    /// Payloads of jobs with a committed kind 30 `delete` in this service
+    /// run, or found deleted at recovery: pages answer `deleted`.
+    deleted: BTreeSet<PayloadId>,
+    /// Jobs under the person pin hold (J4): interim expiry skips them, also
+    /// under quota pressure. Keyed by job ID, so a pin set before admission
+    /// or after recovery holds as soon as the entry exists.
+    pinned: BTreeSet<Id>,
     listeners: Vec<Weak<dyn SpaceListener>>,
 }
 impl State {
@@ -143,7 +163,13 @@ impl State {
         let mut candidates: Vec<(&Id, &CallEntry)> = self
             .calls
             .iter()
-            .filter(|(_, c)| c.settled && c.expirable && c.holds == 0 && !c.deleting)
+            .filter(|(id, c)| {
+                c.settled
+                    && c.expirable
+                    && c.holds == 0
+                    && !c.deleting
+                    && !self.pinned.contains(*id)
+            })
             .collect();
         candidates.sort_by(|(_, a), (_, b)| {
             a.last_use
@@ -217,7 +243,7 @@ impl Ledger {
         }
     }
     /// Reactor admission (arithmetic only): reserves 1 MiB for a new job
-    /// (or J1-mode call, by its job ID) and registers its two payload IDs
+    /// and registers its two payload IDs
     /// ([`job_payloads`]). `operation` owns the payloads. Expirable jobs may
     /// count as available; they are marked for deletion and returned for the
     /// new capture worker to delete before it creates its staging files.
@@ -328,7 +354,7 @@ impl Ledger {
         drop(state);
         self.space_event();
     }
-    /// Settlement after kind 23 (J1) or kind 28 (job) commits: the
+    /// Settlement after the job's kind 28 commits: the
     /// reservation is released and the stored bytes count as retained.
     /// `held` keeps it from expiry while a pending install or an abandoned
     /// worker owns it. An `unconfirmed` prefix is expirable only once its
@@ -500,6 +526,78 @@ impl Ledger {
             );
         }
     }
+    /// Sets or clears the person pin hold of a job after its kind 30 `pin`
+    /// or `unpin` commits (J4). Arithmetic only. A pinned job is never an
+    /// interim expiry victim; clearing the pin may make space available, so
+    /// it is a space event.
+    pub fn set_pinned(&self, job: Id, pinned: bool) {
+        let mut state = lock(self);
+        let changed = if pinned {
+            state.pinned.insert(job)
+        } else {
+            state.pinned.remove(&job)
+        };
+        drop(state);
+        if changed && !pinned {
+            self.space_event();
+        }
+    }
+    /// Whether the job is under the person pin hold.
+    pub fn pinned(&self, job: Id) -> bool {
+        lock(self).pinned.contains(&job)
+    }
+    /// Whether pages of the payload answer `deleted`.
+    pub fn deleted(&self, id: PayloadId) -> bool {
+        lock(self).deleted.contains(&id)
+    }
+    /// The first step of a person delete: pages of both payloads answer
+    /// `deleted` from now on. A settled entry not already chosen for
+    /// deletion is marked and its retained bytes count as free, as for an
+    /// expiry victim; it is returned for the file deletion. `None` when the
+    /// ledger holds no entry (already expired, or never staged) or expiry
+    /// is already deleting it.
+    fn begin_delete(&self, payloads: [PayloadId; 2], job: Id) -> Result<Option<Victim>, ()> {
+        let mut state = lock(self);
+        if state.calls.get(&job).is_some_and(|entry| !entry.settled) {
+            return Err(());
+        }
+        state.deleted.extend(payloads);
+        let Some(entry) = state.calls.get_mut(&job) else {
+            return Ok(None);
+        };
+        if entry.deleting {
+            return Ok(None);
+        }
+        entry.deleting = true;
+        let (retained, payloads) = (entry.retained, entry.payloads);
+        state.used = state.used.saturating_sub(retained);
+        Ok(Some(Victim {
+            call: job,
+            payloads,
+        }))
+    }
+    /// Recovery: the payloads of a job with a committed kind 30 `delete`.
+    pub(super) fn recovered_deleted(&self, payloads: [PayloadId; 2]) {
+        lock(self).deleted.extend(payloads);
+    }
+    /// The stored bytes of a job's stdout and stderr payloads (TJ-Q10). Per
+    /// stream: the live watermark (acquire load) while a capture holds one,
+    /// otherwise the recorded total (after settlement, abandonment or
+    /// recovery). An `unconfirmed` settlement keeps the watermark, so the
+    /// value never falls below what the still-writing worker stored. `None`
+    /// when the ledger holds no entry for the job. Arithmetic under the
+    /// ledger mutex only; never blocks on I/O.
+    pub fn stored(&self, job: Id) -> Option<[u64; 2]> {
+        let state = lock(self);
+        let payloads = state.calls.get(&job)?.payloads;
+        Some(payloads.map(|id| {
+            state.payloads.get(&id).map_or(0, |p| {
+                p.watermark
+                    .as_ref()
+                    .map_or(p.total, |w| w.load(Ordering::Acquire))
+            })
+        }))
+    }
     /// The live watermark of a payload being captured.
     pub(super) fn watermark(&self, id: PayloadId) -> Option<Arc<AtomicU64>> {
         lock(self)
@@ -557,6 +655,33 @@ impl PayloadStore {
         }
         self.ledger.victim_deleted(victim, result.is_ok());
         result
+    }
+    /// Blocking: the person delete of a settled job's output after its kind
+    /// 30 `delete` commits (J4). Payload maintenance worker only. Pages of
+    /// both payloads answer `deleted` from the first step; both stream
+    /// files (objects or staging) are removed; the freed bytes are a space
+    /// event, which wakes queue heads blocked by `quota` and paused
+    /// captures. Deleting again, or a job with no files, is `Ok`. The
+    /// summary, kind 28 facts and notes are journal records and stay.
+    pub fn delete_job(&self, installation: Id, job: Id) -> Result<(), DeleteError> {
+        let payloads = job_payloads(installation, job);
+        let victim = self
+            .ledger
+            .begin_delete(payloads, job)
+            .map_err(|()| DeleteError::NotSettled)?;
+        let mut result = Ok(());
+        for id in payloads {
+            for removal in [PayloadRoot::remove_object, PayloadRoot::remove_staging] {
+                match removal(&self.root, id) {
+                    Ok(()) | Err(PayloadError::Absent) => {}
+                    Err(error) => result = Err(error),
+                }
+            }
+        }
+        if let Some(victim) = victim {
+            self.ledger.victim_deleted(victim, result.is_ok());
+        }
+        result.map_err(DeleteError::Payload)
     }
     /// Blocking: installs both staging files of a settled call.
     pub fn install(&self, call: Id) -> Result<(), PayloadError> {
@@ -1222,5 +1347,254 @@ mod tests {
         assert_eq!(admit(&ledger, 11), Err(Short::Quota));
         ledger.operation_ended(operation(2));
         assert_eq!(victim_calls(&admit(&ledger, 11).unwrap()), [call_id(2)]);
+    }
+
+    /// Counts space events.
+    #[derive(Default)]
+    struct Wakes(std::sync::atomic::AtomicU32);
+    impl SpaceListener for Wakes {
+        fn space_event(&self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    fn listen(ledger: &Ledger) -> Arc<Wakes> {
+        let wakes = Arc::new(Wakes::default());
+        let listener: Arc<dyn SpaceListener> = wakes.clone();
+        // The ledger's weak reference lives as long as the returned Arc.
+        ledger.listen(&listener);
+        wakes
+    }
+    fn woken(wakes: &Wakes) -> u32 {
+        wakes.0.load(Ordering::Acquire)
+    }
+
+    /// J4T-06 (unit): the person pin hold. Interim expiry never chooses a
+    /// pinned job, also under quota pressure; a pin set before admission
+    /// holds once the job settles; unpin makes the job a victim again and
+    /// is a space event; pin and unpin that change nothing are no events.
+    #[test]
+    fn j4t_06_pinned_jobs_are_never_expiry_victims() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        let wakes = listen(&ledger);
+        // Job 3 is pinned while queued, before its admission.
+        ledger.set_pinned(call_id(3), true);
+        for n in 1..=3 {
+            admit(&ledger, n).unwrap();
+            settle(&ledger, n, MIB, u64::from(n));
+        }
+        ledger.set_pinned(call_id(1), true);
+        assert!(ledger.pinned(call_id(1)) && ledger.pinned(call_id(3)));
+        assert!(!ledger.pinned(call_id(2)));
+        tighten(&ledger, 0);
+        // Job 1 is the oldest, but pinned: job 2 is chosen.
+        let victims = admit(&ledger, 10).unwrap();
+        assert_eq!(victim_calls(&victims), [call_id(2)]);
+        delete_all(&ledger, &victims);
+        // Quota pressure: only pinned jobs remain; nothing is chosen.
+        assert_eq!(admit(&ledger, 11), Err(Short::Quota));
+        let before = woken(&wakes);
+        ledger.set_pinned(call_id(1), true);
+        assert_eq!(woken(&wakes), before, "a pin that changes nothing");
+        ledger.set_pinned(call_id(1), false);
+        assert_eq!(woken(&wakes), before + 1, "unpin is a space event");
+        ledger.set_pinned(call_id(1), false);
+        assert_eq!(woken(&wakes), before + 1);
+        let victims = admit(&ledger, 11).unwrap();
+        assert_eq!(victim_calls(&victims), [call_id(1)]);
+        delete_all(&ledger, &victims);
+        assert_eq!(admit(&ledger, 12), Err(Short::Quota));
+        assert!(ledger.used() <= ledger.quota());
+    }
+
+    /// J4T-06 (unit): the first step of a person delete. A live job is
+    /// refused; a settled job's bytes count as free at once and its pages
+    /// answer `deleted`; a second delete, or one of a job expiry is
+    /// already deleting, returns no victim and frees nothing twice.
+    #[test]
+    fn j4t_06_begin_delete_frees_once_and_refuses_a_live_job() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        let ids = |n| job_payloads(INSTALLATION, call_id(n));
+        admit(&ledger, 1).unwrap();
+        assert_eq!(ledger.begin_delete(ids(1), call_id(1)), Err(()));
+        assert!(!ledger.deleted(ids(1)[0]), "a refused delete marks nothing");
+        settle(&ledger, 1, 3 * MIB, 1);
+        ledger.set_pinned(call_id(1), true);
+        assert_eq!(ledger.used(), 3 * MIB);
+        let victim = ledger.begin_delete(ids(1), call_id(1)).unwrap().unwrap();
+        assert_eq!(
+            victim,
+            Victim {
+                call: call_id(1),
+                payloads: ids(1)
+            }
+        );
+        assert_eq!(ledger.used(), 0, "a pinned job's output is deleted too");
+        assert!(ids(1).iter().all(|id| ledger.deleted(*id)));
+        assert_eq!(ledger.begin_delete(ids(1), call_id(1)), Ok(None));
+        ledger.victim_deleted(victim, true);
+        assert_eq!(ledger.used(), 0);
+        assert_eq!(ledger.payload_state(ids(1)[0]), None);
+        assert!(ledger.deleted(ids(1)[0]));
+        // A job unknown to the ledger (expired, or never staged) is marked.
+        assert_eq!(ledger.begin_delete(ids(7), call_id(7)), Ok(None));
+        assert!(ledger.deleted(ids(7)[1]));
+        // A job expiry already chose: no second victim, no double count.
+        admit(&ledger, 2).unwrap();
+        settle(&ledger, 2, 2 * MIB, 2);
+        tighten(&ledger, 0);
+        let victims = admit(&ledger, 3).unwrap();
+        assert_eq!(victim_calls(&victims), [call_id(2)]);
+        let used = ledger.used();
+        assert_eq!(ledger.begin_delete(ids(2), call_id(2)), Ok(None));
+        assert_eq!(ledger.used(), used);
+        delete_all(&ledger, &victims);
+        assert!(ledger.deleted(ids(2)[0]) && ledger.was_expired(ids(2)[0]));
+        // A failed file removal counts the bytes again; pages stay deleted.
+        admit(&ledger, 4).unwrap();
+        settle(&ledger, 4, MIB, 4);
+        let used = ledger.used();
+        let victim = ledger.begin_delete(ids(4), call_id(4)).unwrap().unwrap();
+        assert_eq!(ledger.used(), used - MIB);
+        ledger.victim_deleted(victim, false);
+        assert_eq!(ledger.used(), used);
+        assert!(ledger.deleted(ids(4)[0]));
+    }
+
+    // ------------------------------------------------------- J3T-22 (storage)
+
+    /// J3T-22: `None` for a job the ledger does not hold, also after the
+    /// job's entry leaves (release or expiry).
+    #[test]
+    fn j3t_22_stored_is_none_for_an_unknown_job() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        assert_eq!(ledger.stored(call_id(1)), None);
+        admit(&ledger, 1).unwrap();
+        assert_eq!(ledger.stored(call_id(2)), None);
+        ledger.release(call_id(1));
+        assert_eq!(ledger.stored(call_id(1)), None);
+        admit(&ledger, 3).unwrap();
+        settle(&ledger, 3, MIB, 3);
+        tighten(&ledger, 0);
+        let victims = admit(&ledger, 4).unwrap();
+        assert_eq!(victim_calls(&victims), [call_id(3)]);
+        delete_all(&ledger, &victims);
+        assert_eq!(ledger.stored(call_id(3)), None);
+    }
+
+    /// J3T-22: a live job reports each stream's own watermark as it rises.
+    #[test]
+    fn j3t_22_stored_follows_the_live_watermark_of_each_stream() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        admit(&ledger, 1).unwrap();
+        assert_eq!(ledger.stored(call_id(1)), Some([0, 0]));
+        let stdout = ledger.watermark(stream_id(1, ObjectKind::Stdout)).unwrap();
+        let stderr = ledger.watermark(stream_id(1, ObjectKind::Stderr)).unwrap();
+        stdout.store(7, Ordering::Release);
+        assert_eq!(ledger.stored(call_id(1)), Some([7, 0]));
+        stderr.store(3, Ordering::Release);
+        stdout.store(19, Ordering::Release);
+        assert_eq!(ledger.stored(call_id(1)), Some([19, 3]));
+    }
+
+    /// J3T-22: once settled the recorded totals answer, not the dropped
+    /// watermark.
+    #[test]
+    fn j3t_22_stored_is_the_recorded_total_after_settle() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        admit(&ledger, 1).unwrap();
+        let stdout = ledger.watermark(stream_id(1, ObjectKind::Stdout)).unwrap();
+        stdout.store(100, Ordering::Release);
+        ledger.settle(
+            call_id(1),
+            CaptureState::Complete,
+            streams(100, 23),
+            4,
+            false,
+        );
+        assert!(ledger.watermark(stream_id(1, ObjectKind::Stdout)).is_none());
+        // The old counter no longer reaches the ledger.
+        stdout.store(500, Ordering::Release);
+        assert_eq!(ledger.stored(call_id(1)), Some([100, 23]));
+    }
+
+    /// J3T-22: an `unconfirmed` settlement keeps the watermark, so the value
+    /// never falls to the smaller settled total while the worker writes;
+    /// `abandoned` then records the final watermark.
+    #[test]
+    fn j3t_22_stored_does_not_regress_after_an_unconfirmed_settlement() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        admit(&ledger, 1).unwrap();
+        let stdout = ledger.watermark(stream_id(1, ObjectKind::Stdout)).unwrap();
+        let stderr = ledger.watermark(stream_id(1, ObjectKind::Stderr)).unwrap();
+        stdout.store(30, Ordering::Release);
+        stderr.store(4, Ordering::Release);
+        ledger.settle(
+            call_id(1),
+            CaptureState::Unconfirmed,
+            [(10, None), (2, None)],
+            2,
+            false,
+        );
+        assert_eq!(ledger.stored(call_id(1)), Some([30, 4]));
+        stdout.store(45, Ordering::Release);
+        assert_eq!(ledger.stored(call_id(1)), Some([45, 4]));
+        ledger.abandoned(call_id(1), 50);
+        assert_eq!(ledger.stored(call_id(1)), Some([45, 4]));
+        stdout.store(90, Ordering::Release);
+        assert_eq!(ledger.stored(call_id(1)), Some([45, 4]));
+    }
+
+    /// J3T-22: `abandoned` without a prior settlement also records totals.
+    #[test]
+    fn j3t_22_stored_is_the_recorded_total_after_abandoned() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        admit(&ledger, 1).unwrap();
+        let stderr = ledger.watermark(stream_id(1, ObjectKind::Stderr)).unwrap();
+        stderr.store(12, Ordering::Release);
+        ledger.abandoned(call_id(1), 12);
+        stderr.store(99, Ordering::Release);
+        assert_eq!(ledger.stored(call_id(1)), Some([0, 12]));
+    }
+
+    /// J3T-22: a job registered by recovery answers its recorded totals.
+    #[test]
+    fn j3t_22_stored_is_the_recorded_total_after_recovery() {
+        let ledger = Ledger::default();
+        let [out, err] = [
+            stream_id(5, ObjectKind::Stdout),
+            stream_id(5, ObjectKind::Stderr),
+        ];
+        ledger.recovered(
+            call_id(5),
+            operation(5),
+            [
+                (
+                    out,
+                    PayloadState::Complete,
+                    Location::Objects,
+                    64,
+                    Some([1; 32]),
+                ),
+                (
+                    err,
+                    PayloadState::UnverifiedPrefix,
+                    Location::Staging,
+                    9,
+                    None,
+                ),
+            ],
+            8,
+            73,
+            true,
+        );
+        assert_eq!(ledger.stored(call_id(5)), Some([64, 9]));
+        assert_eq!(ledger.stored(call_id(6)), None);
     }
 }

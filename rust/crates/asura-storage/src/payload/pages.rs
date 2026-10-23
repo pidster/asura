@@ -10,6 +10,10 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 
 /// Source bytes per page.
 pub const PAGE_LIMIT: usize = 8192;
+/// Bytes of delivered page text: the reader stops early so that the text,
+/// with each invalid sequence replaced by U+FFFD, never exceeds it (J3
+/// page block).
+pub const TEXT_LIMIT: usize = 8192;
 /// Queued page requests; the next one is `busy`.
 pub const PAGE_QUEUE: usize = 8;
 
@@ -23,6 +27,8 @@ pub enum PageState {
     Expired,
     Missing,
     Corrupt,
+    /// The person deleted the job's output (J4).
+    Deleted,
     Busy,
     Denied,
     StaleCursor,
@@ -37,6 +43,7 @@ impl PageState {
             Self::Expired => "expired",
             Self::Missing => "missing",
             Self::Corrupt => "corrupt",
+            Self::Deleted => "deleted",
             Self::Busy => "busy",
             Self::Denied => "denied",
             Self::StaleCursor => "stale_cursor",
@@ -145,8 +152,39 @@ pub(crate) fn snap(bytes: &[u8], limit: usize, open_end: bool) -> (usize, usize)
     (skip, end)
 }
 
+/// The longest prefix of `bytes` whose text, with each maximal invalid
+/// sequence replaced by U+FFFD as `String::from_utf8_lossy` does, is at
+/// most `max_text` bytes: the text and the source bytes it consumed. A
+/// non-empty input always yields its first scalar or replacement, which is
+/// at most 4 bytes of text.
+pub(crate) fn bounded_text(bytes: &[u8], max_text: usize) -> (String, usize) {
+    const REPLACEMENT: char = char::REPLACEMENT_CHARACTER;
+    let mut text = String::with_capacity(bytes.len().min(max_text));
+    let mut consumed = 0;
+    for chunk in bytes.utf8_chunks() {
+        for scalar in chunk.valid().chars() {
+            if text.len() + scalar.len_utf8() > max_text && consumed > 0 {
+                return (text, consumed);
+            }
+            text.push(scalar);
+            consumed += scalar.len_utf8();
+        }
+        if !chunk.invalid().is_empty() {
+            if text.len() + REPLACEMENT.len_utf8() > max_text && consumed > 0 {
+                return (text, consumed);
+            }
+            text.push(REPLACEMENT);
+            consumed += chunk.invalid().len();
+        }
+    }
+    (text, consumed)
+}
+
 /// Blocking: reads one text page. Page-read worker only.
 pub fn read_page(store: &PayloadStore, request: PageRequest) -> Page {
+    if store.deleted(request.payload) {
+        return Page::empty(PageState::Deleted, request.offset);
+    }
     if store.was_expired(request.payload) {
         return Page::empty(PageState::Expired, request.offset);
     }
@@ -225,10 +263,12 @@ fn read_held(
     // written yet.
     let open_end = watermark.is_some() && request.offset + filled as u64 >= total;
     let (skip, length) = snap(&buffer, limit, open_end);
-    let bytes = &buffer[skip..skip + length];
+    // The delivered text never exceeds 8,192 bytes; the next offset records
+    // the source bytes the text consumed.
+    let (text, consumed) = bounded_text(&buffer[skip..skip + length], TEXT_LIMIT);
     page.start = request.offset + skip as u64;
-    page.text = String::from_utf8_lossy(bytes).into_owned();
-    page.next_offset = page.start + length as u64;
+    page.text = text;
+    page.next_offset = page.start + consumed as u64;
     page
 }
 
@@ -302,6 +342,10 @@ struct Shared {
     store: Arc<PayloadStore>,
     queue: Mutex<Queue>,
     work: Condvar,
+    /// The reactor wake: a worker notifies it after it stores a reply, so
+    /// the reply reaches the reactor without another event (page wake, J4
+    /// control handler). A failed notify is ignored.
+    wake: Option<asura_platform::events::WakeSender>,
 }
 fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Queue> {
     shared.queue.lock().unwrap_or_else(|e| e.into_inner())
@@ -371,24 +415,37 @@ impl Drop for Ticket {
     }
 }
 
-/// Two retained page-read workers, one reserved for model requests, and a
-/// queue of 8 (J2 numeric limits). No replacement worker ever starts, and no
-/// time bound ends a read.
+/// Page-read workers in the pool (J2 numeric limits).
+pub const PAGE_WORKERS: u32 = 2;
+
+/// Two retained page-read workers, `jobs.modelReservedPageReads` (0 or 1)
+/// of them reserved for model requests, and a queue of 8 (J2 numeric
+/// limits). No replacement worker ever starts, and no time bound ends a
+/// read.
 pub struct PagePool {
     shared: Arc<Shared>,
 }
 impl PagePool {
-    /// Starts both workers. Fails only if a thread cannot start.
-    pub fn start(store: Arc<PayloadStore>) -> std::io::Result<Self> {
+    /// Starts both workers; the last `model_reserved` of them (at most 1)
+    /// take model requests only. `wake` is notified after each stored
+    /// reply. Fails only if a thread cannot start.
+    pub fn start(
+        store: Arc<PayloadStore>,
+        model_reserved: u32,
+        wake: Option<asura_platform::events::WakeSender>,
+    ) -> std::io::Result<Self> {
+        let reserved = model_reserved.min(PAGE_WORKERS - 1);
         let shared = Arc::new(Shared {
             store,
             queue: Mutex::new(Queue::default()),
             work: Condvar::new(),
+            wake,
         });
         let pool = Self {
             shared: shared.clone(),
         };
-        for (index, model_only) in [(0, false), (1, true)] {
+        for index in 0..PAGE_WORKERS {
+            let model_only = index >= PAGE_WORKERS - reserved;
             let shared = shared.clone();
             // A failed start drops `pool`, which closes the started worker.
             std::thread::Builder::new()
@@ -482,6 +539,9 @@ fn worker(shared: &Shared, model_only: bool) {
         if !job.slot.withdrawn() {
             let page = read_page(&shared.store, job.request);
             job.slot.deliver(PageReply::Page(page));
+            if let Some(wake) = &shared.wake {
+                let _ = wake.notify();
+            }
         }
         lock(shared)
             .running
@@ -573,6 +633,63 @@ mod tests {
         // The limit trim still applies before the open end.
         assert_eq!(snap(&text[..9], 2, true), (0, 1));
     }
+    /// J3T-08 (unit): the delivered text never exceeds 8,192 bytes; the
+    /// consumed length is what the text covers, and the text equals the
+    /// lossy decoding of exactly those bytes.
+    #[test]
+    fn j3t_08_delivered_text_is_bounded_and_matches_the_consumed_bytes() {
+        // Valid text under the bound is unchanged.
+        assert_eq!(
+            bounded_text("aé€😀".as_bytes(), TEXT_LIMIT),
+            ("aé€😀".into(), 10)
+        );
+        // 8,192 invalid bytes would be 24,576 bytes of U+FFFD.
+        let invalid = vec![0xFF; PAGE_LIMIT];
+        let (text, consumed) = bounded_text(&invalid, TEXT_LIMIT);
+        assert_eq!((text.len(), consumed), (8190, 2730));
+        assert_eq!(text, String::from_utf8_lossy(&invalid[..consumed]));
+        // A scalar that would cross the bound is left for the next page;
+        // one that ends exactly at it is delivered.
+        let mut mixed = vec![0xFF; 2730];
+        mixed.extend("€".as_bytes());
+        let (text, consumed) = bounded_text(&mixed, TEXT_LIMIT);
+        assert_eq!((text.len(), consumed), (8190, 2730));
+        let mut mixed = vec![0xFF; 2729];
+        mixed.extend("ab€".as_bytes());
+        let (text, consumed) = bounded_text(&mixed, TEXT_LIMIT);
+        assert_eq!((text.len(), consumed), (8192, 2734));
+        assert!(text.ends_with('€'));
+        // A truncated multi-byte sequence is one replacement, consumed whole.
+        let (text, consumed) = bounded_text(b"x\xE2\x82y", TEXT_LIMIT);
+        assert_eq!((text.as_str(), consumed), ("x\u{FFFD}y", 4));
+        // The first scalar is always delivered, even past a tiny bound.
+        assert_eq!(bounded_text("😀b".as_bytes(), 1), ("😀".into(), 4));
+        assert_eq!(bounded_text(&[], 1), (String::new(), 0));
+        // A pseudo-random mix never exceeds the bound and reassembles exactly.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut source = Vec::new();
+        for _ in 0..20_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            source.push(match seed % 4 {
+                0 => 0xFF,
+                1 => 0xE2,
+                _ => b'a' + (seed % 26) as u8,
+            });
+        }
+        let mut offset = 0;
+        while offset < source.len() {
+            let end = (offset + PAGE_LIMIT).min(source.len());
+            let (text, consumed) = bounded_text(&source[offset..end], TEXT_LIMIT);
+            assert!(text.len() <= TEXT_LIMIT && consumed > 0);
+            assert_eq!(
+                text,
+                String::from_utf8_lossy(&source[offset..offset + consumed])
+            );
+            offset += consumed;
+        }
+    }
     #[test]
     fn j1t_10_page_state_names_match_the_composer_interface() {
         let names: Vec<&str> = [
@@ -583,6 +700,7 @@ mod tests {
             PageState::Expired,
             PageState::Missing,
             PageState::Corrupt,
+            PageState::Deleted,
             PageState::Busy,
             PageState::Denied,
             PageState::StaleCursor,
@@ -600,6 +718,7 @@ mod tests {
                 "expired",
                 "missing",
                 "corrupt",
+                "deleted",
                 "busy",
                 "denied",
                 "stale_cursor"

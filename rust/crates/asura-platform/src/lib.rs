@@ -28,7 +28,7 @@ mod config;
 pub use authority::{
     AuthorityError, AuthorityReader, AuthorityScan, AuthoritySource, AuthorityWitness,
 };
-pub use config::{PrivateFileError, PrivateFileSnapshot};
+pub use config::{CONFIG_FILE_LIMIT, PrivateFileError, PrivateFileSnapshot};
 mod lifetime;
 pub use lifetime::{ServiceLease, ServiceLifetime};
 pub mod exec_cmd;

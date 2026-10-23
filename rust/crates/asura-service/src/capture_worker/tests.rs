@@ -5,6 +5,7 @@ fn shared() -> Arc<Shared> {
         queued_bytes: AtomicUsize::new(0),
         queued_chunks: AtomicUsize::new(0),
         backpressured: AtomicBool::new(false),
+        stored: AtomicBool::new(false),
         control: Mutex::new(Control::default()),
         changed: Condvar::new(),
     })
@@ -173,7 +174,6 @@ fn report_streams_clamp_spans_to_stored_bytes() {
         discarded: 3,
         eof: true,
         lines: 4,
-        tail: Vec::new(),
     };
     let report = Report {
         state: CaptureState::Incomplete,
@@ -223,6 +223,10 @@ impl Home {
     }
     /// Admits a job (1 MiB) and starts its capture worker.
     fn start(&self) -> (Id, Handle) {
+        self.start_waking(None)
+    }
+    /// As `start`, with the reactor wake the worker notifies.
+    fn start_waking(&self, wake: Option<WakeSender>) -> (Id, Handle) {
         let job = asura_platform::random_id();
         let victims = self
             .store
@@ -234,7 +238,7 @@ impl Home {
             job,
             victims,
             redaction: JobRedaction::new(rules, &[]),
-            wake: None,
+            wake,
             gate_home: Some(self.path.clone()),
         })
         .unwrap();
@@ -491,4 +495,185 @@ fn discard_removes_staging_of_a_job_that_never_ran() {
     drain_until(&mut handle, |m| matches!(m, Message::Installed));
     assert!(!home.staging(stdout).exists() && !home.staging(stderr).exists());
     assert!(handle.exited);
+}
+
+/// Reads every pending wake byte without blocking; returns how many there
+/// were. Each `WakeSender::notify` writes one byte.
+fn wakes(reader: &asura_platform::events::WakeReader) -> usize {
+    use std::os::fd::AsRawFd;
+    let mut count = 0;
+    let mut buffer = [0u8; 256];
+    loop {
+        // SAFETY: the descriptor is the reader's open, nonblocking socket,
+        // and the buffer is valid for its length.
+        let n = unsafe { libc::read(reader.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+        if n <= 0 {
+            return count;
+        }
+        count += n as usize;
+    }
+}
+/// Waits until the reader holds a wake byte; a 30 s test guard turns a lost
+/// wake into a failure instead of a hung suite.
+fn await_wake(reader: &asura_platform::events::WakeReader, what: &str) {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: reader.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for the reader's open socket.
+    let ready = unsafe { libc::poll(&mut fd, 1, 30_000) };
+    assert!(ready > 0, "{what}");
+}
+/// The ledger's stored bytes of one payload: the live watermark while the
+/// capture writes (the value `Ledger::stored` reads).
+fn ledger_stored(home: &Home, payload: Id) -> u64 {
+    asura_storage::payload::read_page(
+        &home.store,
+        asura_storage::payload::PageRequest {
+            payload,
+            offset: 0,
+            limit: 1,
+            scope: None,
+        },
+    )
+    .total
+}
+
+/// J3T-22 unit (TJ-Q10): the signal is a flag and a wake. A write of no
+/// byte signals nothing; the first write wakes; later writes find the
+/// signal outstanding and do not wake until it is cleared.
+#[test]
+fn j3t_22_stored_signal_is_a_coalesced_flag_and_wake() {
+    let (reader, wake) = asura_platform::events::wake_pair().unwrap();
+    let shared = shared();
+    assert!(!shared.signal_stored(0, Some(&wake)), "zero-byte write");
+    assert!(!shared.stored.load(Ordering::Acquire));
+    assert_eq!(wakes(&reader), 0);
+    assert!(shared.signal_stored(5, Some(&wake)));
+    for _ in 0..100 {
+        assert!(!shared.signal_stored(7, Some(&wake)), "one outstanding");
+    }
+    assert!(!shared.signal_stored(0, Some(&wake)));
+    assert_eq!(wakes(&reader), 1, "a burst gives one wake");
+    assert!(shared.stored.swap(false, Ordering::AcqRel), "the clear");
+    assert!(shared.signal_stored(1, Some(&wake)));
+    assert_eq!(wakes(&reader), 1, "a clear then a write wakes again");
+    // With no reactor wake the flag still records the signal.
+    shared.stored.store(false, Ordering::Release);
+    assert!(shared.signal_stored(1, None));
+    assert!(shared.stored.load(Ordering::Acquire));
+}
+
+/// J3T-22 unit (TJ-Q10) with a real worker, store and wake socket: a burst
+/// of appends gives one wake and no channel message; `take_stored` clears
+/// the signal once, and a later append wakes again; a chunk discarded after
+/// a cancel trigger in `Draining` raises no signal.
+#[test]
+fn j3t_22_worker_signals_stored_bytes_once_per_clear() {
+    let (reader, wake) = asura_platform::events::wake_pair().unwrap();
+    let home = Home::new(64 * asura_storage::payload::MIB);
+    let (job, mut handle) = home.start_waking(Some(wake));
+    let [stdout, stderr] = asura_storage::payload::job_payloads(home.installation, job);
+    let mut sink = handle.output_sink();
+    for i in 0..4 {
+        sink.accept(Stream::Stdout, format!("out {i}\n").as_bytes());
+        sink.accept(Stream::Stderr, format!("err {i}\n").as_bytes());
+    }
+    wait_for("burst stored", || {
+        ledger_stored(&home, stdout) == 24 && ledger_stored(&home, stderr) == 24
+    });
+    await_wake(&reader, "the burst's wake");
+    assert!(handle.stored_pending());
+    assert_eq!(wakes(&reader), 1, "a burst with no clear gives one wake");
+    assert!(
+        handle.drain().is_empty(),
+        "no channel message for the signal"
+    );
+
+    assert!(handle.take_stored());
+    assert!(!handle.take_stored(), "the clear is taken once");
+    sink.accept(Stream::Stdout, b"later\n");
+    wait_for("later stored", || ledger_stored(&home, stdout) == 30);
+    await_wake(&reader, "the wake after the clear");
+    assert_eq!(wakes(&reader), 1, "a clear then an append gives one wake");
+    assert!(handle.drain().is_empty());
+
+    assert!(handle.take_stored());
+    handle.leader_exited();
+    handle.discard_output();
+    sink.accept(Stream::Stdout, b"dropped\n");
+    sink.end(Stream::Stdout);
+    sink.end(Stream::Stderr);
+    handle.sink.close();
+    let report = sealed(drain_until(&mut handle, |m| {
+        matches!(m, Message::Sealed(_))
+    }));
+    assert_eq!(report.streams[0].discarded, 8);
+    assert_eq!(report.streams[0].stored, 30);
+    assert!(
+        !handle.stored_pending(),
+        "a discarded chunk gives no signal"
+    );
+    handle.abandon();
+    drain_until(&mut handle, |m| matches!(m, Message::Abandoned));
+}
+
+/// J3T-22 (TJ-Q10) with a real worker, store and wake socket: a flood of 64
+/// chunks read as the reactor reads them (clear, then read the ledger, then
+/// wait for a wake). After the last append a wake arrives and the ledger's
+/// stored bytes equal the bytes written: no stored advance is lost.
+#[test]
+fn j3t_22_flood_ends_with_a_wake_and_every_byte_stored() {
+    const CHUNKS: usize = 64;
+    let (reader, wake) = asura_platform::events::wake_pair().unwrap();
+    let home = Home::new(64 * asura_storage::payload::MIB);
+    let (job, mut handle) = home.start_waking(Some(wake));
+    let [stdout, _] = asura_storage::payload::job_payloads(home.installation, job);
+    let mut sink = handle.output_sink();
+    let mut line = vec![b'a'; CHUNK_BYTES - 1];
+    line.push(b'\n');
+    let expected = (CHUNKS * CHUNK_BYTES) as u64;
+    // One reactor turn: drain wakes, clear the signal, then read the ledger.
+    let turn = |handle: &mut Handle| {
+        wakes(&reader);
+        handle.sink.flush();
+        handle.take_stored();
+        assert!(
+            handle.drain().iter().all(|m| matches!(m, Message::Room)),
+            "no message other than room"
+        );
+        ledger_stored(&home, stdout)
+    };
+    let end = Instant::now() + Duration::from_secs(60);
+    let mut sent = 0;
+    while sent < CHUNKS {
+        handle.sink.flush();
+        if sink.room() >= CHUNK_BYTES {
+            sink.accept(Stream::Stdout, &line);
+            sent += 1;
+        } else {
+            turn(&mut handle);
+            assert!(Instant::now() < end, "room");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    // Every chunk is accepted: from here the reactor waits only for a wake.
+    let mut seen = turn(&mut handle);
+    while seen < expected {
+        await_wake(&reader, "a wake after the last append");
+        seen = turn(&mut handle);
+    }
+    assert_eq!(seen, expected, "the ledger holds the bytes written");
+    sink.end(Stream::Stdout);
+    sink.end(Stream::Stderr);
+    handle.sink.close();
+    let report = sealed(drain_until(&mut handle, |m| {
+        matches!(m, Message::Sealed(_))
+    }));
+    assert_eq!(report.streams[0].stored, expected);
+    assert_eq!(report.streams[0].lines, CHUNKS as u64);
+    handle.abandon();
+    drain_until(&mut handle, |m| matches!(m, Message::Abandoned));
 }

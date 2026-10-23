@@ -74,6 +74,11 @@ and open a list to change it. See [Projects](#projects), [Models](#models) and
 The input gauge shows how much of the model's input context the last request
 used. It is muted below 50%, bright from 50% and amber from 80%.
 
+When the terminal is at least 40 columns wide, the status bar can also show
+`jobs N` and `exec off`. `jobs N` means that N command jobs of the selected
+project are running or waiting. `exec off` means that the model cannot run
+commands in the selected project. See [Command jobs](#command-jobs).
+
 ## Move between areas
 
 The input box has focus when Asura starts. Shift+Up moves focus up to the queue,
@@ -350,12 +355,116 @@ answer.
 
 ### Model tools
 
-Models can use four tools: `project` reads and lists project files, `memory`
-reads and creates notes, `service` reports status, tools and audit data, and
-`exec_cmd` runs one command in the project. The exec_cmd tool has no network access. A
-command runs until it finishes or you stop the answer with `/cancel`; it has no
-time limit. `/tools` lists the tools. A listed tool is not
-always permitted for the current model or project.
+Models can use five tools: `project` reads and lists project files, `memory`
+reads and creates notes, `service` reports status, tools and audit data,
+`exec_cmd` runs one command in the project as a job, and `job` reads and
+manages those jobs. The exec_cmd tool has no network access. A command has no
+time limit; see [Command jobs](#command-jobs). `/tools` lists the tools. A
+listed tool is not always permitted for the current model or project.
+
+## Command jobs
+
+A job is one command that runs in the service. The model starts a job each
+time it uses `exec_cmd`. The service runs the job in the background and
+records its output.
+
+### How the model uses jobs
+
+When the model uses `exec_cmd`, the service starts the job and waits a short
+time, 10 seconds unless the model asks for 0 to 30 seconds. The model then
+gets the job's ID, its state and the size of its output in bytes. If the job
+ended in that time, the model also gets its result, such as `exit 0`. The
+model never gets output text from `exec_cmd`.
+
+To read the output, the model uses its `job` tool. The tool has these
+commands: `list`, `status`, `read`, `wait`, `cancel` and `note`. The model can
+see and use only the jobs of its own conversation. A note from the model is
+marked as the model's note.
+
+### Jobs after a turn
+
+A job keeps running after its turn ends when the model has received its ID.
+`/cancel`, steering, `/new` and closing the client do not stop such a job. If
+the turn ends before the model receives the ID, the service stops the job.
+
+When jobs keep running after a turn, the log shows a line under that response,
+for example `↳ 2 jobs kept running after this turn · /jobs to view or cancel`.
+While jobs of the selected project run or wait, the status bar shows `jobs N`.
+
+A service that the client started stops its jobs when the service stops. See
+[Exit Asura](#exit-asura). A service that you started separately keeps its
+jobs running when the client exits.
+
+### List jobs
+
+`/jobs` lists the jobs of all conversations in the selected project, newest
+first. `/jobs all` lists the jobs of every project; each row names its project.
+The list shows 8 jobs at a time. Down past the last row shows the next jobs.
+
+Each row shows the first 8 digits of the job ID, the command, the state or
+result, the age, and the output size as `out` and `err`. `pinned` marks a
+pinned job, and `✎2` shows that the job has 2 notes. In a terminal narrower
+than 60 columns, the row omits the output size.
+
+| State | Meaning |
+| --- | --- |
+| `queued` | The job waits for a free slot; the reason follows in brackets |
+| `starting` or `running` | The command is starting or running |
+| `paused` | The service stopped saving output, for example because the disk is full |
+| `stopping`, `draining` or `finalizing` | The job is ending |
+| `exit N` or `signal N` | The command ended with exit status N, or a signal stopped it |
+| `cancelled` | Someone or something stopped the job; the reason follows |
+| `not started` or `interrupted` | The job never started, or a service restart ended it |
+
+`cancel requested` follows the state of a job that is stopping on request. See
+[Job limits](commands.md#job-limits) for the number of jobs that run at the
+same time.
+
+### View job output
+
+`/job ID` opens the job viewer, and so does Enter in the job list. The viewer
+shows one stream at a time: standard output (`stdout`) or standard error
+(`stderr`). It opens at the start of `stdout`. Tab switches the stream.
+
+The top line shows the job ID, its state, the stream, the bytes shown and the
+total bytes. It also shows `pinned`, and the project when the job belongs to
+another project. Press f to follow new output as it arrives; the top line
+then shows `following`. Following stops when the job ends.
+
+Press i to open the detail panel. It shows the state, the output size in bytes
+and lines, the folder, the whole command and the notes. Each note shows
+whether you or the model wrote it.
+
+To open a job from a response, press F6, select the response and press j.
+Escape closes the viewer. Closing the viewer never stops the job. For every
+key, see [Job viewer keys](keys.md#job-viewer-keys).
+
+### Cancel, pin, delete and note jobs
+
+Use these commands, or the keys in the job list:
+
+- `/job cancel ID`, or c, asks the service to stop the job. Asura then shows
+  `Stopping job ID; /jobs shows the settlement`.
+- `/job pin ID`, or p, keeps the job's output from expiring. `/job unpin ID`
+  lets it expire again.
+- `/job delete ID`, or d, deletes the job's output after you answer y. The
+  summary and the notes stay. A running job's output cannot be deleted.
+- `/job note ID TEXT`, or n, adds your note to the job.
+
+For a job of another project, cancel asks you to confirm first. The viewer
+shows `Output deleted` or `Output expired` when the output is gone; i still
+shows the summary and notes. See [Job commands](commands.md#job-commands).
+
+### Execution setting
+
+The execution setting decides whether the model may run commands. It is on by
+default. `/execution off` turns it off for every project without its own
+value. `/execution project off` turns it off for the selected project only.
+
+When execution turns off for a project, the service refuses new model commands
+there and stops the model's jobs in that project. The model is told not to try
+again. The status bar shows `exec off`. Other model tools still work, and the
+model can still read its jobs. See [Execution setting](commands.md#execution-setting).
 
 ## Configuration
 
@@ -379,6 +488,8 @@ Settings are in `~/.asura/config.yaml`. Use these commands:
 | `jobs.queuedAgent` | 1 to 16 | `8` |
 | `jobs.clientViewers` | 1 to 32 | `8` |
 | `jobs.modelReservedPageReads` | 0 or 1 | `1` |
+| `execution.enabled` | `true` or `false` | `true` |
+| `execution.projects.ID` | `on`, `off` or `inherit` for the project with this ID | `inherit` |
 
 Values use YAML. Quote text that contains spaces or punctuation. A model change
 applies to the next message. Audit changes apply after the service restarts.
@@ -433,3 +544,9 @@ service yet, it shows the same warning first.
 
 Exiting stops a service that this client started. A service that was already
 running keeps running, and it keeps your accepted messages.
+
+When this client started the service and jobs are running, every way to exit
+asks you to confirm, even with an empty input box. The dialog then says, for
+example, `2 jobs are still running in all projects; they stop when the service
+stops.` Choose **Discard and exit** to exit and stop those jobs. Exiting from a
+service that was already running never stops jobs.

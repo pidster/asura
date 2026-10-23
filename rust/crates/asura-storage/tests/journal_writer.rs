@@ -1018,7 +1018,7 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
                     tool_operation: Some(ToolOperation::CreateNote),
                     decision: ToolDecision::Run,
                     fault: None,
-                    busy: None,
+                    reason: None,
                     form: ArgumentForm::Verbatim,
                     arguments_bytes: arguments.len() as u32,
                     arguments: arguments.into(),
@@ -1695,7 +1695,7 @@ fn j1_call(ordinal: u32, decision: ToolDecision) -> ToolCall {
         tool_operation: Some(ToolOperation::ExecCmd),
         decision,
         fault: None,
-        busy: None,
+        reason: None,
         form: ArgumentForm::Canonical,
         arguments_bytes: arguments.len() as u32,
         arguments: arguments.into(),
@@ -1735,8 +1735,50 @@ fn j1_status(decision: ToolDecision) -> Record {
         ..j1_call(1, ToolDecision::Run)
     }))
 }
+/// A `run` `job` call with operation code 11 to 16 at `ordinal`.
+fn j3_job_call(ordinal: u32, op: ToolOperation) -> ToolCall {
+    let arguments = format!("{{\"command\":\"{}\"}}", op.as_str());
+    ToolCall {
+        name: "job".into(),
+        name_bytes: 3,
+        tool_operation: Some(op),
+        form: ArgumentForm::Verbatim,
+        arguments_bytes: arguments.len() as u32,
+        arguments,
+        number_kinds: Vec::new(),
+        command_cut: false,
+        whole_command: false,
+        refusal: None,
+        ..j1_call(ordinal, ToolDecision::Run)
+    }
+}
+/// A `run` `job note` call for `job` with its stored `text` argument.
+fn j4_note_call(ordinal: u32, job: Id, text: &str) -> ToolCall {
+    let handle: String = job.iter().map(|b| format!("{b:02x}")).collect();
+    let arguments = format!("{{\"command\":\"note\",\"job\":\"{handle}\",\"text\":\"{text}\"}}");
+    ToolCall {
+        arguments_bytes: arguments.len() as u32,
+        arguments,
+        ..j3_job_call(ordinal, ToolOperation::JobNote)
+    }
+}
+fn j3_result(ordinal: u32, job: Id, body: JobResultBody) -> JobResult {
+    JobResult {
+        operation: [35; 16],
+        generation: 1,
+        ordinal,
+        status: 1,
+        outcome: JobResultOutcome::Ok,
+        job,
+        body,
+    }
+}
+/// J3T-02 (integration): the real writer appends kinds 14, 26 and 29 for
+/// an exec_cmd job call and `job` calls with list and status results; the
+/// journal reopens with the same calls and derived identities; each frame
+/// decodes to the appended record.
 #[test]
-fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
+fn j3t_02_real_writer_appends_kinds_14_26_29_and_reopens() {
     use asura_storage::payload::{ObjectKind, payload_id};
     let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
     let scratch = Scratch::new();
@@ -1747,50 +1789,43 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
     let mut revision = state.revision;
     drop(state);
     let call = j1_call(1, ToolDecision::Run);
-    let settled = CaptureSettled {
-        operation: [35; 16],
-        generation: 1,
-        ordinal: 1,
-        state: CaptureState::Incomplete,
-        reason: CaptureReason::Quota,
-        exit_kind: 2,
-        exit_value: 15,
-        stdout: CaptureStream {
-            observed_bytes: 40,
-            stored_bytes: 33,
-            digest: Some([40; 32]),
-            replacements: 1,
-            literal_replacements: 1,
-            kinds: vec![(SecretKind::GithubToken, 1)],
-            ..CaptureStream::default()
-        },
-        stderr: CaptureStream {
-            digest: Some([41; 32]),
-            eof: true,
-            ..CaptureStream::default()
-        },
-        distinct_numbers: 1,
-        numbers: vec![CaptureNumber {
-            number: 1,
-            kind: SecretKind::GithubToken,
-            origin: NumberOrigin::Command,
-        }],
-        pause_count: 1,
-        first_pause_ms: 10,
-        paused_ms: 20,
-        final_reservation: 2 * INITIAL_RESERVATION,
+    let snapshot = JobSnapshot {
+        state: JobRunState::Queued(JobBlockReason::AgentSlots),
+        numbers: [2, 2, 1],
+        elapsed_ms: 0,
+        stdout_bytes: 0,
+        stderr_bytes: 0,
     };
-    let result = ToolResult {
-        operation: [35; 16],
-        generation: 1,
-        ordinal: 1,
-        status: 5,
-        text: "failure=None exit_code=none signal=15 reason=none truncated=false cleanup_confirmed=true capture=incomplete\nstdout:\n$ASURA_SECRET_1\nstderr:\n".into(),
-        next_offset: None,
-        truncated: false,
-    };
+    let handle = j3_result(1, [0; 16], JobResultBody::State(snapshot));
     // The refused call is complete at its kind 14 (TCR-R5).
     let refused = j1_call(2, ToolDecision::Refused);
+    let list = j3_job_call(3, ToolOperation::JobList);
+    let listed = j3_result(
+        3,
+        [0; 16],
+        JobResultBody::List {
+            more: false,
+            entries: vec![JobListEntry {
+                job: j2_job(1),
+                state: JobRunState::Running,
+                numbers: [0; 3],
+                stdout_bytes: 33,
+                stderr_bytes: 0,
+            }],
+        },
+    );
+    let status = j3_job_call(4, ToolOperation::JobStatus);
+    let running = j3_result(
+        4,
+        j2_job(1),
+        JobResultBody::State(JobSnapshot {
+            state: JobRunState::CapturePaused(JobPauseReason::Quota),
+            numbers: [0; 3],
+            elapsed_ms: 1_200,
+            stdout_bytes: 33,
+            stderr_bytes: 0,
+        }),
+    );
     // SL7: a whole-command run holds its display text and fallback reason.
     let whole = ToolCall {
         arguments: "{\"command\":\"printf %s '$ASURA_SECRET_1'\",\"cwd\":\".\"}".into(),
@@ -1800,22 +1835,41 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
             kind: Some(SecretKind::GithubToken),
             word: Some(3),
         }),
-        ..j1_call(3, ToolDecision::Run)
+        ..j1_call(5, ToolDecision::Run)
     };
     for record in [
         Record::ToolCall(Box::new(call.clone())),
-        Record::CaptureSettled(Box::new(settled.clone())),
-        Record::ToolResult(result),
+        Record::JobIntent(j2_intent(1)),
+        Record::JobResult(Box::new(handle.clone())),
         Record::ToolCall(Box::new(refused.clone())),
+        Record::ToolCall(Box::new(list)),
+        Record::JobResult(Box::new(listed.clone())),
+        Record::ToolCall(Box::new(status)),
+        Record::JobResult(Box::new(running.clone())),
         Record::ToolCall(Box::new(whole.clone())),
     ] {
         submit(&mut writer, &mut revision, record).unwrap();
     }
     close(&mut writer);
-    // The journal on disk replays with both calls and the derived identities.
+    // The journal on disk replays with every call and the derived identities.
     let durable = journal_replay(&scratch);
-    let tools = &durable.operations[&[35; 16]].tools;
-    assert_eq!(tools.len(), 3);
+    let all = &durable.operations[&[35; 16]].tools;
+    assert_eq!(all.len(), 5);
+    assert_eq!(
+        all.iter()
+            .map(|t| t.job_result.as_deref().cloned())
+            .collect::<Vec<_>>(),
+        vec![
+            Some(handle.clone()),
+            None,
+            Some(listed),
+            Some(running),
+            None
+        ]
+    );
+    assert!(all[4].unresolved());
+    let tools = [all[0].clone(), all[1].clone(), all[4].clone()];
+    let tools = &tools;
     let derived = tools[0].exec_cmd.as_deref().unwrap();
     assert_eq!(derived.job, exec_cmd_job_id([35; 16], 1, 1));
     // The stored command is the executable text; one variable per number.
@@ -1827,7 +1881,7 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
         (derived_whole.fixed_command, derived_whole.secret_variables),
         (Some(WHOLE_COMMAND), 1)
     );
-    assert_eq!(derived_whole.job, exec_cmd_job_id([35; 16], 1, 3));
+    assert_eq!(derived_whole.job, exec_cmd_job_id([35; 16], 1, 5));
     assert_eq!(
         derived.stdout_payload,
         payload_id(
@@ -1844,18 +1898,12 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
             ObjectKind::Stderr
         )
     );
-    let settlement = derived.settled.as_ref().unwrap();
-    assert_eq!(settlement.state, CaptureState::Incomplete);
-    assert_eq!(settlement.reason, CaptureReason::Quota);
-    assert_eq!(
-        settlement.streams,
-        [(33, Some([40; 32])), (0, Some([41; 32]))]
-    );
-    assert_eq!(tools[0].result_status, Some(5));
+    let job_frame = derived.job_intent.unwrap();
+    assert_eq!(tools[0].result_status, Some(1));
     assert_eq!(tools[1].decision, ToolDecision::Refused);
     assert!(tools[1].exec_cmd.is_none() && tools[1].result_frame.is_none());
     let intent_frame = tools[0].intent_frame;
-    let settled_frame = settlement.frame;
+    let result_frame = tools[0].result_frame.unwrap();
     let refused_frame = tools[1].intent_frame;
     let whole_frame = tools[2].intent_frame;
     // A restarted writer reopens the journal and reads each record back.
@@ -1864,7 +1912,7 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
         .unwrap()
         .replay
         .unwrap();
-    assert_eq!(reopened.operations[&[35; 16]].tools, *tools);
+    assert_eq!(reopened.operations[&[35; 16]].tools, *all);
     drop(reopened);
     close(&mut writer);
     // Each verified frame range decodes to the appended record.
@@ -1876,7 +1924,8 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
     .unwrap();
     for (range, kind, expected) in [
         (intent_frame, 14, Record::ToolCall(Box::new(call))),
-        (settled_frame, 23, Record::CaptureSettled(Box::new(settled))),
+        (job_frame, 26, Record::JobIntent(j2_intent(1))),
+        (result_frame, 29, Record::JobResult(Box::new(handle))),
         (refused_frame, 14, Record::ToolCall(Box::new(refused))),
         (whole_frame, 14, Record::ToolCall(Box::new(whole))),
     ] {
@@ -1894,7 +1943,7 @@ const TERMINAL: usize = FRAME + 51 + MAX_TEXT;
 const RESULT: usize = FRAME + 43 + 16_384;
 const OWNER: usize = FRAME;
 const CANCEL: usize = FRAME + 25;
-const CAPTURE: usize = FRAME + 4_066;
+const JOB_RESULT: usize = FRAME + MAX_JOB_RESULT_PAYLOAD;
 /// Bytes of every segment file: frames are the only authority.
 fn segment_bytes(scratch: &Scratch) -> u64 {
     fs::read_dir(scratch.0.join(".asura/state/control"))
@@ -1932,7 +1981,7 @@ fn j1_quota_room(scratch: &Scratch, room: usize) -> (WriterHandle, Id, u64, usiz
     (writer, installation, revision, reserved)
 }
 /// J1T-02, TCR-I08 and TCR-D16 at the journal quota (SJ-15): a `run` kind
-/// 14 whose kind 15 (and kind 23) reservation does not fit is held with
+/// 14 whose kind 15 (or for exec_cmd kind 29) reservation does not fit is held with
 /// `journal_quota` and changes nothing; a call that does not run needs no
 /// result reservation and commits; closure records still commit.
 #[test]
@@ -1950,8 +1999,8 @@ fn j1t_02_tcr_i08_run_call_is_held_when_its_reservation_cannot_fit() {
     let (mut writer, _, mut revision, reserved) =
         j1_quota_room(&scratch, TERMINAL + OWNER + CANCEL + MARGIN);
     assert_eq!(reserved, TERMINAL + OWNER + CANCEL);
-    // The run call would reserve its kind 15 (and an exec_cmd its kind 23).
-    const { assert!(MARGIN < RESULT && MARGIN < CAPTURE) };
+    // The run call would reserve its kind 15 (an exec_cmd its kind 29).
+    const { assert!(MARGIN < RESULT && MARGIN < JOB_RESULT) };
     let segment = scratch.0.join(".asura/state/control");
     let size = |_: &std::path::PathBuf| segment_bytes(&scratch);
     // A call that does not run fits: it reserves nothing more.
@@ -2236,16 +2285,19 @@ fn j2_intent(ordinal: u32) -> JobIntent {
 fn j2_job(ordinal: u32) -> Id {
     job_id(&j2_intent(ordinal).origin)
 }
+/// Handle delivery (J3): the call's kind 29 with a `running` snapshot.
 fn j2_handle(ordinal: u32) -> Record {
-    Record::ToolResult(ToolResult {
-        operation: [35; 16],
-        generation: 1,
+    Record::JobResult(Box::new(j3_result(
         ordinal,
-        status: 1,
-        text: "job started".into(),
-        next_offset: None,
-        truncated: false,
-    })
+        [0; 16],
+        JobResultBody::State(JobSnapshot {
+            state: JobRunState::Running,
+            numbers: [0; 3],
+            elapsed_ms: 5,
+            stdout_bytes: 1,
+            stderr_bytes: 0,
+        }),
+    )))
 }
 fn j2_cancel(ordinal: u32, reason: JobReason) -> JobCancelRequested {
     JobCancelRequested {
@@ -2421,8 +2473,9 @@ fn j2t_02_real_writer_holds_kind_26_at_the_quota_while_27_and_28_commit() {
         .unwrap()
         .status
         .unwrap();
-    // Kind 26 trades the kind 23 reservation (4,250 bytes) for the job
-    // ledger (4,481 bytes): 231 more than today, beyond the 100 left.
+    // Kind 26 adds the job ledger (4,481 bytes) beside the call's kind 29
+    // frame, beyond the 100 bytes left.
+
     wait(
         &mut writer
             .try_submit(Command::SetQuota {
@@ -2464,4 +2517,178 @@ fn j2t_02_real_writer_holds_kind_26_at_the_quota_while_27_and_28_commit() {
     close(&mut writer);
     let durable = journal_replay(&scratch);
     assert_eq!(durable.unsettled_jobs()[0].job, j2_job(2));
+}
+
+// ---------------------------------------------------------- J4 kind 30
+// tool-job-controller.md, J4T-02 (integration): kind 30 and the wall times
+// through the real writer on real files.
+
+fn j4_person(job: Id, action: RetentionAction, note: &str) -> Record {
+    Record::JobRetention(Box::new(JobRetention {
+        job,
+        action,
+        author: RetentionAuthor::Person {
+            request: random_id(),
+        },
+        time: 1_760_000_000_010,
+        note: note.into(),
+    }))
+}
+/// J4T-02 (integration): the real writer appends person pins, notes and a
+/// delete and a model note that cites its `job note` call, then reopens;
+/// the writer refuses a record that changes nothing (`Invalid`) and the
+/// 17th note or 65th record of a job (`Limit`), writing nothing; the wall
+/// times and the frame sizes are the designed ones.
+#[test]
+fn j4t_02_real_writer_appends_kind_30_enforces_bounds_and_reopens() {
+    use RetentionAction::*;
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let (project, configuration_digest) = j1_initialize(&scratch, &mut writer);
+    let state = j1_admit_and_start(&mut writer, project, configuration_digest);
+    let mut revision = state.revision;
+    drop(state);
+    let job = j2_job(1);
+    let longest = "n".repeat(MAX_JOB_NOTE);
+    for record in [
+        Record::ToolCall(Box::new(j1_call(1, ToolDecision::Run))),
+        Record::JobIntent(j2_intent(1)),
+        j2_handle(1),
+        j4_person(job, Pin, ""),
+        j4_person(job, Note, &longest),
+        Record::ToolCall(Box::new(j4_note_call(2, job, "rerun after the fix"))),
+        Record::JobRetention(Box::new(JobRetention {
+            job,
+            action: Note,
+            author: RetentionAuthor::Model {
+                operation: [35; 16],
+                generation: 1,
+                ordinal: 2,
+            },
+            time: 1_760_000_000_011,
+            note: String::new(),
+        })),
+        Record::JobResult(Box::new(j3_result(2, job, JobResultBody::None))),
+    ] {
+        submit(&mut writer, &mut revision, record).unwrap();
+    }
+    // Changes nothing: a second pin, a delete before kind 28.
+    let before = segment_bytes(&scratch);
+    for record in [j4_person(job, Pin, ""), j4_person(job, Delete, "")] {
+        assert!(matches!(
+            submit(&mut writer, &mut revision, record),
+            Err(Error::Invalid)
+        ));
+    }
+    assert_eq!(segment_bytes(&scratch), before);
+    // 16 notes per job, person and model together: 2 so far.
+    for n in 0..14 {
+        submit(
+            &mut writer,
+            &mut revision,
+            j4_person(job, Note, &format!("note {n}")),
+        )
+        .unwrap();
+    }
+    let before = segment_bytes(&scratch);
+    assert!(matches!(
+        submit(&mut writer, &mut revision, j4_person(job, Note, "one more")),
+        Err(Error::Limit)
+    ));
+    assert_eq!(segment_bytes(&scratch), before);
+    // 64 records per job: 17 so far; pins and unpins fill the rest.
+    for n in 0..47 {
+        let action = if n % 2 == 0 { Unpin } else { Pin };
+        submit(&mut writer, &mut revision, j4_person(job, action, "")).unwrap();
+    }
+    assert!(matches!(
+        submit(&mut writer, &mut revision, j4_person(job, Pin, "")),
+        Err(Error::Limit)
+    ));
+    assert_eq!(
+        wait(&mut writer.try_submit(Command::JobFacts { job }).unwrap())
+            .unwrap()
+            .job_records
+            .unwrap()
+            .listing
+            .retention,
+        JobRetentionSummary {
+            pinned: false,
+            deleted: false,
+            notes: 16,
+            records: 64,
+        }
+    );
+    // Delete after kind 28 still fits nothing more for this job; another
+    // job's kind 30 is unaffected.
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::JobSettled(Box::new(j2_settled(1))),
+    )
+    .unwrap();
+    assert!(matches!(
+        submit(&mut writer, &mut revision, j4_person(job, Delete, "")),
+        Err(Error::Limit)
+    ));
+    close(&mut writer);
+    // Reopen: the replay rebuilds the same retention state and the model
+    // note's call is resolved by its kind 29.
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    wait(&mut writer.try_submit(Command::Open).unwrap()).unwrap();
+    let facts = wait(&mut writer.try_submit(Command::JobFacts { job }).unwrap())
+        .unwrap()
+        .job_records
+        .unwrap();
+    assert_eq!(facts.retention.len(), 64);
+    assert_eq!(facts.retention[0].1.action, Pin);
+    assert_eq!(facts.retention[1].1.note, longest);
+    assert!(matches!(
+        facts.retention[2].1.author,
+        RetentionAuthor::Model { ordinal: 2, .. }
+    ));
+    // The model note's text comes from its cited kind 14 (J34-S2), and the
+    // listing carries the stored command's excerpt.
+    assert_eq!(
+        facts.model_notes,
+        vec![(facts.retention[2].0, "rerun after the fix".to_string())]
+    );
+    assert_eq!(facts.listing.excerpt, "printf %s \"$ASURA_SECRET_1\"");
+    assert_eq!(facts.listing.intent.time, 1_760_000_000_000);
+    assert_eq!(
+        facts.listing.settled.as_deref().map(|s| s.settled_time),
+        Some(1_760_000_000_002)
+    );
+    // Frame sizes: the longest person note and the model note.
+    assert_eq!(
+        facts.retention[1].0.length as usize,
+        FRAME + MAX_JOB_RETENTION_PAYLOAD
+    );
+    assert_eq!(facts.retention[1].0.length, 2_278);
+    assert_eq!(
+        facts.retention[2].0.length as usize,
+        FRAME + MODEL_NOTE_PAYLOAD
+    );
+    assert_eq!(facts.retention[2].0.length, 242);
+    let reopened = wait(&mut writer.try_submit(Command::Open).unwrap())
+        .unwrap()
+        .replay
+        .unwrap();
+    let note_call = &reopened.operations[&[35; 16]].tools[1];
+    assert_eq!(note_call.note.map(|(j, _)| j), Some(job));
+    assert!(!note_call.unresolved());
+    drop(reopened);
+    close(&mut writer);
+}
+/// J4T-02 (ledger sizes, J4-E1): with the wall times, the kind 28 frame is
+/// 4,278 bytes and the ledger 4,481 bytes per unsettled job; kind 29 is
+/// 528 bytes at most and a model note 242.
+#[test]
+fn j4t_02_ledger_and_frame_constants() {
+    assert_eq!(JOB_SETTLED_CAPACITY, 4_278);
+    assert_eq!(JOB_SETTLED_CAPACITY + JOB_CANCEL_CAPACITY, 4_481);
+    assert_eq!(JOB_RESULT_CAPACITY, 528);
+    assert_eq!(MODEL_NOTE_CAPACITY, 242);
+    assert_eq!(FRAME + MAX_JOB_RETENTION_PAYLOAD, 2_278);
 }

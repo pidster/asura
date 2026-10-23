@@ -1049,6 +1049,7 @@ stateDiagram-v2
     NotStarted --> Warming: Owner spawns asura-secret-rules at start
     NotStarted --> NotStarted: Spawn fails, log secret_rules_warm_unavailable
     NotStarted --> Warming: A turn start or person note needs the set, spawn retried
+    Warming --> NotStarted: Thread ends without a result (compile panic), log secret_rules_warm_failed
     NotStarted --> Ready: A worker thread compiled the set first
     Warming --> Ready: Compile and self-check pass, thread wakes the reactor
     Warming --> Failed: Self-check fails, thread wakes the reactor
@@ -1057,6 +1058,10 @@ stateDiagram-v2
     note right of Warming
         Reactor users wait: turn starts and person notes.
         They end on Ready, Failed, cancel, detach or shutdown.
+    end note
+    note left of NotStarted
+        A need respawns when no thread runs: none was spawned,
+        or the last one has finished without a result.
     end note
     note right of Failed
         Fail closed: no tool text kept, starts refused,
@@ -1098,6 +1103,7 @@ mechanism for each case:
 | --- | --- |
 | Rule set fails its startup self-check | The service runs, but refuses every job start and command with `secret_detection_unavailable`. A unit test compiles every rule, so this is a build defect. |
 | Rule set not yet compiled when the reactor needs it | The turn start or person note waits for the warm wake; nothing compiles on the reactor ([rule set readiness](#rule-set-readiness)) |
+| Warm thread ends without a result (a compile panic) | Log `secret_rules_warm_failed`; the owner joins the finished thread and the next need spawns again; a running thread is never doubled |
 | Warm thread cannot be spawned | Log `secret_rules_warm_unavailable`; the next turn start or person note tries the spawn again; waiting users end on readiness, cancel, detach or shutdown |
 | Unfinished line passes 64 KiB | Prefix to the last delimiter released; rest of the line withheld, `line_over_limit` |
 | Private-key block passes 64 KiB | Withheld from BEGIN to END or the first non-body line, `key_block_over_limit` |
