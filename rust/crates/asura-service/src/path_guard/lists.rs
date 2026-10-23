@@ -194,9 +194,9 @@ pub(crate) fn enters(list: List, path: &[&str]) -> bool {
             let test = path
                 .iter()
                 .enumerate()
-                .filter(|(depth, d)| *depth <= BUILD_DEPTH && TEST_DIRECTORIES.contains(d))
-                .map(|(depth, _)| depth)
-                .last();
+                .rev()
+                .find(|(depth, d)| *depth <= BUILD_DEPTH && TEST_DIRECTORIES.contains(d))
+                .map(|(depth, _)| depth);
             match test {
                 // Files below the test directory up to 4 levels.
                 Some(depth) => index - depth < BUILD_DEPTH,
