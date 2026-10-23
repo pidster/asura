@@ -1594,9 +1594,10 @@ fn notice_jobs(notice: &JobNotice) -> Vec<(Id, u32)> {
             let JobOrigin::Model { ordinal, .. } = s.listing.intent.origin else {
                 panic!("model origin")
             };
-            assert_eq!(s.command.ordinal, ordinal);
+            let call = s.command.model().expect("model command");
+            assert_eq!(call.ordinal, ordinal);
             assert!(s.listing.settled.is_some());
-            (s.listing.job, s.command.ordinal)
+            (s.listing.job, call.ordinal)
         })
         .collect()
 }

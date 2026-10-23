@@ -4026,7 +4026,10 @@ fn j4t_03_listing_entries_and_reads_over_live_state_and_delta() {
     assert!(jobs(JobScope::Project(id(99)), None, 9, &mut index).is_empty());
     // `JobFacts`: the kind 14 and the kind 30 records in order.
     let records = state.job_records(job(1), &mut index).unwrap().unwrap();
-    assert_eq!(records.command.tool_operation, Some(ToolOperation::ExecCmd));
+    assert_eq!(
+        records.command.model().and_then(|c| c.tool_operation),
+        Some(ToolOperation::ExecCmd)
+    );
     assert_eq!(
         records
             .retention

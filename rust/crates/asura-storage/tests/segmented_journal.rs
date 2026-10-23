@@ -1914,7 +1914,10 @@ fn j4t_03_twenty_jobs_over_three_rolls_listed_by_scope_and_page() {
             .job_records
             .unwrap();
         assert_eq!(facts.listing.job, x_jobs[0]);
-        assert_eq!(facts.command.tool_operation, Some(ToolOperation::ExecCmd));
+        assert_eq!(
+            facts.command.model().and_then(|c| c.tool_operation),
+            Some(ToolOperation::ExecCmd)
+        );
         assert_eq!(
             facts
                 .retention

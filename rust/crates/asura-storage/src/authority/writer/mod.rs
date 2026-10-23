@@ -145,8 +145,8 @@ pub enum Command {
         before: Option<u64>,
         limit: usize,
     },
-    /// One job's records, its kind 14, its kind 30 records and its model
-    /// note texts (J4).
+    /// One job's records, its kind 14 or kind 31, its kind 30 records and
+    /// its model note texts (J4).
     JobFacts {
         job: Id,
     },
@@ -261,7 +261,7 @@ pub struct PayloadFact {
     pub payload: Id,
     /// The job ID.
     pub call: Id,
-    /// The model origin's operation.
+    /// The model origin's operation, or the person origin's input.
     pub operation: Id,
     pub payloads: [Id; 2],
     /// The kind 26 sequence.
@@ -356,8 +356,12 @@ pub struct HistoryEntry {
 }
 #[derive(Debug)]
 pub struct InputView {
-    /// The durable kind 18 record; the prompt is a bounded excerpt unless full.
+    /// The durable kind 18 record; the prompt is a bounded excerpt unless
+    /// full. For a person command, the lane fields of its kind 31 with an
+    /// empty prompt and a zero dispatch request.
     pub input: InputQueued,
+    /// The kind 31 of a person command (`kind` is `Person`).
+    pub person: Option<Box<PersonCommandQueued>>,
     /// Queue, or Steer after a durable promotion.
     pub kind: InputKind,
     /// The promotion target; present only for Steer.

@@ -123,7 +123,9 @@ fn settlement(n: u64, sequence: u64, arguments: &str) -> NoticeSettlement {
             excerpt: String::new(),
             retention: Default::default(),
         },
-        command: Box::new(call(n, arguments)),
+        command: asura_storage::authority::conversation::JobCommand::Model(Box::new(call(
+            n, arguments,
+        ))),
     }
 }
 fn inputs(settlements: Vec<NoticeSettlement>, live: u32) -> JobNotice {
@@ -271,7 +273,12 @@ fn j5t_09_each_notice_error_from_crafted_inputs() {
     // Command: over 8,192 stored bytes, and a source with no command.
     let long = settlement(1, 20, &arguments(&"x".repeat(8193), None));
     let mut no_command = fine();
-    no_command.command.tool_operation = Some(ToolOperation::JobList);
+    let asura_storage::authority::conversation::JobCommand::Model(no_call) =
+        &mut no_command.command
+    else {
+        unreachable!("model command")
+    };
+    no_call.tool_operation = Some(ToolOperation::JobList);
     for case in [long, no_command] {
         assert_eq!(
             build(CONVERSATION, &inputs(vec![case], 0)).err(),

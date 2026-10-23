@@ -221,6 +221,17 @@ pub fn request_digest(request: Request<'_>) -> Result<Hash> {
             w.bytes(&operation);
             w.u64(generation);
         }
+        Request::QueuePersonCommand(p) => {
+            // Kind 31: the kind number as one byte, then fields 4 to 12 in
+            // their field encoding (person-command-mode.md, kind 31). A new
+            // conversation is the zero ID: the client names none.
+            valid_person_request(&p)?;
+            w.byte(31);
+            w.bytes(&p.project);
+            w.bytes(&p.conversation.unwrap_or([0; 16]));
+            w.u64(p.expected_generation);
+            person_request_fields(&mut w, &p);
+        }
     }
     Ok(Sha256::digest(w.0).into())
 }
@@ -917,6 +928,8 @@ fn valid_capture(c: &CaptureFacts<'_>) -> bool {
                 && digests
                 && streams.iter().all(|s| s.eof && s.discarded_bytes == 0)
         }
+        // Reason 7 (P2) also needs an exit and a reason; replay checks the
+        // profile `person-outside-1` (PR3).
         CaptureState::Incomplete => {
             !matches!(
                 c.reason,
@@ -952,6 +965,225 @@ fn valid_exit(kind: u8, value: u32) -> bool {
         2 => (1..=127).contains(&value),
         _ => false,
     }
+}
+
+// ----- P2 kind 31: PersonCommandQueued. -----
+
+/// The working directory contract of the exec_cmd `cwd` argument (PCR9):
+/// 1 to 1,024 bytes, relative, no NUL and no `..` component.
+fn valid_person_cwd(cwd: &str) -> bool {
+    (1..=MAX_PERSON_CWD).contains(&cwd.len())
+        && !cwd.starts_with('/')
+        && !cwd.contains('\0')
+        && cwd.split('/').all(|c| c != "..")
+}
+/// The sanitized PATH: 1 to 4,096 bytes, at most 64 entries, no NUL, no
+/// empty or relative entry.
+fn valid_search_path(path: &str) -> bool {
+    (1..=MAX_SEARCH_PATH).contains(&path.len())
+        && !path.contains('\0')
+        && path.split(':').count() <= MAX_SEARCH_PATH_ENTRIES
+        && path.split(':').all(|entry| entry.starts_with('/'))
+}
+/// Kind 31 fields 4 to 12 that the request alone determines: the queue
+/// flags against the conversation, the command, display text, cwd, search
+/// path and client environment bounds. The display text and command form
+/// are checked with fields 14 to 22 in [`PersonCommandQueued::validate`].
+fn valid_person_request(p: &PersonCommandRequest<'_>) -> Result<()> {
+    let conversation = if p.new_conversation {
+        p.conversation.is_none() && p.expected_generation == 0
+    } else {
+        p.conversation.is_some_and(|c| c != [0; 16])
+    };
+    let command = (1..=MAX_PERSON_COMMAND).contains(&p.command.len()) && !p.command.contains('\0');
+    let launch = if p.outside_sandbox {
+        // `!!`: the launch environment waits in the secret store item.
+        p.search_path.is_empty() && p.environment.is_empty()
+    } else {
+        valid_search_path(p.search_path)
+            && p.environment.len() <= ClientVariable::ALL.len()
+            && p.environment.windows(2).all(|pair| pair[0].0 < pair[1].0)
+            && p.environment
+                .iter()
+                .all(|(name, value)| name.valid_value(value))
+    };
+    require(
+        p.project != [0; 16]
+            && conversation
+            && command
+            && p.display_command.len() <= MAX_PERSON_COMMAND
+            && valid_person_cwd(p.cwd)
+            && launch,
+    )
+}
+/// Kind 31 fields 7 to 12 in their field encoding, shared by the record
+/// and the request digest.
+fn person_request_fields(w: &mut Writer, p: &PersonCommandRequest<'_>) {
+    w.byte(u8::from(p.new_conversation) | (u8::from(p.outside_sandbox) << 1));
+    for text in [p.command, p.display_command, p.cwd, p.search_path] {
+        w.u32(text.len() as u32);
+        w.bytes(text.as_bytes());
+    }
+    w.byte(p.environment.len() as u8);
+    for (name, value) in p.environment {
+        w.byte(*name as u8);
+        w.byte(value.len() as u8);
+        w.bytes(value.as_bytes());
+    }
+}
+impl PersonCommandQueued {
+    /// Every kind 31 field rule that the record alone determines, including
+    /// the request digest and the placeholder counts of fields 14 to 16 (as
+    /// kind 14, TCR-D4). Replay adds PR1: the kind 18 rules for request,
+    /// input, conversation, generation and order revision.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let request = self.request();
+        valid_person_request(&request)?;
+        let numbers = if self.whole_command {
+            MAX_TOOL_NUMBERS
+        } else {
+            MAX_PERSON_REWRITE_NUMBERS
+        };
+        let form = if self.whole_command {
+            self.command == WHOLE_COMMAND
+                && !self.display_command.is_empty()
+                && self.fallback.is_some_and(|r| {
+                    !r.code.kept()
+                        && r.code != RefusalCode::DetectionUnavailable
+                        && r.word.is_none_or(|w| (1..=MAX_REFUSAL_WORD).contains(&w))
+                })
+        } else {
+            self.display_command.is_empty() && !self.command_cut && self.fallback.is_none()
+        };
+        let tokens = asura_platform::secrets::placeholder_tokens(self.command_text());
+        let placeholders = !tokens.malformed
+            && tokens.max as usize == self.number_kinds.len()
+            && tokens.distinct.len() == self.number_kinds.len()
+            && tokens.zero == self.unnumbered;
+        require(
+            self.request != [0; 16]
+                && self.input != [0; 16]
+                && self.input != self.request
+                && self.digest == request_digest(Request::QueuePersonCommand(request))?
+                && self.number_kinds.len() <= numbers
+                && form
+                && placeholders
+                && self.rule_set_revision != 0
+                && self.rule_set_digest != [0; 32],
+        )
+    }
+}
+fn write_person_command(w: &mut Writer, p: &PersonCommandQueued) -> Result<()> {
+    if p.command.len() > MAX_PERSON_COMMAND || p.display_command.len() > MAX_PERSON_COMMAND {
+        return Err(ReplayError::Limit);
+    }
+    p.validate()?;
+    person_command_fields(w, p);
+    Ok(())
+}
+/// Kind 31 field order. Callers validate first; tests use it to build
+/// invalid bytes.
+fn person_command_fields(w: &mut Writer, p: &PersonCommandQueued) {
+    w.bytes(&p.request);
+    w.bytes(&p.digest);
+    w.bytes(&p.input);
+    w.bytes(&p.project);
+    w.bytes(&p.conversation);
+    w.u64(p.expected_generation);
+    person_request_fields(w, &p.request());
+    w.u64(p.order_revision);
+    w.u16(p.number_kinds.len() as u16);
+    for kind in &p.number_kinds {
+        w.byte(kind_code(*kind));
+    }
+    w.u32(p.unnumbered);
+    w.byte(u8::from(p.command_cut) | (u8::from(p.whole_command) << 1));
+    w.u32(p.rule_set_revision);
+    w.bytes(&p.rule_set_digest);
+    w.byte(p.fallback.map_or(0, |r| refusal_code(r.code)));
+    w.byte(p.fallback.and_then(|r| r.kind).map_or(0, kind_code));
+    w.u16(p.fallback.and_then(|r| r.word).unwrap_or(0));
+}
+fn read_person_command(r: &mut Reader<'_>) -> Result<PersonCommandQueued> {
+    let request = r.array()?;
+    let digest = r.array()?;
+    let input = r.array()?;
+    let project = r.array()?;
+    let conversation = r.array()?;
+    let expected_generation = r.u64()?;
+    let flags = r.byte()?;
+    require(flags & !0b11 == 0)?;
+    let command = r.bounded_string(MAX_PERSON_COMMAND)?;
+    let display_command = r.bounded_string(MAX_PERSON_COMMAND)?;
+    let cwd = r.bounded_string(MAX_PERSON_CWD)?;
+    let search_path = r.bounded_string(MAX_SEARCH_PATH)?;
+    let count = usize::from(r.byte()?);
+    require(count <= ClientVariable::ALL.len())?;
+    let mut environment = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = ClientVariable::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
+        let len = usize::from(r.byte()?);
+        let value = std::str::from_utf8(r.take(len)?)
+            .map_err(|_| ReplayError::Corrupt)?
+            .to_owned();
+        environment.push((name, value));
+    }
+    let order_revision = r.u64()?;
+    let count = r.u16()? as usize;
+    require(count <= MAX_TOOL_NUMBERS)?;
+    let mut number_kinds = Vec::with_capacity(count);
+    for _ in 0..count {
+        number_kinds.push(kind_from(r.byte()?)?);
+    }
+    let unnumbered = r.u32()?;
+    let command_flags = r.byte()?;
+    require(command_flags & !0b11 == 0)?;
+    let rule_set_revision = r.u32()?;
+    let rule_set_digest = r.array()?;
+    let code = r.byte()?;
+    let kind = match r.byte()? {
+        0 => None,
+        code => Some(kind_from(code)?),
+    };
+    let word = match r.u16()? {
+        0 => None,
+        word => Some(word),
+    };
+    let fallback = if code == 0 {
+        require(kind.is_none() && word.is_none())?;
+        None
+    } else {
+        Some(ExecCmdRefusal {
+            code: refusal_from(code)?,
+            kind,
+            word,
+        })
+    };
+    let value = PersonCommandQueued {
+        request,
+        digest,
+        input,
+        project,
+        conversation,
+        expected_generation,
+        new_conversation: flags & 1 != 0,
+        outside_sandbox: flags & 2 != 0,
+        command,
+        display_command,
+        cwd,
+        search_path,
+        environment,
+        order_revision,
+        number_kinds,
+        unnumbered,
+        command_cut: command_flags & 1 != 0,
+        whole_command: command_flags & 2 != 0,
+        rule_set_revision,
+        rule_set_digest,
+        fallback,
+    };
+    value.validate()?;
+    Ok(value)
 }
 
 // ----- J2 kinds 26, 27 and 28. -----
@@ -1041,13 +1273,21 @@ impl JobSettled {
             }),
             _ => false,
         };
+        // Capture reason 7 `closed_after_cancel` (P2): a cancel closed the
+        // read ends after a `!!` shell exited, so the job exited or was
+        // signalled after a trigger, with capture `incomplete`.
+        let closed = self.capture_reason != CaptureReason::ClosedAfterCancel
+            || (matches!(self.outcome, O::Exited | O::Signalled)
+                && self.reason != JobReason::None
+                && self.capture_state == JobCaptureState::Incomplete);
         require(
             self.job != [0; 16]
                 && self.reason.allows(self.outcome)
                 && exit
                 && cleanup
                 && lines
-                && capture,
+                && capture
+                && closed,
         )
     }
 }
@@ -1218,6 +1458,7 @@ fn capture_reason_from(code: u8) -> Result<CaptureReason> {
         4 => CaptureReason::DetectorFault,
         5 => CaptureReason::DiscardedAfterCancel,
         6 => CaptureReason::SettlementUnconfirmed,
+        7 => CaptureReason::ClosedAfterCancel,
         _ => return Err(ReplayError::Corrupt),
     })
 }
@@ -1717,6 +1958,7 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.string(&p.text, MAX_TEXT)?;
         }
 
+        Record::PersonCommandQueued(p) => write_person_command(&mut w, p)?,
         Record::JobIntent(p) => {
             p.validate()?;
             job_intent_fields(&mut w, p);
@@ -2023,6 +2265,10 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
         30 => {
             require(payload.len() <= MAX_JOB_RETENTION_PAYLOAD)?;
             Record::JobRetention(Box::new(read_job_retention(&mut r)?))
+        }
+        31 => {
+            require(payload.len() <= MAX_PERSON_COMMAND_PAYLOAD)?;
+            Record::PersonCommandQueued(Box::new(read_person_command(&mut r)?))
         }
 
         _ => return Err(ReplayError::UnsupportedFormat),
@@ -5471,5 +5717,725 @@ mod tests {
             s.apply(if s.pinned { Unpin } else { Pin });
         }
         assert!(!s.has_room(Pin) && !s.has_room(Delete));
+    }
+
+    // PC-U20 and PC-U42 (unit): kind 31 PersonCommandQueued
+    // (person-command-mode.md, kind 31) and capture reason 7.
+    const RULES: Hash = [21; 32];
+    fn locale(n: usize) -> String {
+        "a".repeat(n)
+    }
+    /// Recomputes the request digest of a record whose request fields are
+    /// valid.
+    fn sealed(mut p: PersonCommandQueued) -> PersonCommandQueued {
+        p.digest = request_digest(Request::QueuePersonCommand(p.request())).unwrap();
+        p
+    }
+    /// A minimal `!` command in an existing conversation.
+    fn pc31() -> PersonCommandQueued {
+        sealed(PersonCommandQueued {
+            request: [1; 16],
+            digest: [0; 32],
+            input: [2; 16],
+            project: [3; 16],
+            conversation: [4; 16],
+            expected_generation: 2,
+            new_conversation: false,
+            outside_sandbox: false,
+            command: "make test".into(),
+            display_command: String::new(),
+            cwd: ".".into(),
+            search_path: "/usr/bin:/bin".into(),
+            environment: vec![(ClientVariable::Lang, "en_GB.UTF-8".into())],
+            order_revision: 7,
+            number_kinds: vec![],
+            unnumbered: 0,
+            command_cut: false,
+            whole_command: false,
+            rule_set_revision: 1,
+            rule_set_digest: RULES,
+            fallback: None,
+        })
+    }
+    /// A `!!` command in a new conversation: no PATH, no client variables.
+    fn outside31() -> PersonCommandQueued {
+        sealed(PersonCommandQueued {
+            conversation: [5; 16],
+            expected_generation: 0,
+            new_conversation: true,
+            outside_sandbox: true,
+            search_path: String::new(),
+            environment: vec![],
+            ..pc31()
+        })
+    }
+    /// A whole-command `!` input with `n` numbered placeholders in its
+    /// display text.
+    fn whole31(display: String, numbers: usize) -> PersonCommandQueued {
+        sealed(PersonCommandQueued {
+            command: WHOLE_COMMAND.into(),
+            display_command: display,
+            number_kinds: vec![SecretKind::GithubToken; numbers],
+            whole_command: true,
+            fallback: Some(ExecCmdRefusal {
+                code: RefusalCode::SecretInHeredoc,
+                kind: Some(SecretKind::WifiPassword),
+                word: Some(MAX_REFUSAL_WORD),
+            }),
+            ..pc31()
+        })
+    }
+    fn placeholders(n: usize) -> String {
+        (1..=n).map(|i| format!("$ASURA_SECRET_{i} ")).collect()
+    }
+    fn raw31(p: &PersonCommandQueued) -> Vec<u8> {
+        let mut w = Writer(Vec::new());
+        person_command_fields(&mut w, p);
+        w.0
+    }
+    fn round31(p: PersonCommandQueued) -> Vec<u8> {
+        let record = Record::PersonCommandQueued(Box::new(p));
+        let bytes = payload(&record).unwrap();
+        assert_eq!(
+            bytes,
+            raw31(match &record {
+                Record::PersonCommandQueued(p) => p,
+                _ => unreachable!(),
+            })
+        );
+        assert_eq!(decode_record(31, &bytes).unwrap(), record);
+        bytes
+    }
+    fn invalid31(p: PersonCommandQueued) {
+        let raw = raw31(&p);
+        let record = Record::PersonCommandQueued(Box::new(p));
+        assert_eq!(payload(&record), Err(ReplayError::Corrupt), "{record:?}");
+        assert_eq!(
+            decode_record(31, &raw),
+            Err(ReplayError::Corrupt),
+            "{record:?}"
+        );
+    }
+    /// Offset of field 7 (queue flags) and of field 8 in a kind 31 payload.
+    const FLAGS31: usize = 16 + 32 + 16 + 16 + 16 + 8;
+    #[test]
+    fn pc_u20_kind_31_round_trips_every_field_bound() {
+        assert_eq!(Record::PersonCommandQueued(Box::new(pc31())).kind(), 31);
+        round31(pc31());
+        round31(outside31());
+        // Every `!` bound at once: an 8,192-byte rewrite with 16 numbers and
+        // one unnumbered placeholder, a 1,024-byte cwd, a 4,096-byte PATH of
+        // 64 entries, all nine client variables at their maximum.
+        let mut command = placeholders(16) + "$ASURA_SECRET_0 ";
+        command.push_str(&"x".repeat(MAX_PERSON_COMMAND - command.len()));
+        let mut search_path = (0..63).map(|_| "/b").collect::<Vec<_>>().join(":");
+        search_path.push_str(":/");
+        search_path.push_str(&"p".repeat(MAX_SEARCH_PATH - search_path.len()));
+        assert_eq!(search_path.split(':').count(), MAX_SEARCH_PATH_ENTRIES);
+        let mut environment: Vec<_> = ClientVariable::ALL[..8]
+            .iter()
+            .map(|v| (*v, locale(MAX_LOCALE_VALUE)))
+            .collect();
+        environment.push((
+            ClientVariable::SshAuthSock,
+            format!("/{}", "s".repeat(MAX_AGENT_SOCKET - 1)),
+        ));
+        let full = sealed(PersonCommandQueued {
+            command,
+            cwd: "d".repeat(MAX_PERSON_CWD),
+            search_path,
+            environment,
+            number_kinds: (1..=16).map(|code| kind_from(code * 2).unwrap()).collect(),
+            unnumbered: 1,
+            expected_generation: u64::MAX,
+            order_revision: u64::MAX,
+            rule_set_revision: u32::MAX,
+            ..pc31()
+        });
+        let bytes = round31(full);
+        let rewrite_max =
+            105 + 4 + 8192 + 4 + 1028 + 4100 + 634 + 8 + (2 + 16 + 4 + 1 + 4 + 32 + 4);
+        assert_eq!(bytes.len(), rewrite_max);
+        // The whole-command bounds: 8,192 bytes of display text cut at the
+        // limit, 256 numbers, the last secret kind and word 4,096.
+        let mut display = placeholders(256);
+        display.push_str(&"y".repeat(MAX_PERSON_COMMAND - display.len()));
+        let whole = PersonCommandQueued {
+            command_cut: true,
+            number_kinds: vec![SecretKind::WifiPassword; 256],
+            ..whole31(display, 256)
+        };
+        let bytes = round31(sealed(whole));
+        // IDs to flags, field 8, field 9, cwd `.`, the PATH, `LANG`, the
+        // order revision and fields 14 to 22.
+        let whole_max = 105
+            + (4 + WHOLE_COMMAND.len())
+            + (4 + 8192)
+            + (4 + 1)
+            + (4 + 13)
+            + (1 + 2 + 11)
+            + 8
+            + (2 + 256 + 4 + 1 + 4 + 32 + 4);
+        assert_eq!(bytes.len(), whole_max);
+        // Optional fallback fields and the other flag combinations.
+        round31(sealed(PersonCommandQueued {
+            fallback: Some(ExecCmdRefusal {
+                code: RefusalCode::RewrittenCommandTooLong,
+                kind: None,
+                word: None,
+            }),
+            ..whole31("show $ASURA_SECRET_1".into(), 1)
+        }));
+        round31(sealed(PersonCommandQueued {
+            outside_sandbox: true,
+            search_path: String::new(),
+            environment: vec![],
+            ..whole31("eval $ASURA_SECRET_1".into(), 1)
+        }));
+        round31(sealed(PersonCommandQueued {
+            new_conversation: true,
+            expected_generation: 0,
+            ..pc31()
+        }));
+        round31(sealed(PersonCommandQueued {
+            cwd: "a/b/c".into(),
+            environment: vec![],
+            search_path: "/".into(),
+            ..pc31()
+        }));
+        // The decode bound: both texts full is not a valid record, but the
+        // layout sums to the 22,570-byte payload and a 22,754-byte frame.
+        let mut both = whole31("z".repeat(MAX_PERSON_COMMAND), 0);
+        both.command = "c".repeat(MAX_PERSON_COMMAND);
+        both.cwd = "d".repeat(MAX_PERSON_CWD);
+        both.search_path = "/".repeat(MAX_SEARCH_PATH);
+        both.environment = ClientVariable::ALL
+            .iter()
+            .map(|v| {
+                (
+                    *v,
+                    if *v == ClientVariable::SshAuthSock {
+                        "/".repeat(MAX_AGENT_SOCKET)
+                    } else {
+                        locale(MAX_LOCALE_VALUE)
+                    },
+                )
+            })
+            .collect();
+        both.number_kinds = vec![SecretKind::Jwt; 256];
+        let raw = raw31(&both);
+        assert_eq!(raw.len(), MAX_PERSON_COMMAND_PAYLOAD);
+        assert_eq!(HEADER + TRAILER + MAX_PERSON_COMMAND_PAYLOAD, 22_754);
+        assert!(HEADER + TRAILER + MAX_PERSON_COMMAND_PAYLOAD <= MAX_FRAME);
+        assert_eq!(decode_record(31, &raw), Err(ReplayError::Corrupt));
+        let mut over = raw;
+        over.push(0);
+        assert_eq!(decode_record(31, &over), Err(ReplayError::Corrupt));
+        // PC-U42: a `!!` record holds the outside flag and no environment:
+        // an empty PATH and a zero variable count follow the cwd.
+        let p = outside31();
+        let bytes = round31(p.clone());
+        assert_eq!(bytes[FLAGS31], 0b11);
+        let path_at = FLAGS31 + 1 + 4 + p.command.len() + 4 + 4 + p.cwd.len();
+        assert_eq!(&bytes[path_at..path_at + 5], &[0, 0, 0, 0, 0]);
+        assert_eq!(raw31(&pc31())[FLAGS31], 0);
+        assert!(p.has_secret_item() && !pc31().has_secret_item());
+        assert!(whole31("a".into(), 0).has_secret_item());
+    }
+    /// PC-U20: the request digest covers kind 31 fields 4 to 12 in field
+    /// order, with the kind as one byte and the zero ID for a new
+    /// conversation; fields 13 to 22 are outside it.
+    #[test]
+    fn pc_u20_kind_31_request_digest_order() {
+        let p = pc31();
+        let mut hash = Sha256::new();
+        hash.update([31]);
+        hash.update(p.project);
+        hash.update(p.conversation);
+        hash.update(p.expected_generation.to_be_bytes());
+        hash.update([0]);
+        for text in ["make test", "", ".", "/usr/bin:/bin"] {
+            hash.update((text.len() as u32).to_be_bytes());
+            hash.update(text.as_bytes());
+        }
+        hash.update([1, 1, 11]);
+        hash.update(b"en_GB.UTF-8");
+        let expected: Hash = hash.finalize().into();
+        assert_eq!(p.digest, expected);
+        let outside = outside31();
+        let mut hash = Sha256::new();
+        hash.update([31]);
+        hash.update(outside.project);
+        hash.update([0; 16]);
+        hash.update(0u64.to_be_bytes());
+        hash.update([0b11]);
+        for text in ["make test", "", ".", ""] {
+            hash.update((text.len() as u32).to_be_bytes());
+            hash.update(text.as_bytes());
+        }
+        hash.update([0]);
+        let expected: Hash = hash.finalize().into();
+        assert_eq!(outside.digest, expected);
+        // Each covered field changes it; the order revision and secret
+        // facts do not.
+        let base = request_digest(Request::QueuePersonCommand(p.request())).unwrap();
+        let changed = [
+            PersonCommandQueued {
+                project: [9; 16],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                conversation: [9; 16],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                expected_generation: 3,
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                command: "make tests".into(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                cwd: "src".into(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                search_path: "/bin".into(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: vec![],
+                ..p.clone()
+            },
+        ];
+        for other in changed {
+            assert_ne!(
+                request_digest(Request::QueuePersonCommand(other.request())).unwrap(),
+                base
+            );
+        }
+        let same = PersonCommandQueued {
+            order_revision: 99,
+            rule_set_revision: 2,
+            ..p.clone()
+        };
+        assert_eq!(
+            request_digest(Request::QueuePersonCommand(same.request())).unwrap(),
+            base
+        );
+        // The person job of an input: the one job identity with origin 2.
+        assert_eq!(job_id(&JobOrigin::Person { input: p.input }), {
+            let mut hash = Sha256::new();
+            hash.update(b"asura.job\0");
+            hash.update([2]);
+            hash.update(p.input);
+            derived_id(hash)
+        });
+    }
+    #[test]
+    fn pc_u20_kind_31_rejects_each_invalid_field() {
+        let p = pc31();
+        let socket = |value: &str| vec![(ClientVariable::SshAuthSock, value.to_owned())];
+        // Fields 1 to 3 and the digest.
+        for bad in [
+            PersonCommandQueued {
+                request: [0; 16],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                input: [0; 16],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                input: p.request,
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                digest: [0; 32],
+                ..p.clone()
+            },
+            // A stale digest: field 4 changed after sealing.
+            PersonCommandQueued {
+                expected_generation: 1,
+                ..p.clone()
+            },
+        ] {
+            invalid31(bad);
+        }
+        // Request fields: each fails before the digest.
+        let request_cases = [
+            PersonCommandQueued {
+                project: [0; 16],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                conversation: [0; 16],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                new_conversation: true,
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                command: String::new(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                command: "a\0b".into(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                cwd: String::new(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                cwd: "/abs".into(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                cwd: "a/../b".into(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                cwd: "..".into(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                cwd: "a\0".into(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                cwd: "d".repeat(MAX_PERSON_CWD + 1),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                search_path: String::new(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                search_path: "bin".into(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                search_path: "/bin::/usr/bin".into(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                search_path: "/bin:".into(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                search_path: "/bin\0".into(),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                search_path: vec!["/b"; MAX_SEARCH_PATH_ENTRIES + 1].join(":"),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                search_path: "/".repeat(MAX_SEARCH_PATH + 1),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: vec![
+                    (ClientVariable::LcAll, "C".into()),
+                    (ClientVariable::Lang, "C".into()),
+                ],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: vec![
+                    (ClientVariable::Lang, "C".into()),
+                    (ClientVariable::Lang, "C".into()),
+                ],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: vec![(ClientVariable::Lang, String::new())],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: vec![(ClientVariable::Lang, "en GB".into())],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: vec![(ClientVariable::LcTime, "C/x".into())],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: vec![(ClientVariable::Lang, locale(MAX_LOCALE_VALUE + 1))],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: socket("relative.sock"),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: socket(""),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: socket("/a\0"),
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: socket(&format!("/{}", "s".repeat(MAX_AGENT_SOCKET))),
+                ..p.clone()
+            },
+            // `!!`: no PATH and no client variables (PC-U42).
+            PersonCommandQueued {
+                outside_sandbox: true,
+                environment: vec![],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: socket("/s"),
+                ..outside31()
+            },
+            PersonCommandQueued {
+                search_path: "/bin".into(),
+                ..outside31()
+            },
+            PersonCommandQueued {
+                expected_generation: 1,
+                ..outside31()
+            },
+        ];
+        for bad in request_cases {
+            invalid31(bad);
+        }
+        // Over-limit text cannot be encoded; its bytes do not decode.
+        let long = PersonCommandQueued {
+            command: "c".repeat(MAX_PERSON_COMMAND + 1),
+            ..p.clone()
+        };
+        assert_eq!(
+            payload(&Record::PersonCommandQueued(Box::new(long.clone()))),
+            Err(ReplayError::Limit)
+        );
+        assert_eq!(decode_record(31, &raw31(&long)), Err(ReplayError::Corrupt));
+        // Fields 8, 9, 14 to 22.
+        let whole = whole31("show $ASURA_SECRET_1".into(), 1);
+        for bad in [
+            // Field 8 must be the whole-command text exactly with bit 1.
+            sealed(PersonCommandQueued {
+                command: "eval x".into(),
+                ..whole.clone()
+            }),
+            // Field 9 only with bit 1, and not empty then.
+            sealed(PersonCommandQueued {
+                display_command: "x".into(),
+                ..p.clone()
+            }),
+            sealed(PersonCommandQueued {
+                display_command: String::new(),
+                number_kinds: vec![],
+                ..whole.clone()
+            }),
+            // Bit 0 only with bit 1.
+            PersonCommandQueued {
+                command_cut: true,
+                ..p.clone()
+            },
+            // Numbers: 16 for a rewrite, 256 with bit 1, matching the text.
+            sealed(PersonCommandQueued {
+                command: placeholders(17),
+                number_kinds: vec![SecretKind::Jwt; 17],
+                ..p.clone()
+            }),
+            sealed(PersonCommandQueued {
+                display_command: placeholders(257),
+                number_kinds: vec![SecretKind::Jwt; 257],
+                ..whole.clone()
+            }),
+            PersonCommandQueued {
+                number_kinds: vec![SecretKind::Jwt],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                number_kinds: vec![],
+                ..whole.clone()
+            },
+            PersonCommandQueued {
+                unnumbered: 1,
+                ..p.clone()
+            },
+            sealed(PersonCommandQueued {
+                command: "echo $ASURA_SECRET_2".into(),
+                number_kinds: vec![SecretKind::Jwt; 2],
+                ..p.clone()
+            }),
+            sealed(PersonCommandQueued {
+                command: "echo $ASURA_SECRET_01".into(),
+                number_kinds: vec![SecretKind::Jwt],
+                ..p.clone()
+            }),
+            // Rule set: never 0, digest present.
+            PersonCommandQueued {
+                rule_set_revision: 0,
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                rule_set_digest: [0; 32],
+                ..p.clone()
+            },
+            // Fallback: only with bit 1, then required and not a kept code.
+            PersonCommandQueued {
+                fallback: whole.fallback,
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                fallback: None,
+                ..whole.clone()
+            },
+        ] {
+            invalid31(bad);
+        }
+        for code in [
+            RefusalCode::PlaceholderNotAvailable,
+            RefusalCode::DetectionUnavailable,
+            RefusalCode::SecretInCwd,
+        ] {
+            invalid31(PersonCommandQueued {
+                fallback: Some(ExecCmdRefusal {
+                    code,
+                    kind: None,
+                    word: None,
+                }),
+                ..whole.clone()
+            });
+        }
+        invalid31(PersonCommandQueued {
+            fallback: Some(ExecCmdRefusal {
+                code: RefusalCode::SecretInHeredoc,
+                kind: None,
+                word: Some(MAX_REFUSAL_WORD + 1),
+            }),
+            ..whole.clone()
+        });
+        // Raw codes the types cannot hold.
+        let at_flags = |bytes: &mut Vec<u8>, value: u8| bytes[FLAGS31] = value;
+        let mut bytes = raw31(&p);
+        at_flags(&mut bytes, 0b100);
+        assert_eq!(decode_record(31, &bytes), Err(ReplayError::Corrupt));
+        // Field 12 name codes 0 and 10.
+        let env_at = FLAGS31 + 1 + 4 + 9 + 4 + 4 + 1 + 4 + 13;
+        let bytes = raw31(&p);
+        assert_eq!(bytes[env_at], 1);
+        for code in [0, 10] {
+            let mut bad = bytes.clone();
+            bad[env_at + 1] = code;
+            assert_eq!(decode_record(31, &bad), Err(ReplayError::Corrupt), "{code}");
+        }
+        // Field 12 count over 9.
+        let mut bad = bytes.clone();
+        bad[env_at] = 10;
+        assert_eq!(decode_record(31, &bad), Err(ReplayError::Corrupt));
+        // The tail: order revision (8), count (2), unnumbered (4), command
+        // flags (1), revision (4), digest (32), reason, kind (1 each), word.
+        let tail = |bytes: &[u8]| bytes.len() - (8 + 2 + 4 + 1 + 4 + 32 + 1 + 1 + 2);
+        let at = tail(&bytes);
+        for (offset, value) in [(14, 0b100), (14 + 5 + 32, 15), (14 + 5 + 32 + 1, 34)] {
+            let mut bad = bytes.clone();
+            bad[at + offset] = value;
+            assert_eq!(
+                decode_record(31, &bad),
+                Err(ReplayError::Corrupt),
+                "{offset}"
+            );
+        }
+        // Fallback kind or word without a reason.
+        for offset in [14 + 5 + 32 + 1, 14 + 5 + 32 + 3] {
+            let mut bad = bytes.clone();
+            bad[at + offset] = 1;
+            assert_eq!(
+                decode_record(31, &bad),
+                Err(ReplayError::Corrupt),
+                "{offset}"
+            );
+        }
+        // Number kind codes 0 and 34, and a count of 257.
+        let whole_bytes = raw31(&whole);
+        let at = tail(&whole_bytes) - 1;
+        for code in [0, 34] {
+            let mut bad = whole_bytes.clone();
+            bad[at + 10] = code;
+            assert_eq!(decode_record(31, &bad), Err(ReplayError::Corrupt), "{code}");
+        }
+        let mut bad = whole_bytes.clone();
+        bad[at + 8..at + 10].copy_from_slice(&257u16.to_be_bytes());
+        assert_eq!(decode_record(31, &bad), Err(ReplayError::Corrupt));
+        // Trailing and truncated bytes.
+        let mut bad = bytes.clone();
+        bad.push(0);
+        assert_eq!(decode_record(31, &bad), Err(ReplayError::Corrupt));
+        assert_eq!(
+            decode_record(31, &bytes[..bytes.len() - 1]),
+            Err(ReplayError::Corrupt)
+        );
+    }
+    /// The capture reason 7 `closed_after_cancel` rules of kind 28 (P2):
+    /// `incomplete`, exited or signalled after a trigger, both digests.
+    #[test]
+    fn pc_u20_kind_28_capture_reason_7_rules() {
+        let closed = |outcome, reason| JobSettled {
+            capture_state: JobCaptureState::Incomplete,
+            capture_reason: CaptureReason::ClosedAfterCancel,
+            escapees: 2,
+            stdout: JobStream {
+                capture: CaptureStream {
+                    eof: false,
+                    ..settled28().stdout.capture
+                },
+                ..settled28().stdout
+            },
+            ..job28(outcome, reason)
+        };
+        let bytes = round_job(r28(closed(JobOutcome::Exited, JobReason::PersonStop)));
+        assert_eq!(bytes[37 + 1], 7);
+        round_job(r28(closed(JobOutcome::Signalled, JobReason::PersonKill)));
+        round_job(r28(closed(JobOutcome::Exited, JobReason::Shutdown)));
+        assert_eq!(
+            CaptureReason::ClosedAfterCancel.as_str(),
+            "closed_after_cancel"
+        );
+        for bad in [
+            closed(JobOutcome::Exited, JobReason::None),
+            JobSettled {
+                outcome: JobOutcome::Cancelled,
+                exit_kind: 2,
+                exit_value: 9,
+                ..closed(JobOutcome::Exited, JobReason::PersonStop)
+            },
+            JobSettled {
+                capture_state: JobCaptureState::Complete,
+                ..closed(JobOutcome::Exited, JobReason::PersonStop)
+            },
+            JobSettled {
+                capture_state: JobCaptureState::Unconfirmed,
+                ..closed(JobOutcome::Exited, JobReason::PersonStop)
+            },
+            JobSettled {
+                capture_reason: CaptureReason::ClosedAfterCancel,
+                ..job28(JobOutcome::NotStarted, JobReason::PersonStop)
+            },
+            JobSettled {
+                stderr: JobStream {
+                    capture: CaptureStream {
+                        digest: None,
+                        ..settled28().stderr.capture
+                    },
+                    ..settled28().stderr
+                },
+                ..closed(JobOutcome::Exited, JobReason::PersonStop)
+            },
+        ] {
+            invalid_job(r28(bad));
+        }
+        // Code 8 is not a capture reason.
+        let mut bytes = raw(&r28(closed(JobOutcome::Exited, JobReason::PersonStop)));
+        bytes[37 + 1] = 8;
+        assert_eq!(decode_record(28, &bytes), Err(ReplayError::Corrupt));
     }
 }

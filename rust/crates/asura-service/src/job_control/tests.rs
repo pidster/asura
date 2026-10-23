@@ -220,7 +220,9 @@ impl Journal {
                             excerpt: journal::command_excerpt(&command),
                             retention: Default::default(),
                         },
-                        command: Box::new(call(&command)),
+                        command: asura_storage::authority::conversation::JobCommand::Model(
+                            Box::new(call(&command)),
+                        ),
                         retention: Vec::new(),
                         model_notes: Vec::new(),
                     },

@@ -118,6 +118,8 @@ pub enum Request<'a> {
         operation: Id,
         generation: u64,
     },
+    /// Kind 31 (P2).
+    QueuePersonCommand(PersonCommandRequest<'a>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -335,6 +337,8 @@ pub enum Record {
     /// Kind 25: one thinking text segment, the same layout applied to the
     /// operation's thinking text (thinking-level.md).
     ThinkingText(ResponseText),
+    /// Kind 31 (P2): a queued person command.
+    PersonCommandQueued(Box<PersonCommandQueued>),
     /// Kind 26 (J2): a job's intent. Every other intent fact is derived.
     JobIntent(JobIntent),
     /// Kind 27 (J2): the first accepted cancel trigger of a job.
@@ -368,6 +372,7 @@ impl Record {
             Self::InputPromoted(_) => 16,
             Self::ResponseText(_) => 24,
             Self::ThinkingText(_) => 25,
+            Self::PersonCommandQueued(_) => 31,
             Self::JobIntent(_) => 26,
             Self::JobCancelRequested(_) => 27,
             Self::JobSettled(_) => 28,
@@ -532,6 +537,9 @@ pub const MAX_INPUTS: usize = 16;
 pub enum InputKind {
     Queue = 1,
     Steer = 2,
+    /// A person command (kind 31, P2). It never steers and never starts a
+    /// turn; its dispatch is a person job's kind 26.
+    Person = 3,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -562,6 +570,208 @@ pub struct InputQueued {
     pub new_conversation: bool,
     pub prompt: String,
     pub order_revision: u64,
+}
+// ----- P2 kind 31: PersonCommandQueued (person-command-mode.md). -----
+
+/// Kind 31 field 8: the executable command, 1 to 8,192 bytes. Field 9, the
+/// display text of a whole-command input, has the same bound.
+pub const MAX_PERSON_COMMAND: usize = 8192;
+/// Kind 31 field 10: the project-relative working directory (PCR9).
+pub const MAX_PERSON_CWD: usize = 1024;
+/// Kind 31 field 11: the sanitized PATH of a `!` command.
+pub const MAX_SEARCH_PATH: usize = 4096;
+/// Entries of the sanitized PATH.
+pub const MAX_SEARCH_PATH_ENTRIES: usize = 64;
+/// Kind 31 field 12: PC3 locale values (codes 1 to 8).
+pub const MAX_LOCALE_VALUE: usize = 64;
+/// Kind 31 field 12: the `SSH_AUTH_SOCK` value (code 9), an absolute path.
+pub const MAX_AGENT_SOCKET: usize = 103;
+/// Kind 31 field 14 without the whole-command variable: the rewrite's
+/// secret variables, as for an exec_cmd call.
+pub const MAX_PERSON_REWRITE_NUMBERS: usize = 16;
+/// The kind 31 decode bound: 105 bytes of IDs, digest, generation and
+/// flags, 8,196 each for the command and display text, 1,028 for the cwd,
+/// 4,100 for the search path, 634 for the client environment, 8 for the
+/// order revision and 303 for fields 14 to 22. Fields 8 and 9 cannot both
+/// be full in one valid record, so this is an upper bound.
+pub const MAX_PERSON_COMMAND_PAYLOAD: usize = 22_570;
+
+/// Kind 31 field 12 name codes (PC3), stored in increasing order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum ClientVariable {
+    Lang = 1,
+    LcAll = 2,
+    LcCollate = 3,
+    LcCtype = 4,
+    LcMessages = 5,
+    LcMonetary = 6,
+    LcNumeric = 7,
+    LcTime = 8,
+    SshAuthSock = 9,
+}
+impl ClientVariable {
+    pub const ALL: [Self; 9] = [
+        Self::Lang,
+        Self::LcAll,
+        Self::LcCollate,
+        Self::LcCtype,
+        Self::LcMessages,
+        Self::LcMonetary,
+        Self::LcNumeric,
+        Self::LcTime,
+        Self::SshAuthSock,
+    ];
+    pub fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code).checked_sub(1)?).copied()
+    }
+    /// The environment variable name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Lang => "LANG",
+            Self::LcAll => "LC_ALL",
+            Self::LcCollate => "LC_COLLATE",
+            Self::LcCtype => "LC_CTYPE",
+            Self::LcMessages => "LC_MESSAGES",
+            Self::LcMonetary => "LC_MONETARY",
+            Self::LcNumeric => "LC_NUMERIC",
+            Self::LcTime => "LC_TIME",
+            Self::SshAuthSock => "SSH_AUTH_SOCK",
+        }
+    }
+    /// The PC3 value rule: codes 1 to 8 take 1 to 64 bytes of ASCII
+    /// letters, digits, `_`, `-`, `.` and `@`; code 9 an absolute path of 1
+    /// to 103 bytes with no NUL.
+    pub fn valid_value(self, value: &str) -> bool {
+        match self {
+            Self::SshAuthSock => {
+                (1..=MAX_AGENT_SOCKET).contains(&value.len())
+                    && value.starts_with('/')
+                    && !value.contains('\0')
+            }
+            _ => {
+                (1..=MAX_LOCALE_VALUE).contains(&value.len())
+                    && value.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'@')
+                    })
+            }
+        }
+    }
+}
+/// The fields of a person command that the client supplies and the request
+/// digest covers (kind 31 fields 4 to 12). `conversation` is `None` for a
+/// new conversation; the digest then holds the zero ID, so an exact retry
+/// matches before the service allocates the conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PersonCommandRequest<'a> {
+    pub project: Id,
+    pub conversation: Option<Id>,
+    pub expected_generation: u64,
+    pub new_conversation: bool,
+    pub outside_sandbox: bool,
+    pub command: &'a str,
+    pub display_command: &'a str,
+    pub cwd: &'a str,
+    pub search_path: &'a str,
+    pub environment: &'a [(ClientVariable, String)],
+}
+/// Kind 31, PersonCommandQueued (P2): a queued `!` or `!!` command, the
+/// lane entry that replaces kind 18 for that input. It holds the rewritten
+/// command or the whole-command placeholder, never a secret value and never
+/// the `!!` launch environment (those wait in the secret store item).
+/// Fields 14 to 22 mirror kind 14 fields 15 to 23 (SL5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonCommandQueued {
+    /// Field 1.
+    pub request: Id,
+    /// Field 2: [`PersonCommandQueued::request`]'s digest over fields 4 to 12.
+    pub digest: Hash,
+    /// Field 3; the person job's ID derives from it.
+    pub input: Id,
+    pub project: Id,
+    pub conversation: Id,
+    /// 0 for a new conversation; otherwise at most the conversation's
+    /// generation, as kind 18.
+    pub expected_generation: u64,
+    /// Field 7 bit 0.
+    pub new_conversation: bool,
+    /// Field 7 bit 1: a `!!` command; its job's profile is
+    /// `person-outside-1`, otherwise `person-1`.
+    pub outside_sandbox: bool,
+    /// Field 8: the rewrite, or exactly [`WHOLE_COMMAND`] with
+    /// `whole_command`.
+    pub command: String,
+    /// Field 9: empty unless `whole_command`; then the display-redacted
+    /// text, cut at 8,192 bytes with `command_cut`.
+    pub display_command: String,
+    /// Field 10: project relative, `.` for the root.
+    pub cwd: String,
+    /// Field 11: the sanitized PATH of a `!` command; empty for `!!`.
+    pub search_path: String,
+    /// Field 12: the PC3 variables of a `!` command in increasing name
+    /// code; empty for `!!`.
+    pub environment: Vec<(ClientVariable, String)>,
+    /// Field 13.
+    pub order_revision: u64,
+    /// Fields 14 and 15: entry i is the secret kind of
+    /// `$ASURA_SECRET_<i+1>` in the stored command text.
+    pub number_kinds: Vec<SecretKind>,
+    /// Field 16: unnumbered placeholder tokens in the stored command text.
+    pub unnumbered: u32,
+    /// Field 17 bit 0: the display text was cut at 8,192 bytes.
+    pub command_cut: bool,
+    /// Field 17 bit 1: the command runs through the whole-command variable.
+    pub whole_command: bool,
+    /// Fields 18 and 19; never 0: a submit with detection unavailable is
+    /// refused before the record.
+    pub rule_set_revision: u32,
+    pub rule_set_digest: Hash,
+    /// Fields 20 to 22: with `whole_command`, the rewrite's refusal that
+    /// chose the variable; `None` otherwise. Never holds a value.
+    pub fallback: Option<ExecCmdRefusal>,
+}
+impl PersonCommandQueued {
+    /// The digest fields of this record.
+    pub fn request(&self) -> PersonCommandRequest<'_> {
+        PersonCommandRequest {
+            project: self.project,
+            conversation: (!self.new_conversation).then_some(self.conversation),
+            expected_generation: self.expected_generation,
+            new_conversation: self.new_conversation,
+            outside_sandbox: self.outside_sandbox,
+            command: &self.command,
+            display_command: &self.display_command,
+            cwd: &self.cwd,
+            search_path: &self.search_path,
+            environment: &self.environment,
+        }
+    }
+    /// The stored command text a person or model sees: the display text of
+    /// a whole-command input, otherwise the rewrite. Never a secret value.
+    pub fn command_text(&self) -> &str {
+        if self.whole_command {
+            &self.display_command
+        } else {
+            &self.command
+        }
+    }
+    /// Whether the command has a secret store item: secret variables, the
+    /// whole-command variable or the `!!` launch environment. Replay does
+    /// not check the Keychain; dispatch does.
+    pub fn has_secret_item(&self) -> bool {
+        !self.number_kinds.is_empty() || self.whole_command || self.outside_sandbox
+    }
+}
+/// The replay facts of a kind 31 input. Every value except the frames is
+/// derived from kind 31 and the job records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PersonInput {
+    /// Kind 31 field 7 bit 1.
+    pub outside_sandbox: bool,
+    /// The job's kind 26, once dispatched.
+    pub job: Option<Locator>,
+    /// The job's kind 28 outcome, once settled.
+    pub outcome: Option<JobOutcome>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputReordered {
@@ -606,6 +816,8 @@ pub struct QueuedInput {
     pub target_terminal: Option<(TerminalKind, Cause)>,
     /// Sequence at which the input's status became final.
     pub settled: Option<u64>,
+    /// The person command facts of a kind 31 input (`kind` is `Person`).
+    pub person: Option<PersonInput>,
 }
 
 /// The five registered model-facing tool names (TCR-D24, J3-E2). Replay
@@ -1062,6 +1274,10 @@ pub enum CaptureReason {
     DetectorFault = 4,
     DiscardedAfterCancel = 5,
     SettlementUnconfirmed = 6,
+    /// A cancel closed the capture read ends after a `!!` shell exited
+    /// while a survivor held the pipes (OD2, P2). Only for profile
+    /// `person-outside-1`.
+    ClosedAfterCancel = 7,
 }
 impl CaptureReason {
     pub fn as_str(self) -> &'static str {
@@ -1073,6 +1289,7 @@ impl CaptureReason {
             Self::DetectorFault => "detector_fault",
             Self::DiscardedAfterCancel => "discarded_after_cancel",
             Self::SettlementUnconfirmed => "settlement_unconfirmed",
+            Self::ClosedAfterCancel => "closed_after_cancel",
         }
     }
 }
@@ -1226,7 +1443,7 @@ pub enum JobOrigin {
         generation: u64,
         ordinal: u32,
     },
-    /// Origin 2: one person input (kind PCQ, P2). Replay rejects it in J2.
+    /// Origin 2: one person input, a kind 31 (P2).
     Person { input: Id },
 }
 impl JobOrigin {
@@ -2150,8 +2367,8 @@ pub struct JobListing {
     /// job notice entry's source digest (J5 manifest). `None` while
     /// unsettled.
     pub settled_digest: Option<Hash>,
-    /// The command source: the model call's kind 14 (a person job's kind
-    /// 31 after P2). Command, cwd and excerpt are read from it.
+    /// The command source: the model call's kind 14, or the person
+    /// input's kind 31. Command, cwd and excerpt are read from it.
     pub command: Locator,
     /// The `JobEntry.command` text from the command source: the first line
     /// of the stored command, at most 192 bytes (`command_excerpt`);
@@ -2170,8 +2387,53 @@ pub const MAX_NOTICE_SETTLEMENTS: usize = NOTICE_ENTRIES + 1;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoticeSettlement {
     pub listing: JobListing,
-    /// The model call's kind 14 (a person job's kind 31 after P2).
-    pub command: Box<ToolCall>,
+    /// The model call's kind 14 or the person input's kind 31.
+    pub command: JobCommand,
+}
+/// The command source record of a job: the model call's kind 14 or the
+/// person input's kind 31 (P2). It holds the stored command and cwd.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobCommand {
+    Model(Box<ToolCall>),
+    Person(Box<PersonCommandQueued>),
+}
+impl JobCommand {
+    /// The model call's kind 14; `None` for a person job.
+    pub fn model(&self) -> Option<&ToolCall> {
+        match self {
+            Self::Model(call) => Some(call),
+            Self::Person(_) => None,
+        }
+    }
+    /// The person input's kind 31; `None` for a model job.
+    pub fn person(&self) -> Option<&PersonCommandQueued> {
+        match self {
+            Self::Model(_) => None,
+            Self::Person(command) => Some(command),
+        }
+    }
+    /// The stored, redacted command text: the kind 14 `command` argument,
+    /// or the kind 31 command text (the display text of a whole-command
+    /// input). `None` when a kind 14 holds no exec_cmd command.
+    pub fn command(&self) -> Option<String> {
+        match self {
+            Self::Model(call) => super::exec_cmd_command(call),
+            Self::Person(command) => Some(command.command_text().to_owned()),
+        }
+    }
+    /// Whether the command ran through the whole-command variable (SL7,
+    /// SO5).
+    pub fn whole_command(&self) -> bool {
+        match self {
+            Self::Model(call) => call.whole_command,
+            Self::Person(command) => command.whole_command,
+        }
+    }
+    /// Kind 31 field 7 bit 1: a `!!` job (profile `person-outside-1`).
+    /// Always false for a model job.
+    pub fn outside_sandbox(&self) -> bool {
+        self.person().is_some_and(|c| c.outside_sandbox)
+    }
 }
 /// The notice inputs of one turn (J5 binding point): the cursor range
 /// `(after, through]`, the newest settlements in it and the live count.
@@ -2191,13 +2453,13 @@ pub struct JobNotice {
     pub live: u32,
 }
 /// One job's facts for `JobInspect` and the model's `status` (the
-/// `JobFacts` read): its listing, the kind 14 that holds its command and
-/// cwd, its kind 30 records in order, at most 64, and the text of each
-/// model note, at most 16.
+/// `JobFacts` read): its listing, the kind 14 or kind 31 that holds its
+/// command and cwd, its kind 30 records in order, at most 64, and the text
+/// of each model note, at most 16.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobRecords {
     pub listing: JobListing,
-    pub command: Box<ToolCall>,
+    pub command: JobCommand,
     pub retention: Vec<(Locator, JobRetention)>,
     /// For each kind 30 `note` by the model, in kind 30 order: its kind 30
     /// locator and the `text` argument of the cited kind 14, as stored

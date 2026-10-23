@@ -35,9 +35,9 @@ pub(super) fn build(conversation: Id, inputs: &JobNotice) -> Result<Notice, Noti
             .ok_or(NoticeError::Job)?;
         // The command source is the model call's kind 14 (a person job's
         // kind 31 after P2): its stored command and cwd (J5-E5).
-        let command = journal::exec_cmd_command(&settlement.command).ok_or(NoticeError::Command)?;
-        let directory =
-            crate::job_control::exec_cmd_cwd(&settlement.command).ok_or(NoticeError::Command)?;
+        let call = settlement.command.model().ok_or(NoticeError::Command)?;
+        let command = journal::exec_cmd_command(call).ok_or(NoticeError::Command)?;
+        let directory = crate::job_control::exec_cmd_cwd(call).ok_or(NoticeError::Command)?;
         sources.push(Source {
             command,
             directory,

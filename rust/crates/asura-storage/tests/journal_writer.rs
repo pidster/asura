@@ -2825,7 +2825,10 @@ fn j5t_02_real_writer_prepare_returns_notice_inputs_and_checks_the_cursor() {
     let entry = &notice.settlements[0];
     assert_eq!(entry.listing.job, j2_job(1));
     assert_eq!(*entry.listing.settled.as_deref().unwrap(), j2_settled(1));
-    assert_eq!(*entry.command, j1_call(1, ToolDecision::Run));
+    assert_eq!(
+        entry.command,
+        JobCommand::Model(Box::new(j1_call(1, ToolDecision::Run)))
+    );
     // A settlement commits between `Prepare` and the kind 21 append.
     submit(
         &mut writer,
