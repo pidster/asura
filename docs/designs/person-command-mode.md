@@ -2156,6 +2156,13 @@ journeys follow P3-E. Choices made in P4 and accepted:
   `JobObserve` with `at_end` in flight; each reply replaces the unread one; no
   timer. A fold that gets `not_found` shows "waiting for its turn in the queue"
   and reads again when the queue shows the command started.
+- **Refusal notices.** A refusal shows its whole text in the header notice,
+  wrapped to the terminal width; it is never cut to half the width (P4-E
+  finding: at 80 to 120 columns the cut text lost the configuration key).
+- **Draining exit.** A released `!!` entry shows the shell's exit:
+  `↳ shell exited 0 · 1 background process writing`. The controller keeps the
+  kind 5 exit in `JobView` while draining, and `JobEntry` carries `exit_kind`
+  and `exit_value` in `DRAINING` for a released job.
 - **Byte totals.** `JobEntry` has no total-written byte count, so an
   early-stopped capture shows "output kept: first N" without "of M".
 - **PC-U44** (the `, outside the sandbox,` notice label) is covered in

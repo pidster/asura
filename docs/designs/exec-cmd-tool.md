@@ -320,6 +320,12 @@ access modes, symlinks, unexpected data on the lease or invalid job/deadline arg
 A lease is never cloned or inherited by the command. Close all guardian-only FDs
 in the command's posix_spawn actions. Command receives only 0=/dev/null,1=capture 5,
 2=capture 6. Guardian stdout/stderr never contain command or provider data.
+The guardian ignores `SIGPIPE` for itself, but the command starts with every
+signal at its default action and an empty signal mask: the spawn attributes set
+`POSIX_SPAWN_SETSIGDEF` with `SIGPIPE` in the default set and
+`POSIX_SPAWN_SETSIGMASK`, for every profile. A command in a closed pipe then
+ends quietly, as in a terminal (`yes | head` prints no "Broken pipe";
+P4-E finding, 2026-10-23).
 
 Use a fixed 32-byte native startup/status notice, following the existing bounded
 StartupNotice primitive. This is not a public control envelope and introduces no

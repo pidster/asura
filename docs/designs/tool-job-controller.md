@@ -4916,7 +4916,7 @@ message JobEntry {
   optional string reason_text = 9;      // the brief reason, for example "waiting: 2 of 2 jobs running for this agent"
   optional uint32 outcome = 10;         // kind 28 outcome 1-5, SETTLED only
   optional uint32 reason = 11;          // job reason code 0-20
-  optional uint32 exit_kind = 12; optional uint32 exit_value = 13;
+  optional uint32 exit_kind = 12; optional uint32 exit_value = 13;   // SETTLED; also DRAINING for a released `!!` job (the shell's kind 5 exit, kept in JobView)
   optional uint64 stdout_bytes = 14; optional uint64 stderr_bytes = 15;
   optional uint64 stdout_lines = 16; optional uint64 stderr_lines = 17;   // SETTLED only
   optional uint64 intent_unix_ms = 18; optional uint64 settled_unix_ms = 19;
