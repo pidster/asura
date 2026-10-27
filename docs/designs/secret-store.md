@@ -53,7 +53,9 @@ read from the process's own entitlements. The file-based keychain remains only
 as the test-only scratch backend. Stranded items are removed. Every Keychain
 error records its raw status and the session state in the audit event. The
 [release signing design](release-signing.md#team-keychain-store) owns the
-signing-specific rules; this document links to them.
+signing-specific rules; this document links to them. Packet SG3 delivered
+this on 2026-10-27 ([SG3 delivery](release-signing.md#sg3-delivery)); the
+signed qualification run is the owner's.
 
 ## Scope
 

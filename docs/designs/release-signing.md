@@ -19,7 +19,9 @@ The owner's Mac ran probes KC-P1, KC-P2 and KC-P4 on 2026-10-27; KC-P3 was
 skipped ([KC probe results](#kc-probe-results-2026-10-27)). The results
 changed the team Keychain store: every call names the access group, which the
 service reads from its own entitlements, and every Keychain error records its
-status and the session state as field evidence. Packet SG3 is ready.
+status and the session state as field evidence. Packet SG3 delivered the
+code on 2026-10-27 ([SG3 delivery](#sg3-delivery)); the signed qualification
+run remains for the owner.
 
 What is fixed:
 
@@ -1489,7 +1491,7 @@ signing packet.
 | SG0-K | Done for KC-P1, KC-P2 and KC-P4 (2026-10-27) | KC-P3 not run (owner, to revisit) ([results](#kc-probe-results-2026-10-27)) |
 | SG2a | Delivered (branch `sg2a`, 2026-10-23) | — |
 | SG2 | Delivered (branch `sg2`, 2026-10-23) | — ([delivery](#sg2-delivery)) |
-| SG3 | Ready (2026-10-27) | — (KC results recorded; this design and the secret store design revised. -25308 stays unverified, covered by the field evidence) |
+| SG3 | Delivered (2026-10-27) | — ([delivery](#sg3-delivery)); the signed qualification run (SGQ6) is the owner's |
 | SG4 | Not ready | NT-P1 |
 | SG5 | Not ready | SG3 and SG4 |
 
@@ -1632,6 +1634,61 @@ notarisation of the sandboxed helper remain with SG0-K, NT-P1 and SG4. The
 `<out>/package/` helper now claims the App Sandbox with the product
 identifier, so native tests beside it would read only the account home;
 native tests use an unsandboxed development helper or the SG-V5 variant.
+
+### SG3 delivery
+
+Delivered 2026-10-27 on the SG3 worktree branch. No named identity,
+`notarytool`, `stapler` or `security` call was made except the read-only
+`security list-keychains -d user`, which listed only the login keychain before
+and after. No test wrote to the login keychain or the data-protection
+keychain; the only data-protection calls from `cargo test` are KC-N1's list,
+read and delete, which returned -34018.
+
+- `asura-platform::keychain`: `Target::Default` is the data-protection
+  backend (`keychain/data_protection.rs`): the access group check (SG-F7) over
+  `SecTaskCopyValueForEntitlement`, one dictionary builder with the flag, the
+  group, synchronizable false and `kSecUseAuthenticationUIFail`, the
+  data-protection status table, and the `test-support` purge of the test
+  group. `keychain/session.rs` reads the field evidence. `Failure` carries the
+  raw status and gains `NotSigned`. The file backend, its pre-check and
+  `SecKeychainGetStatus` are `test-support` only. `SecKeychainCopyDefault` and
+  `kSecUseKeychain` are gone from production.
+- `asura-service::secret_store`: every failure reply carries the raw status
+  and the session; `not_signed` is terminal; stranded items are removed (a
+  failed delete is an orphan); `qualification.rs` and the
+  `secret_store_qualification` binary (`test-support`).
+- Owner (`conversation/person_command.rs`): audit events carry `status` and
+  `session`; `not_signed` refuses as `secret_store_unavailable` with 34018 and
+  waits at dispatch with `keychain_unavailable`.
+- Schemas, in place: `SecretStoreStatus` fields 4 and 6 reserved; the
+  `secret_store.*` audit `status` is the raw signed `OSStatus`, `session` is
+  added and the sweep's `stranded` count is removed (audit format 1, protocol
+  0.1).
+- TUI: the locked and `not_signed` texts; `/status` drops the stranded notice
+  and names `not_signed`.
+- `tools/release/secret-store-qualification`, its entitlement list and its
+  `--static` refusal checks.
+
+| Case | Layer | Evidence |
+| --- | --- | --- |
+| KC-U1 | Unit | `every_data_protection_dictionary_names_the_keychain_and_group` |
+| KC-U2 | Unit | `data_protection_status_table`; SS-U3 and SS-U9 kept for the scratch backend |
+| KC-U3 | Unit | `secret_store_status_is_bounded` (fields 4 and 6 decode as nothing), `p3e2_secret_store_events` (`stranded` refused), the observation has no stranded field |
+| KC-U4 | Unit | `access_group_rules` |
+| KC-U5 | Unit | `session_state_decoding`, `failure_replies_carry_field_evidence`, `store_failures_refuse_and_audit_with_evidence`, `p3e2_secret_store_events` |
+| KC-U6 | Unit | `not_signed_open_is_terminal`, `not_signed_call_is_terminal`; the owner waits on `not_signed` (`person_command` dispatch cases) |
+| KC-N1 | Integration | `unentitled_group_calls_are_not_signed`: -34018 for list, read and delete naming `ASURATEST0.org.pidster.asura.test`; `unit_tests_never_open_the_default_keychain`: `not_signed` with no call |
+| SS-W, SS-I | Integration | `secret_store` (11 cases, SS-W9 revised) and `person_command_flow` SS-I1 to SS-I11 on scratch keychains |
+| SS-E1, SS-E2 | End to end | `lifecycle --person-secrets` with the new locked text |
+| Qualification | Script | `secret-store-qualification --ad-hoc`: built, signed ad hoc without restricted entitlements, and the executable refused with no Keychain call. The signed run is the owner's (SGQ6) |
+
+Proof limits: the signed qualification run (Q0 to Q7) has not run, so the
+data-protection add, read, list, delete, sweep and restart through Asura's own
+code, and whether `SecItemAdd` accepts `kSecUseAuthenticationUIFail` on the
+data-protection keychain, are unverified. -25308 as `locked` stays unverified
+(KC-P3). The service-level SS-I and SL5 cases on a signed `asura` stay with
+SG5. The field evidence is verified for its content and audit form in tests;
+no SSH or before-first-unlock occurrence has been observed.
 
 ## Design verification
 
