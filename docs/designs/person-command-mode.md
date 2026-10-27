@@ -1041,8 +1041,8 @@ Codec rules (P3-C, 2026-10-23):
 - `JobEntry` fields 28 `left_running` and 29 `shell_exited` appear only on a
   person job with `outside_sandbox = true`: `left_running` only in `DRAINING` or
   `SETTLED`, `shell_exited` only as true and only in `DRAINING`.
-- `SecretStoreStatus` fields are optional; stranded IDs are distinct, valid and
-  no more than `stranded_count` (at most 16 listed, counts at most 257).
+- `SecretStoreStatus` fields are optional; counts are at most 257. Fields 4
+  and 6 (stranded items) are reserved since SG3.
 - One owner checks the environment form: `asura_control::person::environment_refusal`
   (size first: more than 1,024 entries or 40,960 bytes is
   `environment_too_large`; any other form fault is `environment_invalid`). The
@@ -2194,8 +2194,9 @@ Texts the earlier sections did not give word for word:
 
 | Case | Text |
 | --- | --- |
-| `secret_store_unavailable` | "The Keychain is unavailable (OSStatus -N). Press Enter again later." |
-| `secret_store_full` | "The Keychain holds the most Asura items (256); wait for queued commands to finish.", plus "/status lists Keychain items to delete." when stranded items exist |
+| `secret_store_unavailable` | "The Keychain is unavailable (OSStatus -N). Press Enter again later."; for N 34018 (SG3, `not_signed`): "This Asura build is not signed for the Keychain." |
+| `secret_store_locked` | "The Keychain is locked until this Mac is unlocked after start-up. Unlock it, then press Enter again." (SG3) |
+| `secret_store_full` | "The Keychain holds the most Asura items (256); wait for queued commands to finish." |
 | `secret_in_cwd` | "Command refused: the working directory holds a secret." (the reply has no rule kind) |
 | Exit confirmation | "N commands are queued or running; they stop when the service stops." |
 | Accepted | "Command queued", or "Command " followed by the entry's `waiting_text` |

@@ -23,7 +23,7 @@ raised seven gaps; this revision resolves them
 ([SS1-K gap resolution](#ss1-k-gap-resolution-2026-10-22)). Probe SS-P3
 showed that a rebuilt service binary can delete the items of the previous
 build. Items that a build still cannot delete are now
-[stranded items](#stranded-and-unrecognized-items). Packet SS1-K2 (a small
+stranded items (removed by SG3, [unrecognized items](#unrecognized-items)). Packet SS1-K2 (a small
 platform follow-up) and then SS1-S are ready for implementation. Protocol
 numbering remains `0.1`; journal format remains `1`.
 
@@ -43,10 +43,17 @@ KQ2 is revised by SGQ4: any build that the team signs with the access group
 may read and delete items, so stranded items go away. The switch is clean,
 with no migration code (SGQ5), and only the signed qualification run writes
 items, under a separate test access group (SGQ6). The Secure Enclave item
-stays open for later study (SGQ8). Packet SG3 implements the team Keychain store. **Until
-SG3 lands, the file-based login keychain store described below remains the
-implemented state.** Text that SG3 replaces is marked "SG3 replaces" with a
-link to the governing section.
+stays open for later study (SGQ8). Packet SG3 implements the team Keychain store.
+
+Revision of 2026-10-27, for packet SG3: the owner's probes KC-P1, KC-P2 and
+KC-P4 ran ([KC probe results](release-signing.md#kc-probe-results-2026-10-27)).
+This design now describes the **team Keychain store** as the production store:
+the data-protection keychain, with the access group named in every call and
+read from the process's own entitlements. The file-based keychain remains only
+as the test-only scratch backend. Stranded items are removed. Every Keychain
+error records its raw status and the session state in the audit event. The
+[release signing design](release-signing.md#team-keychain-store) owns the
+signing-specific rules; this document links to them.
 
 ## Scope
 
@@ -98,7 +105,7 @@ its job's later output deletion.
 | SSR3 | The item is deleted when its command's job settles (kind 28 committed), when its input is dropped (kind 13 Drop committed), when its kind 31 append is rejected, or when dispatch finds it mismatched. A startup sweep deletes items the journal does not reference as live. |
 | SSR4 | When the Keychain is locked, unavailable or denies access, the person sees why. Asura never falls back to writing values to disk, and never shows a Keychain prompt. |
 | SSR5 | No Keychain call runs on the reactor, a control handler or a render path. No Keychain wait has a time bound; each ends by a reply, a cancel of the waiting request, or shutdown. |
-| SSR6 | Tests never read, write or delete items in the login keychain; they use a scratch keychain file. No test or probe calls `SecItemAdd` unless the status pre-check of its scratch keychain returned 0 in the same worker step ([testing rules](#testing-rules)). SG3 adds (SGQ6): only the signed qualification run writes data-protection items, under the test access group, and it leaves that group empty ([test isolation](release-signing.md#test-isolation-without-the-login-keychain)). |
+| SSR6 | Tests never read, write or delete items in the login keychain; they use a scratch keychain file. No test or probe calls `SecItemAdd` on a scratch keychain unless its status pre-check returned 0 in the same worker step ([testing rules](#testing-rules)). Only the signed qualification run writes data-protection items, under the test access group, and it leaves that group empty (SGQ6, [test isolation](release-signing.md#test-isolation-without-the-login-keychain)). |
 
 ## Terms
 
@@ -107,23 +114,24 @@ its job's later output deletion.
 | Secret store | The service component that holds person command values: the Keychain items and the worker that reads and writes them |
 | Secret item | One Keychain generic-password item holding all values of one person command input |
 | Secret store worker | The retained service thread that makes every Keychain call |
-| Keychain target | The keychain the worker uses: the default (login) keychain in production, a scratch keychain file in tests |
-| Target pre-check | The `SecKeychainGetStatus` call on the target that the worker makes before every item call ([target pre-check](#target-pre-check)) |
+| Keychain target | The keychain the worker uses: the data-protection keychain with the Asura access group in production (`Target::Default`), a scratch keychain file in tests (`Target::Scratch`) |
+| Access group | The keychain access group the process reads from its own signed entitlements; every production call names it ([access group](release-signing.md#access-group-from-the-entitlements)) |
+| Target pre-check | The `SecKeychainGetStatus` call that the scratch backend makes before every item call ([target pre-check](#target-pre-check)). Test-only |
 | Orphan item | A secret item whose input the journal does not reference as live |
-| Stranded item | An orphan item whose delete the Keychain denied to the running service binary. It stays until a later sweep or the person deletes it ([stranded items](#stranded-and-unrecognized-items)) |
 | Unrecognized item | An item under this installation's service attribute whose account is not `input.<32 lowercase hex>`. Asura never writes one |
+| Field evidence | The raw `OSStatus` and the session state that every Keychain error records in its audit event ([field evidence](release-signing.md#keychain-field-evidence)) |
 
 ## Ownership
 
 | Behavior | Canonical owner | Change |
 | --- | --- | --- |
-| Keychain calls: add, read, delete, bounded list, status pre-check; user-interaction lock; scratch keychain create, lock and delete for tests; the fixture writer | Module `asura-platform::keychain` over `security-framework`, plus narrow `extern "C"` wrappers ([unsafe wrappers](#unsafe-wrappers)) | SS1-K delivered; SS1-K2 adds the list bound and the shared fixture function |
-| Status code to `Failure` mapping, including the second `SecKeychainGetStatus` call after -25293 or -25308 | `asura-platform::keychain` (`classify`) | SS1-K delivered ([status mapping](#status-mapping)) |
-| `Failure` to reply mapping, request queue, worker thread, item payload codec, binding check, sweep, item count, stranded and unrecognized counts | Module `asura-service::secret_store` (`secret_store.rs`, `secret_store/{codec,port,worker}.rs`), declared `pub mod secret_store;` so the integration tests reach it | Implemented (SS1-S, `2c17a53`) |
+| Keychain calls: add, read, delete, bounded list on the data-protection keychain with the access group; the access group check; the session state read; user-interaction lock; for tests, the scratch file backend with its pre-check, scratch keychain create, lock and delete, the fixture writer and the qualification purge | Module `asura-platform::keychain` (`keychain.rs`, `keychain/{data_protection,session,tests}.rs`) over `security-framework`, plus narrow `extern "C"` wrappers ([unsafe wrappers](#unsafe-wrappers)) | SS1-K, SS1-K2; SG3 adds the data-protection backend, the group check and the session state |
+| Status code to `Failure` mapping: the data-protection table, and for the scratch backend the second `SecKeychainGetStatus` call after -25293 or -25308 | `asura-platform::keychain` (`classify` of each backend) | SG3 ([status mapping](#status-mapping)) |
+| `Failure` to reply mapping, request queue, worker thread, item payload codec, binding check, sweep, item count and unrecognized count, the `not_signed` terminal state, the field evidence on every failure reply | Module `asura-service::secret_store` (`secret_store.rs`, `secret_store/{codec,port,worker,qualification}.rs`), declared `pub mod secret_store;` so the integration tests reach it | SS1-S; SG3 |
 | When to write and read | Conversation owner (`asura-service/src/conversation.rs`): `put` at submit, `get` at dispatch | Calls the store |
 | When to delete | Conversation owner: on `JobEvent::Settled` for a person-origin job (after kind 28 commits), after a kind 13 Drop commits, after a definite kind 31 rejection, and on a dispatch `mismatch` | Calls the store; the job controller never calls it |
 | Values in flight to the spawn | Existing secret detection environment path and guardian; the launch environment through the [person environment descriptor](person-command-mode.md#platform-changes) | P1 |
-| Item count and sweep state in the service status | Service observer (`ServiceObservation` field 8, [operations](#operations-and-audit)) | New field |
+| Item count and sweep state in the service status | Service observer (`ServiceObservation` field 8, [operations](#operations-and-audit)) | P3-E; SG3 removes the stranded fields |
 | What the person sees | TUI, from queue refusal and waiting reasons ([control API](person-command-mode.md#control-api-additions)) | New reason texts |
 
 The job controller does not call the store. Its `JobEvent::Settled(job,
@@ -150,7 +158,7 @@ functions from the Security framework with `extern "C"`:
 
 | Function | Build | Use |
 | --- | --- | --- |
-| `SecKeychainGetStatus(SecKeychainRef, *mut u32) -> OSStatus` | Production | The [target pre-check](#target-pre-check) and the locked or denied decision |
+| `SecKeychainGetStatus(SecKeychainRef, *mut u32) -> OSStatus` | `test-support` only (SG3) | The scratch backend's [target pre-check](#target-pre-check) and its locked or denied decision |
 | `SecKeychainLock(SecKeychainRef) -> OSStatus` | `test-support` only | Lock a scratch keychain for the locked cases |
 | `SecKeychainDelete(SecKeychainRef) -> OSStatus` | `test-support` only | Delete a scratch keychain at teardown |
 
@@ -160,11 +168,26 @@ for the call. The status pointer is a local `u32`. No pointer outlives the call.
 The deprecated-API warning is allowed on these three items only. KQ3's
 dependency approval is unchanged; no other crate is added.
 
+SG3 (2026-10-27) adds these declarations, for the same reason: the crates do
+not expose them.
+
+| Item | Build | Use |
+| --- | --- | --- |
+| `SecTaskCreateFromSelf`, `SecTaskCopyValueForEntitlement` | Production | The [access group check](release-signing.md#access-group-from-the-entitlements). Each returned object is taken under the create rule and released once |
+| `kSecUseAuthenticationUIFail` (static) | Production | The user-interaction value of every data-protection dictionary |
+| `SecItemAdd`, `SecItemCopyMatching`, `SecItemDelete` (from `security-framework-sys`) | Production | The data-protection calls, over dictionaries the backend builds itself so that KC-U1 can inspect them |
+| `getaudit_addr` and the `auditinfo_addr` layout (48 bytes, flags at offset 40, checked against the SDK header on macOS 27.0) | Production | The session flags of the [field evidence](release-signing.md#keychain-field-evidence) |
+
+`sysctlbyname`, `stat` and `getuid` come from `libc`. Every pointer passed is
+a live local or a Core Foundation object owned for the call.
+
 ### SS-O1: components and trust boundaries
 
-Selected design, revised twice on 2026-10-22. Solid arrows are calls or data. Dashed
-arrows are OS IPC. Subgraphs are process boundaries. Values move only along
-arrows marked "values". Every item call passes the status pre-check first.
+Selected design, revised twice on 2026-10-22 and for SG3 on 2026-10-27. Solid
+arrows are calls or data. Dashed arrows are OS IPC. Subgraphs are process
+boundaries. Values move only along arrows marked "values". Every production
+item call names the data-protection keychain and the access group; every
+scratch (test) item call passes the status pre-check first.
 
 ```mermaid
 flowchart TB
@@ -176,26 +199,28 @@ flowchart TB
         Ctl["Job controller"]
         Q["Secret store queue: 16 requests"]
         W["Secret store worker thread"]
-        KC["asura-platform::keychain: pre-check, then item call"]
-        Obs["Service observer: item count, stranded and unrecognized counts, sweep pending"]
+        KC["asura-platform::keychain: access group check, then item call with the group (production); pre-check, then item call (tests)"]
+        Obs["Service observer: item count, unrecognized count, sweep pending, last status"]
+        A[("Audit: reply, raw status and session state, never values")]
         J[("Format-1 journal: names and display text only")]
     end
     subgraph SD["securityd (OS)"]
         Sec["Security framework service"]
     end
-    LK[("Default keychain file (production)")]
+    LK[("Data-protection keychain: Asura access group (production)")]
     SK[("Scratch keychain file (tests only)")]
     Sub -->|"values"| Own
     Own -->|"put, get, delete (values)"| Q
     Ctl -->|"JobEvent::Settled after kind 28"| Own
     Q --> W
     W -->|"values"| KC
-    KC -.->|"SecKeychainGetStatus, then SecItem calls; user interaction off"| Sec
+    KC -.->|"SecItem calls; user interaction off"| Sec
     Sec -.-> LK
     Sec -.-> SK
-    W -->|"reply: stored, values, missing, locked, denied, unavailable"| Own
+    W -->|"reply: stored, values, missing, locked, unavailable or not_signed, with status and session"| Own
     W -->|"count, sweep state"| Obs
     Own -->|"kind 31 after put is stored"| J
+    Own -->|"secret_store.* events"| A
 ```
 
 ## Keychain item contract
@@ -205,25 +230,22 @@ Selected (engineering) unless marked otherwise.
 | Property | Value |
 | --- | --- |
 | Class | Generic password (`kSecClassGenericPassword`) |
-| Keychain | Production: the default keychain reference from `SecKeychainCopyDefault`, normally the login keychain, passed as `kSecUseKeychain`. Tests: a scratch keychain file (`Location::FileKeychain`), passed the same way |
+| Keychain | Production: the data-protection keychain (`kSecUseDataProtectionKeychain = true`) with the access group in every call ([team Keychain store](release-signing.md#item-contract-changes)). Tests: a scratch keychain file (`Location::FileKeychain`), passed as `kSecUseKeychain` |
+| Access group | Production: the group read from the process's entitlements, `<TeamID>.org.pidster.asura` (`.test` in the qualification bundle). Tests: none |
 | Service attribute | `asura.secret-store.<installation ID, lowercase hex>` |
 | Account attribute | `input.<input ID, lowercase hex>` |
 | Label | `Asura queued command secrets` |
-| Synchronizable | No. A file-based keychain item is never synced to iCloud |
-| Access control | The default ACL of an item the service creates: the creating binary may read it without a prompt ([KQ2](#owner-decisions)). Probe SS-P2 (b) confirmed that read is bound per build: the ACL names the writer's code hash (cdhash). Delete is not bound per build: probe SS-P3 showed that a binary with the writer's executable file name deletes the item, and a binary with another file name gets -25244 |
-| Accessibility class | Not available on a file-based keychain; see [KQ1](#owner-decisions). The login keychain is readable while it is unlocked, normally from login |
+| Synchronizable | `false`, set explicitly in every production call |
+| Access control | Production: any build signed by the team that claims the group reads and deletes the item (SGQ4, KC-P1); another program gets -34018. Tests: the scratch file's default ACL binds read to the writer's cdhash and delete to its executable file name (probes SS-P2 (b), SS-P3) |
+| Accessibility class | Production: `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (KQ1). Tests: not available on a file keychain |
 | Data | The payload below, at most 55,413 bytes |
 
 The service and account attributes bind an item to one installation and one
 input. The payload binds it again by digest, so an item copied under another
 name is rejected.
 
-SG3 replaces the Keychain, Synchronizable, Access control and Accessibility
-class rows with the
-[the team Keychain store item contract](release-signing.md#item-contract-changes):
-the data-protection keychain, the Asura access group,
-`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, and read and delete by any
-team-signed build with the group (SGQ4). The other rows are unchanged.
+The [team Keychain store item contract](release-signing.md#item-contract-changes)
+owns the production rows above and the user-interaction rule.
 
 ### Payload
 
@@ -269,8 +291,8 @@ projects. That limit keeps normal use far below 256.
 Selected (engineering, 2026-10-22, SS1-K gap 5).
 
 - **What counts.** The item count is every item that a list under this
-  installation's service attribute returns: live items, orphans, stranded
-  items and unrecognized items. All of them use the same keychain and the same
+  installation's service attribute returns: live items, orphans and
+  unrecognized items. All of them use the same keychain and the same
   list memory. `put` is refused with `full` when the count is 256 or more.
 - **List bound.** The platform list asks for at most 257 results
   (`kSecMatchLimit` 257, `Limit::Max(257)`): the 256-item limit plus one.
@@ -280,82 +302,58 @@ Selected (engineering, 2026-10-22, SS1-K gap 5).
   attributes only, never item data. SS1-K2 replaces `Limit::All` with this
   bound.
 - **Read bound.** `get` copies the whole item data; the Security framework
-  gives no way to bound a read before the copy. The read ACL lets the service
-  read only items written by its own build, and `add` refuses data over
-  55,413 bytes, so a readable item is never larger. The service payload codec
+  gives no way to bound a read before the copy. Only team-signed builds with
+  the access group can write an item the service reads, and `add` refuses data
+  over 55,413 bytes, so an item Asura wrote is never larger. The service payload codec
   is the one owner of the payload bound: it rejects any data over 55,413
   bytes, and the reply is `mismatch`. The platform does not check the read
   size a second time.
-- **Attribute size.** Another same-UID process can write items with large
-  attributes under Asura's service attribute. A list then holds up to 257
-  such attribute sets for one call. This is a residual under
+- **Attribute size.** In production only a team-signed build with the group
+  can write items under Asura's service attribute in that group. A list then
+  holds up to 257 attribute sets for one call. In the scratch backend another
+  same-UID process can write them. This is a residual under
   [D1](threat-model.md#scope-assets-and-actors), recorded as
   [SS-T9](execution-threat-model.md#secret-store-at-rest).
 
-### Stranded and unrecognized items
+### Unrecognized items
 
-Selected (engineering, 2026-10-22, SS1-K gaps 1 and 4).
-
-SG3 replaces the stranded-item part of this section (SGQ4). Under the team Keychain store
-every team-signed build can delete every Asura item, so stranded items go
-away; the stranded fields and the `/status` stranded notice are removed
-([what SG3 removes](release-signing.md#what-sg3-removes)). The
-unrecognized-item rule stays.
-
-A **stranded item** is an orphan whose delete returned `denied`
-(-25244, or -25293 or -25308 with the keychain unlocked). Probe SS-P3 showed
-when this happens: the deleting binary's executable file name differs from
-the writer's. The production service runs as the `asura` executable
-(`spawn_service` re-executes the canonical `current_exe`), and a rebuild or
-an upgrade keeps that name. So a rebuild leaves no stranded items; a renamed
-binary, or an item written by a test fixture binary, does. The rule is an
-observed behavior of macOS 27.0, not a documented contract. The design
-therefore handles a denied delete without relying on it:
-
-1. The worker keeps a stranded item. It stays in the item count and so
-   counts toward the 256-item limit.
-2. Every sweep tries to delete it again, because a later binary with the
-   writer's file name can delete it.
-3. The service observer reports the stranded count and up to 16 stranded
-   input IDs ([operations](#operations-and-audit)). The TUI's `/status`
-   detail shows the notice "Asura cannot delete N old Keychain items. In
-   Keychain Access, delete the login keychain items named 'Asura queued
-   command secrets' with these accounts:" and the `input.<hex>` accounts.
-   These inputs are not live, so deleting them loses no command.
-4. When stranded items make the store full, the `secret_store_full` text adds
-   "/status lists Keychain items to delete."
+Selected (engineering, 2026-10-22, SS1-K gap 4; revised for SG3,
+2026-10-27). SG3 removed stranded items (SGQ4): every team-signed build can
+delete every Asura item in the group, so a delete fails only for the whole
+store. A delete that fails for any reason, including `denied` from the
+test-only scratch backend, leaves an orphan that the next sweep retries
+([what SG3 removes](release-signing.md#what-sg3-removes)).
 
 An **unrecognized item** has an account that is not `input.<32 hex>`. Asura
 never writes one, and no older Asura format exists to migrate. The store
 counts it and reports the count; it never reads or deletes it, and the
 platform has no call to delete it. Deleting accounts outside the item
-contract would let the service destroy items it did not write. The person
-can delete it in Keychain Access.
-
-Not verified: no probe deleted an item with Keychain Access. The `security`
-command-line tool was not used for this check, because it can show a dialog.
+contract would let the service destroy items it did not write. `/status`
+reports the count.
 
 ## Lifecycle
 
 ### SS-S1: secret item lifecycle
 
-Selected design, revised 2026-10-22. Arrows are events with guards. `Written`
-means the Keychain add returned success; it does not mean the journal refers
-to the item. Resume never reads the item; dispatch does.
+Selected design, revised 2026-10-22 and for SG3 on 2026-10-27. Arrows are
+events with guards. `Written` means the Keychain add returned success; it does
+not mean the journal refers to the item. Resume never reads the item; dispatch
+does. `denied` comes only from the test-only scratch backend; production
+reports a missing entitlement as `unavailable` (`not_signed`).
 
 ```mermaid
 stateDiagram-v2
     [*] --> Writing: submit with values, after rewrite
-    Writing --> Rejected: add fails: locked, denied, unavailable, full, busy
+    Writing --> Rejected: add fails: locked, denied, unavailable or not_signed, full, busy
     Writing --> Written: add succeeds
     Written --> Referenced: kind 31 durable
     Written --> Deleting: kind 31 rejected definitely
     Written --> Orphan: crash before kind 31
     Referenced --> Reading: input reaches dispatch
     Reading --> Consumed: values read, binding matches, kind 26 committed
-    Reading --> Waiting: locked, unavailable or worker busy
+    Reading --> Waiting: locked, unavailable (including not_signed) or worker busy
     Waiting --> Reading: paced recheck or store wake
-    Reading --> HeldDenied: denied
+    Reading --> HeldDenied: denied (scratch backend only)
     Reading --> Lost: missing or binding mismatch
     Consumed --> Deleting: JobEvent Settled (kind 28 committed)
     Referenced --> Held: restart (MQ07R)
@@ -367,9 +365,7 @@ stateDiagram-v2
     Lost --> Deleting: mismatch, or Drop durable
     Orphan --> Deleting: startup sweep
     Deleting --> [*]: delete succeeds or item already absent
-    Deleting --> Orphan: delete unavailable or queue full
-    Deleting --> Stranded: delete denied
-    Stranded --> Deleting: next startup sweep
+    Deleting --> Orphan: delete locked, denied, unavailable or queue full
     Rejected --> [*]
 ```
 
@@ -391,16 +387,16 @@ stateDiagram-v2
    that the numbered values match kind 31's number count and kinds. If kind
    31's rule-set revision differs from the running rule set, the input is
    `Held` with hold reason `secret_rules_changed` and nothing runs; the item
-   stays until Drop. A rule-set change needs a new binary, and the default ACL
-   is bound per build (KQ2), so this case normally appears as `denied` first.
+   stays until Drop. A rule-set change needs a new binary; under the team
+   Keychain store (SGQ4) the new binary reads the item, so this hold reason
+   appears directly.
    The values move into the job admission and are zeroized after spawn, as
    secret detection requires.
 5. **Delete after the deciding record.** The owner sends `delete` only after
    the kind 28 settlement, kind 13 Drop, or definite kind 31 rejection is
-   durable, or after a dispatch `mismatch`. An `unavailable` delete leaves an
-   orphan that the next sweep removes. A `denied` delete leaves a
-   [stranded item](#stranded-and-unrecognized-items). Neither changes the
-   record.
+   durable, or after a dispatch `mismatch`. A delete that fails (`locked`,
+   `unavailable`, or `denied` from the scratch backend) leaves an orphan that
+   the next sweep removes. It does not change the record.
 6. **Exact retry.** A retry with the same request ID is first matched against
    kind 31's request digest. When the item exists, the worker also compares a
    keyed digest of the retried values, using the item's value digest key;
@@ -422,18 +418,16 @@ succeeds for a path with no keychain, and `SecItemAdd` with that reference as
 `kSecUseKeychain` returned success and wrote the item into the login keychain.
 Read, list and delete on the missing keychain returned -25300.
 
-Before every add, get, list or delete, the worker calls `SecKeychainGetStatus`
-on the target reference in the same worker step. A non-zero return makes the
-reply `unavailable` with the status code in audit, and the item call is not
-made. The production target is the default keychain reference, obtained once
-at worker start with `SecKeychainCopyDefault` and pre-checked the same way.
-The worker never passes a keychain reference to an item call without a
-pre-check that returned 0 in that step.
+Before every add, get, list or delete on a scratch keychain, the platform
+calls `SecKeychainGetStatus` on the target reference in the same worker step.
+A non-zero return makes the reply `unavailable` with the status code in audit,
+and the item call is not made. The platform never passes a keychain reference
+to an item call without a pre-check that returned 0 in that step.
 
-SG3 replaces the production part of this rule: the data-protection keychain
-has one target per user, so production makes no pre-check. The pre-check
-stays for the test-only scratch backend
-([what SG3 removes](release-signing.md#what-sg3-removes)).
+This rule applies to the test-only scratch backend alone (SG3). The
+data-protection keychain has one target per user, and every production
+dictionary names it with the flag and the access group, so production makes no
+pre-check ([what SG3 removes](release-signing.md#what-sg3-removes)).
 
 Residual (test-only): a scratch keychain deleted between the pre-check and the
 add is a check-then-add race. Production does not delete its target, so the
@@ -444,21 +438,23 @@ race needs a test that deletes its own keychain while the worker runs. The
 
 Selected (engineering). The sweep runs once on the worker after journal replay
 completes. It does not delay admission: a dispatch read that arrives first is
-queued behind it on the same worker. Probe finding (a) shows that list and
-delete succeed while the keychain is locked, so the sweep runs while locked.
+queued behind it on the same worker. Probe finding (a) showed that list and
+delete succeed while a file keychain is locked. For the data-protection
+keychain before first unlock this is unverified (KC-P3 was not run); a
+`locked` listing defers the sweep like any failed listing.
 
 ### SS-F1: startup sweep
 
-Selected design, revised three times on 2026-10-22. Arrows are decisions in order.
-Every list and delete box is one platform call, which runs the target
-pre-check first. The `Next` loop ends when no listed item is left. The
+Selected design, revised three times on 2026-10-22 and for SG3 on 2026-10-27.
+Arrows are decisions in order. Every list and delete box is one platform
+call; on the scratch backend it runs the target pre-check first. The `Next` loop ends when no listed item is left. The
 `Again` loop ends because each repeat deletes at least one item of a finite
 set; it stops at once when a pass deletes nothing.
 
 ```mermaid
 flowchart TD
     Start["Replay complete"] --> List{"List this installation's service, at most 257 results"}
-    List -->|"Pre-check non-zero or other failure"| Defer["unavailable: sweep pending; retry on next store request or dispatch"]
+    List -->|"locked, not_signed, pre-check non-zero or other failure"| Defer["Failure with status and session: sweep pending; retry before the next store request"]
     List -->|"-25300"| Done["Zero items: sweep complete"]
     List -->|"Items listed"| Next{"Next listed item?"}
     Next -->|"Account not input.32 hex"| Unrec["Count unrecognized; never read or delete"]
@@ -468,13 +464,11 @@ flowchart TD
     Keep --> Next
     Live -->|No| Del["Delete item"]
     Del -->|"deleted or absent"| Next
-    Del -->|"denied"| Strand["Stranded: keep, count, record input ID"]
-    Strand --> Next
-    Del -->|"locked or unavailable"| Fail["Count failure; retry at next sweep"]
+    Del -->|"locked, denied or unavailable"| Fail["Count failure: orphan kept; retry at next sweep"]
     Fail --> Next
     Next -->|"None left"| Again{"Listing truncated at 257 and this pass deleted an item?"}
     Again -->|Yes| List
-    Again -->|No| Done2["Sweep complete; audit counts; observer: count, stranded, unrecognized"]
+    Again -->|No| Done2["Sweep complete; audit counts; observer: count, unrecognized"]
 ```
 
 Items of other installation IDs are never listed or touched. An item that
@@ -491,21 +485,31 @@ refused with `full` until the person removes items.
 | `put` | Installation, input ID, binding, payload | `stored`, `exists_same`, `exists_different`, `locked`, `denied`, `unavailable`, `full` |
 | `get` | Installation, input ID, binding | `values`, `missing`, `mismatch`, `locked`, `denied`, `unavailable` |
 | `delete` | Installation, input ID | `deleted`, `absent`, `locked`, `denied`, `unavailable` |
-| `sweep` | Installation, live input IDs from replay | Counts: kept, deleted, failed, stranded, unrecognized; whether the last listing was truncated |
+| `sweep` | Installation, live input IDs from replay | Counts: kept, deleted, failed, unrecognized; whether the last listing was truncated |
+
+Every failure reply (`locked`, `denied`, `unavailable`) carries the raw
+`OSStatus` and the session state that the worker read when the call failed
+([field evidence](release-signing.md#keychain-field-evidence)). `unavailable`
+also carries a reason: `not_signed` for a missing entitlement (-34018, or the
+access group check), `invalid_request` for a defect that made no call, or
+none.
 
 A full worker queue (16 requests, counting the request the worker is running)
 answers `busy` before the request reaches the worker.
 
 ### Status mapping
 
-Selected (engineering, 2026-10-22), replacing the table that probe SS-P2
-disproved. The worker reads the `OSStatus` of each item call after a
-successful pre-check.
+Production uses the
+[team Keychain store status mapping](release-signing.md#status-mapping)
+(SG3, confirmed by KC-P1 and KC-P4 except -25308): 0 success; -25300
+`missing`, `absent` or zero items; -25299 the duplicate rule; -25308 `locked`
+(unverified); -34018 `unavailable` with reason `not_signed`, terminal; any
+other code `unavailable`.
 
-SG3 replaces this table with the
-[the team Keychain store status mapping](release-signing.md#status-mapping), which adds
-`errSecMissingEntitlement` (-34018) as `unavailable/not_signed`. Probe KC-P4
-must confirm it first.
+The table below is the scratch file backend's mapping (selected, engineering,
+2026-10-22, replacing the table that probe SS-P2 disproved). It applies only
+to `Target::Scratch` in tests. The platform reads the `OSStatus` of each item
+call after a successful pre-check.
 
 | Security status | Reply |
 | --- | --- |
@@ -525,12 +529,13 @@ written by the `security` CLI returned -25244. SS1-K's re-run step R2 found
 that deleting an item written by `keychain_fixture` also returns -25244, so
 the reply is `denied`.
 
-**Owner of the mapping** (implemented by SS1-K, 2026-10-22). The table above
-is implemented once, in `asura_platform::keychain`. The platform function
-`classify` makes the second `SecKeychainGetStatus` call after -25293 or
--25308, in the same platform call as the item call. The worker receives a
-`Failure` and never sees an item call's `OSStatus`. The worker maps platform
-results to replies with this table and nothing else:
+**Owner of the mapping** (SS1-K, 2026-10-22; SG3, 2026-10-27). Each table is
+implemented once, in `asura_platform::keychain`, as the `classify` of its
+backend. The scratch `classify` makes the second `SecKeychainGetStatus` call
+after -25293 or -25308, in the same platform call as the item call. Each
+`Failure` carries the raw status of the call that failed; the worker records
+it as evidence and never maps a raw `OSStatus` itself. The worker maps
+platform results to replies with this table and nothing else:
 
 | Platform result | Worker reply |
 | --- | --- |
@@ -538,10 +543,14 @@ results to replies with this table and nothing else:
 | `Added::Duplicate` | `get` the item, then compare digests: `exists_same` or `exists_different`; that `get`'s failure gives its own reply. A `get` that returns `Found::Missing` after the duplicate (the item was deleted between the two calls) gives `unavailable` with status -25300 |
 | `Found::Data`, `Found::Missing` | Decode and bind: `values` or `mismatch`; `missing` |
 | `Removed::Deleted`, `Removed::Absent` | `deleted`, `absent` |
-| `Failure::Locked` | `locked`, for `put`, `get` and `delete` alike; a locked delete leaves an orphan for the next sweep |
-| `Failure::Denied` | `denied`; on a delete, the item becomes stranded |
+| `Failure::Locked { status }` | `locked`, for `put`, `get` and `delete` alike; a locked delete leaves an orphan for the next sweep |
+| `Failure::Denied { status }` | `denied` (scratch backend only); a denied delete leaves an orphan for the next sweep |
+| `Failure::NotSigned { .. }` | `unavailable` with status -34018 and reason `not_signed`, in audit and in `last_status`. The worker enters its terminal `not_signed` state: every later request gets the same reply with no port call and no open |
 | `Failure::Unavailable { status, .. }` | `unavailable`, with `status` in audit and in `last_status` |
-| `Failure::Invalid` | `unavailable` with status 0 and audit reason `invalid_request`. The codec and the item key rules make this unreachable; reaching it is a defect that SS-U10 detects |
+| `Failure::Invalid` | `unavailable` with status 0 and audit reason `invalid_request`, with no session. The codec and the item key rules make this unreachable; reaching it is a defect that SS-U10 detects |
+
+Every row except `Invalid` also carries the session state the worker read
+after the failure ([field evidence](release-signing.md#keychain-field-evidence)).
 
 ### Worker seam for tests
 
@@ -568,8 +577,9 @@ pub(crate) trait KeychainPort: Send + 'static {
   on its own thread and owns it.
 - Unit tests: a scripted port in `secret_store/tests.rs` returns queued
   platform results and records calls. It covers the `Failure` to reply table,
-  the sweep decisions, stranded and unrecognized counts, and truncation
-  (SS-U5, SS-U6, SS-U10, SS-U11). It never makes a Keychain call.
+  the sweep decisions, the unrecognized count, truncation, the `not_signed`
+  terminal state and the evidence on failure replies (SS-U5, SS-U6, SS-U10,
+  SS-U11, KC-U3, KC-U5, KC-U6). It never makes a Keychain call.
 - Integration tests: a gated port (`test-support` only) wraps the real
   `Keychain`. It can block before a call until the test releases it (SS-W4)
   or return `Failure::Unavailable` once for a named call (SS-W8). Every other
@@ -587,36 +597,32 @@ the queue entry's waiting reason.
 
 | Case | Result |
 | --- | --- |
-| Keychain locked at submit | Refused with `secret_store_locked`: "The login keychain is locked. Unlock it, then press Enter again." Draft and mode kept. Nothing journaled |
-| Access denied at submit | Refused with `secret_store_denied`: "macOS denied Asura access to its Keychain item." Draft kept |
+| Keychain locked at submit | Refused with `secret_store_locked`: "The Keychain is locked until this Mac is unlocked after start-up. Unlock it, then press Enter again." Draft and mode kept. Nothing journaled |
+| Build not signed for the Keychain at submit | Refused with `secret_store_unavailable` and status 34018: "This Asura build is not signed for the Keychain." Draft and mode kept. No Keychain call is made after the first `not_signed` |
+| Access denied at submit (scratch backend only) | Refused with `secret_store_denied`: "macOS denied Asura access to its Keychain item." Draft kept |
 | Keychain unavailable at submit | Refused with `secret_store_unavailable` and the status code. Draft kept |
-| 256 items exist | Refused with `secret_store_full`; draft kept. The count includes stranded and unrecognized items; when stranded items exist, the text adds "/status lists Keychain items to delete." |
+| 256 items exist | Refused with `secret_store_full`; draft kept. The count includes unrecognized items |
 | Worker queue full at submit | Refused with `secret_store_busy`; draft kept |
-| Locked or unavailable at dispatch | The command stays at the lane head with waiting reason `keychain_locked` or `keychain_unavailable`. The owner rechecks on the paced delays 1, 1, 2, 3, 5, 8 s and so on, at most 60 s apart, as the controller's `disk_space` recheck does, and at once on the person's next action in that conversation (Send now, Resume, a new submit, Drop). The pacing ends nothing |
+| Locked or unavailable (including `not_signed`) at dispatch | The command stays at the lane head with waiting reason `keychain_locked` or `keychain_unavailable`. Under `not_signed` the worker answers each recheck at once without a Keychain call; the person can Drop the command or restart a signed build. The owner rechecks on the paced delays 1, 1, 2, 3, 5, 8 s and so on, at most 60 s apart, as the controller's `disk_space` recheck does, and at once on the person's next action in that conversation (Send now, Resume, a new submit, Drop). The pacing ends nothing |
 | Worker queue full at dispatch | Waits with reason `keychain_busy`; dispatch retries when the worker answers any request |
-| Denied at dispatch | The command is `Held` with hold reason `secret_store_denied`: "macOS denied Asura access to this command's Keychain item. Drop it and enter it again." Under KQ2 a rebuilt binary causes this; a recheck cannot clear it |
+| Denied at dispatch (scratch backend only) | The command is `Held` with hold reason `secret_store_denied`: "macOS denied Asura access to this command's Keychain item. Drop it and enter it again." A recheck cannot clear it. Production cannot produce `denied` |
 | Item missing or binding mismatch at dispatch | The command is `Held` with hold reason `secrets_lost`: "This command's secrets are no longer in the Keychain. Drop it and enter it again." A mismatched item is deleted |
 | Rule-set revision changed at dispatch | `Held` with `secret_rules_changed` (rule 4); item kept until Drop |
 | Crash after put, before kind 31 | Orphan; deleted by the startup sweep |
 | Delete locked or unavailable | Item kept as an orphan; counted in audit; retried by the next sweep |
-| Delete denied | Item kept as a [stranded item](#stranded-and-unrecognized-items); counted in audit and in the observer; retried by every sweep; `/status` names it for the person to delete |
+| Delete denied (scratch backend only) | Item kept as an orphan; counted in audit as a failed delete; retried by the next sweep |
 | Unrecognized item under the service | Counted toward the 256-item limit and reported; never read or deleted |
 | List returns 257 items | Count reported as 257 ("more than 256"); `put` refused with `full`; the sweep repeats while each pass deletes an item |
 | Item data over 55,413 bytes | The codec rejects it: `mismatch`, held with `secrets_lost`, item deleted |
 | Keychain stalls inside securityd | The worker waits without a time bound. Later requests queue, then `busy`. Control, cancel, Drop records and other conversations stay responsive |
 | Shutdown while a request is in flight | Shutdown does not wait for the worker. The ordering rules keep records consistent: an unreferenced item is an orphan, a referenced one is still valid |
-| Person deletes the item in Keychain Access | Treated as missing |
-| Another same-UID binary deletes the item | Probe SS-P3: this succeeds without a prompt when the binary's executable file name is the writer's (`asura`); another file name gets -25244. The command is held with `secrets_lost` at dispatch. Denial of service, not disclosure ([SS-T3](execution-threat-model.md#secret-store-at-rest)) |
-| Service binary rebuilt or replaced | The default ACL no longer trusts it for reads: `denied` ([KQ2](#owner-decisions)). Deletes still succeed while the executable file name stays `asura` (probe SS-P3), so Drop and the sweep remove the old items. A renamed binary leaves stranded items |
-| Target keychain missing or deleted | Pre-check non-zero: `unavailable`; no item call; never a write to another keychain |
+| The item is deleted outside Asura | Treated as missing |
+| Another same-UID binary deletes the item | Production: only a build signed by the team with the access group can (SGQ4); another program gets -34018 (KC-P4). The command is held with `secrets_lost` at dispatch. Denial of service, not disclosure ([SS-T3](execution-threat-model.md#secret-store-at-rest)) |
+| Service binary rebuilt or replaced | A team-signed rebuild with the group reads and deletes every earlier item (SGQ4, KC-P1). An unsigned rebuild reports `not_signed` |
+| Scratch keychain missing or deleted (tests) | Pre-check non-zero: `unavailable`; no item call; never a write to another keychain |
 
-SG3 replaces these rows: "Keychain locked at submit" (new text for the
-data-protection keychain before first unlock), "Access denied at submit" and
-"Denied at dispatch" (only a missing entitlement, `not_signed`), "Delete
-denied" (no stranded item), "Another same-UID binary deletes the item" (only a
-team-signed build with the group can), "Service binary rebuilt or replaced"
-(no `denied`, SGQ4) and "Target keychain missing or deleted" (production has
-one target). See [release signing failure handling](release-signing.md#failure-handling).
+The [release signing failure handling](release-signing.md#failure-handling)
+owns the signing-related rows (profile, SSH, before first unlock).
 
 A command with no detected secret, a `!` command with no secret, and a model
 call never touch the Keychain. A `!!` command always has a launch environment,
@@ -629,18 +635,22 @@ Mapping to [AE-01–AE-07](../engineering.md#asynchronous-execution-and-recovery
 | Rule | Application |
 | --- | --- |
 | AE-01 | Every Security framework call runs on the one retained secret store worker thread. The reactor, control handlers and rendering never call it. |
-| AE-02 | Blocking calls: `SecKeychainGetStatus`, `SecItemAdd`, `SecItemCopyMatching`, `SecItemDelete`, `SecKeychainCopyDefault`, `SecKeychainSetUserInteractionAllowed`; in tests `SecKeychainCreate`, `SecKeychainOpen`, `SecKeychainLock` and `SecKeychainDelete`. Each is IPC to securityd and can wait. |
-| AE-03 | Queue: 16 requests, then `busy`. One request runs at a time. Deletes after settlement join the same queue; if it is full, the delete is left for the next sweep. Items: 256 per installation, counting every listed item. List: at most 257 attribute results per call, no item data. Read: one item's data, at most 55,413 bytes for any item this build can read; the codec rejects more. Payload: 55,413 bytes. Observer: at most 16 stranded input IDs. |
+| AE-02 | Blocking calls, all on the worker thread: `SecItemAdd`, `SecItemCopyMatching`, `SecItemDelete` and `SecKeychainSetUserInteractionAllowed` (IPC to securityd, can wait); `SecTaskCreateFromSelf` and `SecTaskCopyValueForEntitlement` (once, at open); the evidence reads `sysctl`, `stat` of `/dev/console` and `getaudit_addr` (once per failed call); in tests `SecKeychainGetStatus`, `SecKeychainCreate`, `SecKeychainOpen`, `SecKeychainLock` and `SecKeychainDelete`. |
+| AE-03 | Queue: 16 requests, then `busy`. One request runs at a time. Deletes after settlement join the same queue; if it is full, the delete is left for the next sweep. Items: 256 per installation, counting every listed item. List: at most 257 attribute results per call, no item data. Read: one item's data, at most 55,413 bytes for any item this build can read; the codec rejects more. Payload: 55,413 bytes. Evidence: one status and four fixed-size session fields per failure reply. |
 | AE-04 | No time bound. A request ends by its reply. A submitter that stops waiting (client cancel or disconnect) leaves the request to finish; its result is applied or swept. A stalled securityd is a stalled dependency: the store reports `busy` and everything else continues. The locked-at-dispatch recheck is pacing (1, 1, 2, 3, 5 … s, at most 60 s) and ends nothing. |
 | AE-05 | Values are read at each dispatch, never relaunched after an unknown outcome. Orphans are reconciled against replay. |
-| AE-06 | Startup: the worker starts after the platform disables Keychain user interaction for the process, takes the default keychain reference, then sweeps after replay. Shutdown: admission closes; the worker is not awaited. |
+| AE-06 | Startup: the worker disables Keychain user interaction for the process and reads the access group when it opens the store on its own thread, then sweeps after replay. A `not_signed` open does not delay start. Shutdown: admission closes; the worker is not awaited. |
 | AE-07 | Acceptance: with the scratch keychain call blocked by a test seam, the TUI stays responsive, Ctrl-C and Drop work, and a submit without secrets still runs. |
 
 User interaction: the platform calls `SecKeychainSetUserInteractionAllowed(false)`
-through `SecKeychain::disable_user_interaction()` once at service start and
-holds the guard for the process lifetime. The setting is process-wide. A call
-that would show a dialog then fails instead of waiting for a person. The
-SS1-K probes ran with it disabled and saw no dialog.
+through `SecKeychain::disable_user_interaction()` once, when the worker opens
+the store, and holds the guard for the process lifetime. The setting is
+process-wide and covers the file backend. Every data-protection dictionary
+also sets `kSecUseAuthenticationUI = kSecUseAuthenticationUIFail`, so a call
+that would show a dialog fails with -25308 instead of waiting for a person.
+The SS1-K probes and KC-P4 saw no dialog. Whether `SecItemAdd` accepts the
+user-interaction key on the data-protection keychain is verified by the signed
+qualification run, not by `cargo test`.
 
 ## Security
 
@@ -648,25 +658,28 @@ Owner decision EXD-2 (2026-10-20) in the
 [threat model](execution-threat-model.md#secret-store-at-rest) accepts secrets
 at rest in the Keychain.
 
-- **At rest.** Values are encrypted in the keychain file under keys derived
-  from the person's login password. They are included in backups of that file
-  in encrypted form. They never sync, because a file-based keychain item does
-  not.
-- **Who can read.** The service binary that created the item reads it without
-  a prompt while the keychain is unlocked. Another same-UID binary gets
-  -25293 with user interaction off (probe SS-P2 (b)). Same-UID processes are
-  one principal under [D1](threat-model.md#scope-assets-and-actors), so this
-  is defense in depth, not a boundary claim.
-- **Who can delete.** Another same-UID binary with the writer's executable
-  file name deleted an Asura item without a prompt (probes SS-P2 (c) and
-  SS-P3). A binary with another file name got -25244. Any same-UID process
-  can start a binary named `asura`, so this is not a boundary either. The
-  effect is a lost command (`secrets_lost`), not disclosure.
+- **At rest.** Values are in the data-protection keychain,
+  `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`: readable after the
+  first unlock since start-up, excluded from backups to other devices and
+  from migration, never synchronized.
+- **Who can read and delete.** Any build signed by the team that claims the
+  access group (SGQ4, residual [SG-T1](release-signing.md#security)).
+  Another same-UID program cannot name the group: it gets -34018 (KC-P4).
+  Same-UID processes are one principal under
+  [D1](threat-model.md#scope-assets-and-actors), so this is defense in depth,
+  not a boundary claim. The effect of an early delete is a lost command
+  (`secrets_lost`), not disclosure.
+- **Field evidence.** Failure audit events carry a raw status, the boot time,
+  the console owner as `self`, `other` or `none`, and the audit session flags.
+  They name no user, account, path or value.
 - **What never holds values.** Journal, payloads, audit, logs, client replies,
   argument vectors and Asura files. The payload binding digest uses identifiers
   only; the value digest is keyed with a random key stored inside the item.
-- **Wrong keychain.** The target pre-check prevents an item call from falling
-  through to the default keychain when a scratch target is missing.
+- **Wrong keychain.** Every production dictionary sets the data-protection
+  flag and the access group (KC-U1), so no call reaches the file-based
+  keychain or omits the group. In tests the target pre-check prevents an item
+  call from falling through to the default keychain when a scratch target is
+  missing.
 - **Memory.** Values read from the Keychain go into zeroizing buffers and are
   dropped after spawn, as secret detection requires. Copies made inside the
   Security framework are outside Asura's control: `security-framework` copies
@@ -674,33 +687,37 @@ at rest in the Keychain.
   securityd holds values in its own process. This is residual
   [SS-T8](execution-threat-model.md#secret-store-at-rest).
 - **Lifetime.** An item lives from submit until its command's job settles or
-  its input is dropped, plus at most one sweep after a failed delete.
+  its input is dropped, plus the sweeps until a failed delete succeeds.
 
 ## Operations and audit
 
-- No configuration key. The production target is the default (login)
-  keychain. SG3 replaces it with the data-protection keychain and removes
-  `SecretStoreStatus` fields 4 and 6, which stay reserved
-  ([what SG3 removes](release-signing.md#what-sg3-removes)).
+- No configuration key. The production target is the data-protection
+  keychain with the access group from the entitlements (SG3).
 - Audit events `secret_store.put`, `secret_store.get`, `secret_store.delete`
-  and `secret_store.sweep` carry the input ID, the reply code, the status code
-  for `unavailable` and counts. They never carry a value, name, digest or
-  payload size. Packet P3-E2 adds them to the audit schema
-  (`asura-storage/src/audit/types.rs`) and emits them from the owner; the
-  project audit read does not show them, as for the `person_command.*`
-  events.
-- Service status (selected, engineering, 2026-10-22). `ServiceObservation`
-  gains field 8 `SecretStoreStatus secret_store`, owned by the service
-  observer and fed by the worker after each put, delete and sweep:
+  and `secret_store.sweep` carry the input ID, the reply code and counts. A
+  failure reply (`locked`, `denied`, `unavailable`) also carries `status`, the
+  raw signed `OSStatus` (0 for `invalid_request`), and, when a Keychain call
+  or the access group check failed, `session`: `boot_time_s`, `console`,
+  `audit_flags` and `origin`
+  ([field evidence](release-signing.md#keychain-field-evidence)). A success
+  reply carries neither. The events never carry a value, name, digest,
+  payload size, user or account name. Packet P3-E2 added them to the audit
+  schema (`asura-storage/src/audit/types.rs`) and emits them from the owner;
+  SG3 changed `status` to the raw signed value, added `session` and removed
+  the sweep's `stranded` count, in place under audit format 1. The project
+  audit read does not show them, as for the `person_command.*` events.
+- Service status (selected, engineering, 2026-10-22; SG3 removed fields 4
+  and 6). `ServiceObservation` field 8 `SecretStoreStatus secret_store` is
+  owned by the service observer and fed by the worker after each request:
 
 ```proto
 message SecretStoreStatus {
+  reserved 4, 6;
+  reserved "stranded_count", "stranded_inputs";
   optional uint32 item_count = 1;         // every listed item, 0-257; 257 means more than 256
   optional bool sweep_pending = 2;        // startup sweep deferred
   optional uint32 last_status = 3;        // 0, or the last unavailable OSStatus as its absolute value
-  optional uint32 stranded_count = 4;     // items whose delete was denied, 0-257
   optional uint32 unrecognized_count = 5; // items whose account is not input.<32 hex>, 0-257
-  repeated bytes stranded_inputs = 6;     // at most 16 input IDs of 16 bytes each
 }
 ```
 
@@ -709,25 +726,29 @@ worker has stored since, minus the items it has deleted since. It is absent
 until the first sweep completes. After a sweep that ends on a truncated
 listing the count stays 257 until a later listing returns fewer. `last_status`
 is cleared to 0 by the next port call that does not fail (recorded 2026-10-22
-from SS1-S). A `denied` delete adds the input to the
-stranded set; a later `deleted` or `absent` reply removes it. The TUI shows
-these fields only in `/status` detail; they are not in the top pane. When
-`stranded_count` is above 0, `/status` shows the
-[stranded item notice](#stranded-and-unrecognized-items) with each
-`input.<hex>` account from `stranded_inputs` and "and N more" for the rest.
+from SS1-S); under `not_signed` no call succeeds, so it stays 34018. The TUI
+shows these fields only in `/status` detail; they are not in the top pane.
 When `unrecognized_count` is above 0, it shows "N Keychain items under
 Asura's service name were not written by Asura."
 
 `/status` is a local TUI command (added by P4, 2026-10-23). It opens the text
 panel titled "Service status" and makes no service request: it shows the
 header facts of the last `ServiceObservation`, then "N Keychain items" (a
-count of 257 reads "more than 256"), "sweep pending" when set, the last
-unavailable `OSStatus` when it is not 0, and the two notices above.
+count of 257 reads "more than 256"), "sweep pending" when set, and the last
+unavailable `OSStatus` when it is not 0: "Keychain unavailable: this Asura
+build is not signed for the Keychain (OSStatus -34018)" for 34018, else
+"Keychain unavailable: last OSStatus -N". Then the unrecognized notice above.
 
 ## Validation
 
-Every test uses a scratch keychain file created in the test's scratch runtime
-root with `CreateOptions::create` and a random password. Probe SS-P1 confirmed
+Every integration test that makes a Keychain item call uses a scratch
+keychain file created in the test's scratch runtime root with
+`CreateOptions::create` and a random password. Unit tests use the scripted
+port or the recording fixture and make no Keychain call. The only cases that
+reach the data-protection keychain from `cargo test` are the negative ones
+([test isolation](release-signing.md#test-isolation-without-the-login-keychain)):
+an unsigned binary's list, read and delete naming an unentitled group, which
+return -34018. Probe SS-P1 confirmed
 that `SecKeychainCreate` does not add the scratch keychain to the search list;
 tests still check after teardown that the person's search list is unchanged.
 
@@ -736,7 +757,8 @@ tests still check after teardown that the person's search list is unchanged.
 Required for every test, probe and fixture (SSR6, 2026-10-22):
 
 1. No test, probe or fixture calls `SecItemAdd` unless the target pre-check of
-   its scratch keychain returned 0 in the same worker step.
+   its scratch keychain returned 0 in the same worker step. No `cargo test`
+   case calls `SecItemAdd` on the data-protection keychain.
 2. Teardown stops the worker before it deletes the scratch keychain
    (`SecKeychainDelete`, test-support).
 3. A test about a missing or deleted keychain checks the pre-check result only.
@@ -744,22 +766,24 @@ Required for every test, probe and fixture (SSR6, 2026-10-22):
    that such an add writes to the default keychain.
 4. The scratch target is selectable only through the test-support seam below.
 
-These rules stay after SG3. SG3 adds an unsigned negative case against the
-data-protection keychain (every call returns -34018, no change is made) and
+These rules stay after SG3. SG3 adds the unsigned negative case against the
+data-protection keychain (no add; list, read and delete return -34018) and
 the signed qualification run under the test access group (SGQ6); see
 [test isolation](release-signing.md#test-isolation-without-the-login-keychain).
 
 ### Test-support seam
 
 Selected (engineering, 2026-10-22). `asura_platform::keychain::Target` has one
-production variant, `Default`. The variant `Scratch { path, password }` exists
+production variant, `Default`, which is the data-protection backend (SG3). The variant `Scratch { path, password }` exists
 only with the `test-support` feature. `asura_service::secret_store::Store::new`
 takes a `Target`. Production service start passes `Target::Default`. The
 service test harness (`asura-service/src/test_support.rs`) creates a scratch
 keychain under the test's scratch runtime root and passes `Target::Scratch`.
 A production build therefore cannot select a scratch keychain, and a test
-build cannot reach the default keychain through the harness. SS-U7 checks
-both.
+build cannot reach the data-protection keychain through the harness. SS-U7
+checks both. The platform's own unit tests refuse `Target::Default` with
+`Invalid` when the access group check finds a group; an unsigned test binary
+gets `not_signed` with no Keychain call.
 
 ### Probe results (2026-10-22)
 
@@ -810,16 +834,22 @@ mapping and a scratch keychain only:
 | --- | --- | --- |
 | SS-U1 | Payload codec at every bound (16 variables of 8,192 bytes in total; whole-command 8,192; 1,024 launch entries and 40,960 bytes), plus one over each; unknown version; trailing bytes; maximum payload 55,413 bytes | Exact round trip; each invalid form rejected |
 | SS-U2 | Binding digest vectors; an item read under another input or installation | `mismatch` |
-| SS-U3 | SS1-K, platform. Status mapping with fixture codes, including -25293 and -25308 with status flags `0x2` and `0x7`, -25244, -25294, -25300 after a pre-check of 0 and a list -25300, and a non-zero pre-check | Each `Failure` as the revised table lists; no item call after a non-zero pre-check |
+| SS-U3 | SS1-K, platform, scratch backend. Status mapping with fixture codes, including -25293 and -25308 with status flags `0x2` and `0x7`, -25244, -25294, -25300 after a pre-check of 0 and a list -25300, and a non-zero pre-check | Each `Failure` as the revised table lists, carrying the call's raw status; no item call after a non-zero pre-check |
 | SS-U4 | P3-E. Ordering: put failure, put then append rejected, append uncertain, `JobEvent::Settled`, Drop | No record before `stored`; delete only after the deciding record; uncertain keeps the item |
 | SS-U5 | Queue: 17th request; full queue on a settlement delete | `busy`; delete left for the sweep |
 | SS-U6 | Store half SS1-S (keep exactly the live set it is given); owner half P3-E (the live set built from a fixture replay state). States: queued, held, waiting, dispatched, settled, dropped, unknown input | Keep the first four; delete the rest |
 | SS-U7 | Store half SS1-S (`Store::new` takes a `Target`); harness half P3-E (`test_support.rs` creates the scratch keychain). Target selection from a scratch runtime root; a production build | Never the default keychain from the harness; `Target::Scratch` absent without `test-support` |
 | SS-U8 | Equal and different values SS1-S (keyed digest); retry after the item was deleted P3-E (needs the kind 31 request digest). Exact retry with equal and different values; retry after the item was deleted | Original input ID; `request_conflict`; original input ID with no new item |
-| SS-U9 | SS1-K, platform. Pre-check order with the recording `Calls` fixture | Every add, get, list and delete is preceded by a status call in the same platform call; a non-zero status prevents the item call |
-| SS-U10 | SS1-S. Scripted port returns each platform result of the [worker reply table](#status-mapping), including `Added::Duplicate` followed by each `get` result, and `Failure::Invalid` | Each worker reply as the table lists; `Invalid` gives `unavailable` with status 0 and audit `invalid_request` |
-| SS-U11 | SS1-S. Sweep over a scripted port: a denied delete; a later sweep where it succeeds; 2 unrecognized accounts; a truncated listing of 257 where the pass deletes 3, then a listing of 254; a truncated listing where the pass deletes nothing; a `denied` delete after settlement | Stranded count 1, then 0; unrecognized counted, never deleted or read; second listing made, then sweep ends; no second listing when nothing was deleted, count 257 and `put` gives `full`; stranded set holds at most 16 IDs while the count keeps the total |
+| SS-U9 | SS1-K, platform, scratch backend. Pre-check order with the recording `Calls` fixture | Every add, get, list and delete is preceded by a status call in the same platform call; a non-zero status prevents the item call |
+| SS-U10 | SS1-S. Scripted port returns each platform result of the [worker reply table](#status-mapping), including `Added::Duplicate` followed by each `get` result, and `Failure::Invalid` | Each worker reply as the table lists, each failure with its raw status and a session; `Invalid` gives `unavailable` with status 0, audit `invalid_request` and no session; `NotSigned` gives `unavailable` -34018 `not_signed` |
+| SS-U11 | SS1-S, revised SG3. Sweep over a scripted port: a denied delete; a later sweep where it succeeds; 2 unrecognized accounts; a truncated listing of 257 where the pass deletes 3, then a listing of 254; a truncated listing where the pass deletes nothing | Denied delete counted as `failed` and kept, then deleted by the later sweep; unrecognized counted, never deleted or read; second listing made, then sweep ends; no second listing when nothing was deleted, count 257 and `put` gives `full` |
 | SS-K2-1 | SS1-K2, platform. `list` with the recording fixture | The search asks for at most 257 results; 257 results set `truncated`; fewer leave it false |
+| KC-U1 | SG3, platform. The data-protection dictionary of each call kind (add, read, delete, list) | Each sets `kSecUseDataProtectionKeychain` true, the access group, `kSecAttrSynchronizable` false, `kSecUseAuthenticationUI` fail, the class and the service; none sets `kSecUseKeychain`; add also sets `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, the label and the data; list asks for at most 257 attribute results |
+| KC-U2 | SG3, platform. Data-protection status mapping with the recording fixture: 0, -25300 on read, delete and list, -25299, -25308, -34018, -25291 and another code | `Found::Missing`, `Removed::Absent`, an empty listing, `Added::Duplicate`, `Locked`, `NotSigned`, `Unavailable` with the code; no pre-check call; every failure carries its raw status |
+| KC-U3 | SG3. The observation, `SecretStoreStatus` and the sweep audit event | No stranded field; fields 4 and 6 reserved; a sweep audit event with a `stranded` key is rejected |
+| KC-U4 | SG3, platform. Access group rules ([SG-F7](release-signing.md#sg-f7-access-group-check)) over entitlement values | The production and test groups accepted; absent, lower-case or nine-character team, another bundle ID, zero or two groups, a group that differs from the identifier, a mismatched team identifier and a wrong value type each refused |
+| KC-U5 | SG3. Session decoding (console owner, origin from audit flags) and the evidence on each failure reply | `self`, `other`, `none`, `unknown`; `remote` before `graphic`, `other`, `unknown`; every failure reply except `invalid_request` carries status and session; the audit event validation requires them together, on failure replies only |
+| KC-U6 | SG3. `not_signed` from the open and from a call | Every later request replies `unavailable` -34018 `not_signed` with no port call and no further open |
 
 ### Integration (SS1, worker layer)
 
@@ -831,14 +861,15 @@ can prove alone.
 | --- | --- | --- |
 | SS-W1 | Put, get, delete and list a 55,413-byte payload | Exact values; `absent` on a second delete; zero items listed afterwards |
 | SS-W2 | Lock the scratch keychain; get and put; list and delete | `locked`; list and delete succeed while locked |
-| SS-W3 | Fixture binary (`secret_store_fixture`) writes an item under the same service and account; get | `denied`; no dialog |
+| SS-W3 | Scratch backend. Fixture binary (`secret_store_fixture`) writes an item under the same service and account; get | `denied`; no dialog |
 | SS-W4 | Block the worker inside a Keychain call (seam) | The 17th request gets `busy`; the caller's reactor fixture stays responsive |
 | SS-W5 | Worker stopped; scratch keychain deleted; worker restarted on the deleted path; get and sweep | Pre-check non-zero: `unavailable`; no add is made; the login keychain gains no item |
 | SS-W6 | Sweep with a fixture live set over 3 items | Keeps the live one; deletes the others; observer counts updated |
 | SS-W7 | 256 items present; put | `full` |
 | SS-W8 | Delete fails once (seam) | Item kept; the next sweep deletes it |
-| SS-W9 | `secret_store_fixture` writes 2 items under this installation's service: one with an `input.<hex>` account that is not live, one with the account `other`; sweep with an empty live set | Input item: delete `denied`, stranded count 1, its ID in the stranded set; `other`: unrecognized count 1, never read or deleted; item count 2; a `put` still succeeds |
+| SS-W9 | `secret_store_fixture` writes 2 items under this installation's service: one with an `input.<hex>` account that is not live, one with the account `other`; sweep with an empty live set | Input item: delete `denied`, counted as `failed`, kept as an orphan; `other`: unrecognized count 1, never read or deleted; item count 2; a `put` still succeeds |
 | SS-W10 | 257 worker-written items, none live, plus 1 more (258); sweep with an empty live set | First listing returns 257 and is truncated; the sweep lists again and ends with zero items; no listing returns more than 257 |
+| KC-N1 | SG3, platform, unsigned test binary. Open `Target::Default`; then list, read and delete naming `ASURATEST0.org.pidster.asura.test` after checking the binary has no Keychain entitlement | `not_signed` with no call; each named call returns -34018 and maps to `NotSigned`; no add is made |
 
 #### Fixture binary
 
@@ -865,8 +896,9 @@ own thin binary, and the fixture logic exists once:
   build of the test, not the test run.
 - The fixture's file name differs from the test executable's, so, by probe
   SS-P3, the test binary is denied both read (SS-W3) and delete (SS-W9) of
-  fixture items. SS-W9 asserts the denied delete; if a later macOS allows it,
-  SS-W9 fails and this design is revised.
+  fixture items in the scratch keychain. SS-W9 asserts the denied delete,
+  which SG3 counts as a failed delete; if a later macOS allows it, SS-W9
+  fails and this design is revised.
 
 SS-W9 needs an unrecognized account, which `ItemKey` cannot name. SS1-K2
 adds `scratch::add_account(target, installation, account, data)`, a
@@ -930,9 +962,9 @@ flowchart TD
     SSS --> SL5
     SL7["SL7: whole-command variable"] --> SL5
     SL5 --> E2E["SS-E1, SS-E2 with person command qualification Q"]
-    SSS --> SG3["SG3 team Keychain store: data-protection Keychain (release signing)"]
-    SGK["SG1 and KC-P1 to KC-P4 (release signing)"] --> SG3
-    SG3 --> E2E2["SS-I and SL5 cases on the signed qualification bundle"]
+    SSS --> SG3["SG3 team Keychain store: data-protection Keychain, explicit group, field evidence (release signing)"]
+    SGK["SG1 and KC-P1, KC-P2, KC-P4 (2026-10-27; KC-P3 not run)"] --> SG3
+    SG3 --> E2E2["Q0-Q7 store run on the signed qualification bundle; SS-I and SL5 on a signed asura with SG5"]
     SL5 --> E2E2
 ```
 
@@ -942,12 +974,21 @@ Selected (owner, 2026-10-20, SO6): a durable Keychain store for person command
 values. Engineering choices in this design:
 
 - **Rust owner, not the Swift helper.** See [ownership](#ownership).
-- **File-based login keychain now.** The data-protection keychain needs a
-  code-signed binary with a keychain access group entitlement. Asura's signing
-  is not selected until I9, and development builds are unsigned. SG3 replaces
-  this choice (owner, 2026-10-23): the
+- **File-based login keychain first, then the team Keychain store.** The
+  data-protection keychain needs a code-signed binary with a keychain access
+  group entitlement, so SS1 used the login keychain. SG3 replaced it
+  (owner, 2026-10-23; delivered 2026-10-27): the
   [release signing design](release-signing.md#team-keychain-store) selects
-  the team Keychain store, the team data-protection Keychain, with a clean switch (SGQ5).
+  the team data-protection Keychain, with a clean switch (SGQ5). The file
+  backend remains for tests only.
+- **Access group named in every call, read from the entitlements**
+  (2026-10-27, F2). Rejected: omitting the group, which lets an unentitled
+  build read -25300 as "absent"; and a build-time constant, which embeds the
+  team ID.
+- **`not_signed` is `unavailable`, not `denied`** (2026-10-27). The owner
+  direction names it `unavailable/not_signed`. It is terminal for the worker,
+  which then makes no Keychain call. Rejected: `denied` with a hold, which
+  the scratch backend's per-item meaning would confuse.
 - **One item per input.** Deletion and the sweep act on one item per command.
   Rejected: one item per value, which multiplies calls and partial states.
 - **Read only at dispatch.** One read path for the first run and after a
@@ -980,8 +1021,9 @@ values. Engineering choices in this design:
   `/secrets purge` command. The running binary is the one that was denied,
   and Drop already deletes the items of live inputs. Revisit at I9, when the
   data-protection keychain and an access group bind items to a signed
-  identity (KQ1). Revisited 2026-10-23: under the team Keychain store (SGQ4) stranded items
-  go away, and SG3 removes this rule.
+  identity (KQ1). Revisited 2026-10-23: under the team Keychain store (SGQ4)
+  stranded items go away. SG3 removed this rule on 2026-10-27: a denied delete
+  (scratch backend only) leaves an orphan for the next sweep.
 - **Unrecognized items are counted, never deleted** (2026-10-22). Rejected: a
   platform delete by raw account, which would let the service delete items
   it did not write.
@@ -1089,7 +1131,7 @@ timeout; the type needs no peek method.
 | 1 A delete of another binary's item returns -25244 (`denied`); can a rebuilt service delete the previous build's items? | Probe SS-P3: yes, while the executable file name stays the same. Denied deletes leave [stranded items](#stranded-and-unrecognized-items): kept, counted, retried, shown in `/status` |
 | 2 The second status call is in the platform | Recorded under [status mapping](#status-mapping); SS1-S uses the [`KeychainPort` seam](#worker-seam-for-tests); SS-U3 and SS-U9 are SS1-K cases |
 | 3 The fixture binary is in `asura-platform` | A thin `secret_store_fixture` binary in `asura-service` over the shared `fixture_main()` ([fixture binary](#fixture-binary)) |
-| 4 Unrecognized accounts have no delete call | Counted and reported, never deleted ([stranded and unrecognized items](#stranded-and-unrecognized-items)) |
+| 4 Unrecognized accounts have no delete call | Counted and reported, never deleted ([unrecognized items](#unrecognized-items)) |
 | 5 `list` and `get` memory | List at most 257 results; the codec rejects data over 55,413 bytes ([bounds](#item-count-and-memory-bounds)) |
 | 6 Copies inside the Security framework | Residual [SS-T8](execution-threat-model.md#secret-store-at-rest), owner-accepted (EXD-3, 2026-10-22); Secure Enclave replacement after release signing (I9). Revised 2026-10-23 (SGQ8): the team Keychain store does not remove these copies; the Secure Enclave item stays open for later study ([release signing](release-signing.md#secure-enclave-open-item)) |
 | 7 Probe facts | Recorded in [probe results](#probe-results-2026-10-22) |
@@ -1120,9 +1162,9 @@ Answered by the owner on 2026-10-20. No owner question remains open.
 | KQ3 | Approved: `security-framework` 3.7.0, with `security-framework-sys` and `core-foundation`, as dependencies of `asura-platform`, minimal features. The implementer verifies the version against crates.io and records the lockfile diff for review. |
 
 Answered by the owner on 2026-10-23 in the
-[release signing design](release-signing.md#owner-decisions). They take effect
-when packet SG3 lands; until then KQ1 and KQ2 above describe the implemented
-store.
+[release signing design](release-signing.md#owner-decisions). They took
+effect with packet SG3 (2026-10-27); KQ1 and KQ2 above describe the SS1
+store that SG3 replaced.
 
 | ID | Decision (owner, 2026-10-23) |
 | --- | --- |
@@ -1168,5 +1210,15 @@ the [release signing design](release-signing.md). Implemented-state text is
 kept; the parts that SG3 replaces are marked. SS-P changed (SG3 nodes) and was
 rendered with Mermaid CLI 12.0.0 and inspected. No Keychain call, code or test
 was run.
+
+Recorded on 2026-10-27: revised for packet SG3 from the owner's KC probe
+results ([release signing](release-signing.md#kc-probe-results-2026-10-27))
+and the code of `asura_platform::keychain`, `asura_service::secret_store` and
+the owner wiring at commit `adc8b02`. The team Keychain store is now the
+described production state; stranded items are removed; the field evidence,
+the `not_signed` terminal state and the KC cases are added. SS-O1, SS-S1,
+SS-F1 and SS-P changed and were rendered with the local Mermaid CLI
+(`mmdc -s 2`) into a temporary directory outside the repository and
+inspected. No Keychain call was made for this revision.
 
 Return to the [design index](README.md).

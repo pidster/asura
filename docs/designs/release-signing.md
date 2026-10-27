@@ -15,6 +15,11 @@ Packet SG1 delivered the package script and the bundle resource lookup on
 2026-10-23 ([SG1 delivery](#sg1-delivery)); it signed ad hoc only. Packet SG2
 delivered the helper App Sandbox entitlements and the SG-V5 checks on
 2026-10-23 ([SG2 delivery](#sg2-delivery)), also ad hoc only.
+The owner's Mac ran probes KC-P1, KC-P2 and KC-P4 on 2026-10-27; KC-P3 was
+skipped ([KC probe results](#kc-probe-results-2026-10-27)). The results
+changed the team Keychain store: every call names the access group, which the
+service reads from its own entitlements, and every Keychain error records its
+status and the session state as field evidence. Packet SG3 is ready.
 
 What is fixed:
 
@@ -31,15 +36,16 @@ What is open:
 
 - the probe results in [probes](#probes). Packets that depend on a probe are
   not ready until the probe result is recorded here
-  ([readiness](#packet-readiness));
+  ([readiness](#packet-readiness)). KC-P3 (SSH and before first unlock) was
+  not run; the `locked` mapping of -25308 stays unverified until KC-P3 runs or
+  field evidence ([F3](#keychain-field-evidence)) settles it;
 - the Secure Enclave design item, kept open for later study (SGQ8,
   [Secure Enclave](#secure-enclave-open-item)).
 
 This design owns the signing and notarisation contract that
-[release distribution](release-distribution.md) leaves open. When packet SG3
-lands, it replaces the file-based login keychain mechanism of the
-[secret store](secret-store.md) under KQ1 and EXD-3. Until then the login
-keychain store remains the implemented state.
+[release distribution](release-distribution.md) leaves open. Packet SG3
+replaces the file-based login keychain mechanism of the
+[secret store](secret-store.md) under KQ1 and EXD-3.
 
 ## Scope
 
@@ -95,7 +101,7 @@ Read from the repository on 2026-10-23.
 | `swift-transformers` `Hub` reads `Bundle.module` when a model's tokenizer configuration has no `tokenizer_class` and the model has a `model_type`. The generated accessor calls `fatalError` when `swift-transformers_Hub.bundle` is not beside the executable. The development package does not contain this bundle. | `Hub.swift` (`tokenizerConfig`, `fallbackTokenizerConfig`); generated `resource_bundle_accessor.swift` |
 | `swift-transformers_Hub.bundle` from the build holds 7 files in 44 KiB: `Info.plist`, the build's `_CodeSignature` files, and `Resources/gpt2_tokenizer_config.json` and `Resources/t5_tokenizer_config.json`. | Local inspection of `target/debug/swift-transformers_Hub.bundle`, 2026-10-23 |
 | Test and fixture executables: `keychain_fixture`, `secret_store_fixture`, `asura-toolchain-bootstrap`, `examples/tcr_p1`, every Cargo test binary, and the Swift test bundle. | `rust/crates/*/src/bin`, `Cargo.toml` |
-| The secret store uses the file-based login keychain. The SS-P3 probe found that read access follows the writer's cdhash and delete access follows the executable file name. | [secret store](secret-store.md#stranded-and-unrecognized-items) |
+| Before SG3, the secret store used the file-based login keychain. The SS-P3 probe found that read access follows the writer's cdhash and delete access follows the executable file name. | [secret store](secret-store.md#stranded-and-unrecognized-items) |
 
 ## Requirements
 
@@ -176,6 +182,13 @@ Selected (engineering), consistent with the owner decisions:
   (SG3).** No legacy reader (RS7, SGQ5).
 - **D-S6. BN1 ships the Hub resource bundle and copies it beside the
   helper.** See [BN1](#bn1-hub-resource-bundle-defect).
+- **D-S7. Every Keychain call names the access group, read at run time from
+  the process's own entitlements (2026-10-27, finding F2).** A build without
+  a valid group makes no Keychain call and reports `not_signed`. See
+  [access group](#access-group-from-the-entitlements).
+- **D-S8. Every Keychain error records its raw status and the session state
+  in the audit event (owner direction, 2026-10-27, finding F3).** See
+  [field evidence](#keychain-field-evidence).
 - Rejected: **runtime self-verification of the helper signature**
   (`SecStaticCodeCheckValidity`) before spawn. The embedded SHA-256 already pins
   the exact signed bytes, and the Rust binary that holds the digest is itself
@@ -319,7 +332,7 @@ Selected (SGQ9).
 | Apple Development key (development bundles, SGQ3) | The owner's login keychain | As above |
 | Notary credential | `notarytool store-credentials` profile (App Store Connect API key, Developer role). The operator deletes the `.p8` file after storing it | In environment files, scripts, logs or arguments |
 | Provisioning profiles | Downloaded by the operator into an ignored path (`.build/signing/`). They are not secret, but they hold the team's certificate and are not tracked | Tracked in git |
-| Team ID | Given to the package script by the operator (argument or environment) at run time. The script checks it against the profile and against the signed result (`codesign -dv` `TeamIdentifier`), so it never reads the keychain to find it. Rust code does not embed it: `SecItem` calls omit `kSecAttrAccessGroup`, so the default group is the first group in the entitlement | Hard-coded in source or written to a tracked file |
+| Team ID | Given to the package script by the operator (argument or environment) at run time. The script checks it against the profile and against the signed result (`codesign -dv` `TeamIdentifier`), so it never reads the keychain to find it. Rust code does not embed it: the service reads its access group, which holds the team ID, from its own signed entitlements at run time ([access group](#access-group-from-the-entitlements)) | Hard-coded in source or written to a tracked file |
 
 Tracked files: entitlement property lists for each executable and build kind,
 the `Info.plist` template, and the package script
@@ -343,7 +356,7 @@ Selected (SGQ3).
 | Hardened Runtime | No | Yes | Yes |
 | `get-task-allow` | Implicit (ad hoc) | Yes, so that the owner can debug | No |
 | Profile | None | macOS development profile, registered Mac | Developer ID profile |
-| Data-protection keychain | Unavailable (`errSecMissingEntitlement`, -34018, expected; probe KC-P1) | Available, group `<TeamID>.org.pidster.asura` | Available, same group |
+| Data-protection keychain | Unavailable: the build claims no group, so the store makes no Keychain call and reports `not_signed` ([access group](#access-group-from-the-entitlements)). A call that names a group returns -34018 (KC-P1) | Available, group `<TeamID>.org.pidster.asura` | Available, same group |
 | Helper App Sandbox | No | Yes if the HS probes pass, development signed | Yes if the HS probes pass |
 | Notarised | No | No | Yes, stapled |
 | Secret store result | `unavailable` with the text "This Asura build is not signed for the Keychain." | Normal | Normal |
@@ -351,8 +364,15 @@ Selected (SGQ3).
 The development group and the release group are the same string. A
 development build and a release build on one Mac therefore share items
 (SGQ4). The sweep and the binding digest already handle items from another
-installation. Probe KC-P1 must show whether Apple Development and Developer ID
-signatures from one team both satisfy the group.
+installation. Probe KC-P1 showed that Apple Development and Developer ID
+signatures from one team both satisfy the group: each read and deleted the
+other's items (2026-10-27).
+
+Found by the owner's profile check (2026-10-27): macOS development profiles
+carry no `com.apple.security.get-task-allow`. The SG1 script refuses a
+development profile without it, and `asura.development.plist` claims it. This
+is an SG1 defect for packet SG4 (or an SG1 follow-up) to correct before the
+first `--development` bundle; SG3 does not change `asura-bundle`.
 
 ### SG1 package script
 
@@ -641,8 +661,10 @@ flowchart TD
 
 ## Team Keychain store
 
-Selected (SGQ4, SGQ5, SGQ6, SGQ8). Packet SG3 implements it. Until SG3 lands,
-the [secret store](secret-store.md) keeps the file-based login keychain.
+Selected (SGQ4, SGQ5, SGQ6, SGQ8), revised 2026-10-27 from the KC probe
+results. Packet SG3 implements it in `asura-platform::keychain` and
+`asura-service::secret_store`; the [secret store](secret-store.md) design
+describes the store as a whole.
 
 ### Is a provisioning profile, and so a bundle, required?
 
@@ -665,86 +687,209 @@ Yes. Apple states this directly:
 - TN3137: "The data protection keychain is only available in a user login
   context." The per-user service runs in the person's login context when the
   CLI starts it from a GUI login session. Over SSH this is **unverified** (probe
-  KC-P3).
+  KC-P3 was not run; [field evidence](#keychain-field-evidence) records it).
 
-This is the reason for SGQ1. Probe KC-P1 must confirm that a process whose
-executable is `Contents/MacOS/asura` gets the group, and probe KC-P2 must
-confirm it when `asura` starts through a symlink and when it re-execs itself
-as the service.
+This is the reason for SGQ1. Probe KC-P1 confirmed that a process whose
+executable is `Contents/MacOS/asura` gets the group, and probe KC-P2 confirmed
+it when `asura` starts through a Homebrew-style symlink, by path or by `PATH`,
+and when it re-execs itself in a new session (2026-10-27).
 
 ### Item contract changes
 
 Selected, replacing rows of the
-[secret store item contract](secret-store.md#keychain-item-contract) when SG3
-lands:
+[secret store item contract](secret-store.md#keychain-item-contract) (SG3):
 
 | Property | Team Keychain store |
 | --- | --- |
 | Keychain | Data-protection keychain: `kSecUseDataProtectionKeychain = true` on every add, query and delete. Production no longer uses `kSecUseKeychain` or `SecKeychainCopyDefault` |
-| Access group | Omitted in calls. The default group is the first `keychain-access-groups` entry, `<TeamID>.org.pidster.asura` ([Apple: sharing access](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps)) |
+| Access group | `kSecAttrAccessGroup` is set in every add, query and delete, to the group the process reads from its own entitlements ([access group](#access-group-from-the-entitlements)): `<TeamID>.org.pidster.asura`, or `<TeamID>.org.pidster.asura.test` in the qualification bundle. Never omitted: KC-P1 showed that a process with no Keychain entitlement that omits the group gets -25300, which reads as "absent" (F2) |
 | Accessibility | `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (KQ1). "ThisDeviceOnly" keeps the item out of backups to other devices and out of migration |
 | Synchronizable | `false`, explicitly |
-| Who can read and delete | Any executable signed by the team that claims the group under a valid profile (SGQ4, KQ2 revised). Other same-user programs get no match ([Apple](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps): a query on a group the program does not belong to returns `errSecItemNotFound`) |
-| Service, account, label, payload, 55,413-byte bound, 256 items, 257-item list bound | Unchanged |
+| User interaction | `kSecUseAuthenticationUI = kSecUseAuthenticationUIFail` in every dictionary, so a call that would need a dialog fails with -25308 instead. The process-wide `SecKeychainSetUserInteractionAllowed(false)` also stays: it costs one call at worker start and also covers the test-only file backend. KC-P4 saw no dialog for any call |
+| Who can read and delete | Any executable signed by the team that claims the group under a valid profile (SGQ4, KQ2 revised; KC-P1). Another same-user program cannot name the group: a query on a group the program is not entitled to returns `errSecMissingEntitlement` (-34018), not `errSecItemNotFound` (KC-P4, F1). Apple's [sharing access](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps) page suggests the second; the probe found the first on macOS 27.0 (26A428) |
+| Service, account, label, payload, 55,413-byte bound, 256 items, 257-item list bound | Unchanged. KC-P4 added and read a 55,413-byte item |
 
-The platform wrapper must build every dictionary through one function that
-always sets `kSecUseDataProtectionKeychain`. A dictionary without it would reach
-the file-based keychain (TN3137: `SecItem` "defaults to targeting the
-file-based keychain"). Unit test KC-U1 asserts this for every call.
+The platform wrapper builds every dictionary through one function that always
+sets `kSecUseDataProtectionKeychain`, the access group, `kSecAttrSynchronizable
+= false` and the user-interaction key. A dictionary without the flag would
+reach the file-based keychain (TN3137: `SecItem` "defaults to targeting the
+file-based keychain"). Unit test KC-U1 asserts this for every call kind, and
+asserts that no dictionary carries `kSecUseKeychain`.
+
+### Access group from the entitlements
+
+Selected (engineering, 2026-10-27, finding F2). Rejected: a build-time
+constant. It would put the team ID in source or in a build input, which the
+[credentials rule](#where-credentials-live) forbids, and it would still need a
+run-time check that the signature grants it.
+
+The secret store worker reads the group once, when it opens the store, on its
+own thread. `SecTaskCreateFromSelf` and `SecTaskCopyValueForEntitlement` read
+the running process's signed entitlements; they make no `securityd` call, but
+they run on the worker like every other Security framework call (AE-02). A
+running process cannot gain or lose an entitlement, so the worker never reads
+them again.
+
+The group is valid only when all of these hold. Otherwise the store is
+`unavailable` with reason `not_signed`, and the worker makes **no** Keychain
+call for the rest of the process:
+
+1. `com.apple.application-identifier` is a string `<T>.<B>`, where `<T>` is ten
+   upper-case letters or digits and `<B>` is `org.pidster.asura` or
+   `org.pidster.asura.test`;
+2. `keychain-access-groups` is an array of exactly one string, equal to the
+   application identifier;
+3. `com.apple.developer.team-identifier` is absent or equals `<T>`;
+4. each value has the expected Core Foundation type.
+
+A release or development `asura` therefore uses `<T>.org.pidster.asura`. The
+qualification bundle, signed with the test App ID, uses
+`<T>.org.pidster.asura.test`, so it cannot name the production group (owner
+runbook, open point 1). An unsigned or ad hoc build has no entitlements and
+fails rule 1 before any call. A build with an extra or unexpected group fails
+rule 2: it reports `not_signed` rather than choosing one of its groups.
+
+#### SG-F7: access group check
+
+Selected design. Arrows show the next check; labels show the result. Every
+"not_signed" end makes no Keychain call.
+
+```mermaid
+flowchart TD
+    Open["Worker opens the store (its own thread)"] --> Read["SecTaskCopyValueForEntitlement: application identifier, access groups, team identifier"]
+    Read --> App{"Application identifier is T.org.pidster.asura or T.org.pidster.asura.test, T ten upper-case letters or digits?"}
+    App -->|No, absent or wrong type| NS["not_signed: no Keychain call for the process lifetime"]
+    App -->|Yes| Groups{"Exactly one access group, equal to the application identifier?"}
+    Groups -->|No| NS
+    Groups -->|Yes| Team{"Team identifier absent or equal to T?"}
+    Team -->|No| NS
+    Team -->|Yes| Use["Group selected: every dictionary names it"]
+    Use --> Calls["SecItem calls with the data-protection flag, the group and UI fail"]
+```
 
 ### What SG3 removes
 
 - The target pre-check (`SecKeychainGetStatus`) in production. There is one
-  data-protection keychain per user, so SS-T7 (a call reaching the wrong
-  keychain) cannot happen in production. The pre-check remains a rule for the
-  test-only scratch backend.
-- `SecKeychainSetUserInteractionAllowed`. It controls the file-based keychain
-  only. The data-protection items carry no `SecAccessControl` user-presence
-  flag, so no prompt can be shown. Probe KC-P4 must confirm that no call
-  prompts.
+  data-protection keychain per user, and every dictionary names it with the
+  flag and the group, so SS-T7 (a call reaching the wrong keychain) cannot
+  happen in production. The pre-check remains a rule for the test-only
+  scratch backend.
+- `SecKeychainCopyDefault` and `kSecUseKeychain` in production.
 - **Stranded items, as a category** (SGQ4). SS-P3 stranding comes from the
   file keychain's per-cdhash read ACL and per-file-name delete rule. With an
   access group, every team-signed Asura build can delete every Asura item. A
   delete can then fail only for the whole store (missing entitlement, or
   `errSecInteractionNotAllowed` before the first unlock), never for one item.
-  `stranded_count` and `stranded_inputs` (`SecretStoreStatus` fields 4 and 6)
-  and the `/status` stranded notice are removed. Field numbers 4 and 6 are
-  reserved. This is a schema change within protocol `0.1` under the
+  `stranded_count` and `stranded_inputs` (`SecretStoreStatus` fields 4 and 6),
+  the `stranded` count of the `secret_store.sweep` audit event and the
+  `/status` stranded notice are removed. Field numbers 4 and 6 are reserved.
+  This is a schema change within protocol `0.1` under the
   [numbering authority](../engineering.md#wire-protocol-change-authority).
-- `secret_store_denied` after a rebuild (KQ2 revised). It remains only as the
-  reply to a missing entitlement, with new text.
+  A delete that fails for any reason leaves an orphan that the next sweep
+  retries.
+- `denied` in production (KQ2 revised). A missing entitlement is
+  `unavailable` with reason `not_signed`, not `denied`, because no later call
+  can succeed and the person needs the build fixed, not the item. The
+  `denied` reply, the `secret_store_denied` refusal and hold reason stay only
+  for the test-only scratch file backend, whose per-build ACL still produces
+  -25293 and -25244. A production build cannot produce them.
 - Unrecognized items stay: counted, never read or deleted.
+
+The process-wide `SecKeychainSetUserInteractionAllowed(false)` is **not**
+removed (revised 2026-10-27): every Keychain call must run with user
+interaction disabled, and the per-call `kSecUseAuthenticationUIFail` key covers
+the data-protection calls only.
 
 ### Status mapping
 
-Selected; probe KC-P4 must confirm each code before SG3 is ready.
+Selected; revised 2026-10-27 from probes KC-P1 and KC-P4. One platform
+function maps the status of a data-protection call; the worker never sees an
+`OSStatus` except as the evidence it records. Every row except success records
+the raw status and the session state ([field evidence](#keychain-field-evidence)).
 
-| Status | Reply |
-| --- | --- |
-| 0 | Success |
-| `errSecItemNotFound` (-25300) | `absent` |
-| `errSecDuplicateItem` (-25299) | Existing duplicate rule |
-| `errSecInteractionNotAllowed` (-25308) | `locked`: the Mac has not been unlocked since start-up. The existing paced recheck applies |
-| `errSecMissingEntitlement` (-34018) | `unavailable`, reason `not_signed`: "This Asura build is not signed for the Keychain." No retry |
-| `errSecNotAvailable` (-25291) or any other code | `unavailable` with the code, as today |
+| Status | Reply | Evidence |
+| --- | --- | --- |
+| 0 | Success | KC-P1, KC-P4 (add, read, list, delete) |
+| `errSecItemNotFound` (-25300) | `absent` on delete, `missing` on read, zero items on list. This holds only because the call named an entitled group: a process that omits the group and has no entitlement also gets -25300 (F2), which is why no call omits it | KC-P4 (list, read and delete of a missing item) |
+| `errSecDuplicateItem` (-25299) | Existing duplicate rule | KC-P4 |
+| `errSecInteractionNotAllowed` (-25308) | `locked`: the Mac has not been unlocked since start-up. The existing paced recheck applies | **Unverified**: KC-P3 case B was not run. The audit event records each occurrence with its session state |
+| `errSecMissingEntitlement` (-34018) | `unavailable`, reason `not_signed`: "This Asura build is not signed for the Keychain." Returned for any group the process is not entitled to, not only for an unsigned build (F1). Terminal: the worker makes no further Keychain call | KC-P1 (unsigned list and add naming the group), KC-P4 (`list-unclaimed-group`) |
+| Access group check fails before any call | Same as -34018 (`unavailable/not_signed`, status -34018); no Keychain call is made | [SG-F7](#sg-f7-access-group-check) |
+| `errSecNotAvailable` (-25291) or any other code | `unavailable` with the code, as today | No probe case forced one |
 
 #### SG-S1: secret store availability under the team Keychain store
 
-Selected design. Arrows are observed call results on the secret store
-worker. `NotSigned` is terminal for the process: no recheck can add an
-entitlement.
+Selected design, revised 2026-10-27. Arrows are the access group check or
+observed call results on the secret store worker. `NotSigned` is terminal for
+the process: no recheck can add an entitlement, so the worker answers every
+later request at once without a Keychain call. Every transition into
+`Locked`, `NotSigned` or `Unavailable` records the raw status and the session
+state in that request's audit event.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Starting
+    Starting --> NotSigned: access group check fails, no call made
     Starting --> NotSigned: first call returns -34018
     Starting --> Available: first list returns 0 or -25300
-    Starting --> Locked: -25308 before first unlock
+    Starting --> Locked: -25308 before first unlock (unverified)
     Available --> Locked: -25308
     Locked --> Available: paced recheck returns 0
     Available --> Unavailable: other OSStatus
     Unavailable --> Available: next call succeeds
+    Available --> NotSigned: -34018
     NotSigned --> [*]: process exit, no retry
+```
+
+### Keychain field evidence
+
+Selected (owner direction, 2026-10-27, finding F3). KC-P3 was skipped, so the
+running product gathers the evidence it would have given. On every Keychain
+error (`locked`, `denied`, `unavailable`, including `not_signed`), the
+secret store worker records two facts with the request's reply, and the
+conversation owner writes them into that request's `secret_store.put`,
+`.get`, `.delete` or `.sweep` audit event:
+
+- `status`: the raw `OSStatus` as a signed 32-bit integer (for example
+  -25308 or -34018). A request the worker refused as a defect
+  (`invalid_request`) made no Keychain call; it records status 0 and no
+  session.
+- `session`: the session state, read on the worker thread when the error
+  returns:
+
+| Field | Source | Values |
+| --- | --- | --- |
+| `boot_time_s` | `sysctl kern.boottime` | Seconds since 1970; absent if the call fails |
+| `console` | Owner of `/dev/console` (`stat`) compared with the process's real user ID | `self` (this user owns the console: a GUI login), `other` (another user), `none` (owned by root: the login window), `unknown` (the call failed) |
+| `audit_flags` | `getaudit_addr`: the audit session flags of the process | The raw flags; absent if the call fails |
+| `origin` | Derived from `audit_flags` | `remote` (`AU_SESSION_FLAG_IS_REMOTE`, set for SSH logins), else `graphic` (`AU_SESSION_FLAG_HAS_GRAPHIC_ACCESS`, a GUI login session started by `loginwindow` and `launchd`), else `other` (for example a `launchd` background session), or `unknown` |
+
+The audit session is inherited across `fork`, `exec` and `setsid`, so the
+service reports the session of the CLI that started it. Together, boot time,
+console owner and origin distinguish the KC-P3 cases: an SSH start with a GUI
+login of the same user (`remote`, `self`), an SSH start with no GUI login
+(`remote`, `none`) and a start soon after boot.
+
+Bounds: four fixed-size fields, no strings from the system, no user or account
+name, no path and no item data (RS5). Each call is one system call on the
+worker thread (AE-02); none blocks on `securityd`. Success replies record
+neither field. The audit record format number does not change: the fields are
+added in place to the `secret_store.*` events (RS7).
+
+#### SG-F8: evidence for one Keychain error
+
+Selected design. Arrows show the order of work for one failed call; labels
+name the thread.
+
+```mermaid
+flowchart TD
+    Call["Worker: SecItem call returns non-zero, or the access group check fails"] --> Map["Platform: map the status (status mapping)"]
+    Map --> Snap["Worker: read boot time, console owner, audit session flags"]
+    Snap --> Reply["Worker: reply carries the failure, its raw status and the session"]
+    Reply --> Owner["Owner (reactor): applies the reply as before"]
+    Owner --> Audit["Owner: secret_store.* audit event with reply, status and session"]
+    Snap -->|"A system call fails"| Unknown["That field is absent or unknown; the reply is unchanged"]
+    Unknown --> Reply
 ```
 
 ### Switch from the login keychain
@@ -763,25 +908,74 @@ Selected (SGQ5): a clean switch.
 Rejected: a one-release sweep of the login keychain. It is a legacy reader
 (RS7) and keeps the deprecated `SecKeychain` API in production.
 
+An unsigned development build (a plain `cargo build`) now reports
+`not_signed`. Person commands that need the store, and every `!!` command,
+are refused with "This Asura build is not signed for the Keychain." Commands
+with no secret and model turns are unaffected.
+
 ### Test isolation without the login keychain
 
-Selected (SGQ6).
+Selected (SGQ6), revised 2026-10-27.
 
 | Layer | Backend | What it proves |
 | --- | --- | --- |
-| Unit (`cargo test`) | Scripted `KeychainPort` (exists) | Worker, codec, sweep, replies, KC-U cases |
+| Unit (`cargo test`) | Scripted `KeychainPort`; recording `Calls` fixture in the platform | Worker, codec, sweep, replies, `not_signed` terminal state, field evidence, KC-U cases |
+| Unit (`cargo test`) | Pure functions of the platform | KC-U1 dictionaries, KC-U2 mapping, KC-U4 access group rules, KC-U5 session decoding |
 | Integration (`cargo test`, test-support) | The scratch **file** keychain backend, kept as the test-only `Target::Scratch` with its target pre-check and testing rules | Real Security framework IPC, queueing, a blocked call (AE-07). It does not prove data-protection behavior |
-| Integration, negative (`cargo test`) | Unsigned test binary against the data-protection keychain | Every call returns -34018 and the reply is `unavailable/not_signed`. The binary has no entitlement, so it can make no change. This is safe under RS5 |
-| Qualification (signed, not `cargo test`) | The qualification bundle, signed with the test group `<TeamID>.org.pidster.asura.test` and a random installation ID | Real data-protection add, read, list, delete, sweep and restart. Production Asura cannot see this group. The run deletes every item it wrote and then lists the group to prove that it is empty |
+| Integration, negative (`cargo test`) | The unsigned test binary against the data-protection keychain | (a) Opening `Target::Default` reads no entitlement and returns `not_signed` with no Keychain call. (b) A list, a read and a delete that name the group `ASURATEST0.org.pidster.asura.test` (a made-up team ID, so no real item can match) each return -34018 and map to `not_signed`. The test checks first that the binary has no Keychain entitlement. No test calls `SecItemAdd` against the data-protection keychain; KC-P1 recorded that an unsigned add returns -34018 |
+| Qualification (signed, not `cargo test`) | The qualification bundle ([below](#signed-qualification-run)) | Real data-protection add, read, list, delete, sweep and restart through the production backend and the store worker. Production Asura cannot see the test group. The run deletes every item it wrote and then lists the group to prove that it is empty |
 
-`Target::Default` becomes the data-protection backend. `Target::Scratch` stays
+`Target::Default` is the data-protection backend. `Target::Scratch` stays
 behind the `test-support` feature. A production build therefore cannot select
-the file keychain, and SS-U7 is extended to check this.
+the file keychain, and SS-U7 is extended to check this. The platform's own
+unit tests refuse `Target::Default` when the access group check succeeds, so
+a signed test binary still never reaches the data-protection keychain.
 
 If the qualification run ends before its clean-up (crash or cancel), the next
 qualification run lists the test group first and deletes every item it finds
 before it writes. The test group holds only qualification items, so this
 delete never touches a production item.
+
+#### Signed qualification run
+
+Selected (engineering, 2026-10-27; owner runbook open points 1 and 4).
+
+- **Executable.** `secret_store_qualification`, a `test-support` binary of
+  `asura-service` over `asura_service::secret_store::qualification_main`. It
+  uses the production `Target::Default` backend and the production store
+  worker; only the case driver is test code. It is never part of `Asura.app`.
+- **Identity.** A bundle `AsuraKeychainQualification.app` with
+  `CFBundleIdentifier` `org.pidster.asura.test`, the test App ID's profile
+  embedded, and the entitlements of the tracked list
+  `tools/release/entitlements/secret-store-qualification.plist`: application
+  identifier and the one access group `<TeamID>.org.pidster.asura.test`, and
+  the team identifier. The access group check therefore selects the test
+  group. The executable refuses to run, with no Keychain call, unless the
+  selected group ends in `.org.pidster.asura.test`.
+- **Build.** `tools/release/secret-store-qualification` builds the binary,
+  assembles and signs the bundle with the operator's identity (Apple
+  Development or Developer ID) and the test profile, checks the signed
+  entitlements and runs the cases. Its `--ad-hoc` mode assembles and signs ad
+  hoc without restricted entitlements and expects the executable to refuse
+  with `not_signed`; `cargo test` never runs either mode.
+- **Cases.** Q0 purges the test group. Q1 a sweep of an empty store lists zero
+  items. Q2 puts a 55,413-byte payload; a retry with equal values is
+  `exists_same` and with other values `exists_different`. Q3 reads the values
+  back exactly. Q4 puts a second item, closes the store and starts a new
+  worker (restart); a sweep with the first input live keeps it and deletes the
+  second. Q5 reads the first again, deletes it, then `absent` and `missing`.
+  Q6 the observation reports zero items and status 0. Q7 purges and lists the
+  whole test group: it must be empty (`test-group-empty=yes`).
+- **Purge.** A `test-support` platform function lists every generic-password
+  item in the test group (at most 257 per listing, attributes only) and
+  deletes each by its service and account. It refuses unless the selected
+  group is the test group. It repeats while a listing was full and the pass
+  deleted an item.
+
+The run proves the data-protection path of the store worker. The service-level
+SS-I and SL5 cases on a signed bundle need the real `asura` signed with the
+test group in an isolated home, which no build mode provides; they stay with
+SG5.
 
 ### Secure Enclave: open item
 
@@ -1025,9 +1219,9 @@ flowchart TD
 | Notarisation returns `Invalid` | The script downloads the log, stops and publishes nothing. A fixed build is a new build with a new digest |
 | `notarytool --wait` does not return | No time bound (RS8). The operator cancels. A later `notarytool info <id>` resumes the check without a new submission |
 | `stapler staple` fails because the ticket is not yet available | Paced retries 1, 2, 4, 8 … s, at most 60 s apart. Pacing ends nothing; success or an operator cancel ends the loop |
-| Profile missing or expired in the bundle | `asura` fails to start, or the group is missing (-34018). Release verification checks the entitlements against the profile before submission |
-| Data-protection keychain unavailable (SSH, before first unlock) | `locked` or `unavailable`, with the existing paced recheck. Never a fallback to a file |
-| Unsigned development binary | `unavailable/not_signed`. Person commands that need the store and every `!!` command are refused with that text. Draft and mode kept |
+| Profile missing or expired in the bundle | `asura` fails to start, or the group is missing: `not_signed` (SG-F7 or -34018). Release verification checks the entitlements against the profile before submission |
+| Data-protection keychain unavailable (SSH, before first unlock) | `locked` or `unavailable`, with the existing paced recheck. Never a fallback to a file. The audit event records the raw status and the session state ([field evidence](#keychain-field-evidence)) |
+| Unsigned development binary, or a build with an unexpected group | `unavailable/not_signed` with no Keychain call. Person commands that need the store and every `!!` command are refused with "This Asura build is not signed for the Keychain." Draft and mode kept. A command already queued waits at dispatch with `keychain_unavailable`; the worker answers each recheck at once without a call. `/status` shows the text with OSStatus -34018 |
 | Sandboxed helper denied a needed path or service | The helper exits or reports a provider error. The service reports the provider unavailable through the existing paths. No relaxation at run time |
 | Sandboxed helper first launch while the container manager stalls | The helper process is stalled. The model owner already waits with no time bound, ending on Hello, exit, cancel or shutdown. Control stays responsive |
 | `fatalError` from a missing resource bundle | Helper exit; existing helper-failure settlement. BN1 removes the cause |
@@ -1097,11 +1291,11 @@ flowchart TD
 | Rule | Application |
 | --- | --- |
 | AE-01 | No signing or notarisation code exists in the runtime. The runtime gains no new call on the reactor, control or render path |
-| AE-02 | Runtime blocking calls: `SecItemAdd`, `SecItemCopyMatching` and `SecItemDelete` with the data-protection flag run on the existing secret store worker thread only (IPC to securityd). The Hub bundle copy runs on the existing preparation worker. The helper's sandbox set-up runs inside the helper process at exec, under the existing model-owner supervision. Release-time blocking tools (`codesign`, `ditto`, `notarytool`, `stapler`, `spctl`) run only in the operator's release script, one at a time |
+| AE-02 | Runtime blocking calls: `SecItemAdd`, `SecItemCopyMatching` and `SecItemDelete` with the data-protection flag run on the existing secret store worker thread only (IPC to securityd). So do the access group check (`SecTaskCreateFromSelf`, `SecTaskCopyValueForEntitlement`, once per worker) and the field evidence reads (`sysctl`, `stat` of `/dev/console`, `getaudit_addr`, once per failed call). The Hub bundle copy runs on the existing preparation worker. The helper's sandbox set-up runs inside the helper process at exec, under the existing model-owner supervision. Release-time blocking tools (`codesign`, `ditto`, `notarytool`, `stapler`, `spctl`) run only in the operator's release script, one at a time |
 | AE-03 | See [limits](#limits). No new queue is added |
 | AE-04 | No time bound. Store calls end with a reply, cancel or shutdown. `notarytool --wait` ends with the service's reply or an operator cancel. Stapling uses pacing only. The Hub copy ends on completion, failure or the preparation cancel flag |
 | AE-05 | A notarisation submission is not repeated after an unknown outcome. The operator queries its ID. A rejected build is never re-signed in place; a new build gets a new digest |
-| AE-06 | Service start: the store worker makes its first list call after replay, as today. A `not_signed` result is recorded once and does not delay start |
+| AE-06 | Service start: the store worker reads its access group when it opens the store and makes its first list call after replay, as today. A `not_signed` result is recorded and does not delay start; later requests get it without a call |
 | AE-07 | Acceptance: with a data-protection call blocked by the test seam, the TUI stays responsive and Ctrl-C and Drop work (existing SS case, repeated on the signed qualification bundle). With the Hub copy blocked by the test seam, cancel ends preparation and control stays responsive |
 
 ## Probes
@@ -1139,7 +1333,7 @@ requires:
 | BN-P1 | Does an MLX asset without `tokenizer_class` crash a relocated helper? Which providers reach `Hub.tokenizerConfig`? | Fixture model directory with `model_type` set and no `tokenizer_class`, run through the copied helper with and without the bundle beside it | Without the bundle: records the exit; with it: the tokenizer loads | None |
 | KC-P1 | Does a Developer ID `Asura.app` with the profile and group add, read, list and delete data-protection items? Does a rebuilt, re-signed build read them? Do an Apple Development build and a Developer ID build share the group? Does an unsigned binary get -34018? | Qualification bundle, test group | All as stated | Owner |
 | KC-P2 | Does the group apply when `asura` starts through a symlink, and in its re-exec as the service? | Homebrew-style `bin/asura` link | Same results as KC-P1 | Owner |
-| KC-P3 | Data-protection availability over SSH, and before first unlock | SSH session to the qualification Mac | Records the status codes | Owner |
+| KC-P3 | Data-protection availability over SSH, and before first unlock | SSH session to the qualification Mac | Records the status codes. Not run (owner, 2026-10-27); the [field evidence](#keychain-field-evidence) gathers it until a rerun | Owner |
 | KC-P4 | Status code inventory; no prompt on any call | Qualification bundle | [Status mapping](#status-mapping) confirmed or corrected | Owner |
 | NT-P1 | Notarise a zip of `Asura.app` with a sandboxed helper that claims temporary exceptions; staple; tar round trip; Homebrew install | Real release dry run to a private tap branch | Accepted; `stapler validate` passes after extraction; `codesign --verify --strict` passes in the keg; quarantine state recorded | Owner |
 
@@ -1194,6 +1388,40 @@ had collected; the owner approved deleting them on 2026-10-23). The embedded
 `Info.plist` identity (HS-P1) is the fix; packet SG2a delivers it for
 development builds before SG1.
 
+### KC probe results (2026-10-27)
+
+Run on the owner's Mac (Mac16,6, macOS 27.0 build 26A428, team ID recorded
+with the owner's evidence) at the owner's request, from the owner's runbook.
+The probe was a C program in a probe-only bundle, signed with the test App ID
+`org.pidster.asura.test` and the access group `<TeamID>.org.pidster.asura.test`
+only; it refused to run with any other entitlement set. Items used the probe
+service `org.pidster.asura.kc-probe`. Each run started and ended with a purge
+of the test group, which ended empty. `security list-keychains -d user`
+listed only the login keychain afterwards. No dialog appeared during any
+Keychain call; the only dialog was `codesign` asking for the login keychain
+password to use the signing key while building.
+
+| Probe | Result | Effect |
+| --- | --- | --- |
+| Profiles (open point 2) | All four profiles (development and Developer ID, for `org.pidster.asura` and for `org.pidster.asura.test`) carry `keychain-access-groups` = `<TeamID>.*` with no capability turned on. The development profiles list this Mac; the Developer ID profiles provision all devices. The macOS development profiles carry no `get-task-allow` | Open point 2 resolved: no Keychain Sharing capability is needed. The `get-task-allow` finding is an SG1 defect ([development builds](#development-builds-compared-with-release-builds)) |
+| KC-P1 | Pass. A Developer ID build adds, reads, lists and deletes data-protection items in the group. A rebuild with a different CDHash reads them. Apple Development and Developer ID builds of the team read and delete each other's items. An unsigned binary that names the group gets -34018 for list and for add. **Difference:** an unsigned binary that omits the group gets -25300 for list, not -34018 (F2) | SGQ4 confirmed. F2: every call names the group (D-S7) |
+| KC-P2 | Pass. A start through a Homebrew-style `bin/asura` symlink, by path and by `PATH`, keeps the entitlements, and the executable path resolves to the canonical bundle path. A `posix_spawn` re-exec with `POSIX_SPAWN_SETSID` in a new session reads, adds, lists and deletes in the group | The service and guardian re-exec keep the group. No design change |
+| KC-P3 A | Not run (SSH with a GUI login). Skipped by the owner on 2026-10-27, to revisit | -25308 stays unverified; field evidence (F3, D-S8) |
+| KC-P3 B | Not run (before first unlock). Skipped by the owner on 2026-10-27 | As KC-P3 A |
+| KC-P4 | 17 of 18 cases match the design for both the Developer ID and the Apple Development builds: -25300 for list, read and delete of a missing item; 0 for add, read and list; -25299 for a duplicate add; a 55,413-byte item adds and reads exactly; with the group omitted, the default group is the first `keychain-access-groups` entry. **Difference:** a list naming a group the process does not claim returns -34018, not -25300 (F1). The SSH run of KC-P4 was not made | Status mapping revised: -34018 means "not entitled to this group" |
+
+Findings that changed this design:
+
+- **F1.** A query on a group that the process is not entitled to returns
+  -34018. The code means "not entitled to this group", not only "unsigned".
+- **F2.** A process with no Keychain entitlement that omits the group gets
+  -25300, which looks like "absent". Every call now names the group, read
+  from the process's own entitlements, and a build without a valid group
+  reports `not_signed` before any call (D-S7).
+- **F3 (owner direction).** KC-P3 case B was skipped, so the product gathers
+  the evidence: every Keychain error records its raw status and the session
+  state (D-S8). -25308 is handled as `locked` and stays marked unverified.
+
 ## Validation
 
 | ID | Requirement | Unit | Integration | End to end | Environment |
@@ -1203,8 +1431,8 @@ development builds before SG1.
 | SG-V3 | RS3, RS10 | A check that no tracked file matches `*.p12`, `*.p8`, `*.provisionprofile` or contains `BEGIN PRIVATE KEY` | The release script refuses without identity arguments; the dry run calls no real identity | — | — |
 | SG-V4 | D-S1, RS6 | — | SB-P1, SB-P2 and SB-P3 recorded | Existing EC and PC suites pass on the signed qualification bundle, including the `KERN_PROCARGS2` environment-marker scan | macOS 27 |
 | SG-V5 | SGQ7 | — | HS-P1 to HS-P7 | Native system, MLX, Core AI and Ollama journeys with the sandboxed helper | macOS 27, real models |
-| SG-V6 | RS4, the team Keychain store | KC-U1 every dictionary sets the data-protection flag; KC-U2 status mapping including -34018; KC-U3 no stranded fields; SS-U7 extended | Unsigned negative case (-34018, no change); scratch file backend cases unchanged | Signed qualification: SS-I and SL5 cases with the test group; the store ends empty | Qualification Mac (SGQ6) |
-| SG-V7 | RS5 | Test-support seam: production cannot select `Scratch` | After each run, the test group lists empty; no test runs a login keychain search | — | — |
+| SG-V6 | RS4, the team Keychain store | KC-U1 every dictionary kind sets the data-protection flag, the access group, `kSecAttrSynchronizable` false and UI fail, and none sets `kSecUseKeychain`; KC-U2 status mapping including -34018 as `not_signed` and -25308 as `locked`; KC-U3 no stranded fields in the observation, the schema or the audit event; KC-U4 access group rules (SG-F7); KC-U5 session decoding and the evidence on every failure reply; KC-U6 `not_signed` is terminal: later requests make no port call; SS-U7 extended | Unsigned negative case: `Target::Default` gives `not_signed` with no call, and list, read and delete naming an unentitled group give -34018; scratch file backend cases, with a denied delete now an orphan; TUI and audit carry the not_signed text and the evidence | Signed qualification run Q0 to Q7 with the test group; the group ends empty. SS-I and SL5 on a signed `asura` stay with SG5 | Qualification Mac (SGQ6) |
+| SG-V7 | RS5 | Test-support seam: production cannot select `Scratch`; platform unit tests refuse `Target::Default` when a group is found | After each qualification run, the test group lists empty; `cargo test` makes no data-protection add and no login keychain search | — | — |
 | SG-V8 | PC-I38 | — | PC-I38 unsigned (existing) | PC-I38-S signed; HR-P2 recorded | macOS 27 |
 | SG-V9 | Bundle lookup | Resource path resolution from `Contents/MacOS` | Copy step finds `Resources/mlx.metallib` and the Hub bundle | `--native-mlx` from the installed keg | Clean host |
 | SG-V10 | BN1 | Digest over sorted (path, SHA-256) pairs, pinned to the `shasum` form; limit checks (17 files, 17 directories, depth 5, 1 MiB + 1 byte file, 1 MiB + 1 byte total rejected; the limits themselves accepted); empty file accepted; symlink, group-writable and control-character names rejected | Copy into a scratch run root and read by the copied helper; mismatch and absence fail before spawn; Core AI copies, system does not; cleanup leaves unknown entries; cancel during copy cleans owned copies; the service reports an MLX selection unavailable before spawn when the package bundle does not match its embedded digest | `conversation_flow --native-mlx` with a fixture model that has `model_type` and no `tokenizer_class` completes | macOS 27, real MLX model (BN-P1 fixture) |
@@ -1242,7 +1470,7 @@ flowchart TD
 | SG0-K | Owner's Mac; results recorded in this design | SG1 (a signed qualification bundle) | KC-P1 to KC-P4 results |
 | SG2a | HS-P8 probe (Seatbelt `process-info*` and `kern.procargs2` denial for the helper); `swift/model-helper` build: embed `Info.plist` (`CFBundleIdentifier` `org.pidster.asura.model`) in every helper build; the model inventory opens the asset root by its full path instead of walking from `/` | SG0 ad hoc results | HS-P1 and HS-P6 rerun with an ad hoc sandboxed helper; one Core AI cache for repeated spawns (two spawns create one cache directory) |
 | SG2 | Helper entitlement plist; threat model rows | SG1, SG2a | SG-V5, or EX-H1 recorded |
-| SG3 | `asura-platform/src/keychain*`, `asura-service/src/secret_store*`, `ServiceObservation` field 8 schema (fields 4 and 6 reserved), TUI `/status` text, secret store design | SG0-K, SGQ4–SGQ6 | SG-V6, SG-V7 |
+| SG3 | `asura-platform/src/keychain*`, `asura-service/src/secret_store*`, `ServiceObservation` field 8 schema (fields 4 and 6 reserved) and its validation, the `secret_store.*` audit event fields (status, session; `stranded` removed), the owner's store wiring in `conversation/person_command.rs`, TUI `/status` and refusal text, the qualification binary and `tools/release/secret-store-qualification` with its entitlement list, secret store design | SG0-K, SGQ4–SGQ6 | SG-V6, SG-V7 |
 | SG4 | `tools/release/`, `pidster/homebrew-tap` formula | SG1, SG2, NT-P1 | HD1, HD5, HD9, HD10, HD12, HD13 |
 | SG5 | Qualification records | SG2, SG3, SG4 | SG-V4, SG-V8 and the release-distribution gates |
 
@@ -1258,10 +1486,10 @@ signing packet.
 | SG0 | Ready | BN-P1 done; SB, HS and HR probes remain |
 | BN1 | Ready | — (BN-P1 confirmed the crash, 2026-10-23) |
 | SG1 | Delivered (branch `sg1`, 2026-10-23) | — ([delivery](#sg1-delivery)) |
-| SG0-K | Not ready | A qualification-bundle variant of the package script (entitlements naming the test group `<TeamID>.org.pidster.asura.test`, and its profile); then the owner runs it (SGQ9) |
+| SG0-K | Done for KC-P1, KC-P2 and KC-P4 (2026-10-27) | KC-P3 not run (owner, to revisit) ([results](#kc-probe-results-2026-10-27)) |
 | SG2a | Delivered (branch `sg2a`, 2026-10-23) | — |
 | SG2 | Delivered (branch `sg2`, 2026-10-23) | — ([delivery](#sg2-delivery)) |
-| SG3 | Not ready | KC-P1 to KC-P4 results; then the secret store design revision that SG3 owns |
+| SG3 | Ready (2026-10-27) | — (KC results recorded; this design and the secret store design revised. -25308 stays unverified, covered by the field evidence) |
 | SG4 | Not ready | NT-P1 |
 | SG5 | Not ready | SG3 and SG4 |
 
@@ -1439,5 +1667,20 @@ Updated 2026-10-23 by packet SG2: the helper
 [helper sandbox](#security) bullet, [readiness](#packet-readiness) and the
 [delivery record](#sg2-delivery). Diagram SG-F6 was rendered with the local
 Mermaid CLI and inspected.
+
+Updated 2026-10-27 for packet SG3, from the owner's KC probe record sheet and
+raw outputs (KC-P1, KC-P2, KC-P4 for the Developer ID and Apple Development
+builds, the final purge and the dialog note) and the probe source. Changed:
+the status block, the item contract, the
+[access group](#access-group-from-the-entitlements) rule (new, SG-F7), the
+status mapping and SG-S1, the [field evidence](#keychain-field-evidence)
+(new, SG-F8), what SG3 removes, test isolation and the
+[signed qualification run](#signed-qualification-run), the
+[KC probe results](#kc-probe-results-2026-10-27), failure handling, AE-02 and
+AE-06, SG-V6, SG-V7, the SG3 owned paths and readiness. The `get-task-allow`
+profile finding is recorded for SG1 or SG4 and not acted on here. Diagrams
+SG-F7, SG-S1 and SG-F8 were rendered with the local Mermaid CLI (`mmdc -s 2`)
+into a temporary directory outside the repository and inspected. The design
+writer made no Keychain call and signed nothing for this revision.
 
 Return to the [design index](README.md).
