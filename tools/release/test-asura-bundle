@@ -61,9 +61,9 @@ static_checks() {
     check 'asura lists do not claim the App Sandbox (D-S1)' sh -c '! grep -l "app-sandbox" "$1"/entitlements/asura.*.plist' sh "$release"
     for kind in release development; do
         file=$release/entitlements/asura.$kind.plist
-        check "$kind application identifier" [ "$(value com.apple.application-identifier "$file")" = '@TEAM_ID@.com.pidster.asura' ]
+        check "$kind application identifier" [ "$(value com.apple.application-identifier "$file")" = '@TEAM_ID@.org.pidster.asura' ]
         check "$kind team identifier" [ "$(value com.apple.developer.team-identifier "$file")" = '@TEAM_ID@' ]
-        check "$kind access group is the only group" [ "$(value keychain-access-groups "$file" | sed 's/^ *//' | tr '\n' ' ')" = 'Array { @TEAM_ID@.com.pidster.asura } ' ]
+        check "$kind access group is the only group" [ "$(value keychain-access-groups "$file" | sed 's/^ *//' | tr '\n' ' ')" = 'Array { @TEAM_ID@.org.pidster.asura } ' ]
     done
     for file in asura.development.plist asura-model.development.plist; do
         check "$file get-task-allow is true" [ "$(value com.apple.security.get-task-allow "$release/entitlements/$file")" = true ]
@@ -73,7 +73,7 @@ static_checks() {
     check 'no Hardened Runtime exception entitlement' sh -c '! grep -l "com.apple.security.cs\." "$1"/entitlements/*.plist' sh "$release"
     info=$release/Info.plist.in
     check 'Info.plist keys' [ "$(sorted_keys "$info")" = 'CFBundleDevelopmentRegion CFBundleExecutable CFBundleIdentifier CFBundleInfoDictionaryVersion CFBundleName CFBundlePackageType CFBundleShortVersionString CFBundleVersion LSMinimumSystemVersion LSUIElement' ]
-    check 'Info.plist bundle identifier' [ "$(value CFBundleIdentifier "$info")" = com.pidster.asura ]
+    check 'Info.plist bundle identifier' [ "$(value CFBundleIdentifier "$info")" = org.pidster.asura ]
     check 'Info.plist executable' [ "$(value CFBundleExecutable "$info")" = asura ]
     check 'Info.plist LSUIElement' [ "$(value LSUIElement "$info")" = true ]
     check 'Info.plist minimum system' [ "$(value LSMinimumSystemVersion "$info")" = 27.0 ]
@@ -85,7 +85,7 @@ static_checks() {
     check 'no tracked PEM private key' sh -c \
         '! git -C "$1" grep -lE -e "-----BEGIN [A-Z ]*PRIVATE KEY-----" -- .' sh "$root"
     check 'no tracked file names a team ID in place of the placeholder' sh -c \
-        '! git -C "$1" grep -lE "[A-Z0-9]{10}\.com\.pidster\.asura" -- tools' sh "$root"
+        '! git -C "$1" grep -lE "[A-Z0-9]{10}\.org\.pidster\.asura" -- tools' sh "$root"
 
     # SG-V3 integration: the script refuses before building or signing.
     scratch=$(mktemp -d "${TMPDIR:-/tmp}/asura-bundle-test.XXXXXXXX")
@@ -156,7 +156,7 @@ static_checks() {
 <key>ExpirationDate</key><date>$3</date>
 <key>TeamIdentifier</key><array><string>$1</string></array>
 <key>Entitlements</key><dict>
-<key>com.apple.application-identifier</key><string>$1.com.pidster.asura</string>
+<key>com.apple.application-identifier</key><string>$1.org.pidster.asura</string>
 <key>keychain-access-groups</key><array><string>$2</string></array>
 <key>com.apple.security.get-task-allow</key><$4/>
 </dict></dict></plist>
@@ -167,8 +167,8 @@ EOF
         }
         dev() { "$tree/tools/release/asura-bundle" --development --out "$out" \
             --identity 'Apple Development: T' --team-id ABCDE12345 --profile "$1"; }
-        refuses 'expired profile' 'profile expired' dev "$(profile_for ABCDE12345 "ABCDE12345".com.pidster.asura 2020-01-01T00:00:00Z true expired)"
-        refuses 'profile for another team' 'another team' dev "$(profile_for ZZZZZ12345 "ZZZZZ12345".com.pidster.asura 2099-01-01T00:00:00Z true team)"
+        refuses 'expired profile' 'profile expired' dev "$(profile_for ABCDE12345 "ABCDE12345".org.pidster.asura 2020-01-01T00:00:00Z true expired)"
+        refuses 'profile for another team' 'another team' dev "$(profile_for ZZZZZ12345 "ZZZZZ12345".org.pidster.asura 2099-01-01T00:00:00Z true team)"
         refuses 'profile without the access group' 'keychain access group' dev "$(profile_for ABCDE12345 ABCDE12345.com.other 2099-01-01T00:00:00Z true group)"
         refuses 'development profile without get-task-allow' 'must allow get-task-allow' dev "$(profile_for ABCDE12345 'ABCDE12345.*' 2099-01-01T00:00:00Z false gta)"
         refuses 'unsigned file as profile' 'cannot decode' dev "$scratch/profile"
@@ -200,14 +200,14 @@ bundle_checks() {
     check 'no profile in an ad hoc bundle' [ ! -e "$contents/embedded.provisionprofile" ]
     check 'no other top-level entry' [ "$(ls "$contents" | LC_ALL=C sort | tr '\n' ' ')" = 'Info.plist MacOS Resources _CodeSignature ' ]
     check 'at most 64 files' [ "$(find "$app" -type f | wc -l | tr -d ' ')" -le 64 ]
-    check 'bundle identifier' [ "$(value CFBundleIdentifier "$contents/Info.plist")" = com.pidster.asura ]
+    check 'bundle identifier' [ "$(value CFBundleIdentifier "$contents/Info.plist")" = org.pidster.asura ]
     check 'bundle executable' [ "$(value CFBundleExecutable "$contents/Info.plist")" = asura ]
     check 'bundle version' [ "$(value CFBundleVersion "$contents/Info.plist")" = "$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/rust/crates/asura-cli/Cargo.toml" | head -n 1)" ]
     info=$(codesign -d --verbose=2 "$contents/MacOS/asura-model" 2>&1)
-    check 'helper identifier' sh -c 'printf "%s\n" "$1" | grep -qx "Identifier=com.pidster.asura.model"' sh "$info"
+    check 'helper identifier' sh -c 'printf "%s\n" "$1" | grep -qx "Identifier=org.pidster.asura.model"' sh "$info"
     check 'helper embedded Info.plist bound' sh -c 'printf "%s\n" "$1" | grep -Eq "^Info.plist entries=[1-9]"' sh "$info"
     check 'helper embedded CFBundleIdentifier' sh -c \
-        'launchctl plist __TEXT,__info_plist "$1" | grep -Fq "\"CFBundleIdentifier\" = \"com.pidster.asura.model\""' \
+        'launchctl plist __TEXT,__info_plist "$1" | grep -Fq "\"CFBundleIdentifier\" = \"org.pidster.asura.model\""' \
         sh "$contents/MacOS/asura-model"
     for binary in asura asura-model; do
         info=$(codesign -d --verbose=2 "$contents/MacOS/$binary" 2>&1)
@@ -220,7 +220,7 @@ bundle_checks() {
             '[ "$(printf "%s" "$1" | plutil -p -)" = "$(plutil -p "$2")" ]' sh "$actual" "$release/entitlements/$binary.ad-hoc.plist"
         check "$binary has no get-task-allow" sh -c '! printf "%s" "$1" | grep -q get-task-allow' sh "$actual"
     done
-    check 'app identifier' sh -c 'codesign -d --verbose=2 "$1" 2>&1 | grep -qx "Identifier=com.pidster.asura"' sh "$app"
+    check 'app identifier' sh -c 'codesign -d --verbose=2 "$1" 2>&1 | grep -qx "Identifier=org.pidster.asura"' sh "$app"
     check 'Hub bundle signed ad hoc' sh -c 'codesign -d --verbose=2 "$1" 2>&1 | grep -qx "Signature=adhoc"' sh "$contents/Resources/swift-transformers_Hub.bundle"
     # SG-V2 integration: digests inside the bundle equal the package identity.
     manifest=$contents/Resources/model-package.json
@@ -246,7 +246,7 @@ bundle_checks() {
 # read-only absolute-path exception for the harness homes under /private/tmp/,
 # under the probe identifier, never the product identifier. No release list
 # carries that exception (--static).
-probe_id=com.pidster.asura.probe.model
+probe_id=org.pidster.asura.probe.model
 harness_root=/private/tmp/
 sandbox_checks() {
     app=$1
@@ -305,8 +305,8 @@ if len(start) != 1:
 fields = dict(line.split()[:2] for line in lines[start[0] + 1:start[0] + 8] if len(line.split()) == 2)
 size, offset = int(fields["size"], 16), int(fields["offset"])
 info = plistlib.loads(bytes(data[offset:offset + size]))
-if info.get("CFBundleIdentifier") != "com.pidster.asura.model":
-    sys.exit("the bundle helper does not embed com.pidster.asura.model")
+if info.get("CFBundleIdentifier") != "org.pidster.asura.model":
+    sys.exit("the bundle helper does not embed org.pidster.asura.model")
 info["CFBundleIdentifier"] = identifier
 text = b"\n".join(line.lstrip(b"\t") for line in plistlib.dumps(info).split(b"\n"))
 if len(text) > size:
@@ -349,7 +349,7 @@ PY
     cp "$work/sandbox-probe" "$work/sandbox-probe-control"
     codesign --force --sign - --timestamp=none --identifier "$probe_id" --options runtime \
         --entitlements "$test_list" "$work/sandbox-probe" 2>/dev/null &&
-        codesign --force --sign - --timestamp=none --identifier com.pidster.asura.probe.control \
+        codesign --force --sign - --timestamp=none --identifier org.pidster.asura.probe.control \
             "$work/sandbox-probe-control" 2>/dev/null ||
         { bad 'cannot sign the negative fixture'; return; }
     ssh=$account_home/.ssh

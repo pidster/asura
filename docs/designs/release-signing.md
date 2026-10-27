@@ -9,6 +9,8 @@ Status: selected design, 2026-10-23. The owner answered the nine signing
 questions SGQ1–SGQ9 on 2026-10-23 ([owner decisions](#owner-decisions)). No
 code, test, signature, notarisation or Keychain call was made to write this
 design. Protocol numbering stays `0.1`; journal format stays `1`.
+The owner revised SGQ2 on 2026-10-27: the reverse-DNS prefix is now
+`org.pidster` ([owner decisions](#owner-decisions)).
 Packet SG1 delivered the package script and the bundle resource lookup on
 2026-10-23 ([SG1 delivery](#sg1-delivery)); it signed ad hoc only. Packet SG2
 delivered the helper App Sandbox entitlements and the SG-V5 checks on
@@ -121,7 +123,7 @@ Required behavior.
 | Restricted entitlement | An entitlement that a provisioning profile must authorise, such as `keychain-access-groups` ([TN3125](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles)) |
 | App-like bundle | A directory `Asura.app/Contents/{Info.plist, MacOS/, Resources/, embedded.provisionprofile}`. It holds a command-line executable so that a profile can be embedded |
 | Data-protection keychain | The per-user keychain that `SecItem` calls reach with `kSecUseDataProtectionKeychain = true`. Its access control is keychain access groups ([TN3137](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains)) |
-| Asura access group | `<TeamID>.com.pidster.asura` (SGQ2). The test access group is `<TeamID>.com.pidster.asura.test` (SGQ6) |
+| Asura access group | `<TeamID>.org.pidster.asura` (SGQ2). The test access group is `<TeamID>.org.pidster.asura.test` (SGQ6) |
 | Team Keychain store | The secret store on the data-protection keychain with the Asura access group, replacing the file-based login keychain (SGQ4, SGQ8) |
 | Qualification bundle | A test `Asura.app` that the owner signs with the test access group, used only by the signed qualification run (SGQ6) |
 
@@ -133,7 +135,7 @@ the packets below.
 | ID | Question | Decision (owner, 2026-10-23) |
 | --- | --- | --- |
 | SGQ1 | Can the released `asura` command live in `Asura.app/Contents/MacOS/asura`, with Homebrew linking `bin/asura` to it? The team Keychain store needs a provisioning profile, and a profile needs an app-like bundle. | Yes, `Asura.app`; Homebrew links `bin/asura`. |
-| SGQ2 | Which bundle IDs? | `com.pidster.asura` and `com.pidster.asura.model`; access group `<TeamID>.com.pidster.asura`. |
+| SGQ2 | Which bundle IDs? | Original (2026-10-23): `com.pidster.asura` and `com.pidster.asura.model`; access group `<TeamID>.com.pidster.asura`. Revised by the owner on 2026-10-27 (see the note below): `org.pidster.asura` and `org.pidster.asura.model`; access group `<TeamID>.org.pidster.asura`. |
 | SGQ3 | Sign the assembled development bundle with the Apple Development identity and a development profile? | Yes. Development `Asura.app` bundles are signed with the Apple Development identity and a development profile. Cargo test binaries stay unsigned. |
 | SGQ4 | KQ2 says that only the build that wrote an item can read it. In the team Keychain store, any build that the team signs with the access group can read and delete the item. Accept? | Yes. Any build signed by the team with the access group may read and delete items (KQ2 revised). Stranded items go away. |
 | SGQ5 | Old items named "Asura queued command secrets" stay in the login keychain on development Macs. Accept a one-time manual clean-up, with no Asura code that reads or deletes them? | Clean switch. No migration code. The leftovers are deleted by hand once. |
@@ -141,6 +143,16 @@ the packets below.
 | SGQ7 | Must the Swift model helper run in the App Sandbox? | The helper App Sandbox is a release requirement if probes HS-P1 to HS-P7 pass. Otherwise the helper ships unsandboxed, with the gap recorded. |
 | SGQ8 | EXD-3 planned a Secure Enclave replacement for SS-T8. Close it? | Keep the Secure Enclave design item open for later study. The team Keychain store for now is the team data-protection Keychain. |
 | SGQ9 | Who signs and notarises? | Only the owner, on the owner's Mac, for the first release. No CI secrets. |
+
+SGQ2 revision (owner, 2026-10-27): the reverse-DNS prefix changes from
+`com.pidster` to `org.pidster`, because the owner also owns pidster.org. The
+bundle IDs are `org.pidster.asura` and `org.pidster.asura.model`, the test App
+ID is `org.pidster.asura.test`, and the access groups are
+`<TeamID>.org.pidster.asura` and `<TeamID>.org.pidster.asura.test`. The project
+is unreleased, so there is no alias and no migration for the old prefix. The
+SG0, SG1 and SG2 runs used the original prefix; this design now states every
+identifier, including those in the probe and delivery records, with the revised
+prefix. The identifiers change; the behavior and the results do not.
 
 The draft of this design recommended closing the Secure Enclave item (SGQ8).
 The owner did not accept that recommendation; the item stays open.
@@ -177,8 +189,8 @@ Selected mechanism.
 
 | Executable | Release signature | Hardened Runtime | Entitlements | Why |
 | --- | --- | --- | --- | --- |
-| `Asura.app` / `Contents/MacOS/asura` (CLI, TUI, service, guardian) | Developer ID Application, secure timestamp | Yes | `keychain-access-groups: [<TeamID>.com.pidster.asura]`, plus `com.apple.application-identifier` and `com.apple.developer.team-identifier` as the profile requires. Nothing else. | The secret store needs the access group (RS4). The process needs no JIT, no `DYLD_*`, no unsigned libraries and no debugger rights. The guardian calls `sandbox_check`, `proc_listpids`, `proc_pidinfo` and `sysctl(KERN_PROCARGS2)` on same-user processes; these need no entitlement (the escapee control probes ran unsigned). |
-| `Asura.app/Contents/MacOS/asura-model` | Developer ID Application, secure timestamp, identifier `com.pidster.asura.model` | Yes | If the HS probes pass (SGQ7): `com.apple.security.app-sandbox`, `com.apple.security.network.client`, and `com.apple.security.temporary-exception.files.home-relative-path.read-only` for `/.asura/data/models/` and `/.asura/run/`. If an HS probe fails: none. | See [helper App Sandbox](#helper-app-sandbox). An embedded `Info.plist` (`-sectcreate __TEXT __info_plist`, `CFBundleIdentifier` equal to the signing identifier) is required: without it a sandboxed bare executable traps at start in `_libsecinit_appsandbox` (HS-P1). It also gives the helper a stable identity in every build, so Core AI reuses one compiled-model cache instead of one per copy. |
+| `Asura.app` / `Contents/MacOS/asura` (CLI, TUI, service, guardian) | Developer ID Application, secure timestamp | Yes | `keychain-access-groups: [<TeamID>.org.pidster.asura]`, plus `com.apple.application-identifier` and `com.apple.developer.team-identifier` as the profile requires. Nothing else. | The secret store needs the access group (RS4). The process needs no JIT, no `DYLD_*`, no unsigned libraries and no debugger rights. The guardian calls `sandbox_check`, `proc_listpids`, `proc_pidinfo` and `sysctl(KERN_PROCARGS2)` on same-user processes; these need no entitlement (the escapee control probes ran unsigned). |
+| `Asura.app/Contents/MacOS/asura-model` | Developer ID Application, secure timestamp, identifier `org.pidster.asura.model` | Yes | If the HS probes pass (SGQ7): `com.apple.security.app-sandbox`, `com.apple.security.network.client`, and `com.apple.security.temporary-exception.files.home-relative-path.read-only` for `/.asura/data/models/` and `/.asura/run/`. If an HS probe fails: none. | See [helper App Sandbox](#helper-app-sandbox). An embedded `Info.plist` (`-sectcreate __TEXT __info_plist`, `CFBundleIdentifier` equal to the signing identifier) is required: without it a sandboxed bare executable traps at start in `_libsecinit_appsandbox` (HS-P1). It also gives the helper a stable identity in every build, so Core AI reuses one compiled-model cache instead of one per copy. |
 | `Asura.app/Contents/Resources/mlx.metallib` | Not code. Sealed by the bundle's `CodeResources` | — | — | Metal loads it as data. The service still checks its SHA-256 (RS9). |
 | `Asura.app/Contents/Resources/model-package.json` | Sealed by the bundle | — | — | Manifest |
 | `Asura.app/Contents/Resources/swift-transformers_Hub.bundle` | Nested bundle, signed before the helper and the outer bundle (BN1) | — | — | `Bundle.module` calls `fatalError` when it is absent ([BN1](#bn1-hub-resource-bundle-defect)) |
@@ -199,14 +211,14 @@ must change together (packet SG1).
 ```text
 Asura.app/
   Contents/
-    Info.plist                  CFBundleIdentifier com.pidster.asura, CFBundleExecutable asura,
+    Info.plist                  CFBundleIdentifier org.pidster.asura, CFBundleExecutable asura,
                                 LSUIElement true, LSMinimumSystemVersion 27.0
     MacOS/asura
     MacOS/asura-model
     Resources/mlx.metallib
     Resources/model-package.json
     Resources/swift-transformers_Hub.bundle/   (BN1)
-    embedded.provisionprofile   Developer ID profile for com.pidster.asura
+    embedded.provisionprofile   Developer ID profile for org.pidster.asura
     _CodeSignature/CodeResources
 LICENSE
 ```
@@ -228,7 +240,7 @@ flowchart TD
     subgraph Operator["Owner's Mac: release operator (SGQ9)"]
         Cert["Developer ID Application key (login keychain)"]
         Notary["notarytool profile: App Store Connect API key"]
-        Prof["Developer ID profile com.pidster.asura"]
+        Prof["Developer ID profile org.pidster.asura"]
     end
     subgraph Bundle["Asura.app: sealed bundle"]
         A["MacOS/asura: runtime, keychain-access-groups"]
@@ -331,7 +343,7 @@ Selected (SGQ3).
 | Hardened Runtime | No | Yes | Yes |
 | `get-task-allow` | Implicit (ad hoc) | Yes, so that the owner can debug | No |
 | Profile | None | macOS development profile, registered Mac | Developer ID profile |
-| Data-protection keychain | Unavailable (`errSecMissingEntitlement`, -34018, expected; probe KC-P1) | Available, group `<TeamID>.com.pidster.asura` | Available, same group |
+| Data-protection keychain | Unavailable (`errSecMissingEntitlement`, -34018, expected; probe KC-P1) | Available, group `<TeamID>.org.pidster.asura` | Available, same group |
 | Helper App Sandbox | No | Yes if the HS probes pass, development signed | Yes if the HS probes pass |
 | Notarised | No | No | Yes, stapled |
 | Secret store result | `unavailable` with the text "This Asura build is not signed for the Keychain." | Normal | Normal |
@@ -369,8 +381,8 @@ team ID must be ten upper-case letters or digits.
 The profile is decoded with `/usr/bin/openssl smime -verify -noverify`, which
 reads no keychain. The script refuses a profile that has expired, whose
 `TeamIdentifier` does not hold the team ID, whose
-`com.apple.application-identifier` is not `<TeamID>.com.pidster.asura`, or
-whose `keychain-access-groups` lacks `<TeamID>.com.pidster.asura` (or
+`com.apple.application-identifier` is not `<TeamID>.org.pidster.asura`, or
+whose `keychain-access-groups` lacks `<TeamID>.org.pidster.asura` (or
 `<TeamID>.*`). No step calls `security`.
 
 #### Entitlement files
@@ -380,7 +392,7 @@ team ID at signing time, in the output directory only.
 
 | File | Keys |
 | --- | --- |
-| `asura.release.plist` | `keychain-access-groups` [`@TEAM_ID@.com.pidster.asura`], `com.apple.application-identifier` `@TEAM_ID@.com.pidster.asura`, `com.apple.developer.team-identifier` `@TEAM_ID@` |
+| `asura.release.plist` | `keychain-access-groups` [`@TEAM_ID@.org.pidster.asura`], `com.apple.application-identifier` `@TEAM_ID@.org.pidster.asura`, `com.apple.developer.team-identifier` `@TEAM_ID@` |
 | `asura.development.plist` | The release keys and `com.apple.security.get-task-allow` `true` |
 | `asura.ad-hoc.plist` | None |
 | `asura-model.release.plist`, `asura-model.ad-hoc.plist` | `com.apple.security.app-sandbox` `true`, `com.apple.security.network.client` `true`, `com.apple.security.temporary-exception.files.home-relative-path.read-only` [`/.asura/data/models/`, `/.asura/run/`] (SG2, SGQ7) |
@@ -418,14 +430,14 @@ the archive. A new run needs a new output directory.
 4. **Stage and check limits.** Helper at most 128 MiB, `mlx.metallib` at most
    64 MiB, Hub bundle within the BN1 limits, no symbolic link anywhere.
 5. **Sign inside-out (D-S3).** The Hub bundle first, then `asura-model` with
-   identifier `com.pidster.asura.model` and the Hardened Runtime. Check:
+   identifier `org.pidster.asura.model` and the Hardened Runtime. Check:
    `codesign --verify --strict` passes for both; the helper's identifier is
-   `com.pidster.asura.model`, its flags hold `runtime`, its embedded
+   `org.pidster.asura.model`, its flags hold `runtime`, its embedded
    `Info.plist` is bound, and the signed helper's code reports the build ID
    and schema digest from step 2 through `--version` (step 2 also checks that
    each generated array holds 32 bytes). The check runs an ad hoc copy with
    no entitlements: the signed helper claims the App Sandbox, and starting it
-   would create its container under `com.pidster.asura.model` on the
+   would create its container under `org.pidster.asura.model` on the
    packaging Mac. The copy has the same code; only its signature differs.
 6. **Hash.** SHA-256 of the signed helper and `mlx.metallib`, and the Hub
    bundle digest ([encoding](#hub-bundle-digest-encoding)). Write the five
@@ -441,7 +453,7 @@ the archive. A new run needs a new output directory.
    without `--deep`, so nested code is not signed again. Check:
    `codesign --verify --deep --strict` passes; the entitlements of `asura` and
    `asura-model` (`codesign -d --entitlements`) equal the expected files; both
-   carry `runtime`; the bundle identifier is `com.pidster.asura`; in a signed
+   carry `runtime`; the bundle identifier is `org.pidster.asura`; in a signed
    mode both carry the team ID and the profile allows every signed
    entitlement; the digests inside the bundle still equal step 6 (SG-V2).
 10. **Notarise (release only).** Zip with `ditto -c -k --keepParent`, then
@@ -669,7 +681,7 @@ lands:
 | Property | Team Keychain store |
 | --- | --- |
 | Keychain | Data-protection keychain: `kSecUseDataProtectionKeychain = true` on every add, query and delete. Production no longer uses `kSecUseKeychain` or `SecKeychainCopyDefault` |
-| Access group | Omitted in calls. The default group is the first `keychain-access-groups` entry, `<TeamID>.com.pidster.asura` ([Apple: sharing access](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps)) |
+| Access group | Omitted in calls. The default group is the first `keychain-access-groups` entry, `<TeamID>.org.pidster.asura` ([Apple: sharing access](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps)) |
 | Accessibility | `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (KQ1). "ThisDeviceOnly" keeps the item out of backups to other devices and out of migration |
 | Synchronizable | `false`, explicitly |
 | Who can read and delete | Any executable signed by the team that claims the group under a valid profile (SGQ4, KQ2 revised). Other same-user programs get no match ([Apple](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps): a query on a group the program does not belong to returns `errSecItemNotFound`) |
@@ -760,7 +772,7 @@ Selected (SGQ6).
 | Unit (`cargo test`) | Scripted `KeychainPort` (exists) | Worker, codec, sweep, replies, KC-U cases |
 | Integration (`cargo test`, test-support) | The scratch **file** keychain backend, kept as the test-only `Target::Scratch` with its target pre-check and testing rules | Real Security framework IPC, queueing, a blocked call (AE-07). It does not prove data-protection behavior |
 | Integration, negative (`cargo test`) | Unsigned test binary against the data-protection keychain | Every call returns -34018 and the reply is `unavailable/not_signed`. The binary has no entitlement, so it can make no change. This is safe under RS5 |
-| Qualification (signed, not `cargo test`) | The qualification bundle, signed with the test group `<TeamID>.com.pidster.asura.test` and a random installation ID | Real data-protection add, read, list, delete, sweep and restart. Production Asura cannot see this group. The run deletes every item it wrote and then lists the group to prove that it is empty |
+| Qualification (signed, not `cargo test`) | The qualification bundle, signed with the test group `<TeamID>.org.pidster.asura.test` and a random installation ID | Real data-protection add, read, list, delete, sweep and restart. Production Asura cannot see this group. The run deletes every item it wrote and then lists the group to prove that it is empty |
 
 `Target::Default` becomes the data-protection backend. `Target::Scratch` stays
 behind the `test-support` feature. A production build therefore cannot select
@@ -1134,7 +1146,7 @@ requires:
 ### SG0 results (ad hoc part, 2026-10-23)
 
 Run on the macOS 27 host with ad hoc signing only, scratch homes, probe-only
-bundle IDs (`com.pidster.asura.probe.*`) and no Keychain call. The full record
+bundle IDs (`org.pidster.asura.probe.*`) and no Keychain call. The full record
 with commands, entitlement plists and output is kept with the session
 evidence; the results and their design effect are:
 
@@ -1165,7 +1177,7 @@ helper's run copy for system, Ollama and inventory selections is a bare
 probe passed, so the name need not match.
 
 Core AI cache: with the embedded identity, repeated spawns share one cache,
-`~/Library/Caches/coreai-cache/<os build>/com.pidster.asura.model` (about
+`~/Library/Caches/coreai-cache/<os build>/org.pidster.asura.model` (about
 2.1 GB per identity and OS build). Core AI owns that cache; Asura does not
 delete it, and the user documentation states its size and location.
 
@@ -1228,7 +1240,7 @@ flowchart TD
 | BN1 | `asura-platform/src/model_process.rs` (bundle copy, limits, cleanup), `asura-service/build.rs` and `asura-service/src/model_owner.rs` (`hub_bundle_sha256`), `model-package.json` producer, `swift/model-helper/README.md` (package step), model provider integration design | BN-P1 | SG-V10 |
 | SG1 | `tools/release/` (new script, `Info.plist` template, entitlement plists), `asura-service/src/model_owner.rs` (resource path), `asura-platform/src/model_process.rs` (resource source path), `swift/model-helper/README.md` | SGQ1–SGQ3, BN1 | SG-V1 to SG-V3, SG-V9 |
 | SG0-K | Owner's Mac; results recorded in this design | SG1 (a signed qualification bundle) | KC-P1 to KC-P4 results |
-| SG2a | HS-P8 probe (Seatbelt `process-info*` and `kern.procargs2` denial for the helper); `swift/model-helper` build: embed `Info.plist` (`CFBundleIdentifier` `com.pidster.asura.model`) in every helper build; the model inventory opens the asset root by its full path instead of walking from `/` | SG0 ad hoc results | HS-P1 and HS-P6 rerun with an ad hoc sandboxed helper; one Core AI cache for repeated spawns (two spawns create one cache directory) |
+| SG2a | HS-P8 probe (Seatbelt `process-info*` and `kern.procargs2` denial for the helper); `swift/model-helper` build: embed `Info.plist` (`CFBundleIdentifier` `org.pidster.asura.model`) in every helper build; the model inventory opens the asset root by its full path instead of walking from `/` | SG0 ad hoc results | HS-P1 and HS-P6 rerun with an ad hoc sandboxed helper; one Core AI cache for repeated spawns (two spawns create one cache directory) |
 | SG2 | Helper entitlement plist; threat model rows | SG1, SG2a | SG-V5, or EX-H1 recorded |
 | SG3 | `asura-platform/src/keychain*`, `asura-service/src/secret_store*`, `ServiceObservation` field 8 schema (fields 4 and 6 reserved), TUI `/status` text, secret store design | SG0-K, SGQ4–SGQ6 | SG-V6, SG-V7 |
 | SG4 | `tools/release/`, `pidster/homebrew-tap` formula | SG1, SG2, NT-P1 | HD1, HD5, HD9, HD10, HD12, HD13 |
@@ -1246,7 +1258,7 @@ signing packet.
 | SG0 | Ready | BN-P1 done; SB, HS and HR probes remain |
 | BN1 | Ready | — (BN-P1 confirmed the crash, 2026-10-23) |
 | SG1 | Delivered (branch `sg1`, 2026-10-23) | — ([delivery](#sg1-delivery)) |
-| SG0-K | Not ready | A qualification-bundle variant of the package script (entitlements naming the test group `<TeamID>.com.pidster.asura.test`, and its profile); then the owner runs it (SGQ9) |
+| SG0-K | Not ready | A qualification-bundle variant of the package script (entitlements naming the test group `<TeamID>.org.pidster.asura.test`, and its profile); then the owner runs it (SGQ9) |
 | SG2a | Delivered (branch `sg2a`, 2026-10-23) | — |
 | SG2 | Delivered (branch `sg2`, 2026-10-23) | — ([delivery](#sg2-delivery)) |
 | SG3 | Not ready | KC-P1 to KC-P4 results; then the secret store design revision that SG3 owns |
@@ -1306,7 +1318,7 @@ temporary exceptions ([SG-F2](#sg-f2-helper-sandbox-decision)).
 
 - `tools/release/entitlements/asura-model.{release,development,ad-hoc}.plist`:
   the App Sandbox keys of the [entitlement table](#entitlement-files). The
-  embedded `Info.plist` identity (`com.pidster.asura.model`) is unchanged.
+  embedded `Info.plist` identity (`org.pidster.asura.model`) is unchanged.
 - `tools/release/asura-bundle`: step 5 checks `--version` on an ad hoc copy
   without entitlements, so that packaging never starts the sandboxed helper
   and creates no container under the product identifier. No other step
@@ -1329,9 +1341,9 @@ plus `com.apple.security.temporary-exception.files.absolute-path.read-only`
 [`/private/tmp/`], the parent of every harness home (the home name is random,
 and an exception names a directory, not a prefix). Its signing identifier and
 its embedded `CFBundleIdentifier` are the probe identifier
-`com.pidster.asura.probe.model` (the section is rewritten at the same size),
+`org.pidster.asura.probe.model` (the section is rewritten at the same size),
 so tests never create a container or Core AI cache under
-`com.pidster.asura.model`. The variant's digest goes into
+`org.pidster.asura.model`. The variant's digest goes into
 `package-identity.txt` for the journey build only; the script restores the
 file afterwards. At the end it removes the probe container's `Data`
 directory and lists what remains.
@@ -1347,7 +1359,7 @@ flowchart TD
     B["Ad hoc Asura.app from asura-bundle --ad-hoc"] --> E{"Bundle helper claims exactly asura-model.ad-hoc.plist?"}
     E -->|"No: record FAIL"| T
     E -->|Yes| T["Test list: shipped list plus absolute-path read-only /private/tmp/"]
-    T --> V["Variant: copy bundle, embedded Info.plist set to com.pidster.asura.probe.model, re-sign ad hoc with runtime and the test list"]
+    T --> V["Variant: copy bundle, embedded Info.plist set to org.pidster.asura.probe.model, re-sign ad hoc with runtime and the test list"]
     V -->|"Copy or signing fails"| Stop["Stop the remaining steps: record FAIL"]
     V --> VC{"Identifier, bound Info.plist, runtime, entitlements and build ID verified?"}
     VC -->|"No: record FAIL"| N

@@ -99,7 +99,7 @@ read-only access to `~/.asura/data/models/` and `~/.asura/run/` of the account
 home (SG2). Tests never use that home, so the bundle's own helper cannot read a
 test home. `--sandbox` therefore re-signs a copy of the bundle's helper as a
 test-only variant: the shipped list plus a read-only exception for
-`/private/tmp/`, under the probe identifier `com.pidster.asura.probe.model`.
+`/private/tmp/`, under the probe identifier `org.pidster.asura.probe.model`.
 No tracked list carries that exception. It then:
 
 1. runs `sandbox-probe` with the same identifier and list: `~/.ssh` reads,
@@ -124,7 +124,7 @@ tools/release/test-asura-bundle --sandbox .build/bundles/dry-run-1/Asura.app
 
 The script never starts the bundle's own helper: the package script checks
 `--version` on an unsandboxed ad hoc copy, so that packaging creates no
-container under `com.pidster.asura.model`.
+container under `org.pidster.asura.model`.
 
 ## What the dry run does not prove
 

@@ -35,7 +35,7 @@ private func section(_ file: Data, _ segment: String, _ name: String) -> Data? {
 @Test func helperInfoPlistNamesTheModelIdentity() throws {
     let data = try Data(contentsOf: packageRoot.appending(path: "Support/Info.plist"))
     let plist = try #require(try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
-    #expect(plist["CFBundleIdentifier"] as? String == "com.pidster.asura.model")
+    #expect(plist["CFBundleIdentifier"] as? String == "org.pidster.asura.model")
     #expect(plist["CFBundleExecutable"] as? String == "asura-model")
     #expect(plist["CFBundleInfoDictionaryVersion"] as? String == "6.0")
 }

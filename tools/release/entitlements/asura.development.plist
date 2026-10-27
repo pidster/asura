@@ -3,12 +3,12 @@
 <plist version="1.0">
 <dict>
 	<key>com.apple.application-identifier</key>
-	<string>@TEAM_ID@.com.pidster.asura</string>
+	<string>@TEAM_ID@.org.pidster.asura</string>
 	<key>com.apple.developer.team-identifier</key>
 	<string>@TEAM_ID@</string>
 	<key>keychain-access-groups</key>
 	<array>
-		<string>@TEAM_ID@.com.pidster.asura</string>
+		<string>@TEAM_ID@.org.pidster.asura</string>
 	</array>
 	<key>com.apple.security.get-task-allow</key>
 	<true/>

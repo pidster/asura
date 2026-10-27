@@ -109,11 +109,11 @@ if [ "$mode" != ad-hoc ]; then
     [ "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \< "$expires" ] || fail "the profile expired at $expires"
     plutil -extract TeamIdentifier json -o - "$decoded/profile.plist" | grep -Fq "\"$team\"" ||
         fail 'the profile is for another team'
-    [ "$(pb Entitlements:com.apple.application-identifier "$decoded/profile.plist")" = "$team.com.pidster.asura" ] ||
-        fail "the profile application identifier is not $team.com.pidster.asura"
+    [ "$(pb Entitlements:com.apple.application-identifier "$decoded/profile.plist")" = "$team.org.pidster.asura" ] ||
+        fail "the profile application identifier is not $team.org.pidster.asura"
     pb Entitlements:keychain-access-groups "$decoded/profile.plist" |
-        sed 's/^ *//' | grep -Fqx -e "$team.com.pidster.asura" -e "$team.*" ||
-        fail "the profile does not allow the keychain access group $team.com.pidster.asura"
+        sed 's/^ *//' | grep -Fqx -e "$team.org.pidster.asura" -e "$team.*" ||
+        fail "the profile does not allow the keychain access group $team.org.pidster.asura"
     gta=$(pb Entitlements:com.apple.security.get-task-allow "$decoded/profile.plist" || :)
     if [ "$mode" = development ]; then
         [ "$gta" = true ] || fail 'a development profile must allow get-task-allow'
@@ -245,11 +245,11 @@ copy "$bin/swift-transformers_Hub.bundle" "$pkg/swift-transformers_Hub.bundle"
 # --- 5. Sign inside-out (D-S3) ----------------------------------------------
 step='helper signature'
 sign "$pkg/swift-transformers_Hub.bundle" || fail 'cannot sign the Hub bundle'
-sign --identifier com.pidster.asura.model --options runtime \
+sign --identifier org.pidster.asura.model --options runtime \
     --entitlements "$helper_entitlements" "$pkg/asura-model" || fail 'cannot sign asura-model'
 codesign --verify --strict --deep "$pkg/swift-transformers_Hub.bundle" || fail 'the Hub bundle does not verify'
 codesign --verify --strict "$pkg/asura-model" || fail 'asura-model does not verify'
-[ "$(field "$pkg/asura-model" Identifier)" = com.pidster.asura.model ] || fail 'asura-model has the wrong identifier'
+[ "$(field "$pkg/asura-model" Identifier)" = org.pidster.asura.model ] || fail 'asura-model has the wrong identifier'
 require_runtime "$pkg/asura-model"
 details "$pkg/asura-model" | grep -Eq '^Info.plist entries=[1-9]' || fail 'asura-model has no bound Info.plist'
 require_signer "$pkg/asura-model"
@@ -312,7 +312,7 @@ step='bundle signature'
 sign --options runtime --entitlements "$asura_entitlements" "$app" || fail 'cannot sign Asura.app'
 verify_bundle() {
     codesign --verify --deep --strict --verbose=2 "$app" || fail 'Asura.app does not verify'
-    [ "$(field "$app" Identifier)" = com.pidster.asura ] || fail 'Asura.app has the wrong identifier'
+    [ "$(field "$app" Identifier)" = org.pidster.asura ] || fail 'Asura.app has the wrong identifier'
     for binary in "$app/Contents/MacOS/asura" "$app/Contents/MacOS/asura-model"; do
         require_runtime "$binary"
         require_signer "$binary"

@@ -817,7 +817,7 @@ builds with Keychain entitlements.
 
 EXD-3 update (owner, 2026-10-23): the storage after release signing is
 resolved as the team Keychain store: the team data-protection Keychain with the access group
-`<TeamID>.com.pidster.asura`
+`<TeamID>.org.pidster.asura`
 ([release signing](release-signing.md#team-keychain-store)). Any build that the
 team signs with the group may read and delete items (SGQ4, KQ2 revised); this
 is residual [SG-T1](release-signing.md#security). The Secure Enclave design

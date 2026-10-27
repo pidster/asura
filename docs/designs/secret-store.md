@@ -38,7 +38,7 @@ Revision of 2026-10-23, for release signing: the owner answered the signing
 questions SGQ1–SGQ9 ([release signing](release-signing.md#owner-decisions)).
 The storage that follows the login keychain (KQ1, EXD-3) is now resolved as
 [team Keychain store](release-signing.md#team-keychain-store): the team
-data-protection Keychain with the access group `<TeamID>.com.pidster.asura`.
+data-protection Keychain with the access group `<TeamID>.org.pidster.asura`.
 KQ2 is revised by SGQ4: any build that the team signs with the access group
 may read and delete items, so stranded items go away. The switch is clean,
 with no migration code (SGQ5), and only the signed qualification run writes
@@ -1126,7 +1126,7 @@ store.
 
 | ID | Decision (owner, 2026-10-23) |
 | --- | --- |
-| KQ1 follow-up (EXD-3) | Resolved: after release signing the store is the team Keychain store: the team data-protection Keychain with the access group `<TeamID>.com.pidster.asura` and `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (SGQ2, SGQ8). |
+| KQ1 follow-up (EXD-3) | Resolved: after release signing the store is the team Keychain store: the team data-protection Keychain with the access group `<TeamID>.org.pidster.asura` and `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (SGQ2, SGQ8). |
 | KQ2 revised (SGQ4) | Any build that the team signs with the access group may read and delete items. Stranded items go away. |
 | SGQ5 | Clean switch. No migration code. Leftover login keychain items are deleted by hand once. |
 | SGQ6 | Only the signed qualification run writes items, under a separate test access group, and it must leave that group empty. |

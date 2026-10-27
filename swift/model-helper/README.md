@@ -15,7 +15,7 @@ Before a standard SwiftPM build, the root build owner must:
    model-free tests with `swift test --package-path swift/model-helper`.
    Every build embeds `Support/Info.plist` in the `__TEXT,__info_plist`
    section (`-sectcreate`, set in `Package.swift`): `CFBundleIdentifier`
-   `com.pidster.asura.model`, `CFBundleExecutable` `asura-model`. The
+   `org.pidster.asura.model`, `CFBundleExecutable` `asura-model`. The
    linker's ad hoc signature takes that identifier and binds the plist. An
    App-Sandboxed bare helper cannot start without it, and Core AI keys its
    compiled-model cache by it, so every copy shares one cache
