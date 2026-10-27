@@ -556,9 +556,13 @@ fn pc_u56_waiting_reasons_and_paced_recheck() {
         fallback: None,
     });
     let t0 = Instant::now();
+    let session = Some(crate::secret_store::Session::read());
     for (failure, wait, code, text) in [
         (
-            StoreFailure::Locked,
+            StoreFailure::Locked {
+                status: -25_308,
+                session,
+            },
             KeychainWait::Locked,
             pb::QueueWaitReason::KeychainLocked,
             "waiting: Keychain locked",
@@ -567,6 +571,18 @@ fn pc_u56_waiting_reasons_and_paced_recheck() {
             StoreFailure::Unavailable {
                 status: -25291,
                 reason: None,
+                session,
+            },
+            KeychainWait::Unavailable,
+            pb::QueueWaitReason::KeychainUnavailable,
+            "waiting: Keychain unavailable",
+        ),
+        // SG3: `not_signed` waits at the lane head like `unavailable`.
+        (
+            StoreFailure::Unavailable {
+                status: -34_018,
+                reason: Some(crate::secret_store::NOT_SIGNED),
+                session,
             },
             KeychainWait::Unavailable,
             pb::QueueWaitReason::KeychainUnavailable,
@@ -719,7 +735,10 @@ fn pc_u57_dispatch_read_outcomes_hold() {
     let mismatch = owner.person_item_read(record(inputs[1]), GetReply::Mismatch, None, now);
     let denied = owner.person_item_read(
         record(inputs[2]),
-        GetReply::Failed(StoreFailure::Denied),
+        GetReply::Failed(StoreFailure::Denied {
+            status: -25_293,
+            session: None,
+        }),
         None,
         now,
     );
@@ -1027,4 +1046,58 @@ fn a_failed_start_removes_the_scratch_keychain_and_home() {
     let home = seen.expect("the seam ran");
     assert!(!home.join("scratch.keychain").exists());
     assert!(!home.exists());
+}
+
+/// SG3: a store failure's refusal and audit form. `not_signed` refuses as
+/// `secret_store_unavailable` with |OSStatus| 34018; every Keychain failure
+/// audits its raw status and session (KC-U5); a defect audits status 0 and
+/// no session.
+#[test]
+fn store_failures_refuse_and_audit_with_evidence() {
+    use asura_storage::audit::{KeychainConsole, SecretStoreReply as R};
+    let session = crate::secret_store::Session::read();
+    let not_signed = StoreFailure::Unavailable {
+        status: -34_018,
+        reason: Some(crate::secret_store::NOT_SIGNED),
+        session: Some(session),
+    };
+    assert_eq!(
+        store_refusal(not_signed),
+        (Refusal::SecretStoreUnavailable, Some(34_018))
+    );
+    let (code, status, evidence) = failure_reply(&not_signed);
+    assert_eq!((code, status), (R::Unavailable, Some(-34_018)));
+    let evidence = evidence.expect("session");
+    assert_eq!(evidence.boot_time_s, session.boot_time_s);
+    assert_eq!(evidence.audit_flags, session.audit_flags);
+    assert_ne!(evidence.console, KeychainConsole::Unknown);
+    let locked = StoreFailure::Locked {
+        status: -25_308,
+        session: Some(session),
+    };
+    assert_eq!(store_refusal(locked), (Refusal::SecretStoreLocked, None));
+    let (code, status, evidence) = failure_reply(&locked);
+    assert_eq!((code, status), (R::Locked, Some(-25_308)));
+    assert!(evidence.is_some());
+    let defect = StoreFailure::Unavailable {
+        status: 0,
+        reason: Some(crate::secret_store::INVALID_REQUEST),
+        session: None,
+    };
+    assert_eq!(failure_reply(&defect), (R::Unavailable, Some(0), None));
+    // Every audit form the owner builds validates.
+    for (code, status, session) in [
+        failure_reply(&not_signed),
+        failure_reply(&locked),
+        failure_reply(&defect),
+    ] {
+        asura_storage::audit::Event::SecretStoreDelete {
+            input: [7; 16],
+            reply: code,
+            status,
+            session,
+        }
+        .validate()
+        .expect("valid audit event");
+    }
 }

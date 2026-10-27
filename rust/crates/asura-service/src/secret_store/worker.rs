@@ -1,13 +1,16 @@
 //! The secret store worker thread: one request at a time, the reply mapping
 //! of `docs/designs/secret-store.md` (status mapping, worker reply table),
-//! the item count and the sweep (SS-F1).
+//! the item count, the sweep (SS-F1), the field evidence on every failure
+//! and the terminal `not_signed` state (SG3).
 use super::codec::{self, DIGEST_BYTES};
 use super::port::KeychainPort;
 use super::{
-    COUNT_TRUNCATED, DeleteReply, GetReply, ITEM_LIMIT, OBSERVED_STRANDED, Observation, PutReply,
-    Request, Shared, StoreFailure, SweepReport,
+    COUNT_TRUNCATED, DeleteReply, GetReply, INVALID_REQUEST, ITEM_LIMIT, NOT_SIGNED, Observation,
+    PutReply, Request, Session, Shared, StoreFailure, SweepReport,
 };
-use asura_platform::keychain::{Added, Failure, Found, ItemKey, LIST_BOUND, Listing, Removed};
+use asura_platform::keychain::{
+    Added, Failure, Found, ItemKey, Listing, MISSING_ENTITLEMENT, Removed,
+};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -36,10 +39,11 @@ pub(super) struct Worker<P, O> {
     /// each is referenced, or its kind 31 outcome is not yet known (ordering
     /// rule 3). Bounded by the item limit.
     written: BTreeSet<[u8; 16]>,
-    /// Inputs whose delete was denied, at most [`LIST_BOUND`].
-    stranded: BTreeSet<[u8; 16]>,
     unrecognized: u32,
     last_status: u32,
+    /// A call or the open reported a missing entitlement. Terminal: no
+    /// later request opens the target or reaches the port.
+    not_signed: bool,
 }
 
 impl<P, O> Worker<P, O>
@@ -58,9 +62,9 @@ where
             swept: false,
             pending: None,
             written: BTreeSet::new(),
-            stranded: BTreeSet::new(),
             unrecognized: 0,
             last_status: 0,
+            not_signed: false,
         }
     }
 
@@ -115,14 +119,7 @@ where
             item_count: self.swept.then_some(self.count).flatten(),
             sweep_pending: self.pending.is_some(),
             last_status: self.last_status,
-            stranded_count: self.stranded.len() as u32,
             unrecognized_count: self.unrecognized,
-            stranded_inputs: self
-                .stranded
-                .iter()
-                .take(OBSERVED_STRANDED)
-                .copied()
-                .collect(),
         };
         *self
             .shared
@@ -132,8 +129,12 @@ where
     }
 
     /// One port call, opening the target first while it is not open. Every
-    /// result goes through the reply table here and nowhere else.
+    /// result goes through the reply table here and nowhere else. After
+    /// `not_signed` no open and no port call is made.
     fn call<T>(&mut self, call: impl FnOnce(&P) -> Result<T, Failure>) -> Result<T, StoreFailure> {
+        if self.not_signed {
+            return Err(self.failure(Failure::NotSigned { item_call: false }));
+        }
         if self.port.is_none() {
             self.port = Some((self.open)().map_err(|failure| self.failure(failure))?);
         }
@@ -147,22 +148,41 @@ where
         }
     }
 
-    /// The worker reply table for a platform `Failure`.
+    /// The worker reply table for a platform `Failure`. Every Keychain
+    /// failure records the session state read now, on this thread (F3).
     fn failure(&mut self, failure: Failure) -> StoreFailure {
         match failure {
-            Failure::Locked => StoreFailure::Locked,
-            Failure::Denied => StoreFailure::Denied,
+            Failure::Locked { status } => StoreFailure::Locked {
+                status,
+                session: Some(Session::read()),
+            },
+            Failure::Denied { status } => StoreFailure::Denied {
+                status,
+                session: Some(Session::read()),
+            },
+            Failure::NotSigned { .. } => {
+                self.not_signed = true;
+                self.port = None;
+                self.last_status = MISSING_ENTITLEMENT.unsigned_abs();
+                StoreFailure::Unavailable {
+                    status: MISSING_ENTITLEMENT,
+                    reason: Some(NOT_SIGNED),
+                    session: Some(Session::read()),
+                }
+            }
             Failure::Unavailable { status, .. } => {
                 self.last_status = status.unsigned_abs();
                 StoreFailure::Unavailable {
                     status,
                     reason: None,
+                    session: Some(Session::read()),
                 }
             }
             // The codec and the item key rules make this unreachable.
             Failure::Invalid => StoreFailure::Unavailable {
                 status: 0,
-                reason: Some("invalid_request"),
+                reason: Some(INVALID_REQUEST),
+                session: None,
             },
         }
     }
@@ -300,18 +320,16 @@ where
         reply
     }
 
-    /// A delete's effect on the stranded set and the written set.
+    /// A delete's effect on the written set. A failed delete leaves an
+    /// orphan, which the next sweep retries (SG3 removed stranded items).
     fn settle_delete(&mut self, input: [u8; 16], reply: DeleteReply) {
         match reply {
             DeleteReply::Deleted | DeleteReply::Absent => {
-                self.stranded.remove(&input);
                 self.written.remove(&input);
             }
-            DeleteReply::Failed(StoreFailure::Denied) => {
+            DeleteReply::Failed(StoreFailure::Denied { .. }) => {
+                // The owner has decided the item: the sweep may retry it.
                 self.written.remove(&input);
-                if self.stranded.len() < LIST_BOUND {
-                    self.stranded.insert(input);
-                }
             }
             DeleteReply::Failed(_) => {}
         }
@@ -334,7 +352,6 @@ where
             report.listings += 1;
             let mut pass = SweepReport::default();
             let mut removed = 0u32;
-            let mut stranded = BTreeSet::new();
             for &input in &listing.inputs {
                 if live.contains(&input) || self.written.contains(&input) {
                     pass.kept += 1;
@@ -351,10 +368,6 @@ where
                         removed += 1;
                         DeleteReply::Absent
                     }
-                    Err(StoreFailure::Denied) => {
-                        stranded.insert(input);
-                        DeleteReply::Failed(StoreFailure::Denied)
-                    }
                     Err(failure) => {
                         pass.failed += 1;
                         DeleteReply::Failed(failure)
@@ -367,13 +380,11 @@ where
                 continue;
             }
             self.unrecognized = listing.unrecognized as u32;
-            self.stranded = stranded;
             self.set_count(&listing, removed);
             self.swept = true;
             self.pending = None;
             report.kept = pass.kept;
             report.failed = pass.failed;
-            report.stranded = self.stranded.len() as u32;
             report.unrecognized = self.unrecognized;
             report.truncated = listing.truncated;
             report.outcome = Ok(());

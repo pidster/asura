@@ -395,14 +395,15 @@ pub(super) fn search_path(raw: Option<&[u8]>) -> Result<String, pb::QueueRefusal
     Ok(kept.join(":"))
 }
 
+/// The |OSStatus| of `errSecMissingEntitlement`: the service's build is not
+/// signed for the Keychain (`not_signed`, SG3).
+pub(super) const NOT_SIGNED_STATUS: u32 = 34_018;
+/// The person-facing text of `not_signed`.
+pub(super) const NOT_SIGNED_TEXT: &str = "This Asura build is not signed for the Keychain.";
+
 /// The person-facing text of a person command refusal (control API
-/// additions, TUI texts for refusals). `stranded` adds the `/status` hint to
-/// `secret_store_full` when stranded items exist.
-pub(super) fn refusal_text(
-    refusal: pb::QueueRefusal,
-    status: Option<u32>,
-    stranded: bool,
-) -> String {
+/// additions, TUI texts for refusals).
+pub(super) fn refusal_text(refusal: pb::QueueRefusal, status: Option<u32>) -> String {
     use pb::QueueRefusal as R;
     match refusal {
         R::OutsideSandboxOff => "Running outside the sandbox is turned off (personCommands.allowOutsideSandbox is false). Type it after a single ! to run it in the sandbox.".into(),
@@ -410,16 +411,14 @@ pub(super) fn refusal_text(
         R::EnvironmentTooLarge => "This terminal's environment is too large to pass to a command (at most 1,024 variables and 40 KiB).".into(),
         R::PathInvalid => "PATH has no usable absolute entry.".into(),
         R::CwdInvalid => "The working directory cannot be used for commands.".into(),
-        R::SecretStoreLocked => "The login keychain is locked. Unlock it, then press Enter again.".into(),
+        R::SecretStoreLocked => "The Keychain is locked until this Mac is unlocked after start-up. Unlock it, then press Enter again.".into(),
         R::SecretStoreDenied => "macOS denied Asura access to its Keychain item.".into(),
+        R::SecretStoreUnavailable if status == Some(NOT_SIGNED_STATUS) => NOT_SIGNED_TEXT.into(),
         R::SecretStoreUnavailable => format!(
             "The Keychain is unavailable (OSStatus -{}). Press Enter again later.",
             status.unwrap_or(0)
         ),
-        R::SecretStoreFull => format!(
-            "The Keychain holds the most Asura items (256); wait for queued commands to finish.{}",
-            if stranded { " /status lists Keychain items to delete." } else { "" }
-        ),
+        R::SecretStoreFull => "The Keychain holds the most Asura items (256); wait for queued commands to finish.".into(),
         R::SecretStoreBusy => "The Keychain is busy. Press Enter again.".into(),
         R::SecretInCwd => "Command refused: the working directory holds a secret.".into(),
         R::PlaceholderNotAvailable => "Command refused: it names a reserved $ASURA_SECRET_ placeholder.".into(),
@@ -443,22 +442,12 @@ pub(super) fn secret_store_lines(status: Option<&pb::SecretStoreStatus>) -> Vec<
     if status.sweep_pending == Some(true) {
         lines.push("Keychain sweep pending".into());
     }
-    if let Some(code) = status.last_status.filter(|c| *c != 0) {
-        lines.push(format!("Keychain unavailable: last OSStatus -{code}"));
-    }
-    let stranded = status.stranded_count.unwrap_or(0);
-    if stranded > 0 {
-        lines.push(format!(
-            "Asura cannot delete {stranded} old Keychain item{}. In Keychain Access, delete the login keychain items named 'Asura queued command secrets' with these accounts:",
-            if stranded == 1 { "" } else { "s" }
-        ));
-        for input in status.stranded_inputs.iter().take(16) {
-            lines.push(format!("  input.{}", crate::conversation::hex(input)));
-        }
-        let listed = status.stranded_inputs.len().min(16) as u32;
-        if stranded > listed {
-            lines.push(format!("  and {} more", stranded - listed));
-        }
+    match status.last_status.filter(|c| *c != 0) {
+        Some(NOT_SIGNED_STATUS) => lines.push(format!(
+            "Keychain unavailable: this Asura build is not signed for the Keychain (OSStatus -{NOT_SIGNED_STATUS})"
+        )),
+        Some(code) => lines.push(format!("Keychain unavailable: last OSStatus -{code}")),
+        None => {}
     }
     let unrecognized = status.unrecognized_count.unwrap_or(0);
     if unrecognized > 0 {
@@ -971,7 +960,7 @@ impl App {
             .person_directory()
             .filter(|(cwd, _)| rules::cwd_form_valid(cwd))
         else {
-            self.notice = refusal_text(pb::QueueRefusal::CwdInvalid, None, false);
+            self.notice = refusal_text(pb::QueueRefusal::CwdInvalid, None);
             return;
         };
         let mode = self.mode;
@@ -982,7 +971,7 @@ impl App {
             ) {
                 (Ok(path), Ok(variables)) => Some((path, variables)),
                 (Err(refusal), _) | (_, Err(refusal)) => {
-                    self.notice = refusal_text(refusal, None, false);
+                    self.notice = refusal_text(refusal, None);
                     return;
                 }
             }
@@ -1071,13 +1060,7 @@ impl App {
             .refusal
             .and_then(|r| pb::QueueRefusal::try_from(r).ok())
             .unwrap_or(pb::QueueRefusal::Unspecified);
-        let stranded = self
-            .person
-            .secret_store
-            .as_ref()
-            .and_then(|s| s.stranded_count)
-            .is_some_and(|n| n > 0);
-        let text = refusal_text(refusal, reply.refusal_status, stranded);
+        let text = refusal_text(refusal, reply.refusal_status);
         let request = self.local_outbox[index].request_id;
         self.person
             .log
@@ -2786,38 +2769,42 @@ mod tests {
     fn refusal_texts_follow_the_design_table() {
         use pb::QueueRefusal as R;
         assert_eq!(
-            refusal_text(R::EnvironmentInvalid, None, false),
+            refusal_text(R::EnvironmentInvalid, None),
             "This terminal's environment cannot be passed to a command (invalid or reserved variable name)."
         );
         assert_eq!(
-            refusal_text(R::EnvironmentTooLarge, None, false),
+            refusal_text(R::EnvironmentTooLarge, None),
             "This terminal's environment is too large to pass to a command (at most 1,024 variables and 40 KiB)."
         );
         assert_eq!(
-            refusal_text(R::CwdInvalid, None, false),
+            refusal_text(R::CwdInvalid, None),
             "The working directory cannot be used for commands."
         );
         assert_eq!(
-            refusal_text(R::SecretStoreBusy, None, false),
+            refusal_text(R::SecretStoreBusy, None),
             "The Keychain is busy. Press Enter again."
         );
         assert_eq!(
-            refusal_text(R::SecretStoreLocked, None, false),
-            "The login keychain is locked. Unlock it, then press Enter again."
+            refusal_text(R::SecretStoreLocked, None),
+            "The Keychain is locked until this Mac is unlocked after start-up. Unlock it, then press Enter again."
         );
         assert_eq!(
-            refusal_text(R::SecretStoreDenied, None, false),
+            refusal_text(R::SecretStoreDenied, None),
             "macOS denied Asura access to its Keychain item."
         );
-        assert!(refusal_text(R::SecretStoreUnavailable, Some(25_307), false).contains("-25307"));
-        assert!(
-            refusal_text(R::SecretStoreFull, None, true)
-                .ends_with("/status lists Keychain items to delete.")
+        assert!(refusal_text(R::SecretStoreUnavailable, Some(25_307)).contains("-25307"));
+        // SG3: a build not signed for the Keychain names itself.
+        assert_eq!(
+            refusal_text(R::SecretStoreUnavailable, Some(34_018)),
+            "This Asura build is not signed for the Keychain."
         );
-        assert!(!refusal_text(R::SecretStoreFull, None, false).contains("/status"));
+        assert_eq!(
+            refusal_text(R::SecretStoreFull, None),
+            "The Keychain holds the most Asura items (256); wait for queued commands to finish."
+        );
         for code in 1..=rules::MAX_REFUSAL {
             let refusal = R::try_from(code).unwrap();
-            assert!(!refusal_text(refusal, Some(1), false).is_empty());
+            assert!(!refusal_text(refusal, Some(1)).is_empty());
         }
     }
     #[test]
@@ -2826,21 +2813,32 @@ mod tests {
             item_count: Some(257),
             sweep_pending: Some(true),
             last_status: Some(25_307),
-            stranded_count: Some(18),
             unrecognized_count: Some(2),
-            stranded_inputs: (0..16u8).map(|n| vec![n; 16]).collect(),
         };
         let lines = secret_store_lines(Some(&status));
-        assert_eq!(lines[0], "more than 256 Keychain items");
-        assert_eq!(lines[1], "Keychain sweep pending");
-        assert_eq!(lines[2], "Keychain unavailable: last OSStatus -25307");
-        assert!(lines[3].starts_with("Asura cannot delete 18 old Keychain items. In Keychain Access, delete the login keychain items named 'Asura queued command secrets' with these accounts:"));
-        assert_eq!(lines[4], format!("  input.{}", "00".repeat(16)));
-        assert_eq!(lines[19], format!("  input.{}", "0f".repeat(16)));
-        assert_eq!(lines[20], "  and 2 more");
         assert_eq!(
-            lines[21],
-            "2 Keychain items under Asura's service name were not written by Asura."
+            lines,
+            [
+                "more than 256 Keychain items",
+                "Keychain sweep pending",
+                "Keychain unavailable: last OSStatus -25307",
+                "2 Keychain items under Asura's service name were not written by Asura.",
+            ]
+        );
+        // SG3: no stranded notice exists; `not_signed` names itself.
+        assert!(!lines.iter().any(|l| l.contains("cannot delete")));
+        let unsigned = pb::SecretStoreStatus {
+            last_status: Some(34_018),
+            sweep_pending: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            secret_store_lines(Some(&unsigned)),
+            [
+                "Keychain items: not known until the first sweep",
+                "Keychain sweep pending",
+                "Keychain unavailable: this Asura build is not signed for the Keychain (OSStatus -34018)",
+            ]
         );
         let quiet = pb::SecretStoreStatus {
             item_count: Some(1),

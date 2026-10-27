@@ -12,9 +12,12 @@ fn key(input: u8) -> ItemKey {
 }
 
 /// A recording fixture of the Security framework calls: each call is logged
-/// and answered from a script.
+/// and answered from a script. By default it behaves as the scratch file
+/// backend (pre-check and the unlock-bit rule); `Fixture::data_protection`
+/// switches it to the data-protection table, which has no pre-check.
 #[derive(Default)]
 struct Fixture {
+    data_protection: bool,
     log: RefCell<Vec<&'static str>>,
     statuses: RefCell<VecDeque<Result<u32, i32>>>,
     item: RefCell<Option<Result<(), i32>>>,
@@ -48,15 +51,35 @@ impl Fixture {
     fn log(&self) -> Vec<&'static str> {
         self.log.borrow().clone()
     }
-}
-
-impl Calls for Fixture {
+    fn data_protection() -> Self {
+        Self {
+            data_protection: true,
+            ..Self::default()
+        }
+    }
     fn status(&self) -> Result<u32, i32> {
         self.log.borrow_mut().push("status");
         self.statuses
             .borrow_mut()
             .pop_front()
             .expect("unscripted status call")
+    }
+}
+
+impl Calls for Fixture {
+    fn precheck(&self) -> Result<(), i32> {
+        if self.data_protection {
+            Ok(())
+        } else {
+            self.status().map(drop)
+        }
+    }
+    fn classify(&self, code: i32) -> Failure {
+        if self.data_protection {
+            data_protection::classify(code)
+        } else {
+            classify_file(code, || self.status())
+        }
     }
     fn add(&self, service: &str, account: &str, _: &[u8]) -> Result<(), i32> {
         assert!(service.starts_with(SERVICE_PREFIX) && account.starts_with(ACCOUNT_PREFIX));
@@ -222,15 +245,17 @@ fn list_is_bounded_and_reports_truncation() {
 #[test]
 fn auth_failures_map_by_unlock_bit() {
     for code in [-25_293, -25_308] {
+        let locked = Failure::Locked { status: code };
+        let denied = Failure::Denied { status: code };
         let f = Fixture::statuses(&[Ok(0x2), Ok(0x2)]).data(Err(code));
-        assert_eq!(get_with(&f, &key(1)), Err(Failure::Locked));
+        assert_eq!(get_with(&f, &key(1)), Err(locked));
         assert_eq!(f.log(), ["status", "copy", "status"]);
         let f = Fixture::statuses(&[Ok(0x7), Ok(0x7)]).data(Err(code));
-        assert_eq!(get_with(&f, &key(1)), Err(Failure::Denied));
+        assert_eq!(get_with(&f, &key(1)), Err(denied));
         let f = Fixture::statuses(&[Ok(0x2), Ok(0x2)]).item(Err(code));
-        assert_eq!(add_with(&f, &key(1), b"v"), Err(Failure::Locked));
+        assert_eq!(add_with(&f, &key(1), b"v"), Err(locked));
         let f = Fixture::statuses(&[Ok(0x7), Ok(0x7)]).item(Err(code));
-        assert_eq!(delete_with(&f, &key(1)), Err(Failure::Denied));
+        assert_eq!(delete_with(&f, &key(1)), Err(denied));
         let f = Fixture::statuses(&[Ok(0x7), Err(-25_294)]).item(Err(code));
         assert_eq!(
             add_with(&f, &key(1), b"v"),
@@ -254,7 +279,10 @@ fn status_table_rows() {
     let f = Fixture::statuses(&[Ok(0x7)]).accounts(Err(-25_300));
     assert_eq!(list_with(&f, &INSTALLATION), Ok(Listing::default()));
     let f = Fixture::statuses(&[Ok(0x7)]).item(Err(-25_244));
-    assert_eq!(delete_with(&f, &key(1)), Err(Failure::Denied));
+    assert_eq!(
+        delete_with(&f, &key(1)),
+        Err(Failure::Denied { status: -25_244 })
+    );
     assert_eq!(f.log(), ["status", "delete"]);
     for code in [-25_294, -25_291, UNEXPECTED_RESULT_STATUS] {
         let f = Fixture::statuses(&[Ok(0x7)]).data(Err(code));
@@ -296,12 +324,331 @@ fn add_bounds_need_no_keychain_call() {
     );
 }
 
+/// An unsigned test binary has no access group: opening the production
+/// target is `not_signed` with no Keychain item call (SG-F7). A signed
+/// binary would get `Invalid` here and still make no call.
 #[test]
 fn unit_tests_never_open_the_default_keychain() {
-    assert_eq!(
-        Keychain::open(&Target::Default).map(drop),
-        Err(Failure::Invalid)
+    let opened = Keychain::open(&Target::Default).map(drop);
+    if data_protection::has_keychain_entitlements() {
+        assert_eq!(opened, Err(Failure::Invalid));
+    } else {
+        assert_eq!(opened, Err(Failure::NotSigned { item_call: false }));
+    }
+}
+
+/// KC-U1: every data-protection dictionary sets the flag, the group,
+/// synchronizable false and UI fail, and none names a file keychain.
+#[test]
+fn every_data_protection_dictionary_names_the_keychain_and_group() {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::string::CFString;
+    use data_protection::{Op, key, pairs};
+    use security_framework_sys::access_control::kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
+    use security_framework_sys::item as sys;
+    let group = "ABCDE12345.org.pidster.asura";
+    let data = core_foundation::data::CFData::from_buffer(b"v");
+    let find = |pairs: &[(CFString, CFType)], name: &CFString| {
+        pairs
+            .iter()
+            .filter(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .collect::<Vec<_>>()
+    };
+    // SAFETY: Security framework constants, valid for the process lifetime.
+    let (dp, access_group, sync, ui, ui_fail, class, generic, service, file) = unsafe {
+        (
+            key(data_protection::kSecUseDataProtectionKeychain),
+            key(sys::kSecAttrAccessGroup),
+            key(sys::kSecAttrSynchronizable),
+            key(sys::kSecUseAuthenticationUI),
+            key(data_protection::kSecUseAuthenticationUIFail),
+            key(sys::kSecClass),
+            key(sys::kSecClassGenericPassword),
+            key(sys::kSecAttrService),
+            data_protection::file_keychain_key(),
+        )
+    };
+    let ops = [
+        (
+            "add",
+            Op::Add {
+                service: "s",
+                account: "a",
+                data: &data,
+            },
+        ),
+        (
+            "copy",
+            Op::Copy {
+                service: "s",
+                account: "a",
+            },
+        ),
+        (
+            "delete",
+            Op::Delete {
+                service: "s",
+                account: "a",
+            },
+        ),
+        (
+            "list",
+            Op::List {
+                service: Some("s"),
+                max: LIST_BOUND as i64,
+            },
+        ),
+    ];
+    for (name, op) in ops {
+        let p = pairs(group, op);
+        let one = |k: &CFString| {
+            let found = find(&p, k);
+            assert_eq!(found.len(), 1, "{name}: {k}");
+            found.into_iter().next().unwrap()
+        };
+        assert_eq!(one(&dp), CFBoolean::true_value().as_CFType(), "{name}");
+        assert_eq!(
+            one(&access_group),
+            CFString::new(group).as_CFType(),
+            "{name}"
+        );
+        assert_eq!(one(&sync), CFBoolean::false_value().as_CFType(), "{name}");
+        assert_eq!(one(&ui), ui_fail.as_CFType(), "{name}");
+        assert_eq!(one(&class), generic.as_CFType(), "{name}");
+        assert_eq!(one(&service), CFString::new("s").as_CFType(), "{name}");
+        assert!(find(&p, &file).is_empty(), "{name} names a file keychain");
+    }
+    let add = pairs(
+        group,
+        Op::Add {
+            service: "s",
+            account: "a",
+            data: &data,
+        },
     );
+    // SAFETY: Security framework constants, as above.
+    let (accessible, after_first_unlock, label) = unsafe {
+        (
+            key(data_protection::kSecAttrAccessible),
+            key(kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly),
+            key(sys::kSecAttrLabel),
+        )
+    };
+    assert_eq!(find(&add, &accessible), [after_first_unlock.as_CFType()]);
+    assert_eq!(find(&add, &label), [CFString::new(LABEL).as_CFType()]);
+    // A group-wide listing (the qualification purge) still names the group.
+    let purge = pairs(
+        group,
+        Op::List {
+            service: None,
+            max: 257,
+        },
+    );
+    assert!(find(&purge, &service).is_empty());
+    assert_eq!(find(&purge, &access_group).len(), 1);
+}
+
+/// KC-U2: the data-protection status table, with no pre-check call.
+#[test]
+fn data_protection_status_table() {
+    let dp = Fixture::data_protection;
+    let f = dp().item(Ok(()));
+    assert_eq!(add_with(&f, &key(1), b"v"), Ok(Added::Stored));
+    assert_eq!(f.log(), ["add"]);
+    let f = dp().item(Err(-25_299));
+    assert_eq!(add_with(&f, &key(1), b"v"), Ok(Added::Duplicate));
+    let f = dp().data(Err(-25_300));
+    assert_eq!(get_with(&f, &key(1)), Ok(Found::Missing));
+    let f = dp().item(Err(-25_300));
+    assert_eq!(delete_with(&f, &key(1)), Ok(Removed::Absent));
+    let f = dp().accounts(Err(-25_300));
+    assert_eq!(list_with(&f, &INSTALLATION), Ok(Listing::default()));
+    assert_eq!(f.log(), ["list"]);
+    let f = dp().data(Err(-25_308));
+    assert_eq!(
+        get_with(&f, &key(1)),
+        Err(Failure::Locked { status: -25_308 })
+    );
+    let f = dp().item(Err(-34_018));
+    assert_eq!(
+        add_with(&f, &key(1), b"v"),
+        Err(Failure::NotSigned { item_call: true })
+    );
+    let f = dp().accounts(Err(-34_018));
+    assert_eq!(
+        list_with(&f, &INSTALLATION),
+        Err(Failure::NotSigned { item_call: true })
+    );
+    for code in [-25_291, -25_293, -25_244, UNEXPECTED_RESULT_STATUS] {
+        let f = dp().item(Err(code));
+        assert_eq!(
+            delete_with(&f, &key(1)),
+            Err(Failure::Unavailable {
+                status: code,
+                item_call: true
+            })
+        );
+        assert_eq!(f.log(), ["delete"]);
+    }
+    assert_eq!(
+        Failure::NotSigned { item_call: false }.status(),
+        Some(-34_018)
+    );
+    assert_eq!(Failure::Locked { status: -25_308 }.status(), Some(-25_308));
+    assert_eq!(Failure::Invalid.status(), None);
+}
+
+/// KC-U4: the access group rules of SG-F7.
+#[test]
+fn access_group_rules() {
+    use data_protection::{Entitlements, Value, access_group};
+    let s = |t: &str| Value::String(t.to_owned());
+    let list = |g: &[&str]| Value::Strings(g.iter().map(|t| (*t).to_owned()).collect());
+    let e = |app: Value, groups: Value, team: Value| Entitlements {
+        application_identifier: app,
+        access_groups: groups,
+        team_identifier: team,
+    };
+    let product = "ABCDE12345.org.pidster.asura";
+    let test = "ABCDE12345.org.pidster.asura.test";
+    assert_eq!(
+        access_group(&e(s(product), list(&[product]), s("ABCDE12345"))).as_deref(),
+        Some(product)
+    );
+    assert_eq!(
+        access_group(&e(s(test), list(&[test]), Value::Absent)).as_deref(),
+        Some(test)
+    );
+    let none = Entitlements {
+        application_identifier: Value::Absent,
+        access_groups: Value::Absent,
+        team_identifier: Value::Absent,
+    };
+    assert!(!none.any());
+    for (case, entitlements) in [
+        ("no entitlements", none),
+        ("no groups", e(s(product), Value::Absent, Value::Absent)),
+        (
+            "no identifier",
+            e(Value::Absent, list(&[product]), Value::Absent),
+        ),
+        (
+            "two groups",
+            e(s(product), list(&[product, test]), Value::Absent),
+        ),
+        ("zero groups", e(s(product), list(&[]), Value::Absent)),
+        ("group differs", e(s(product), list(&[test]), Value::Absent)),
+        (
+            "lower-case team",
+            e(
+                s("abcde12345.org.pidster.asura"),
+                list(&["abcde12345.org.pidster.asura"]),
+                Value::Absent,
+            ),
+        ),
+        (
+            "nine-character team",
+            e(
+                s("ABCDE1234.org.pidster.asura"),
+                list(&["ABCDE1234.org.pidster.asura"]),
+                Value::Absent,
+            ),
+        ),
+        (
+            "another bundle",
+            e(
+                s("ABCDE12345.org.pidster.other"),
+                list(&["ABCDE12345.org.pidster.other"]),
+                Value::Absent,
+            ),
+        ),
+        (
+            "old prefix",
+            e(
+                s("ABCDE12345.com.pidster.asura"),
+                list(&["ABCDE12345.com.pidster.asura"]),
+                Value::Absent,
+            ),
+        ),
+        (
+            "team mismatch",
+            e(s(product), list(&[product]), s("ZZZZZ12345")),
+        ),
+        (
+            "team wrong type",
+            e(s(product), list(&[product]), Value::Other),
+        ),
+        (
+            "groups wrong type",
+            e(s(product), Value::Other, Value::Absent),
+        ),
+        ("groups a string", e(s(product), s(product), Value::Absent)),
+        (
+            "identifier wrong type",
+            e(Value::Other, list(&[product]), Value::Absent),
+        ),
+    ] {
+        assert_eq!(access_group(&entitlements), None, "{case}");
+    }
+}
+
+/// KC-U5: session decoding, and a live read of this process's session.
+#[test]
+fn session_state_decoding() {
+    use session::{Console, Origin, console_from, origin_from};
+    assert_eq!(console_from(Some(501), 501), Console::SameUser);
+    assert_eq!(console_from(Some(502), 501), Console::OtherUser);
+    assert_eq!(console_from(Some(0), 501), Console::LoginWindow);
+    assert_eq!(console_from(None, 501), Console::Unknown);
+    assert_eq!(origin_from(Some(0x6030)), Origin::Graphic);
+    assert_eq!(origin_from(Some(0x1030)), Origin::Remote);
+    assert_eq!(origin_from(Some(0x1000)), Origin::Remote);
+    assert_eq!(origin_from(Some(0x4000)), Origin::Other);
+    assert_eq!(origin_from(None), Origin::Unknown);
+    for (console, name) in [
+        (Console::SameUser, "self"),
+        (Console::OtherUser, "other"),
+        (Console::LoginWindow, "none"),
+        (Console::Unknown, "unknown"),
+    ] {
+        assert_eq!(console.as_str(), name);
+    }
+    for (origin, name) in [
+        (Origin::Remote, "remote"),
+        (Origin::Graphic, "graphic"),
+        (Origin::Other, "other"),
+        (Origin::Unknown, "unknown"),
+    ] {
+        assert_eq!(origin.as_str(), name);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let session = session::Session::read();
+    let boot = session.boot_time_s.expect("kern.boottime");
+    assert!(boot > 1_600_000_000 && boot <= now, "boot time {boot}");
+    assert!(session.audit_flags.is_some(), "getaudit_addr");
+    assert_ne!(session.console, Console::Unknown);
+}
+
+/// KC-N1: an unsigned binary's calls naming a group it is not entitled to
+/// return -34018 and map to `NotSigned` (KC-P1, KC-P4). The group uses a
+/// made-up team ID, so no real item can match, and no add is made.
+#[test]
+fn unentitled_group_calls_are_not_signed() {
+    assert!(
+        !data_protection::has_keychain_entitlements(),
+        "this test runs only in an unsigned test binary"
+    );
+    let backend =
+        data_protection::DataProtection::new("ASURATEST0.org.pidster.asura.test".to_owned());
+    let not_signed = Failure::NotSigned { item_call: true };
+    assert_eq!(list_with(&backend, &INSTALLATION), Err(not_signed));
+    assert_eq!(get_with(&backend, &key(1)), Err(not_signed));
+    assert_eq!(delete_with(&backend, &key(1)), Err(not_signed));
 }
 
 /// Real Keychain cases over scratch keychain files (SSR6, R1-R5). Each test
@@ -432,8 +779,14 @@ mod scratch_keychain {
         assert_eq!(scratch::lock(scratch.target()), Ok(()));
         let flags = keychain.status().expect("pre-check 0 while locked");
         assert_eq!(flags & STATUS_UNLOCKED, 0, "flags {flags:#x}");
-        assert_eq!(keychain.get(&key(1)), Err(Failure::Locked));
-        assert_eq!(keychain.add(&key(3), b"three"), Err(Failure::Locked));
+        assert!(
+            matches!(keychain.get(&key(1)), Err(Failure::Locked { .. })),
+            "locked read"
+        );
+        assert!(
+            matches!(keychain.add(&key(3), b"three"), Err(Failure::Locked { .. })),
+            "locked add"
+        );
         let listing = keychain.list(&INSTALLATION).expect("list while locked");
         let mut inputs = listing.inputs;
         inputs.sort();
@@ -492,10 +845,13 @@ mod scratch_keychain {
         );
         assert!(output.status.success());
         let keychain = scratch.open();
-        assert_eq!(keychain.get(&key(7)), Err(Failure::Denied));
+        assert!(
+            matches!(keychain.get(&key(7)), Err(Failure::Denied { .. })),
+            "read of another binary's item"
+        );
         let deleted = keychain.delete(&key(7));
         assert!(
-            matches!(deleted, Ok(Removed::Deleted) | Err(Failure::Denied)),
+            matches!(deleted, Ok(Removed::Deleted) | Err(Failure::Denied { .. })),
             "{deleted:?}"
         );
         eprintln!("R2 delete of another binary's item: {deleted:?}");
@@ -601,11 +957,11 @@ mod scratch_keychain {
         let service = service_name(&INSTALLATION);
         assert_eq!(keychain.status().map(drop), Ok(()));
         assert_eq!(
-            Calls::accounts(&keychain, &service, 2).map(|a| a.len()),
+            Calls::accounts(keychain.calls(), &service, 2).map(|a| a.len()),
             Ok(2)
         );
         assert_eq!(
-            Calls::accounts(&keychain, &service, LIST_BOUND).map(|a| a.len()),
+            Calls::accounts(keychain.calls(), &service, LIST_BOUND).map(|a| a.len()),
             Ok(3)
         );
         let listing = keychain.list(&INSTALLATION).expect("listing");

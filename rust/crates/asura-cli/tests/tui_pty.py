@@ -4728,7 +4728,7 @@ def person_secrets_journey(fixture, source):
         assert locked.returncode == 0, locked
         offset = len(trial.output)
         trial.send(b"!!echo unlocked-run\r")
-        notice_until(trial, "The login keychain is locked. Unlock it, then press Enter again.", offset,
+        notice_until(trial, "The Keychain is locked until this Mac is unlocked after start-up. Unlock it, then press Enter again.", offset,
                      limit=20)
         trial.until("↵ run OUTSIDE the sandbox".encode(), offset, plain=True, limit=10)
         rows = [row.strip() for row in trial.screen.text().splitlines()]

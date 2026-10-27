@@ -1,4 +1,7 @@
-//! SS1-S unit cases over a scripted port. No case makes a Keychain call.
+//! SS1-S and SG3 unit cases over a scripted port. No case makes a Keychain
+//! call. Failure replies carry the session state the worker reads; within
+//! one test process it is the same on every read, so cases compare it with
+//! [`ev`].
 use super::codec::{self, CodecError, decode, encode};
 use super::*;
 use asura_platform::keychain::{
@@ -188,6 +191,20 @@ fn listing(inputs: impl IntoIterator<Item = u16>, unrecognized: usize) -> Listin
 
 fn data(secrets: &Secrets, binding: &[u8; 32]) -> Found {
     Found::Data(encode(binding, secrets, &KEY).expect("encode"))
+}
+
+/// The session state a failure reply carries in this process.
+fn ev() -> Option<Session> {
+    Some(Session::read())
+}
+
+/// The store failure of an `unavailable` port result.
+fn store_unavailable(status: i32) -> StoreFailure {
+    StoreFailure::Unavailable {
+        status,
+        reason: None,
+        session: ev(),
+    }
 }
 
 fn unavailable(status: i32) -> Failure {
@@ -416,20 +433,27 @@ fn ss_u2_binding_vectors_and_mismatch() {
 #[test]
 fn ss_u10_reply_table() {
     let failures = [
-        (Failure::Locked, StoreFailure::Locked),
-        (Failure::Denied, StoreFailure::Denied),
         (
-            unavailable(-25_294),
-            StoreFailure::Unavailable {
-                status: -25_294,
-                reason: None,
+            Failure::Locked { status: -25_308 },
+            StoreFailure::Locked {
+                status: -25_308,
+                session: ev(),
             },
         ),
+        (
+            Failure::Denied { status: -25_244 },
+            StoreFailure::Denied {
+                status: -25_244,
+                session: ev(),
+            },
+        ),
+        (unavailable(-25_294), store_unavailable(-25_294)),
         (
             Failure::Invalid,
             StoreFailure::Unavailable {
                 status: 0,
-                reason: Some("invalid_request"),
+                reason: Some(INVALID_REQUEST),
+                session: None,
             },
         ),
     ];
@@ -451,10 +475,7 @@ fn ss_u10_reply_table() {
         (Ok(data(&small(1), &[0x44; 32])), PutReply::ExistsDifferent),
         (
             Ok(Found::Missing),
-            PutReply::Failed(StoreFailure::Unavailable {
-                status: -25_300,
-                reason: None,
-            }),
+            PutReply::Failed(store_unavailable(-25_300)),
         ),
     ];
     for (found, reply) in duplicates {
@@ -502,7 +523,8 @@ fn ss_u10_reply_table() {
         put(&store, 7, invalid),
         PutReply::Failed(StoreFailure::Unavailable {
             status: 0,
-            reason: Some("invalid_request"),
+            reason: Some(INVALID_REQUEST),
+            session: None,
         })
     );
     assert_eq!(script.log().len(), before);
@@ -597,28 +619,26 @@ fn ss_u6_sweep_keeps_live_inputs() {
     assert_eq!(store.observation().item_count, Some(4));
 }
 
-/// SS-U11: stranded and unrecognized counts and truncated listings.
+/// SS-U11 (revised SG3): a denied delete is a failed delete that the next
+/// sweep retries; unrecognized counts and truncated listings.
 #[test]
 fn ss_u11_sweep_counts_and_truncation() {
     let script = Script::default();
     let store = start(&script);
 
-    // A denied delete strands the item; a later sweep deletes it.
+    // A denied delete (scratch backend) keeps the item as an orphan; a
+    // later sweep deletes it.
     script
         .list(Ok(listing([1], 0)))
-        .delete(Err(Failure::Denied));
+        .delete(Err(Failure::Denied { status: -25_244 }));
     let report = sweep(&store, []);
-    assert_eq!((report.stranded, report.deleted), (1, 0));
-    let observation = store.observation();
-    assert_eq!(observation.stranded_count, 1);
-    assert_eq!(observation.stranded_inputs, vec![id(1)]);
-    assert_eq!(observation.item_count, Some(1), "a stranded item counts");
+    assert_eq!((report.failed, report.deleted), (1, 0));
+    assert_eq!(store.observation().item_count, Some(1), "the orphan counts");
     script
         .list(Ok(listing([1], 0)))
         .delete(Ok(Removed::Deleted));
     let report = sweep(&store, []);
-    assert_eq!((report.stranded, report.deleted), (0, 1));
-    assert_eq!(store.observation().stranded_count, 0);
+    assert_eq!((report.failed, report.deleted), (0, 1));
     assert_eq!(store.observation().item_count, Some(0));
 
     // Two unrecognized accounts: counted, never read or deleted.
@@ -666,23 +686,92 @@ fn ss_u11_sweep_counts_and_truncation() {
     delete(&store, 1);
     assert_eq!(store.observation().item_count, Some(COUNT_TRUNCATED));
 
-    // Denied deletes after settlement: the observation holds 16 IDs while
-    // the count keeps the total.
-    for _ in 0..20 {
-        script.delete(Err(Failure::Denied));
-    }
-    for n in 400..420 {
-        assert_eq!(delete(&store, n), DeleteReply::Failed(StoreFailure::Denied));
-    }
+    // A denied delete after settlement is a failed delete with evidence.
+    script.delete(Err(Failure::Denied { status: -25_244 }));
+    assert_eq!(
+        delete(&store, 400),
+        DeleteReply::Failed(StoreFailure::Denied {
+            status: -25_244,
+            session: ev(),
+        })
+    );
+}
+
+/// KC-U6: `not_signed` from the open is terminal: every later request
+/// replies `unavailable/not_signed` (-34018) with evidence, and the worker
+/// neither opens again nor reaches the port.
+#[test]
+fn not_signed_open_is_terminal() {
+    let script = Script::default();
+    let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = opens.clone();
+    let port = script.clone();
+    let store = Store::with_port(INSTALLATION, None, move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if true {
+            Err(Failure::NotSigned { item_call: false })
+        } else {
+            Ok(port.clone())
+        }
+    })
+    .unwrap();
+    let not_signed = StoreFailure::Unavailable {
+        status: asura_platform::keychain::MISSING_ENTITLEMENT,
+        reason: Some(NOT_SIGNED),
+        session: ev(),
+    };
+    assert!(not_signed.not_signed());
+    assert_eq!(get(&store, 1), GetReply::Failed(not_signed));
+    assert_eq!(put(&store, 2, small(1)), PutReply::Failed(not_signed));
+    assert_eq!(delete(&store, 3), DeleteReply::Failed(not_signed));
+    let report = sweep(&store, []);
+    assert_eq!(report.outcome, Err(not_signed));
+    assert_eq!(
+        opens.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one open"
+    );
+    assert!(script.log().is_empty(), "no port call");
     let observation = store.observation();
-    assert_eq!(observation.stranded_count, 20);
-    assert_eq!(observation.stranded_inputs.len(), OBSERVED_STRANDED);
-    assert_eq!(observation.stranded_inputs[0], id(400));
-    // A later successful delete removes the input from the stranded set.
-    script.delete(Ok(Removed::Absent));
-    delete(&store, 400);
-    assert_eq!(store.observation().stranded_count, 19);
-    assert!(!store.observation().stranded_inputs.contains(&id(400)));
+    assert_eq!(observation.last_status, 34_018);
+    assert!(observation.sweep_pending);
+}
+
+/// KC-U6: `not_signed` from a call (-34018 after the open) is terminal too.
+#[test]
+fn not_signed_call_is_terminal() {
+    let script = Script::default();
+    script.get(Err(Failure::NotSigned { item_call: true }));
+    let store = start(&script);
+    let first = get(&store, 1);
+    assert!(
+        matches!(&first, GetReply::Failed(f) if f.not_signed() && f.status() == -34_018 && f.session().is_some()),
+        "{first:?}"
+    );
+    assert_eq!(get(&store, 1), first);
+    assert_eq!(script.calls("get"), 1, "no second port call");
+}
+
+/// KC-U5: every Keychain failure reply carries its raw status and the
+/// session state; a defect carries neither session nor a real status.
+#[test]
+fn failure_replies_carry_field_evidence() {
+    let script = Script::default();
+    script
+        .get(Err(Failure::Locked { status: -25_308 }))
+        .delete(Err(unavailable(-25_291)));
+    let store = start(&script);
+    let GetReply::Failed(locked) = get(&store, 1) else {
+        panic!("locked read");
+    };
+    assert_eq!((locked.code(), locked.status()), ("locked", -25_308));
+    let session = locked.session().expect("session");
+    assert!(session.boot_time_s.is_some() && session.audit_flags.is_some());
+    let DeleteReply::Failed(unavailable) = delete(&store, 1) else {
+        panic!("unavailable delete");
+    };
+    assert_eq!(unavailable.status(), -25_291);
+    assert!(unavailable.session().is_some());
 }
 
 /// A sweep whose listing fails is pending, and the worker retries it before
@@ -693,13 +782,7 @@ fn failed_sweep_is_retried_before_the_next_request() {
     script.list(Err(unavailable(-25_294)));
     let store = start(&script);
     let report = sweep(&store, [1]);
-    assert_eq!(
-        report.outcome,
-        Err(StoreFailure::Unavailable {
-            status: -25_294,
-            reason: None,
-        })
-    );
+    assert_eq!(report.outcome, Err(store_unavailable(-25_294)));
     let observation = store.observation();
     assert!(observation.sweep_pending);
     assert_eq!(
@@ -747,13 +830,7 @@ fn failed_open_is_retried() {
         }
     })
     .unwrap();
-    assert_eq!(
-        get(&store, 1),
-        GetReply::Failed(StoreFailure::Unavailable {
-            status: -25_294,
-            reason: None,
-        })
-    );
+    assert_eq!(get(&store, 1), GetReply::Failed(store_unavailable(-25_294)));
     assert_eq!(get(&store, 1), GetReply::Missing);
 }
 
@@ -768,7 +845,8 @@ fn ss_u7_unit_tests_never_open_the_default_keychain() {
         get(&store, 1),
         GetReply::Failed(StoreFailure::Unavailable {
             status: 0,
-            reason: Some("invalid_request"),
+            reason: Some(INVALID_REQUEST),
+            session: None,
         })
     );
 }

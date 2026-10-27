@@ -93,7 +93,7 @@ impl Observer {
     }
     fn reply(&self, mut request: pb::Envelope, pending: bool) -> pb::Envelope {
         request.body = Some(Body::ServiceObservation(pb::ServiceObservation {
-            secret_store: self.secret_store.clone(),
+            secret_store: self.secret_store,
             revision: Some(self.revision),
             pending: Some(pending),
             status: Some(self.status),

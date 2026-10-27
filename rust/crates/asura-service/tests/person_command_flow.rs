@@ -608,7 +608,7 @@ fn secrets() -> Result<()> {
                 "kept",
                 "deleted",
                 "failed",
-                "stranded",
+                "session",
                 "unrecognized",
                 "truncated",
                 "listings",
@@ -1867,7 +1867,6 @@ fn full() -> Result<()> {
     })?;
     let status = status.unwrap();
     assert_eq!(status.unrecognized_count, Some(256));
-    assert_eq!(status.stranded_count, Some(0));
     assert_eq!(status.sweep_pending, Some(false));
     let environment = launch(&env, &[]);
     let submit = outside(project, None, "echo full", &environment);

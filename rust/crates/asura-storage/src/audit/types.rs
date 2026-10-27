@@ -310,9 +310,54 @@ impl PersonCommandRefusal {
         serde_json::from_value(serde_json::Value::String(name.to_owned())).ok()
     }
 }
+/// The session state a Keychain error records (release-signing.md,
+/// Keychain field evidence, SG3). Four fixed-size fields; no user, account
+/// or path name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeychainSession {
+    /// Seconds since 1970 at boot; absent when `sysctl` failed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_u64"
+    )]
+    pub boot_time_s: Option<u64>,
+    pub console: KeychainConsole,
+    /// The raw audit session flags; absent when `getaudit_addr` failed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_u64"
+    )]
+    pub audit_flags: Option<u64>,
+    pub origin: KeychainOrigin,
+}
+/// Who owns the console, compared with the service's user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeychainConsole {
+    #[serde(rename = "self")]
+    SameUser,
+    #[serde(rename = "other")]
+    OtherUser,
+    #[serde(rename = "none")]
+    LoginWindow,
+    Unknown,
+}
+/// How the service's audit session started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeychainOrigin {
+    Remote,
+    Graphic,
+    Other,
+    Unknown,
+}
 /// The reply code of a secret store call (secret-store.md, operations and
-/// audit). Each `secret_store.*` event takes the codes of its own call;
-/// `unavailable` alone carries a status.
+/// audit). Each `secret_store.*` event takes the codes of its own call; a
+/// failure (`locked`, `denied`, `unavailable`) alone carries the raw
+/// status, and the session state when a Keychain call failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretStoreReply {
@@ -338,11 +383,11 @@ pub enum SecretStoreReply {
     Swept,
     /// Any call: the keychain is locked.
     Locked,
-    /// Any call: macOS denied this binary access.
+    /// Any call: the scratch keychain denied this binary access (tests).
     Denied,
-    /// Any call: the target or the Security framework failed; the event
-    /// carries the |OSStatus| (0 for a request the worker refused as a
-    /// defect).
+    /// Any call: the target or the Security framework failed, or the build
+    /// is not signed for the Keychain (-34018); the status is 0 for a
+    /// request the worker refused as a defect.
     Unavailable,
 }
 impl SecretStoreReply {
@@ -722,9 +767,11 @@ pub enum Event {
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            deserialize_with = "present_u32"
+            deserialize_with = "present_i32"
         )]
-        status: Option<u32>,
+        status: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<KeychainSession>,
     },
     /// One Keychain item read (dispatch, or an exact retry's comparison).
     #[serde(rename = "secret_store.get")]
@@ -735,9 +782,11 @@ pub enum Event {
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            deserialize_with = "present_u32"
+            deserialize_with = "present_i32"
         )]
-        status: Option<u32>,
+        status: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<KeychainSession>,
     },
     /// One Keychain item delete after its deciding record.
     #[serde(rename = "secret_store.delete")]
@@ -748,9 +797,11 @@ pub enum Event {
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            deserialize_with = "present_u32"
+            deserialize_with = "present_i32"
         )]
-        status: Option<u32>,
+        status: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<KeychainSession>,
     },
     /// The startup sweep (SS-F1): the counts of its last listing pass,
     /// with `deleted` summed over every pass.
@@ -760,13 +811,14 @@ pub enum Event {
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            deserialize_with = "present_u32"
+            deserialize_with = "present_i32"
         )]
-        status: Option<u32>,
+        status: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<KeychainSession>,
         kept: u32,
         deleted: u32,
         failed: u32,
-        stranded: u32,
         unrecognized: u32,
         truncated: bool,
         listings: u32,
@@ -984,42 +1036,63 @@ impl Event {
                 input,
                 reply,
                 status,
-            } => nonzero(input) && reply.allowed("put") && Self::status_rule(*reply, *status),
+                session,
+            } => {
+                nonzero(input)
+                    && reply.allowed("put")
+                    && Self::status_rule(*reply, *status, session)
+            }
             Self::SecretStoreGet {
                 input,
                 reply,
                 status,
-            } => nonzero(input) && reply.allowed("get") && Self::status_rule(*reply, *status),
+                session,
+            } => {
+                nonzero(input)
+                    && reply.allowed("get")
+                    && Self::status_rule(*reply, *status, session)
+            }
             Self::SecretStoreDelete {
                 input,
                 reply,
                 status,
-            } => nonzero(input) && reply.allowed("delete") && Self::status_rule(*reply, *status),
+                session,
+            } => {
+                nonzero(input)
+                    && reply.allowed("delete")
+                    && Self::status_rule(*reply, *status, session)
+            }
             Self::SecretStoreSweep {
                 reply,
                 status,
+                session,
                 kept,
                 failed,
-                stranded,
                 unrecognized,
                 ..
             } => {
                 // One listing holds at most 257 results; `deleted` is summed
                 // over the passes, so it has no such bound.
                 reply.allowed("sweep")
-                    && Self::status_rule(*reply, *status)
-                    && [kept, failed, stranded, unrecognized]
-                        .iter()
-                        .all(|n| **n <= 257)
+                    && Self::status_rule(*reply, *status, session)
+                    && [kept, failed, unrecognized].iter().all(|n| **n <= 257)
             }
         };
         if valid { Ok(()) } else { Err(Error::Invalid) }
     }
 }
 impl Event {
-    /// A status goes with `unavailable` alone, and `unavailable` has one.
-    fn status_rule(reply: SecretStoreReply, status: Option<u32>) -> bool {
-        status.is_some() == (reply == SecretStoreReply::Unavailable)
+    /// A status goes with a failure reply alone, and every failure has one
+    /// (SG3 field evidence). A session goes only with a failure whose
+    /// status is not 0: status 0 is a defect that made no Keychain call.
+    fn status_rule(
+        reply: SecretStoreReply,
+        status: Option<i32>,
+        session: &Option<KeychainSession>,
+    ) -> bool {
+        use SecretStoreReply as R;
+        let failure = matches!(reply, R::Locked | R::Denied | R::Unavailable);
+        status.is_some() == failure && (session.is_none() || status.is_some_and(|s| s != 0))
     }
     /// The kind 28 outcome rules, applied to the facts `job.settled` carries.
     fn settled_facts(&self) -> bool {
@@ -1204,6 +1277,10 @@ fn present_true<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error
 }
 fn present_u32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
     u32::deserialize(d).map(Some)
+}
+
+fn present_i32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i32>, D::Error> {
+    i32::deserialize(d).map(Some)
 }
 
 #[cfg(test)]

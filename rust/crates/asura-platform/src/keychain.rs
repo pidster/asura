@@ -1,5 +1,6 @@
 //! macOS Keychain calls for the durable secret store
-//! (`docs/designs/secret-store.md`, packets SS1-K and SS1-K2).
+//! (`docs/designs/secret-store.md`, packets SS1-K and SS1-K2;
+//! `docs/designs/release-signing.md`, team Keychain store, packet SG3).
 //!
 //! Every function that takes a [`Keychain`] or a [`Target`] makes IPC calls
 //! to securityd and can wait without a bound. Call them only on the secret
@@ -7,23 +8,38 @@
 //! render paths must never call them. This module adds no queue, thread or
 //! time bound: the worker in `asura-service::secret_store` owns those.
 //!
-//! Each item call (add, get, delete, list) is preceded in the same call by
-//! the target pre-check, `SecKeychainGetStatus` on the target reference. A
-//! non-zero pre-check returns [`Failure::Unavailable`] and the item call is
-//! not made, because an add against a missing keychain reference falls
-//! through to the default keychain (probe SS-P2 (d)).
-use core_foundation::base::TCFType;
-use core_foundation::data::CFData;
-use security_framework::item::{
-    ItemAddOptions, ItemAddValue, ItemClass, ItemSearchOptions, Limit, Location, SearchResult,
-};
+//! Production ([`Target::Default`]) uses the data-protection keychain with
+//! the access group read from the process's own entitlements; every call
+//! names it ([`data_protection`]). A process without a valid group gets
+//! [`Failure::NotSigned`] and makes no Keychain item call.
+//!
+//! The test-only scratch backend (`Target::Scratch`, `test-support`) uses a
+//! scratch keychain file. Each of its item calls is preceded in the same
+//! call by the target pre-check, `SecKeychainGetStatus` on the target
+//! reference. A non-zero pre-check returns [`Failure::Unavailable`] and the
+//! item call is not made, because an add against a missing keychain
+//! reference falls through to the default keychain (probe SS-P2 (d)).
+pub mod data_protection;
+pub mod session;
+
 use security_framework::os::macos::keychain::SecKeychain;
-use security_framework_sys::base::SecKeychainRef;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use zeroize::Zeroizing;
 
 #[cfg(feature = "test-support")]
+use core_foundation::base::TCFType;
+#[cfg(feature = "test-support")]
+use core_foundation::data::CFData;
+#[cfg(feature = "test-support")]
+use security_framework::item::{
+    ItemAddOptions, ItemAddValue, ItemClass, ItemSearchOptions, Limit, Location, SearchResult,
+};
+#[cfg(feature = "test-support")]
+use security_framework_sys::base::SecKeychainRef;
+#[cfg(feature = "test-support")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "test-support")]
+use std::sync::Arc;
 
 /// Service attribute prefix; the installation ID follows in lowercase hex.
 pub const SERVICE_PREFIX: &str = "asura.secret-store.";
@@ -42,11 +58,18 @@ pub const LIST_BOUND: usize = 257;
 pub const STATUS_UNLOCKED: u32 = 0x1;
 
 const ERR_SEC_SUCCESS: i32 = 0;
+#[cfg(any(test, feature = "test-support"))]
 const ERR_SEC_INVALID_OWNER_EDIT: i32 = -25_244;
+#[cfg(any(test, feature = "test-support"))]
 const ERR_SEC_AUTH_FAILED: i32 = -25_293;
 const ERR_SEC_DUPLICATE_ITEM: i32 = -25_299;
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25_300;
+#[cfg(any(test, feature = "test-support"))]
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25_308;
+/// `errSecMissingEntitlement`: the process is not entitled to the group it
+/// named (KC-P1, KC-P4). Also the status a failed access group check
+/// reports, although that check made no Keychain call.
+pub const MISSING_ENTITLEMENT: i32 = -34_018;
 /// `errSecInternal`. Reported when a search succeeds with a result shape the
 /// request cannot produce, so the reply is `unavailable` with a real code.
 pub const UNEXPECTED_RESULT_STATUS: i32 = -26_276;
@@ -54,16 +77,17 @@ pub const UNEXPECTED_RESULT_STATUS: i32 = -26_276;
 // Selected (engineering, 2026-10-22): security-framework 3.7.0 and
 // security-framework-sys 2.17.0 do not expose these three functions. Each is
 // called from exactly one wrapper below. The API is deprecated in Apple's
-// headers; Rust declarations emit no deprecation warning.
+// headers; Rust declarations emit no deprecation warning. Since SG3 only the
+// test-only scratch backend uses them.
+#[cfg(feature = "test-support")]
 unsafe extern "C" {
     fn SecKeychainGetStatus(keychain: SecKeychainRef, status: *mut u32) -> i32;
-    #[cfg(feature = "test-support")]
     fn SecKeychainLock(keychain: SecKeychainRef) -> i32;
-    #[cfg(feature = "test-support")]
     fn SecKeychainDelete(keychain: SecKeychainRef) -> i32;
 }
 
 /// The target pre-check: `SecKeychainGetStatus` on `keychain`.
+#[cfg(feature = "test-support")]
 fn keychain_status(keychain: &SecKeychain) -> Result<u32, i32> {
     let mut flags = 0u32;
     // SAFETY: the reference comes from a live `SecKeychain` borrowed for the
@@ -92,18 +116,38 @@ fn keychain_delete(keychain: &SecKeychain) -> i32 {
     unsafe { SecKeychainDelete(keychain.as_concrete_TypeRef()) }
 }
 
-/// Why a Keychain call did not give a result.
+/// Why a Keychain call did not give a result. Every variant but
+/// [`Failure::Invalid`] has a raw `OSStatus` ([`Failure::status`]) that the
+/// worker records as field evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
-    /// The target keychain is locked.
-    Locked,
-    /// The keychain is unlocked but refused this binary access to the item.
-    Denied,
+    /// The keychain is locked: -25308 on the data-protection keychain
+    /// (before first unlock; unverified), or the scratch unlock-bit rule.
+    Locked { status: i32 },
+    /// The scratch keychain is unlocked but refused this binary access to
+    /// the item. The data-protection backend never returns it.
+    Denied { status: i32 },
+    /// The process is not entitled to the access group: a call returned
+    /// -34018, or the access group check failed and no call was made
+    /// (`item_call` false). Terminal for the process.
+    NotSigned { item_call: bool },
     /// The target or the Security framework failed. `item_call` is false when
     /// the open or the pre-check failed and no item call was made.
     Unavailable { status: i32, item_call: bool },
     /// The request broke a bound or a name rule; no Keychain call was made.
     Invalid,
+}
+
+impl Failure {
+    /// The raw `OSStatus` of the failure; `None` for [`Failure::Invalid`].
+    pub fn status(&self) -> Option<i32> {
+        match *self {
+            Self::Locked { status } | Self::Denied { status } => Some(status),
+            Self::NotSigned { .. } => Some(MISSING_ENTITLEMENT),
+            Self::Unavailable { status, .. } => Some(status),
+            Self::Invalid => None,
+        }
+    }
 }
 
 /// Reply to [`Keychain::add`].
@@ -195,8 +239,8 @@ fn parse_hex_id(text: &str) -> Option<[u8; 16]> {
 /// The keychain the secret store uses.
 #[derive(Clone)]
 pub enum Target {
-    /// The default keychain from `SecKeychainCopyDefault`, normally the login
-    /// keychain. The only production target.
+    /// The data-protection keychain with the access group from this
+    /// process's entitlements. The only production target.
     Default,
     /// A scratch keychain file made by [`scratch::create`]. Test builds only.
     #[cfg(feature = "test-support")]
@@ -222,9 +266,10 @@ impl std::fmt::Debug for Target {
 static INTERACTION: OnceLock<i32> = OnceLock::new();
 
 /// Disables Keychain user interaction for the whole process, once, for the
-/// process lifetime. A call that would show a dialog then fails instead of
-/// waiting for a person. [`Keychain::open`] calls this first, so no item call
-/// can run with interaction allowed.
+/// process lifetime. A file-keychain call that would show a dialog then
+/// fails instead of waiting for a person; every data-protection dictionary
+/// also sets `kSecUseAuthenticationUIFail`. [`Keychain::open`] calls this
+/// first, so no item call can run with interaction allowed.
 pub fn disable_user_interaction() -> Result<(), Failure> {
     let code = *INTERACTION.get_or_init(|| match SecKeychain::disable_user_interaction() {
         Ok(lock) => {
@@ -247,7 +292,13 @@ pub fn disable_user_interaction() -> Result<(), Failure> {
 
 /// An open target keychain. Owned by the secret store worker.
 pub struct Keychain {
-    reference: SecKeychain,
+    backend: Backend,
+}
+
+enum Backend {
+    DataProtection(data_protection::DataProtection),
+    #[cfg(feature = "test-support")]
+    File(FileKeychain),
 }
 
 impl std::fmt::Debug for Keychain {
@@ -257,62 +308,136 @@ impl std::fmt::Debug for Keychain {
 }
 
 impl Keychain {
-    /// Disables user interaction, then takes the target reference. Opening
-    /// does not prove the keychain exists: every later call pre-checks it.
+    /// Disables user interaction, then opens the target. For
+    /// [`Target::Default`] it reads the access group from the entitlements
+    /// (SG-F7): without a valid group it returns [`Failure::NotSigned`] and
+    /// no Keychain item call can follow. A scratch open does not prove the
+    /// keychain exists: every later call pre-checks it.
     pub fn open(target: &Target) -> Result<Self, Failure> {
         disable_user_interaction()?;
-        let reference = match target {
+        let backend = match target {
             Target::Default => {
+                let group = data_protection::entitled_group()
+                    .ok_or(Failure::NotSigned { item_call: false })?;
                 // The platform's own unit tests must never reach the
-                // person's default keychain.
+                // data-protection keychain, even from a signed binary.
                 if cfg!(test) {
                     return Err(Failure::Invalid);
                 }
-                SecKeychain::default()
+                Backend::DataProtection(data_protection::DataProtection::new(group))
             }
             #[cfg(feature = "test-support")]
             Target::Scratch { path, .. } => {
                 scratch::check_path(path)?;
-                SecKeychain::open(path)
+                let reference = SecKeychain::open(path).map_err(|error| Failure::Unavailable {
+                    status: error.code(),
+                    item_call: false,
+                })?;
+                Backend::File(FileKeychain { reference })
             }
-        }
-        .map_err(|error| Failure::Unavailable {
-            status: error.code(),
-            item_call: false,
-        })?;
-        Ok(Self { reference })
+        };
+        Ok(Self { backend })
     }
 
-    /// The target pre-check alone. Returns the status flags.
+    /// The access group every call names; `None` for a scratch keychain.
+    pub fn group(&self) -> Option<&str> {
+        match &self.backend {
+            Backend::DataProtection(backend) => Some(backend.group()),
+            #[cfg(feature = "test-support")]
+            Backend::File(_) => None,
+        }
+    }
+
+    fn calls(&self) -> &dyn Calls {
+        match &self.backend {
+            Backend::DataProtection(backend) => backend,
+            #[cfg(feature = "test-support")]
+            Backend::File(backend) => backend,
+        }
+    }
+
+    /// The scratch target pre-check alone. Returns the status flags.
+    #[cfg(feature = "test-support")]
     pub fn status(&self) -> Result<u32, Failure> {
-        keychain_status(&self.reference).map_err(|status| Failure::Unavailable {
+        let Backend::File(file) = &self.backend else {
+            return Err(Failure::Invalid);
+        };
+        keychain_status(&file.reference).map_err(|status| Failure::Unavailable {
             status,
             item_call: false,
         })
     }
 
-    /// Pre-checks, then adds one generic-password item of 1 to
-    /// [`MAX_ITEM_BYTES`] bytes.
+    /// Adds one generic-password item of 1 to [`MAX_ITEM_BYTES`] bytes.
     pub fn add(&self, key: &ItemKey, data: &[u8]) -> Result<Added, Failure> {
-        add_with(self, key, data)
+        add_with(self.calls(), key, data)
     }
 
-    /// Pre-checks, then reads one item's data into a zeroizing buffer.
+    /// Reads one item's data into a zeroizing buffer.
     pub fn get(&self, key: &ItemKey) -> Result<Found, Failure> {
-        get_with(self, key)
+        get_with(self.calls(), key)
     }
 
-    /// Pre-checks, then deletes one item.
+    /// Deletes one item.
     pub fn delete(&self, key: &ItemKey) -> Result<Removed, Failure> {
-        delete_with(self, key)
+        delete_with(self.calls(), key)
     }
 
-    /// Pre-checks, then lists the items of one installation, at most
-    /// [`LIST_BOUND`] of them. Items of other installations are never listed.
+    /// Lists the items of one installation, at most [`LIST_BOUND`] of them.
+    /// Items of other installations are never listed.
     pub fn list(&self, installation: &[u8; 16]) -> Result<Listing, Failure> {
-        list_with(self, installation)
+        list_with(self.calls(), installation)
     }
+}
 
+/// The Security framework calls behind the status mapping, and for the
+/// scratch backend the pre-check. `DataProtection` and the scratch
+/// `FileKeychain` implement it; unit tests substitute a recording fixture
+/// to check call order and mapping.
+pub(crate) trait Calls {
+    /// The scratch backend's target pre-check. The data-protection backend
+    /// has none.
+    fn precheck(&self) -> Result<(), i32> {
+        Ok(())
+    }
+    /// This backend's status mapping for a failed item call.
+    fn classify(&self, code: i32) -> Failure;
+    fn add(&self, service: &str, account: &str, data: &[u8]) -> Result<(), i32>;
+    fn copy(&self, service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>, i32>;
+    fn delete(&self, service: &str, account: &str) -> Result<(), i32>;
+    /// The account attributes of at most `max` items under `service`.
+    fn accounts(&self, service: &str, max: usize) -> Result<Vec<String>, i32>;
+}
+
+/// The scratch backend's status table: -25293 and -25308 map by the unlock
+/// bit of a second status call (`status`); -25244 is denied.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn classify_file(code: i32, status: impl FnOnce() -> Result<u32, i32>) -> Failure {
+    match code {
+        ERR_SEC_AUTH_FAILED | ERR_SEC_INTERACTION_NOT_ALLOWED => match status() {
+            Ok(flags) if flags & STATUS_UNLOCKED == 0 => Failure::Locked { status: code },
+            Ok(_) => Failure::Denied { status: code },
+            Err(status) => Failure::Unavailable {
+                status,
+                item_call: true,
+            },
+        },
+        ERR_SEC_INVALID_OWNER_EDIT => Failure::Denied { status: code },
+        status => Failure::Unavailable {
+            status,
+            item_call: true,
+        },
+    }
+}
+
+/// A scratch keychain file (`test-support`).
+#[cfg(feature = "test-support")]
+pub(crate) struct FileKeychain {
+    reference: SecKeychain,
+}
+
+#[cfg(feature = "test-support")]
+impl FileKeychain {
     fn search(&self, service: &str) -> ItemSearchOptions {
         let mut options = ItemSearchOptions::new();
         options
@@ -323,21 +448,13 @@ impl Keychain {
     }
 }
 
-/// The Security framework calls behind the pre-check and status mapping.
-/// [`Keychain`] is the one production implementation; unit tests substitute
-/// a recording fixture to check call order and mapping.
-pub(crate) trait Calls {
-    fn status(&self) -> Result<u32, i32>;
-    fn add(&self, service: &str, account: &str, data: &[u8]) -> Result<(), i32>;
-    fn copy(&self, service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>, i32>;
-    fn delete(&self, service: &str, account: &str) -> Result<(), i32>;
-    /// The account attributes of at most `max` items under `service`.
-    fn accounts(&self, service: &str, max: usize) -> Result<Vec<String>, i32>;
-}
-
-impl Calls for Keychain {
-    fn status(&self) -> Result<u32, i32> {
-        keychain_status(&self.reference)
+#[cfg(feature = "test-support")]
+impl Calls for FileKeychain {
+    fn precheck(&self) -> Result<(), i32> {
+        keychain_status(&self.reference).map(drop)
+    }
+    fn classify(&self, code: i32) -> Failure {
+        classify_file(code, || keychain_status(&self.reference))
     }
     fn add(&self, service: &str, account: &str, data: &[u8]) -> Result<(), i32> {
         // CF uses this zeroizing buffer without copying and drops it when the
@@ -401,34 +518,12 @@ impl Calls for Keychain {
     }
 }
 
-/// Runs the target pre-check; a non-zero status prevents the item call.
+/// Runs the backend's pre-check; a non-zero status prevents the item call.
 fn precheck<C: Calls + ?Sized>(calls: &C) -> Result<(), Failure> {
-    calls
-        .status()
-        .map(drop)
-        .map_err(|status| Failure::Unavailable {
-            status,
-            item_call: false,
-        })
-}
-
-/// Maps a failed item call's status under the revised table.
-fn classify<C: Calls + ?Sized>(calls: &C, code: i32) -> Failure {
-    match code {
-        ERR_SEC_AUTH_FAILED | ERR_SEC_INTERACTION_NOT_ALLOWED => match calls.status() {
-            Ok(flags) if flags & STATUS_UNLOCKED == 0 => Failure::Locked,
-            Ok(_) => Failure::Denied,
-            Err(status) => Failure::Unavailable {
-                status,
-                item_call: true,
-            },
-        },
-        ERR_SEC_INVALID_OWNER_EDIT => Failure::Denied,
-        status => Failure::Unavailable {
-            status,
-            item_call: true,
-        },
-    }
+    calls.precheck().map_err(|status| Failure::Unavailable {
+        status,
+        item_call: false,
+    })
 }
 
 pub(crate) fn add_with<C: Calls + ?Sized>(
@@ -454,7 +549,7 @@ fn add_raw_with<C: Calls + ?Sized>(
     match calls.add(service, account, data) {
         Ok(()) => Ok(Added::Stored),
         Err(ERR_SEC_DUPLICATE_ITEM) => Ok(Added::Duplicate),
-        Err(code) => Err(classify(calls, code)),
+        Err(code) => Err(calls.classify(code)),
     }
 }
 
@@ -462,9 +557,10 @@ pub(crate) fn get_with<C: Calls + ?Sized>(calls: &C, key: &ItemKey) -> Result<Fo
     precheck(calls)?;
     match calls.copy(&key.service(), &key.account()) {
         Ok(data) => Ok(Found::Data(data)),
-        // Missing only because the pre-check returned 0 in this call.
+        // Missing only because the call named an entitled group (KC-P4), or
+        // the scratch pre-check returned 0 in this call.
         Err(ERR_SEC_ITEM_NOT_FOUND) => Ok(Found::Missing),
-        Err(code) => Err(classify(calls, code)),
+        Err(code) => Err(calls.classify(code)),
     }
 }
 
@@ -473,7 +569,7 @@ pub(crate) fn delete_with<C: Calls + ?Sized>(calls: &C, key: &ItemKey) -> Result
     match calls.delete(&key.service(), &key.account()) {
         Ok(()) => Ok(Removed::Deleted),
         Err(ERR_SEC_ITEM_NOT_FOUND) => Ok(Removed::Absent),
-        Err(code) => Err(classify(calls, code)),
+        Err(code) => Err(calls.classify(code)),
     }
 }
 
@@ -504,7 +600,7 @@ pub(crate) fn list_with<C: Calls + ?Sized>(
         }
         // A search with no match returns -25300, not an empty list.
         Err(ERR_SEC_ITEM_NOT_FOUND) => Ok(Listing::default()),
-        Err(code) => Err(classify(calls, code)),
+        Err(code) => Err(calls.classify(code)),
     }
 }
 
@@ -553,19 +649,22 @@ pub mod scratch {
         })
     }
 
-    fn open_checked(target: &Target) -> Result<(Keychain, &Zeroizing<String>), Failure> {
+    fn open_checked(target: &Target) -> Result<(SecKeychain, &Zeroizing<String>), Failure> {
         let Target::Scratch { password, .. } = target else {
             return Err(Failure::Invalid);
         };
         let keychain = Keychain::open(target)?;
         keychain.status()?;
-        Ok((keychain, password))
+        let Backend::File(file) = keychain.backend else {
+            return Err(Failure::Invalid);
+        };
+        Ok((file.reference, password))
     }
 
     /// Locks a scratch keychain (`SecKeychainLock`) after a pre-check.
     pub fn lock(target: &Target) -> Result<(), Failure> {
         let (keychain, _) = open_checked(target)?;
-        match keychain_lock(&keychain.reference) {
+        match keychain_lock(&keychain) {
             ERR_SEC_SUCCESS => Ok(()),
             status => Err(Failure::Unavailable {
                 status,
@@ -576,8 +675,7 @@ pub mod scratch {
 
     /// Unlocks a scratch keychain with its password after a pre-check.
     pub fn unlock(target: &Target) -> Result<(), Failure> {
-        let (keychain, password) = open_checked(target)?;
-        let mut reference = keychain.reference.clone();
+        let (mut reference, password) = open_checked(target)?;
         reference
             .unlock(Some(password.as_str()))
             .map_err(|error| Failure::Unavailable {
@@ -590,7 +688,7 @@ pub mod scratch {
     /// pre-check. Stop every worker on the target first (testing rule 2).
     pub fn delete(target: &Target) -> Result<(), Failure> {
         let (keychain, _) = open_checked(target)?;
-        match keychain_delete(&keychain.reference) {
+        match keychain_delete(&keychain) {
             ERR_SEC_SUCCESS => Ok(()),
             status => Err(Failure::Unavailable {
                 status,
@@ -616,7 +714,7 @@ pub mod scratch {
             return Err(Failure::Invalid);
         }
         let keychain = Keychain::open(target)?;
-        add_raw_with(&keychain, &service_name(installation), account, data)
+        add_raw_with(keychain.calls(), &service_name(installation), account, data)
     }
 
     /// The data every fixture item holds.

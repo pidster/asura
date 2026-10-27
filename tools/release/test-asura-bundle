@@ -36,7 +36,7 @@ static_checks() {
         check "parses: ${plist#"$root"/}" plutil -lint -s "$plist"
     done
     count=$(find "$release/entitlements" -type f | wc -l | tr -d ' ')
-    check 'six entitlement files' [ "$count" = 6 ]
+    check 'seven entitlement files' [ "$count" = 7 ]
     restricted='com.apple.application-identifier com.apple.developer.team-identifier keychain-access-groups'
     expect() { check "keys of $1: ${2:-none}" [ "$(sorted_keys "$release/entitlements/$1")" = "$2" ]; }
     expect asura.release.plist "$restricted"
@@ -65,6 +65,13 @@ static_checks() {
         check "$kind team identifier" [ "$(value com.apple.developer.team-identifier "$file")" = '@TEAM_ID@' ]
         check "$kind access group is the only group" [ "$(value keychain-access-groups "$file" | sed 's/^ *//' | tr '\n' ' ')" = 'Array { @TEAM_ID@.org.pidster.asura } ' ]
     done
+    # SG3: the qualification list names only the test App ID and group, so
+    # the qualification bundle can never reach the production group.
+    expect secret-store-qualification.plist "$restricted"
+    file=$release/entitlements/secret-store-qualification.plist
+    check 'qualification application identifier is the test App ID' [ "$(value com.apple.application-identifier "$file")" = '@TEAM_ID@.org.pidster.asura.test' ]
+    check 'qualification team identifier' [ "$(value com.apple.developer.team-identifier "$file")" = '@TEAM_ID@' ]
+    check 'qualification access group is the test group only' [ "$(value keychain-access-groups "$file" | sed 's/^ *//' | tr '\n' ' ')" = 'Array { @TEAM_ID@.org.pidster.asura.test } ' ]
     for file in asura.development.plist asura-model.development.plist; do
         check "$file get-task-allow is true" [ "$(value com.apple.security.get-task-allow "$release/entitlements/$file")" = true ]
     done
@@ -186,6 +193,18 @@ EOF
     else
         bad 'generator refusal and profile cases need ASURA_PROTOC and ASURA_PROTOC_GEN_SWIFT'
     fi
+    # SG3: the qualification script refuses before building or signing.
+    qualification=$release/secret-store-qualification
+    rm -rf "$out"
+    refuses 'qualification without a mode' 'choose --ad-hoc or --signed' "$qualification" --out "$out"
+    refuses 'qualification with two modes' 'exactly one' "$qualification" --ad-hoc --signed --out "$out"
+    refuses 'qualification ad hoc with an identity' 'takes no identity' "$qualification" --ad-hoc --out "$out" --identity x
+    refuses 'qualification signed without a profile' 'test App ID profile' \
+        "$qualification" --signed --out "$out" --identity 'Apple Development: T' --team-id ABCDE12345
+    refuses 'qualification signed with a malformed team ID' 'ten upper-case' \
+        "$qualification" --signed --out "$out" --identity 'Apple Development: T' --team-id abc --profile "$scratch/profile"
+    refuses 'qualification signed ad hoc' 'named identity' \
+        "$qualification" --signed --out "$out" --identity - --team-id ABCDE12345 --profile "$scratch/profile"
     rm -rf "$scratch"
 }
 

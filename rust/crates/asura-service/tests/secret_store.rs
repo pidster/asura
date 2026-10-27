@@ -276,11 +276,22 @@ fn ss_w2_locked_keychain() {
     stop(store);
     scratch::lock(&scratch.target()).expect("lock scratch keychain");
     let store = scratch.store();
-    assert_eq!(get(&store, 1), GetReply::Failed(StoreFailure::Locked));
-    assert_eq!(
-        put(&store, 2, small()),
-        PutReply::Failed(StoreFailure::Locked)
+    // SG3: the locked reply carries the raw status and the session state.
+    let locked = get(&store, 1);
+    assert!(
+        matches!(
+            locked,
+            GetReply::Failed(StoreFailure::Locked {
+                status: -25_293 | -25_308,
+                session: Some(_),
+            })
+        ),
+        "{locked:?}"
     );
+    assert!(matches!(
+        put(&store, 2, small()),
+        PutReply::Failed(StoreFailure::Locked { .. })
+    ));
     let report = sweep(&store, []);
     assert_eq!((report.deleted, report.outcome), (1, Ok(())));
     assert_eq!(delete(&store, 1), DeleteReply::Absent);
@@ -297,7 +308,17 @@ fn ss_w3_item_of_another_binary_is_denied() {
     let mut scratch = Scratch::new();
     scratch.fixture(&format!("input.{}", hex(&id(1))));
     let store = scratch.store();
-    assert_eq!(get(&store, 1), GetReply::Failed(StoreFailure::Denied));
+    let denied = get(&store, 1);
+    assert!(
+        matches!(
+            denied,
+            GetReply::Failed(StoreFailure::Denied {
+                session: Some(_),
+                ..
+            })
+        ),
+        "{denied:?}"
+    );
     stop(store);
     scratch.delete_keychain();
 }
@@ -425,10 +446,7 @@ fn ss_w6_sweep_keeps_the_live_item() {
     );
     let observation = store.observation();
     assert_eq!(observation.item_count, Some(1));
-    assert_eq!(
-        (observation.stranded_count, observation.unrecognized_count),
-        (0, 0)
-    );
+    assert_eq!(observation.unrecognized_count, 0);
     assert_eq!(get(&store, 2), GetReply::Values(small()));
     assert_eq!(get(&store, 1), GetReply::Missing);
     stop(store);
@@ -471,11 +489,12 @@ fn ss_w8_failed_delete_is_swept() {
     scratch.delete_keychain();
 }
 
-/// SS-W9: a fixture item with an input account is stranded (delete denied);
-/// a fixture item with the account `other` is unrecognized, never read or
+/// SS-W9 (revised SG3): a fixture item with an input account cannot be
+/// deleted by this binary (denied): a failed delete, kept as an orphan; a
+/// fixture item with the account `other` is unrecognized, never read or
 /// deleted; both count; a put still succeeds.
 #[test]
-fn ss_w9_stranded_and_unrecognized_items() {
+fn ss_w9_denied_delete_and_unrecognized_items() {
     let mut scratch = Scratch::new();
     scratch.fixture(&format!("input.{}", hex(&id(1))));
     scratch.fixture("other");
@@ -485,15 +504,13 @@ fn ss_w9_stranded_and_unrecognized_items() {
     assert_eq!(
         (
             report.deleted,
-            report.stranded,
+            report.failed,
             report.unrecognized,
             report.outcome
         ),
         (0, 1, 1, Ok(()))
     );
     let observation = store.observation();
-    assert_eq!(observation.stranded_count, 1);
-    assert_eq!(observation.stranded_inputs, vec![id(1)]);
     assert_eq!(observation.unrecognized_count, 1);
     assert_eq!(observation.item_count, Some(2));
     // One list and one delete (of the input item); no read of either item.

@@ -91,12 +91,13 @@ message ServiceObservation {
   optional SecretStoreStatus secret_store = 8;
 }
 message SecretStoreStatus {
+  // Stranded items were removed by SG3 (release-signing.md, what SG3 removes).
+  reserved 4, 6;
+  reserved "stranded_count", "stranded_inputs";
   optional uint32 item_count = 1;         // every listed item, 0-257; 257 means more than 256
   optional bool sweep_pending = 2;        // startup sweep deferred
-  optional uint32 last_status = 3;        // 0, or the last unavailable OSStatus as its absolute value
-  optional uint32 stranded_count = 4;     // items whose delete was denied, 0-257
+  optional uint32 last_status = 3;        // 0, or the last unavailable OSStatus as its absolute value; 34018 is not_signed
   optional uint32 unrecognized_count = 5; // items whose account is not input.<32 hex>, 0-257
-  repeated bytes stranded_inputs = 6;     // at most 16 input IDs of 16 bytes each
 }
 // The person's thinking level and the form sent for a turn (thinking-level.md).
 enum ThinkingLevel { THINKING_LEVEL_DEFAULT = 0; THINKING_LEVEL_OFF = 1; THINKING_LEVEL_LOW = 2; THINKING_LEVEL_MEDIUM = 3; THINKING_LEVEL_HIGH = 4; }

@@ -12,9 +12,13 @@
 //!
 //! The worker owns the item payload codec and its 55,413-byte read bound,
 //! the platform-result to reply mapping, the item count, the startup sweep
-//! and the stranded and unrecognized counts. It publishes the facts for
-//! `ServiceObservation` field 8 as an [`Observation`]. Conversation wiring,
-//! audit emission and the observer field are the integrator's (P3-E).
+//! and the unrecognized count. It publishes the facts for
+//! `ServiceObservation` field 8 as an [`Observation`]. Every failure reply
+//! carries the raw `OSStatus` and the session state the worker read when
+//! the call failed (field evidence, SG3). A missing entitlement is terminal:
+//! the worker then answers every request `unavailable/not_signed` without a
+//! Keychain call. Conversation wiring, audit emission and the observer field
+//! are the integrator's (P3-E).
 //!
 //! Shutdown does not wait for the worker: dropping the [`Store`] closes
 //! admission, and the worker exits after the requests already queued. Tests
@@ -31,8 +35,14 @@ pub use codec::{
 };
 #[cfg(feature = "test-support")]
 pub use port::{Call, Gate};
+#[cfg(feature = "test-support")]
+pub use qualification::qualification_main;
+
+#[cfg(feature = "test-support")]
+mod qualification;
 
 use asura_platform::events::WakeSender;
+pub use asura_platform::keychain::session::Session;
 use asura_platform::keychain::{Keychain, Target};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -46,22 +56,36 @@ pub const QUEUE_BOUND: usize = 16;
 pub const ITEM_LIMIT: u32 = 256;
 /// The item count reported for a truncated listing: "more than 256".
 pub const COUNT_TRUNCATED: u32 = asura_platform::keychain::LIST_BOUND as u32;
-/// Stranded input IDs the observation carries; the count keeps the total.
-pub const OBSERVED_STRANDED: usize = 16;
+/// The `unavailable` reason of a missing entitlement (SG3).
+pub const NOT_SIGNED: &str = "not_signed";
+/// The `unavailable` reason of a request that broke a codec or item-key
+/// rule: a defect, with no Keychain call.
+pub const INVALID_REQUEST: &str = "invalid_request";
 
-/// Why a Keychain request did not succeed.
+/// Why a Keychain request did not succeed. `status` is the raw `OSStatus`
+/// and `session` the session state the worker read after the failed call
+/// (field evidence); both go to audit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreFailure {
     /// The keychain is locked: `secret_store_locked` or `keychain_locked`.
-    Locked,
-    /// macOS denied this binary access to the item: `secret_store_denied`.
-    Denied,
-    /// The target or the Security framework failed. `status` goes to audit
-    /// and `last_status`; `reason` is `invalid_request` for a request that
-    /// broke a codec or item-key rule (status 0), which is a defect.
+    Locked {
+        status: i32,
+        session: Option<Session>,
+    },
+    /// The scratch keychain denied this binary access to the item:
+    /// `secret_store_denied`. Production never replies `denied`.
+    Denied {
+        status: i32,
+        session: Option<Session>,
+    },
+    /// The target or the Security framework failed. `status` also goes to
+    /// `last_status`. `reason` is [`NOT_SIGNED`] for a missing entitlement
+    /// (status -34018, terminal) and [`INVALID_REQUEST`] for a defect
+    /// (status 0, no session).
     Unavailable {
         status: i32,
         reason: Option<&'static str>,
+        session: Option<Session>,
     },
 }
 
@@ -69,10 +93,37 @@ impl StoreFailure {
     /// The audit reply code.
     pub fn code(&self) -> &'static str {
         match self {
-            Self::Locked => "locked",
-            Self::Denied => "denied",
+            Self::Locked { .. } => "locked",
+            Self::Denied { .. } => "denied",
             Self::Unavailable { .. } => "unavailable",
         }
+    }
+    /// The raw `OSStatus` (0 for `invalid_request`).
+    pub fn status(&self) -> i32 {
+        match *self {
+            Self::Locked { status, .. }
+            | Self::Denied { status, .. }
+            | Self::Unavailable { status, .. } => status,
+        }
+    }
+    /// The session state read after the failed call; `None` when no
+    /// Keychain call or access group check failed.
+    pub fn session(&self) -> Option<Session> {
+        match *self {
+            Self::Locked { session, .. }
+            | Self::Denied { session, .. }
+            | Self::Unavailable { session, .. } => session,
+        }
+    }
+    /// True for `unavailable/not_signed`.
+    pub fn not_signed(&self) -> bool {
+        matches!(
+            self,
+            Self::Unavailable {
+                reason: Some(NOT_SIGNED),
+                ..
+            }
+        )
     }
 }
 
@@ -100,7 +151,8 @@ pub enum GetReply {
     Failed(StoreFailure),
 }
 
-/// Reply to [`Store::delete`]. `Failed(Denied)` leaves a stranded item.
+/// Reply to [`Store::delete`]. A failed delete leaves an orphan for the
+/// next sweep.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeleteReply {
     Deleted,
@@ -114,10 +166,9 @@ pub enum DeleteReply {
 pub struct SweepReport {
     pub kept: u32,
     pub deleted: u32,
-    /// Deletes that failed locked or unavailable; retried by the next sweep.
+    /// Deletes that failed (locked, denied or unavailable); the items stay
+    /// as orphans and the next sweep retries them.
     pub failed: u32,
-    /// Deletes that were denied: stranded items.
-    pub stranded: u32,
     pub unrecognized: u32,
     /// The last listing returned 257 results.
     pub truncated: bool,
@@ -134,7 +185,6 @@ impl Default for SweepReport {
             kept: 0,
             deleted: 0,
             failed: 0,
-            stranded: 0,
             unrecognized: 0,
             truncated: false,
             listings: 0,
@@ -152,14 +202,10 @@ pub struct Observation {
     /// The startup sweep was deferred and awaits a retry.
     pub sweep_pending: bool,
     /// 0, or the last `unavailable` status as its absolute value; cleared by
-    /// the next port call that succeeds.
+    /// the next port call that succeeds. 34018 stays under `not_signed`.
     pub last_status: u32,
-    /// Items whose delete was denied.
-    pub stranded_count: u32,
     /// Items whose account is not `input.<32 hex>`.
     pub unrecognized_count: u32,
-    /// At most [`OBSERVED_STRANDED`] stranded input IDs, in ascending order.
-    pub stranded_inputs: Vec<[u8; 16]>,
 }
 
 /// A request was not admitted.
@@ -251,8 +297,9 @@ pub struct Store {
 impl Store {
     /// Starts the worker on `target`. The worker opens the keychain on its
     /// own thread (which disables Keychain user interaction for the process
-    /// first) and retries the open before each request while it fails.
-    /// Production passes `Target::Default`.
+    /// first and, for `Target::Default`, reads the access group) and retries
+    /// the open before each request while it fails, except after
+    /// `not_signed`. Production passes `Target::Default`.
     pub fn new(
         target: Target,
         installation: [u8; 16],
@@ -393,8 +440,8 @@ impl Store {
     }
 }
 
-/// Opens the target. Unit tests of this crate never open the default
-/// keychain (SSR6, SS-U7).
+/// Opens the target. Unit tests of this crate never open the
+/// data-protection keychain (SSR6, SS-U7).
 fn open_target(target: &Target) -> Result<Keychain, asura_platform::keychain::Failure> {
     if cfg!(test) && matches!(target, Target::Default) {
         return Err(asura_platform::keychain::Failure::Invalid);

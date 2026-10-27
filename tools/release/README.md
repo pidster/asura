@@ -11,6 +11,7 @@ profile.
 | `asura-bundle` | The package script: `--ad-hoc` (dry run), `--development` or `--release` |
 | `test-asura-bundle` | Checks: `--static` (tracked files and refusals), `--bundle APP` (an ad hoc bundle), `--sandbox APP` (the helper App Sandbox with an ad hoc bundle, SG-V5) |
 | `sandbox-probe.c` | The SG-V5 negative fixture that `--sandbox` builds and signs with the helper's sandbox list |
+| `secret-store-qualification` | The signed qualification of the team Keychain store (SG3, SGQ6): builds, signs and runs `AsuraKeychainQualification.app` with the test App ID |
 | `Info.plist.in` | `Asura.app/Contents/Info.plist`; `@VERSION@` is the `asura-cli` version |
 | `entitlements/*.plist` | One list for each executable and mode; `@TEAM_ID@` is replaced at signing time |
 
@@ -125,6 +126,44 @@ tools/release/test-asura-bundle --sandbox .build/bundles/dry-run-1/Asura.app
 The script never starts the bundle's own helper: the package script checks
 `--version` on an unsandboxed ad hoc copy, so that packaging creates no
 container under `org.pidster.asura.model`.
+
+## Keychain store qualification
+
+`secret-store-qualification` proves the team Keychain store on the real
+data-protection keychain
+([signed qualification run](../../docs/designs/release-signing.md#signed-qualification-run)).
+It builds the `test-support` binary `secret_store_qualification` into
+`<out>/cargo-target`, assembles `AsuraKeychainQualification.app`
+(`CFBundleIdentifier` `org.pidster.asura.test`), signs it with the
+Hardened Runtime and runs it. The binary drives the production store worker
+over `Target::Default`. It writes items only in
+`<TeamID>.org.pidster.asura.test`, purges that group before and after the
+cases, and passes only when it ends with `test-group-empty=yes`.
+
+Signed run, by the owner only (SGQ6, SGQ9). It needs a profile for the test
+App ID `org.pidster.asura.test` (development or Developer ID) whose
+`keychain-access-groups` allows the test group or `<TeamID>.*`:
+
+```sh
+ASURA_PROTOC="$PWD/.build/dev-tools/protoc" \
+tools/release/secret-store-qualification --signed --out .build/bundles/kc-qual-1 \
+  --identity "Developer ID Application: <name> (<TeamID>)" --team-id <TeamID> \
+  --profile <path to the org.pidster.asura.test Developer ID profile>
+```
+
+An Apple Development identity with the test App ID's development profile
+works the same way. Before and after, `security list-keychains -d user`
+(read only) must list only the login keychain. If a run is cancelled, the
+next run purges the test group first.
+
+Ad hoc check (no identity; `test-asura-bundle` does not run it because it
+builds in release mode): the bundle is signed without restricted
+entitlements, and the executable must refuse with no Keychain call:
+
+```sh
+ASURA_PROTOC="$PWD/.build/dev-tools/protoc" \
+tools/release/secret-store-qualification --ad-hoc --out .build/bundles/kc-qual-adhoc-1
+```
 
 ## What the dry run does not prove
 

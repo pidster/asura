@@ -230,7 +230,7 @@ impl Worker {
     /// The secret store status of the last successful observation. The
     /// lock is held only for a copy; contention reports nothing this cycle.
     pub(super) fn secret_store(&self) -> Option<asura_control::pb::SecretStoreStatus> {
-        self.secret_store.try_lock().ok()?.clone()
+        *self.secret_store.try_lock().ok()?
     }
     pub fn running(&self) -> bool {
         self.handle.as_ref().is_some_and(|h| !h.is_finished())

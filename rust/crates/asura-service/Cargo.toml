@@ -84,6 +84,12 @@ path = "src/bin/secret_store_fixture.rs"
 required-features = ["test-support"]
 test = false
 
+[[bin]]
+name = "secret_store_qualification"
+path = "src/bin/secret_store_qualification.rs"
+required-features = ["test-support"]
+test = false
+
 [[test]]
 name = "person_command_flow"
 path = "tests/person_command_flow.rs"

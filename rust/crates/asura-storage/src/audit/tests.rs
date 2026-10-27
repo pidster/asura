@@ -1927,48 +1927,59 @@ fn pcr23_person_commands_setting_names_match_config_keys() {
     }
 }
 
-/// Secret store operations and audit (P3-E2): `secret_store.put`, `.get`,
-/// `.delete` and `.sweep` have their names and exact field sets,
+/// Secret store operations and audit (P3-E2, SG3): `secret_store.put`,
+/// `.get`, `.delete` and `.sweep` have their names and exact field sets,
 /// round-trip, name no project (so the project audit read skips them),
-/// carry a status with `unavailable` alone, take only their own call's
-/// reply codes, bound the listing counts, and the closed schema refuses
-/// any value, name, digest or size field.
+/// carry the raw signed status with every failure reply and with nothing
+/// else, carry the session state only with a failure (KC-U5), take only
+/// their own call's reply codes, bound the listing counts, have no
+/// `stranded` count (KC-U3), and the closed schema refuses any value, name,
+/// digest or size field.
 #[test]
 fn p3e2_secret_store_events() {
     use SecretStoreReply as R;
+    let session = KeychainSession {
+        boot_time_s: Some(1_790_000_000),
+        console: KeychainConsole::SameUser,
+        audit_flags: Some(0x6030),
+        origin: KeychainOrigin::Graphic,
+    };
     let put = |reply, status| Event::SecretStorePut {
         input: [7; 16],
         reply,
         status,
+        session: None,
     };
     let get = |reply, status| Event::SecretStoreGet {
         input: [7; 16],
         reply,
         status,
+        session: None,
     };
     let delete = |reply, status| Event::SecretStoreDelete {
         input: [7; 16],
         reply,
         status,
+        session: None,
     };
     let sweep = |reply, status| Event::SecretStoreSweep {
         reply,
         status,
+        session: None,
         kept: 3,
         deleted: 300,
         failed: 1,
-        stranded: 2,
         unrecognized: 4,
         truncated: false,
         listings: 2,
     };
     let item_fields: &[&str] = &["input", "reply"];
+    let failure_fields: &[&str] = &["input", "reply", "status"];
     let sweep_fields: &[&str] = &[
         "reply",
         "kept",
         "deleted",
         "failed",
-        "stranded",
         "unrecognized",
         "truncated",
         "listings",
@@ -1995,9 +2006,9 @@ fn p3e2_secret_store_events() {
             "missing",
         ),
         (
-            get(R::Locked, None),
+            get(R::Locked, Some(-25_308)),
             "secret_store.get",
-            item_fields,
+            failure_fields,
             "locked",
         ),
         (
@@ -2007,9 +2018,9 @@ fn p3e2_secret_store_events() {
             "deleted",
         ),
         (
-            delete(R::Denied, None),
+            delete(R::Denied, Some(-25_244)),
             "secret_store.delete",
-            item_fields,
+            failure_fields,
             "denied",
         ),
         (
@@ -2045,34 +2056,124 @@ fn p3e2_secret_store_events() {
                 "{broken}"
             );
         }
-        // A status without `unavailable` is refused.
-        let broken = text.replacen(&anchor, &format!("{anchor},\"status\":25291"), 1);
+        // A status on a success, or a second status, is refused.
+        let broken = text.replacen(&anchor, &format!("{anchor},\"status\":-25291"), 1);
         assert_eq!(
             Record::decode(broken.as_bytes()),
             Err(Error::MalformedRecord),
             "{broken}"
         );
     }
-    // `unavailable` carries its |OSStatus|, 0 included; never without one.
+    // Every failure carries its raw signed OSStatus, 0 included for a
+    // defect; never without one.
     for event in [
-        put(R::Unavailable, Some(25_291)),
+        put(R::Unavailable, Some(-34_018)),
         get(R::Unavailable, Some(0)),
-        delete(R::Unavailable, Some(25_300)),
-        sweep(R::Unavailable, Some(25_291)),
+        delete(R::Unavailable, Some(-25_300)),
+        sweep(R::Unavailable, Some(-25_291)),
+        put(R::Locked, Some(-25_308)),
     ] {
         event.validate().unwrap();
         let value = job_record(event);
         let text = String::from_utf8(value.encode().unwrap()).unwrap();
-        assert!(text.contains("\"status\":"), "{text}");
+        assert!(
+            text.contains("\"status\":-") || text.contains("\"status\":0"),
+            "{text}"
+        );
         assert_eq!(Record::decode(text.as_bytes()).unwrap(), value);
     }
     for event in [
         put(R::Unavailable, None),
         get(R::Read, Some(1)),
+        get(R::Locked, None),
+        delete(R::Denied, None),
         sweep(R::Unavailable, None),
     ] {
         assert_eq!(event.validate(), Err(Error::Invalid), "{event:?}");
     }
+    // The session state goes with a failure that made a Keychain call.
+    let with_session = |event: Event| match event {
+        Event::SecretStorePut {
+            input,
+            reply,
+            status,
+            ..
+        } => Event::SecretStorePut {
+            input,
+            reply,
+            status,
+            session: Some(session),
+        },
+        Event::SecretStoreSweep {
+            reply,
+            status,
+            kept,
+            deleted,
+            failed,
+            unrecognized,
+            truncated,
+            listings,
+            ..
+        } => Event::SecretStoreSweep {
+            reply,
+            status,
+            session: Some(session),
+            kept,
+            deleted,
+            failed,
+            unrecognized,
+            truncated,
+            listings,
+        },
+        other => other,
+    };
+    let evidence = with_session(put(R::Unavailable, Some(-34_018)));
+    evidence.validate().unwrap();
+    let value = job_record(evidence);
+    let bytes = value.encode().unwrap();
+    assert_eq!(Record::decode(&bytes).unwrap(), value);
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["details"]["status"], -34_018);
+    assert_eq!(
+        json["details"]["session"],
+        serde_json::json!({
+            "boot_time_s": 1_790_000_000u64,
+            "console": "self",
+            "audit_flags": 0x6030,
+            "origin": "graphic"
+        })
+    );
+    // The session names nothing else: an extra key is refused.
+    let text = String::from_utf8(bytes).unwrap();
+    let broken = text.replacen(
+        "\"origin\":\"graphic\"",
+        "\"origin\":\"graphic\",\"user\":\"x\"",
+        1,
+    );
+    assert_ne!(broken, text);
+    assert_eq!(
+        Record::decode(broken.as_bytes()),
+        Err(Error::MalformedRecord)
+    );
+    with_session(sweep(R::Locked, Some(-25_308)))
+        .validate()
+        .unwrap();
+    for event in [
+        with_session(put(R::Stored, None)),
+        with_session(put(R::Unavailable, Some(0))),
+        with_session(sweep(R::Swept, None)),
+    ] {
+        assert_eq!(event.validate(), Err(Error::Invalid), "{event:?}");
+    }
+    // KC-U3: the sweep has no `stranded` count.
+    let value = job_record(sweep(R::Swept, None));
+    let text = String::from_utf8(value.encode().unwrap()).unwrap();
+    let broken = text.replacen("\"failed\":1", "\"failed\":1,\"stranded\":0", 1);
+    assert_ne!(broken, text);
+    assert_eq!(
+        Record::decode(broken.as_bytes()),
+        Err(Error::MalformedRecord)
+    );
     // Each call takes its own codes and the three failures.
     for (event, valid) in [
         (put(R::ExistsSame, None), true),
@@ -2082,9 +2183,9 @@ fn p3e2_secret_store_events() {
         (get(R::Stored, None), false),
         (delete(R::Absent, None), true),
         (delete(R::Missing, None), false),
-        (delete(R::Locked, None), true),
+        (delete(R::Locked, Some(-25_308)), true),
         (sweep(R::Swept, None), true),
-        (sweep(R::Denied, None), true),
+        (sweep(R::Denied, Some(-25_244)), true),
         (sweep(R::Deleted, None), false),
     ] {
         assert_eq!(event.validate().is_ok(), valid, "{event:?}");
@@ -2095,6 +2196,7 @@ fn p3e2_secret_store_events() {
             input: [0; 16],
             reply: R::Stored,
             status: None,
+            session: None,
         }
         .validate(),
         Err(Error::Invalid)

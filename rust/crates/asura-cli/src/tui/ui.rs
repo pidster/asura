@@ -4273,7 +4273,7 @@ mod tests {
             QueueRefusal::EnvironmentTooLarge,
             QueueRefusal::SecretStoreLocked,
         ] {
-            let text = person::refusal_text(refusal, None, false);
+            let text = person::refusal_text(refusal, None);
             let mut app = App::new();
             app.insert("!!ls");
             app.notice = text.clone();

@@ -33,7 +33,8 @@ use asura_platform::secrets::{
     self, JobRedaction, Plan, RefusalCode, RuleSet, SecretVariable, WHOLE_COMMAND,
 };
 use asura_storage::audit::{
-    Event, PersonCommandRefusal as Refusal, SecretStoreReply as StoreReply,
+    Event, KeychainConsole, KeychainOrigin, KeychainSession, PersonCommandRefusal as Refusal,
+    SecretStoreReply as StoreReply,
 };
 use asura_storage::authority::conversation::{
     self as journal, ClientVariable, Id, InputKind, InputStatus, JobBlockReason, JobRunState,
@@ -76,12 +77,14 @@ pub(super) const SECRET_RULES_CHANGED: &str = "secret_rules_changed";
 /// input is held, so it never dispatches again without Resume.
 pub(super) const CANCELLED: &str = "cancelled";
 
-/// The secret store target for this runtime. Production uses the default
-/// (login) keychain. A test-support build, or this crate's unit tests, use
-/// the scratch keychain the harness names in `HOME/secret-store-keychain`
-/// (its path, then its password, one per line), the default keychain only
-/// for the account's own Asura home, and no target otherwise, so no test
-/// reaches the login keychain (SSR6). Blocking (file read, account
+/// The secret store target for this runtime. Production uses the
+/// data-protection keychain with the access group from the entitlements
+/// (`Target::Default`, SG3). A test-support build, or this crate's unit
+/// tests, use the scratch keychain the harness names in
+/// `HOME/secret-store-keychain` (its path, then its password, one per
+/// line), `Target::Default` only for the account's own Asura home, and no
+/// target otherwise, so no test reaches the login or data-protection
+/// keychain (SSR6). Blocking (file read, account
 /// database): the start-time read thread only.
 pub(super) fn store_target(runtime: &asura_platform::RuntimeDirectory) -> Option<Target> {
     #[cfg(any(test, feature = "test-support"))]
@@ -210,11 +213,12 @@ fn typed_refusal(refusal: Refusal) -> Option<pb::QueueRefusal> {
     })
 }
 
-/// The refusal of a store failure at submit.
+/// The refusal of a store failure at submit. `not_signed` is
+/// `secret_store_unavailable` with status 34018, which the TUI names.
 fn store_refusal(failure: StoreFailure) -> (Refusal, Option<u32>) {
     match failure {
-        StoreFailure::Locked => (Refusal::SecretStoreLocked, None),
-        StoreFailure::Denied => (Refusal::SecretStoreDenied, None),
+        StoreFailure::Locked { .. } => (Refusal::SecretStoreLocked, None),
+        StoreFailure::Denied { .. } => (Refusal::SecretStoreDenied, None),
         StoreFailure::Unavailable { status, .. } => (
             Refusal::SecretStoreUnavailable,
             Some(status.unsigned_abs())
@@ -224,53 +228,80 @@ fn store_refusal(failure: StoreFailure) -> (Refusal, Option<u32>) {
     }
 }
 
-/// The audit reply code and status of a store failure.
-fn failure_reply(failure: &StoreFailure) -> (StoreReply, Option<u32>) {
-    match failure {
-        StoreFailure::Locked => (StoreReply::Locked, None),
-        StoreFailure::Denied => (StoreReply::Denied, None),
-        StoreFailure::Unavailable { status, .. } => {
-            (StoreReply::Unavailable, Some(status.unsigned_abs()))
-        }
+/// The audit form of the session state a Keychain error recorded.
+pub(super) fn audit_session(session: secret_store::Session) -> KeychainSession {
+    use asura_platform::keychain::session::{Console, Origin};
+    KeychainSession {
+        boot_time_s: session.boot_time_s,
+        console: match session.console {
+            Console::SameUser => KeychainConsole::SameUser,
+            Console::OtherUser => KeychainConsole::OtherUser,
+            Console::LoginWindow => KeychainConsole::LoginWindow,
+            Console::Unknown => KeychainConsole::Unknown,
+        },
+        audit_flags: session.audit_flags,
+        origin: match session.origin() {
+            Origin::Remote => KeychainOrigin::Remote,
+            Origin::Graphic => KeychainOrigin::Graphic,
+            Origin::Other => KeychainOrigin::Other,
+            Origin::Unknown => KeychainOrigin::Unknown,
+        },
     }
 }
-fn put_reply(reply: &PutReply) -> (StoreReply, Option<u32>) {
+
+/// The audit reply code, raw status and session of one store reply: a
+/// failure carries its status and, when a Keychain call failed, the
+/// session state (field evidence, SG3).
+type AuditReply = (StoreReply, Option<i32>, Option<KeychainSession>);
+
+fn failure_reply(failure: &StoreFailure) -> AuditReply {
+    let code = match failure {
+        StoreFailure::Locked { .. } => StoreReply::Locked,
+        StoreFailure::Denied { .. } => StoreReply::Denied,
+        StoreFailure::Unavailable { .. } => StoreReply::Unavailable,
+    };
+    let status = failure.status();
+    // A session goes only with a real Keychain status (audit rule).
+    let session = failure.session().filter(|_| status != 0).map(audit_session);
+    (code, Some(status), session)
+}
+fn put_reply(reply: &PutReply) -> AuditReply {
     match reply {
-        PutReply::Stored => (StoreReply::Stored, None),
-        PutReply::ExistsSame => (StoreReply::ExistsSame, None),
-        PutReply::ExistsDifferent => (StoreReply::ExistsDifferent, None),
-        PutReply::Full => (StoreReply::Full, None),
+        PutReply::Stored => (StoreReply::Stored, None, None),
+        PutReply::ExistsSame => (StoreReply::ExistsSame, None, None),
+        PutReply::ExistsDifferent => (StoreReply::ExistsDifferent, None, None),
+        PutReply::Full => (StoreReply::Full, None, None),
         PutReply::Failed(failure) => failure_reply(failure),
     }
 }
-fn get_reply(reply: &GetReply) -> (StoreReply, Option<u32>) {
+fn get_reply(reply: &GetReply) -> AuditReply {
     match reply {
-        GetReply::Values(_) => (StoreReply::Read, None),
-        GetReply::Missing => (StoreReply::Missing, None),
-        GetReply::Mismatch => (StoreReply::Mismatch, None),
+        GetReply::Values(_) => (StoreReply::Read, None, None),
+        GetReply::Missing => (StoreReply::Missing, None, None),
+        GetReply::Mismatch => (StoreReply::Mismatch, None, None),
         GetReply::Failed(failure) => failure_reply(failure),
     }
 }
-fn delete_reply(reply: &DeleteReply) -> (StoreReply, Option<u32>) {
+fn delete_reply(reply: &DeleteReply) -> AuditReply {
     match reply {
-        DeleteReply::Deleted => (StoreReply::Deleted, None),
-        DeleteReply::Absent => (StoreReply::Absent, None),
+        DeleteReply::Deleted => (StoreReply::Deleted, None, None),
+        DeleteReply::Absent => (StoreReply::Absent, None, None),
         DeleteReply::Failed(failure) => failure_reply(failure),
     }
 }
 /// The `secret_store.sweep` event of a sweep report.
 fn sweep_event(report: &SweepReport) -> Event {
-    let (reply, status) = match &report.outcome {
-        Ok(()) => (StoreReply::Swept, None),
+    let (reply, status, session) = match &report.outcome {
+        Ok(()) => (StoreReply::Swept, None, None),
         Err(failure) => failure_reply(failure),
     };
     Event::SecretStoreSweep {
         reply,
         status,
+        session,
         kept: report.kept,
         deleted: report.deleted,
         failed: report.failed,
-        stranded: report.stranded,
         unrecognized: report.unrecognized,
         truncated: report.truncated,
         listings: report.listings,
@@ -458,9 +489,7 @@ impl Persons {
             item_count: o.item_count,
             sweep_pending: Some(o.sweep_pending),
             last_status: Some(o.last_status),
-            stranded_count: Some(o.stranded_count),
             unrecognized_count: Some(o.unrecognized_count),
-            stranded_inputs: o.stranded_inputs.iter().map(|i| i.to_vec()).collect(),
         })
     }
     /// The next paced Keychain recheck.
@@ -1101,11 +1130,12 @@ impl Owner {
                         Ok(())
                     }
                     Polled::Ready(reply) => {
-                        let (code, status) = put_reply(&reply);
+                        let (code, status, session) = put_reply(&reply);
                         self.audit_store(Event::SecretStorePut {
                             input: submit.record.input,
                             reply: code,
                             status,
+                            session,
                         });
                         self.person_put(&mut submit, reply)
                     }
@@ -1117,11 +1147,12 @@ impl Owner {
                         Ok(())
                     }
                     Polled::Ready(reply) => {
-                        let (code, status) = get_reply(&reply);
+                        let (code, status, session) = get_reply(&reply);
                         self.audit_store(Event::SecretStoreGet {
                             input: submit.record.input,
                             reply: code,
                             status,
+                            session,
                         });
                         match reply {
                             // Equal values return the original input;
@@ -1538,11 +1569,12 @@ impl Owner {
             Dispatch::Getting(record, ticket, pacing) => match ticket.poll() {
                 Polled::Pending => Dispatch::Getting(record, ticket, pacing),
                 Polled::Ready(reply) => {
-                    let (code, status) = get_reply(&reply);
+                    let (code, status, session) = get_reply(&reply);
                     self.audit_store(Event::SecretStoreGet {
                         input: record.input,
                         reply: code,
                         status,
+                        session,
                     });
                     self.person_item_read(record, reply, pacing, now)
                 }
@@ -1618,12 +1650,15 @@ impl Owner {
                 self.person_delete(record.input);
                 self.command_hold(record.input, SECRETS_LOST)
             }
-            GetReply::Failed(StoreFailure::Denied) => {
+            // The scratch backend alone replies `denied` (SG3).
+            GetReply::Failed(StoreFailure::Denied { .. }) => {
                 self.command_hold(record.input, SECRET_STORE_DENIED)
             }
-            GetReply::Failed(StoreFailure::Locked) => {
+            GetReply::Failed(StoreFailure::Locked { .. }) => {
                 Dispatch::Waiting(record, KeychainWait::Locked, paced(pacing, now))
             }
+            // `not_signed` waits too: the worker answers each paced recheck
+            // at once with no Keychain call, and the person can Drop.
             GetReply::Failed(StoreFailure::Unavailable { .. }) => {
                 Dispatch::Waiting(record, KeychainWait::Unavailable, paced(pacing, now))
             }
@@ -2139,11 +2174,12 @@ impl Owner {
         deletes.retain(|(input, ticket)| match ticket.poll() {
             Polled::Pending => true,
             Polled::Ready(reply) => {
-                let (code, status) = delete_reply(&reply);
+                let (code, status, session) = delete_reply(&reply);
                 self.audit_store(Event::SecretStoreDelete {
                     input: *input,
                     reply: code,
                     status,
+                    session,
                 });
                 false
             }
@@ -2201,7 +2237,6 @@ impl Owner {
                         kept = report.kept,
                         deleted = report.deleted,
                         failed = report.failed,
-                        stranded = report.stranded,
                         unrecognized = report.unrecognized,
                         truncated = report.truncated,
                         "secret_store_swept"

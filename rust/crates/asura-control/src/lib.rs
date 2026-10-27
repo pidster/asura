@@ -248,22 +248,11 @@ fn installation_reply(value: &pb::InspectInstallationReply) -> bool {
 }
 /// Items one secret store listing reports: 257 means more than 256.
 pub const MAX_SECRET_STORE_COUNT: u32 = 257;
-/// Input IDs a `SecretStoreStatus` names of its stranded items.
-pub const MAX_STRANDED_INPUTS: usize = 16;
 /// `ServiceObservation.secret_store` (secret-store.md, operations and audit):
-/// counts 0-257, and at most 16 distinct stranded input IDs, no more than
-/// the stranded count.
+/// counts 0-257. Fields 4 and 6 (stranded items) are reserved since SG3.
 fn secret_store_status(v: &pb::SecretStoreStatus) -> bool {
     let count = |n: Option<u32>| n.is_none_or(|n| n <= MAX_SECRET_STORE_COUNT);
-    count(v.item_count)
-        && count(v.stranded_count)
-        && count(v.unrecognized_count)
-        && v.stranded_inputs.len() <= MAX_STRANDED_INPUTS
-        && v.stranded_inputs.len() as u64 <= u64::from(v.stranded_count.unwrap_or(0))
-        && v.stranded_inputs
-            .iter()
-            .enumerate()
-            .all(|(i, input)| id_slice(input) && !v.stranded_inputs[..i].contains(input))
+    count(v.item_count) && count(v.unrecognized_count)
 }
 /// Validates domain shape and direction. Attachment state stays with its owner.
 pub fn validate_semantics(
@@ -662,23 +651,18 @@ mod person_command_tests {
             false,
         )
     }
-    /// ServiceObservation field 8: counts 0-257 and at most 16 distinct
-    /// stranded input IDs, no more than the stranded count.
+    /// ServiceObservation field 8: counts 0-257; the stranded fields 4 and
+    /// 6 are gone (KC-U3, SG3): a peer that sends them has them ignored as
+    /// unknown fields, never read as stranded counts.
     #[test]
     fn secret_store_status_is_bounded() {
         let full = pb::SecretStoreStatus {
             item_count: Some(MAX_SECRET_STORE_COUNT),
             sweep_pending: Some(false),
-            last_status: Some(25_308),
-            stranded_count: Some(MAX_SECRET_STORE_COUNT),
+            last_status: Some(34_018),
             unrecognized_count: Some(MAX_SECRET_STORE_COUNT),
-            stranded_inputs: (1..=16u8).map(|n| vec![n; 16]).collect(),
         };
-        for accepted in [
-            None,
-            Some(pb::SecretStoreStatus::default()),
-            Some(full.clone()),
-        ] {
+        for accepted in [None, Some(pb::SecretStoreStatus::default()), Some(full)] {
             let value = observation(accepted);
             assert!(validate_semantics(&value, Direction::ServerToClient).is_ok());
             assert!(round_trips(&value));
@@ -688,49 +672,14 @@ mod person_command_tests {
                 "items",
                 pb::SecretStoreStatus {
                     item_count: Some(258),
-                    ..full.clone()
-                },
-            ),
-            (
-                "stranded",
-                pb::SecretStoreStatus {
-                    stranded_count: Some(258),
-                    ..full.clone()
+                    ..full
                 },
             ),
             (
                 "unrecognized",
                 pb::SecretStoreStatus {
                     unrecognized_count: Some(258),
-                    ..full.clone()
-                },
-            ),
-            (
-                "more IDs than count",
-                pb::SecretStoreStatus {
-                    stranded_count: Some(15),
-                    ..full.clone()
-                },
-            ),
-            (
-                "zero ID",
-                pb::SecretStoreStatus {
-                    stranded_inputs: vec![vec![0; 16]],
-                    ..full.clone()
-                },
-            ),
-            (
-                "short ID",
-                pb::SecretStoreStatus {
-                    stranded_inputs: vec![vec![1; 15]],
-                    ..full.clone()
-                },
-            ),
-            (
-                "repeated ID",
-                pb::SecretStoreStatus {
-                    stranded_inputs: vec![vec![1; 16], vec![1; 16]],
-                    ..full.clone()
+                    ..full
                 },
             ),
         ] {
@@ -740,11 +689,13 @@ mod person_command_tests {
                 "{name}"
             );
         }
-        // Seventeen IDs exceed the wire bound.
-        let seventeen = pb::SecretStoreStatus {
-            stranded_inputs: (1..=17u8).map(|n| vec![n; 16]).collect(),
-            ..full
-        };
-        assert!(encode_frame(&observation(Some(seventeen))).is_err());
+        // Fields 4 and 6 of an older peer decode as nothing: field 4 =
+        // varint 9, field 6 = 16 bytes.
+        use prost::Message;
+        let mut bytes = full.encode_to_vec();
+        bytes.extend_from_slice(&[0x20, 9, 0x32, 16]);
+        bytes.extend_from_slice(&[1; 16]);
+        let decoded = pb::SecretStoreStatus::decode(bytes.as_slice()).expect("decode");
+        assert_eq!(decoded, full);
     }
 }
