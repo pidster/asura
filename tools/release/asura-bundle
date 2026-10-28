@@ -114,10 +114,11 @@ if [ "$mode" != ad-hoc ]; then
     pb Entitlements:keychain-access-groups "$decoded/profile.plist" |
         sed 's/^ *//' | grep -Fqx -e "$team.org.pidster.asura" -e "$team.*" ||
         fail "the profile does not allow the keychain access group $team.org.pidster.asura"
-    gta=$(pb Entitlements:com.apple.security.get-task-allow "$decoded/profile.plist" || :)
-    if [ "$mode" = development ]; then
-        [ "$gta" = true ] || fail 'a development profile must allow get-task-allow'
-    else
+    # get-task-allow is not profile-restricted on macOS: the development lists
+    # claim it without the profile granting it (release-signing.md,
+    # development builds). A release must never be debuggable.
+    if [ "$mode" = release ]; then
+        gta=$(pb Entitlements:com.apple.security.get-task-allow "$decoded/profile.plist" || :)
         [ "$gta" != true ] || fail 'a Developer ID profile must not allow get-task-allow'
     fi
 fi
@@ -376,3 +377,4 @@ note "helper $helper_sha"
 note "metallib $metallib_sha"
 note "hub_bundle $hub_sha"
 note "package identity written to $identity_file"
+note 'step=done'

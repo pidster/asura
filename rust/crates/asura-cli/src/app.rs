@@ -9,6 +9,9 @@ const BUILD: &str = concat!("asura/", env!("CARGO_PKG_VERSION"));
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Help,
+    /// Prints the package version only; no runtime, log or Keychain access
+    /// (release-signing.md, SG4 `asura --version`).
+    Version,
     Initialize,
     ProjectAdd(String),
     ProjectList,
@@ -53,6 +56,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
             })
         }
         ["--help" | "-h"] => Ok(Command::Help),
+        ["--version"] => Ok(Command::Version),
         ["service", "start"] => Ok(Command::Start),
         ["service", "status", "--json"] => Ok(Command::Status),
         ["installation", "status"] => Ok(Command::InstallationStatus { json: false }),
@@ -346,7 +350,7 @@ fn logging_options(args: &[String]) -> Result<(Command, Option<std::path::PathBu
     if logs.is_some()
         && matches!(
             command,
-            Command::Help | Command::Tui | Command::Run { notice: true, .. }
+            Command::Help | Command::Version | Command::Tui | Command::Run { notice: true, .. }
         )
     {
         return Err(());
@@ -441,8 +445,12 @@ pub fn entry_with_logs(
     match parsed.map(|(command, _)| command) {
         Ok(Command::Help) => {
             println!(
-                "Asura\nUsage:\n  asura (interactive TUI)\n  asura service start [--logs DIR]\n  asura service status --json [--logs DIR]\n  asura service stop [--logs DIR]\n  asura service run [--logs DIR]\n  asura installation status [--json] [--logs DIR]\n  asura init\n  asura project add PATH\n  asura project list\n  asura sensors PROJECT_ID [OFFSET REVISION]"
+                "Asura\nUsage:\n  asura (interactive TUI)\n  asura --version\n  asura service start [--logs DIR]\n  asura service status --json [--logs DIR]\n  asura service stop [--logs DIR]\n  asura service run [--logs DIR]\n  asura installation status [--json] [--logs DIR]\n  asura init\n  asura project add PATH\n  asura project list\n  asura sensors PROJECT_ID [OFFSET REVISION]"
             );
+            0
+        }
+        Ok(Command::Version) => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
             0
         }
         Ok(Command::Tui) => unreachable!("interactive command handled before logger setup"),

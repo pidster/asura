@@ -4,7 +4,8 @@
 #   test-asura-bundle --static         SG-V1 and SG-V3 unit checks of the tracked
 #                                      files; SG-V3 refusal checks of the script
 #   test-asura-bundle --bundle APP     SG-V1 and SG-V2 checks of an assembled
-#                                      ad hoc Asura.app (from asura-bundle --ad-hoc)
+#                                      ad hoc Asura.app (from asura-bundle --ad-hoc),
+#                                      and the SG4 check of its dry-run archive
 #   test-asura-bundle --sandbox APP    SG-V5 checks of the helper App Sandbox with
 #                                      an ad hoc Asura.app: a test-only signed
 #                                      variant, the HS-P7 negative fixture and the
@@ -177,7 +178,6 @@ EOF
         refuses 'expired profile' 'profile expired' dev "$(profile_for ABCDE12345 "ABCDE12345".org.pidster.asura 2020-01-01T00:00:00Z true expired)"
         refuses 'profile for another team' 'another team' dev "$(profile_for ZZZZZ12345 "ZZZZZ12345".org.pidster.asura 2099-01-01T00:00:00Z true team)"
         refuses 'profile without the access group' 'keychain access group' dev "$(profile_for ABCDE12345 ABCDE12345.com.other 2099-01-01T00:00:00Z true group)"
-        refuses 'development profile without get-task-allow' 'must allow get-task-allow' dev "$(profile_for ABCDE12345 'ABCDE12345.*' 2099-01-01T00:00:00Z false gta)"
         refuses 'unsigned file as profile' 'cannot decode' dev "$scratch/profile"
         good=$(profile_for ABCDE12345 'ABCDE12345.*' 2099-01-01T00:00:00Z true good)
         rm -rf "$out"
@@ -185,6 +185,24 @@ EOF
         message=$(unset ASURA_SIGN_IDENTITY; dev "$good" 2>&1 >/dev/null)
         set -e
         check 'a valid profile passes preflight (stops at generate in the scratch tree)' \
+            sh -c 'printf "%s" "$1" | grep -Fq "asura-bundle: generate:"' sh "$message"
+        rm -rf "$out"
+        # SG4: macOS development profiles carry no get-task-allow; the
+        # development lists still claim it, so the profile key is not read.
+        set +e
+        message=$(dev "$(profile_for ABCDE12345 'ABCDE12345.*' 2099-01-01T00:00:00Z false gta)" 2>&1 >/dev/null)
+        set -e
+        check 'a development profile without get-task-allow passes preflight (SG4)' \
+            sh -c 'printf "%s" "$1" | grep -Fq "asura-bundle: generate:"' sh "$message"
+        rm -rf "$out"
+        rel() { "$tree/tools/release/asura-bundle" --release --out "$out" \
+            --identity 'Developer ID Application: T' --team-id ABCDE12345 --profile "$1" --notary-profile n; }
+        refuses 'Developer ID profile that grants get-task-allow' 'must not allow get-task-allow' \
+            rel "$(profile_for ABCDE12345 'ABCDE12345.*' 2099-01-01T00:00:00Z true relgta)"
+        set +e
+        message=$(rel "$(profile_for ABCDE12345 'ABCDE12345.*' 2099-01-01T00:00:00Z false relgood)" 2>&1 >/dev/null)
+        set -e
+        check 'a Developer ID profile without get-task-allow passes preflight' \
             sh -c 'printf "%s" "$1" | grep -Fq "asura-bundle: generate:"' sh "$message"
         rm -rf "$out"
         : > "$tree/untracked"
@@ -205,7 +223,74 @@ EOF
         "$qualification" --signed --out "$out" --identity 'Apple Development: T' --team-id abc --profile "$scratch/profile"
     refuses 'qualification signed ad hoc' 'named identity' \
         "$qualification" --signed --out "$out" --identity - --team-id ABCDE12345 --profile "$scratch/profile"
+    sg4_static_checks
     rm -rf "$scratch"
+}
+
+# SG4 (release-signing.md#sg4-release-promotion-and-formula): the formula
+# template, the absence of publishing commands (HD10) and the refusals of
+# asura-release. Uses $scratch from static_checks.
+sg4_static_checks() {
+    template=$release/asura.rb.in
+    for line in 'class Asura < Formula' '  homepage "https://github.com/pidster/asura"' \
+        '  url "https://github.com/pidster/asura/releases/download/v@VERSION@/asura-@VERSION@-macos-arm64.tar.gz"' \
+        '  sha256 "@SHA256@"' '  license "MIT"' '  depends_on arch: :arm64' '  depends_on macos: :golden_gate' \
+        '    libexec.install "Asura.app"' '    bin.install_symlink libexec/"Asura.app/Contents/MacOS/asura"' \
+        '    assert_equal "@VERSION@", shell_output("#{bin}/asura --version").strip' \
+        '    system "/usr/bin/codesign", "--verify", "--deep", "--strict", app'; do
+        check "formula template line: ${line#"${line%%[! ]*}"}" grep -Fqx -- "$line" "$template"
+    done
+    for digest in helper_sha256 metallib_sha256 hub_bundle_sha256; do
+        check "formula test checks $digest" grep -Fq "manifest[\"$digest\"]" "$template"
+    done
+    check 'formula has no post_install, service, caveats or uninstall hook' sh -c '! grep -Eq "def (post_install|caveats)|^ *service do|uninstall" "$1"' sh "$template"
+    check 'formula never runs the helper' sh -c '! grep -Eq "shell_output\\(.*asura-model|system .*asura-model" "$1"' sh "$template"
+    check 'formula placeholders are only @VERSION@ and @SHA256@' \
+        [ "$(grep -o '@[A-Z0-9_]*@' "$template" | LC_ALL=C sort -u | tr '\n' ' ')" = '@SHA256@ @VERSION@ ' ]
+    for script in asura-release asura-bundle; do
+        check "HD10: $script holds no publishing command" sh -c \
+            '! grep -En "gh +release +(create|upload|edit|delete)|gi[t]( -C [^ ]+)? +(push|tag)|gh +api .*(-X|--method)|gh +repo +(create|edit)" "$1"' sh "$release/$script"
+    done
+    tool=$release/asura-release
+    fake=$scratch/sg4
+    mkdir -p "$fake"
+    printf 'archive' > "$fake/asura-9.9.9-macos-arm64.tar.gz"
+    (cd "$fake" && shasum -a 256 asura-9.9.9-macos-arm64.tar.gz > asura-9.9.9-macos-arm64.tar.gz.sha256)
+    refuses_tool() { # LABEL EXPECTED ARGS... (no output file may appear)
+        label=$1 expected=$2; shift 2
+        set +e
+        message=$("$tool" "$@" 2>&1 >/dev/null)
+        status=$?
+        set -e
+        if [ "$status" -eq 1 ] && printf '%s' "$message" | grep -Fq -- "$expected" && [ ! -e "$fake/out.rb" ]; then
+            pass "asura-release refuses: $label"
+        else
+            bad "asura-release refuses: $label (status $status: $message)"
+        fi
+    }
+    a9=$fake/asura-9.9.9-macos-arm64.tar.gz
+    refuses_tool 'unknown argument' 'unknown argument' check --bogus
+    refuses_tool 'malformed version' 'MAJOR.MINOR.PATCH' preflight --version 1.0
+    refuses_tool 'check without a kind' 'choose --release or --ad-hoc' check --version 9.9.9 --archive "$a9"
+    refuses_tool 'release check without a team' 'team-id' check --release --version 9.9.9 --archive "$a9"
+    refuses_tool 'ad hoc check with a team' 'takes no team ID' check --ad-hoc --team-id ABCDE12345 --version 9.9.9 --archive "$a9"
+    refuses_tool 'missing archive' 'regular file' formula --version 9.9.9 --archive "$fake/none.tar.gz" --out "$fake/out.rb"
+    refuses_tool 'formula for another version' 'does not match version' formula --version 9.9.8 --archive "$a9" --out "$fake/out.rb"
+    : > "$fake/exists.rb"
+    refuses_tool 'formula over an existing file' 'must not exist' formula --version 9.9.9 --archive "$a9" --out "$fake/exists.rb"
+    cp "$a9.sha256" "$fake/keep"
+    printf '%064d  asura-9.9.9-macos-arm64.tar.gz\n' 0 > "$a9.sha256"
+    refuses_tool 'formula from an archive that fails its .sha256 (HD5)' 'does not match its .sha256' formula --version 9.9.9 --archive "$a9" --out "$fake/out.rb"
+    mv "$fake/keep" "$a9.sha256"
+    refuses_tool 'tap test of a formula for another version' 'is not the v9.9.8 release asset' tap-test --version 9.9.8 --formula "$template"
+    refuses_tool 'verify-release without a revision' '--revision R is required' verify-release --version 9.9.9 --team-id ABCDE12345 --archive "$a9"
+    if "$tool" formula --version 9.9.9 --archive "$a9" --out "$fake/asura.rb" >/dev/null; then
+        digest=$(cut -d ' ' -f 1 < "$a9.sha256")
+        check 'formula equals the template with the version and digest' \
+            [ "$(cat "$fake/asura.rb")" = "$(sed -e 's/@VERSION@/9.9.9/g' -e "s/@SHA256@/$digest/g" "$template")" ]
+    else
+        bad 'formula writes the formula for a matching archive'
+    fi
 }
 
 bundle_checks() {
@@ -257,6 +342,23 @@ bundle_checks() {
     check 'asura binary embeds the helper and Hub bundle digests' /usr/bin/python3 -I -c \
         'import sys; data = open(sys.argv[1], "rb").read(); sys.exit(0 if all(bytes.fromhex(h) in data for h in sys.argv[2:]) else 1)' \
         "$contents/MacOS/asura" "$(field helper_sha256)" "$(field hub_bundle_sha256)" "$(field build_id)"
+    # SG4: the dry-run archive beside the bundle passes the ad hoc archive check
+    # (manifest, signatures, digests, asura --version) and yields a formula.
+    version=$(value CFBundleShortVersionString "$contents/Info.plist")
+    archive=$(dirname -- "$app")/asura-$version-macos-arm64-adhoc-unstapled.tar.gz
+    if [ -f "$archive" ]; then
+        log=$(mktemp -d "${TMPDIR:-/tmp}/asura-bundle-test.XXXXXXXX")
+        if "$release/asura-release" check --ad-hoc --version "$version" --archive "$archive" > "$log/check.txt" 2>&1; then
+            pass "asura-release check --ad-hoc ($(tail -n 1 "$log/check.txt"))"
+        else
+            bad "asura-release check --ad-hoc"; grep '^FAIL' "$log/check.txt" | sed 's/^/  /'
+        fi
+        check 'asura-release formula from the dry-run archive' \
+            "$release/asura-release" formula --version "$version" --archive "$archive" --out "$log/asura.rb"
+        rm -rf "$log"
+    else
+        bad "no dry-run archive beside the bundle: $archive"
+    fi
 }
 
 # SG-V5 (release-signing.md#sg2-delivery). The shipped helper list reads only

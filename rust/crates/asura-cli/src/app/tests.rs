@@ -200,3 +200,16 @@ fn project_list_prints_every_page_as_it_arrives() {
         crate::conversation::JOURNAL_DISK_NOTICE
     );
 }
+#[test]
+fn version_parses_alone_and_refuses_a_log_directory() {
+    assert_eq!(parse(&arguments(&["--version"])), Ok(Command::Version));
+    for args in [
+        &["--version", "extra"][..],
+        &["version"],
+        &["-V"],
+        &["--help", "--version"],
+    ] {
+        assert!(parse(&arguments(args)).is_err());
+    }
+    assert!(logging_options(&arguments(&["--version", "--logs", "a"])).is_err());
+}

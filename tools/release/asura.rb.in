@@ -1,0 +1,33 @@
+class Asura < Formula
+  desc "Coding AI harness for macOS with on-device models"
+  homepage "https://github.com/pidster/asura"
+  url "https://github.com/pidster/asura/releases/download/v@VERSION@/asura-@VERSION@-macos-arm64.tar.gz"
+  sha256 "@SHA256@"
+  license "MIT"
+
+  depends_on arch: :arm64
+  depends_on macos: :golden_gate
+
+  def install
+    # The signed and notarised Asura.app stays whole: its profile authorises the Keychain access group,
+    # and the service re-execs the canonical bundle path, not the bin link (release-signing.md, SG4).
+    libexec.install "Asura.app"
+    bin.install_symlink libexec/"Asura.app/Contents/MacOS/asura"
+  end
+
+  test do
+    # --version opens no service, socket, log or Keychain. The helper is never started here: it claims
+    # the App Sandbox, so it is checked by signature and digest instead.
+    assert_equal "@VERSION@", shell_output("#{bin}/asura --version").strip
+    app = libexec/"Asura.app"
+    system "/usr/bin/codesign", "--verify", "--deep", "--strict", app
+    manifest = JSON.parse((app/"Contents/Resources/model-package.json").read)
+    assert_equal manifest["helper_sha256"], Digest::SHA256.file(app/"Contents/MacOS/asura-model").hexdigest
+    assert_equal manifest["metallib_sha256"], Digest::SHA256.file(app/"Contents/Resources/mlx.metallib").hexdigest
+    hub = app/"Contents/Resources/swift-transformers_Hub.bundle"
+    lines = Dir.glob("**/*", File::FNM_DOTMATCH, base: hub).select { |path| File.file?(hub/path) }.sort.map do |path|
+      "#{Digest::SHA256.file(hub/path).hexdigest}  #{path}\n"
+    end
+    assert_equal manifest["hub_bundle_sha256"], Digest::SHA256.hexdigest(lines.join)
+  end
+end

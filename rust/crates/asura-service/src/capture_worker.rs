@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use zeroize::Zeroizing;
 
 /// Transfer queue limits (R4).
@@ -832,12 +832,12 @@ impl Worker {
             // The held scan is a blocked call: abandonment takes effect
             // only when it returns.
             while home.join("capture-hold-scan").exists() {
-                std::thread::sleep(Duration::from_millis(2));
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
             if let Ok(text) = std::fs::read_to_string(home.join("capture-throttle-scan"))
                 && let Ok(micros) = text.trim().parse::<u64>()
             {
-                std::thread::sleep(Duration::from_micros(micros));
+                std::thread::sleep(std::time::Duration::from_micros(micros));
             }
         }
         #[cfg(not(feature = "test-support"))]

@@ -9,6 +9,8 @@ profile.
 | File | Purpose |
 | --- | --- |
 | `asura-bundle` | The package script: `--ad-hoc` (dry run), `--development` or `--release` |
+| `asura-release` | Release promotion checks and the formula (SG4): `preflight`, `check`, `formula`, `tap-test`, `verify-release`. It never publishes |
+| `asura.rb.in` | The Homebrew formula template for `pidster/homebrew-tap` (`Formula/asura.rb`) |
 | `test-asura-bundle` | Checks: `--static` (tracked files and refusals), `--bundle APP` (an ad hoc bundle), `--sandbox APP` (the helper App Sandbox with an ad hoc bundle, SG-V5) |
 | `sandbox-probe.c` | The SG-V5 negative fixture that `--sandbox` builds and signs with the helper's sandbox list |
 | `secret-store-qualification` | The signed qualification of the team Keychain store (SG3, SGQ6): builds, signs and runs `AsuraKeychainQualification.app` with the test App ID |
@@ -56,6 +58,11 @@ tools/release/asura-bundle --development --out .build/bundles/dev-1 \
   --profile .build/signing/<development>.provisionprofile
 ```
 
+`--identity` also takes the certificate's SHA-1 hash, which is needed when two
+certificates share a name. macOS development profiles do not grant
+`get-task-allow`, and the script does not ask them to: the development lists
+claim it, and macOS does not restrict it to a profile.
+
 Release (Developer ID identity, Developer ID profile, notarised and stapled):
 
 ```sh
@@ -78,6 +85,9 @@ submission continues at Apple. Query it later with
 `xcrun notarytool info <submission-id> --keychain-profile <notary-profile>`.
 Do not submit the same build again. Stapling retries at 1, 2, 4 … 60 s until it
 succeeds or you press Ctrl-C.
+
+A successful run ends with the line `asura-bundle: step=done`. A run that
+stops earlier wrote no archive.
 
 ## Outputs
 
@@ -165,12 +175,109 @@ ASURA_PROTOC="$PWD/.build/dev-tools/protoc" \
 tools/release/secret-store-qualification --ad-hoc --out .build/bundles/kc-qual-adhoc-1
 ```
 
+## Release promotion and publication (SG4)
+
+The [SG4 design](../../docs/designs/release-signing.md#sg4-release-promotion-and-formula)
+governs these steps. `asura-release` only checks; every command that creates a
+tag, a release or a tap commit below is the owner's (SGQ9). Each mode prints
+`PASS`, `FAIL`, `NOTE` and `RECORD` lines and exits 1 on any `FAIL`. No step
+has a time bound; Ctrl-C cancels. Keep the output of each step with the
+release evidence.
+
+Owner prerequisites, once:
+
+- Enable immutable releases for `pidster/asura` (repository Settings >
+  General > Releases). `preflight` refuses until
+  `gh api repos/pidster/asura/immutable-releases` reports `"enabled": true`.
+- Decide SG4-O1 (embedded build-host paths, reported as `NOTE` by `check`).
+
+Below, `V` is the `asura-cli` version, `T` the team ID and `R` the released
+commit. Use a clean worktree of `main` at `R`, as for NT-P1.
+
+1. Preflight (read only):
+
+   ```sh
+   tools/release/asura-release preflight --version V
+   ```
+
+2. Build, notarise and staple; the last line must be `asura-bundle: step=done`:
+
+   ```sh
+   tools/release/asura-bundle --release --out .build/bundles/release-V \
+     --identity "Developer ID Application: <Name> (T)" --team-id T \
+     --profile .build/signing/<developer-id>.provisionprofile --notary-profile <notary-profile>
+   ```
+
+3. Check the archive and keep the `RECORD` lines:
+
+   ```sh
+   A=.build/bundles/release-V/asura-V-macos-arm64.tar.gz
+   tools/release/asura-release check --release --team-id T --version V --archive "$A" | tee .build/bundles/release-V/check.txt
+   ```
+
+4. Generate the formula and test it from a local tap (`file://` URL). The
+   mode refuses if `$(brew --prefix)/bin/asura` exists or `asura` is installed,
+   sets `HOMEBREW_NO_AUTO_UPDATE=1`, uses only the tap `asura-release/local`,
+   and uninstalls and untaps at the end:
+
+   ```sh
+   tools/release/asura-release formula --version V --archive "$A" --out .build/bundles/release-V/asura.rb
+   tools/release/asura-release tap-test --version V --formula .build/bundles/release-V/asura.rb \
+     --archive "$A" --release --team-id T
+   ```
+
+5. Publish (owner). Upload exactly the two assets as a draft, then publish:
+
+   ```sh
+   gh release create vV --repo pidster/asura --draft --target R --title "Asura V" \
+     --notes "Asura V for Apple silicon, macOS 27 or later." "$A" "$A.sha256"
+   gh release edit vV --repo pidster/asura --draft=false
+   ```
+
+   If the draft step fails, delete the draft and repeat; nothing is published.
+
+6. Verify the published release (HD12, HD13). On any `FAIL`, stop: the release
+   stays, the tap is not changed, and a fix needs a new version:
+
+   ```sh
+   tools/release/asura-release verify-release --version V --archive "$A" --revision R --team-id T
+   ```
+
+7. Test the unchanged formula against the HTTPS asset (also `brew audit
+   --online`; records the HTTPS quarantine state, open point 6):
+
+   ```sh
+   tools/release/asura-release tap-test --version V --formula .build/bundles/release-V/asura.rb --release --team-id T
+   ```
+
+8. Tap (owner). In a clone of `pidster/homebrew-tap`, copy the formula to
+   `Formula/asura.rb`, add this row to the `README.md` table, commit and push
+   with a normal fast-forward push:
+
+   ```text
+   | [asura](Formula/asura.rb) | Coding AI harness for macOS with on-device models. Apple silicon, macOS 27 or later. Source and docs: [pidster/asura](https://github.com/pidster/asura). |
+   ```
+
+9. Clean host (HD1): with no `asura` installed,
+
+   ```sh
+   HOMEBREW_NO_AUTO_UPDATE=1 brew install pidster/tap/asura
+   brew test pidster/tap/asura
+   K="$(brew --prefix pidster/tap/asura)/libexec/Asura.app"
+   codesign --verify --deep --strict "$K" && xcrun stapler validate "$K" && spctl --assess --type execute --verbose=2 "$K"
+   asura --version
+   ```
+
+   On a failure, revert the tap commit with a new commit and fix in a new
+   version.
+
 ## What the dry run does not prove
 
 - The restricted entitlements (`keychain-access-groups`, application and team
   identifiers). An ad hoc process that claims them is killed at launch, so the
   ad hoc lists omit them. Probes KC-P1 and KC-P2 need a signed bundle.
-- Notarisation and stapling (probe NT-P1, packet SG4), including whether the
-  notary service accepts the helper's temporary exceptions.
+- Notarisation and stapling. Probe NT-P1 proved them on 2026-10-27, with the
+  helper's temporary exceptions accepted; each release proves them again in
+  step 3 above.
 - The helper App Sandbox under a real signature. The ad hoc helper claims the
   same list, and `--sandbox` proves it with a test variant.
