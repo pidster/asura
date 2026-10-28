@@ -27,6 +27,8 @@ the notary service accepted `Asura.app` with the sandboxed helper, and the
 stapled ticket and the signatures survived the archive and a Homebrew keg.
 Packet SG4 (2026-10-28) corrects the development `get-task-allow` profile
 check and selects the [release promotion and formula](#sg4-release-promotion-and-formula).
+SG4 delivered the scripts on 2026-10-28 ([SG4 delivery](#sg4-delivery)); nothing
+was published.
 
 What is fixed:
 
@@ -1764,7 +1766,7 @@ signing packet.
 | SG2a | Delivered (branch `sg2a`, 2026-10-23) | — |
 | SG2 | Delivered (branch `sg2`, 2026-10-23) | — ([delivery](#sg2-delivery)) |
 | SG3 | Delivered (2026-10-27) | — ([delivery](#sg3-delivery)); the signed qualification run (SGQ6) is the owner's |
-| SG4 | Ready (NT-P1 passed, 2026-10-27) | — ([SG4 design](#sg4-release-promotion-and-formula)); publication is the owner's |
+| SG4 | Delivered (2026-10-28) | — ([delivery](#sg4-delivery)); publication, the release-mode checks and the clean-host install are the owner's |
 | SG5 | Not ready | SG3 and SG4 |
 
 ### SG1 delivery
@@ -1962,6 +1964,55 @@ data-protection keychain, are unverified. -25308 as `locked` stays unverified
 SG5. The field evidence is verified for its content and audit form in tests;
 no SSH or before-first-unlock occurrence has been observed.
 
+### SG4 delivery
+
+Delivered 2026-10-28 on the SG4 worktree branch. One Apple Development
+signature was made (the development bundle below). No Developer ID signature,
+`notarytool` submission or `stapler` call was made: the NT-P1 notarised
+archive and the checks below satisfy the gates that a new submission would
+serve, and the release build must come from the merged `main`.
+`security list-keychains -d user` listed only the login keychain before and
+after. No tag, GitHub release, asset or tap commit was created; the owner's
+`pidster/tap` was not touched; `~/.asura` was not used.
+
+- `tools/release/asura-bundle`: the development `get-task-allow` fix and the
+  final `asura-bundle: step=done` line.
+- `tools/release/asura-release` and `tools/release/asura.rb.in`
+  ([modes](#sg4-asura-release-modes), [formula](#formula)).
+- `tools/release/test-asura-bundle`: SG4 static checks, and the ad hoc
+  archive check and formula under `--bundle`.
+- `asura-cli`: `asura --version` ([contract](#asura---version)).
+- `asura-service`: the unused `Duration` import is gone from builds without
+  `test-support` (NT-P1 anomaly).
+- `tools/release/README.md`: the operator steps and the owner's publication
+  commands.
+
+| Case | Layer | Evidence (macOS 27.0 26A428, Homebrew 7.0.11) |
+| --- | --- | --- |
+| `get-task-allow` fix | Unit | `--static`: a development profile without `get-task-allow` passes preflight; a Developer ID profile that grants it is refused; one without it passes |
+| `get-task-allow` fix | Integration | `asura-bundle --development` with the Apple Development certificate (by SHA-1, team `LFQFWCB8Y3`) and the owner's development profile, which grants no `get-task-allow`: `step=done`; `codesign --verify --strict` and `--deep --strict` pass; `asura` claims the application and team identifiers, the one access group and `get-task-allow`; the helper claims the three SG2 keys and `get-task-allow`; `asura --help` and `asura --version` run. The service was not started |
+| SG-V11, HD8 | Unit | `version_parses_alone_and_refuses_a_log_directory` |
+| SG-V11, HD8 | Integration | `version_prints_the_package_version_without_writes_or_network` (Seatbelt: deny file writes and network) |
+| SG-V11, HD10 | Unit | `--static`: neither script holds a publishing command; 11 `asura-release` refusals; the generated formula equals the template with the values; 115 checks passed |
+| SG-V11, HD9 | Integration | `asura-release check --ad-hoc` on the dry-run archive: 38 passed. `check --release` on the NT-P1 notarised archive: 50 passed, 1 failed (`asura --version`, which that build predates); every manifest, signature, profile, ticket, Gatekeeper and digest check passed |
+| SG-V11, HD1, HD5, HD9 | Integration | `tap-test --archive` with the ad hoc archive: `brew audit --strict` passes on the formula as published; the wrong-digest install fails with Homebrew's checksum error, and no keg and no link remain; install, `brew test` (version, signature, digests), the link into the keg, the digests and `bin/asura --version` pass; cleanup leaves no `bin/asura` and no trust entry: 17 passed |
+| SG-V11, HD12 | Integration | `preflight --version 0.1.0` on this branch: refused, as required, for the unclean tree, `HEAD` not at `origin/main` and immutable releases disabled |
+
+Proof limits:
+
+- Not run (owner, after merge): `check --release` and `tap-test --release` on
+  a new release archive, publication, `verify-release` (HD12, HD13 after
+  publication), the HTTPS `tap-test` with `audit --online`, and the
+  clean-host install (HD1 end to end).
+- HD13's remote digest comparison is exercised only through its shared
+  `check` path and the `.sha256` refusal; no published release exists.
+- The HTTPS quarantine state (open point 6) and the NT-P1 offline Gatekeeper
+  check remain open.
+- The formula test ran on an ad hoc keg; the notarised keg is NT-P1's
+  (2026-10-27), which predates `--version`.
+- `asura --version` under Homebrew's own test sandbox ran for the ad hoc keg
+  only.
+
 ## Design verification
 
 Recorded on 2026-10-23. Written from the draft of the same day and the owner's
@@ -2026,6 +2077,7 @@ security bullet, limits, AE-02, AE-04, SG-V11, the SG4 owned paths and
 readiness. Diagrams SG-F9 and SG-F10, and CF01 in the
 [command flows](command-flows.md), were rendered with the local Mermaid CLI
 (`mmdc -s 2`) into a temporary directory outside the repository and
-inspected.
+inspected. The [SG4 delivery](#sg4-delivery) record was added after the code
+and its checks; it changes no diagram.
 
 Return to the [design index](README.md).
