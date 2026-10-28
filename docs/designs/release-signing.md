@@ -22,6 +22,11 @@ service reads from its own entitlements, and every Keychain error records its
 status and the session state as field evidence. Packet SG3 delivered the
 code on 2026-10-27 ([SG3 delivery](#sg3-delivery)); the signed qualification
 run remains for the owner.
+Probe NT-P1 ran on 2026-10-27 ([NT-P1 results](#nt-p1-results-2026-10-27)):
+the notary service accepted `Asura.app` with the sandboxed helper, and the
+stapled ticket and the signatures survived the archive and a Homebrew keg.
+Packet SG4 (2026-10-28) corrects the development `get-task-allow` profile
+check and selects the [release promotion and formula](#sg4-release-promotion-and-formula).
 
 What is fixed:
 
@@ -42,7 +47,12 @@ What is open:
   not run; the `locked` mapping of -25308 stays unverified until KC-P3 runs or
   field evidence ([F3](#keychain-field-evidence)) settles it;
 - the Secure Enclave design item, kept open for later study (SGQ8,
-  [Secure Enclave](#secure-enclave-open-item)).
+  [Secure Enclave](#secure-enclave-open-item));
+- the NT-P1 offline Gatekeeper check (network off, stapled ticket only),
+  which the owner runs ([NT-P1 results](#nt-p1-results-2026-10-27));
+- the owner decisions that SG4 records in
+  [SG4 open items](#sg4-open-items): embedded build-host paths and the first
+  publication.
 
 This design owns the signing and notarisation contract that
 [release distribution](release-distribution.md) leaves open. Packet SG3
@@ -318,11 +328,16 @@ Apple facts used here, from
 - `notarytool store-credentials` saves the credential as a keychain profile,
   and `--keychain-profile` keeps it out of scripts.
 
-Unverified: whether the stapled ticket survives the `.tar.gz` round trip and
-Homebrew's extraction (probe NT-P1). Unverified: whether Homebrew sets
-`com.apple.quarantine` on formula downloads. If it does not, Gatekeeper never
-assesses the formula install, and notarisation protects only direct downloads
-from the GitHub release. Probe NT-P1 records the result either way.
+Verified by NT-P1 (2026-10-27): the stapled ticket survives the `.tar.gz`
+round trip and Homebrew's extraction into a keg, and `stapler validate`,
+`codesign --verify --deep --strict` and `spctl` pass in both places. Homebrew
+did not change the signed files in the keg. Unverified: whether Homebrew sets
+`com.apple.quarantine` on an HTTPS formula download. NT-P1 used a `file://`
+URL, and that download got no quarantine. If an HTTPS download gets none
+either, Gatekeeper never assesses the formula install, and notarisation
+protects only direct downloads from the GitHub release. The first
+post-publication tap test records the HTTPS result
+([SG4 checks](#sg4-asura-release-modes)).
 
 ### Where credentials live
 
@@ -356,7 +371,7 @@ Selected (SGQ3).
 | --- | --- | --- | --- |
 | Signature | Linker ad hoc | Apple Development certificate | Developer ID Application |
 | Hardened Runtime | No | Yes | Yes |
-| `get-task-allow` | Implicit (ad hoc) | Yes, so that the owner can debug | No |
+| `get-task-allow` | Implicit (ad hoc) | Yes, so that the owner can debug. The profile need not list it | No. The script refuses a Developer ID profile that grants it |
 | Profile | None | macOS development profile, registered Mac | Developer ID profile |
 | Data-protection keychain | Unavailable: the build claims no group, so the store makes no Keychain call and reports `not_signed` ([access group](#access-group-from-the-entitlements)). A call that names a group returns -34018 (KC-P1) | Available, group `<TeamID>.org.pidster.asura` | Available, same group |
 | Helper App Sandbox | No | Yes if the HS probes pass, development signed | Yes if the HS probes pass |
@@ -370,11 +385,18 @@ installation. Probe KC-P1 showed that Apple Development and Developer ID
 signatures from one team both satisfy the group: each read and deleted the
 other's items (2026-10-27).
 
-Found by the owner's profile check (2026-10-27): macOS development profiles
-carry no `com.apple.security.get-task-allow`. The SG1 script refuses a
-development profile without it, and `asura.development.plist` claims it. This
-is an SG1 defect for packet SG4 (or an SG1 follow-up) to correct before the
-first `--development` bundle; SG3 does not change `asura-bundle`.
+`get-task-allow` in development (corrected by SG4, 2026-10-28). The owner's
+profile check (2026-10-27) found that macOS development profiles carry no
+`com.apple.security.get-task-allow`. On macOS this entitlement is not
+restricted: a profile need not authorise it. KC-P1's Apple Development bundle
+claimed it under a profile without it, launched and passed every Keychain
+case. SG1 refused such a profile, which was a defect. The rule is now:
+
+- `--development` does not read `get-task-allow` from the profile.
+  `asura.development.plist` and `asura-model.development.plist` still claim it
+  as `true`, so the owner can debug a development bundle.
+- `--release` still refuses a Developer ID profile that grants it, and no
+  release list claims it (RS1: notarisation rejects it).
 
 ### SG1 package script
 
@@ -405,7 +427,10 @@ reads no keychain. The script refuses a profile that has expired, whose
 `TeamIdentifier` does not hold the team ID, whose
 `com.apple.application-identifier` is not `<TeamID>.org.pidster.asura`, or
 whose `keychain-access-groups` lacks `<TeamID>.org.pidster.asura` (or
-`<TeamID>.*`). No step calls `security`.
+`<TeamID>.*`). In release mode it also refuses a profile that grants
+`com.apple.security.get-task-allow`. Development mode does not check that key
+([development builds](#development-builds-compared-with-release-builds)).
+No step calls `security`.
 
 #### Entitlement files
 
@@ -487,7 +512,9 @@ the archive. A new run needs a new output directory.
 11. **Archive.** `asura-<version>-macos-arm64.tar.gz` holding `Asura.app` and
     `LICENSE`, with its SHA-256 beside it. The ad hoc archive is named
     `…-adhoc-unstapled.tar.gz` so that it cannot be mistaken for a release.
-    The release promotion and the formula stay with SG4.
+    The last line of a successful run is `asura-bundle: step=done` (SG4); a
+    run without it did not finish. The release promotion and the formula
+    follow in [SG4](#sg4-release-promotion-and-formula).
 
 The script also leaves the signed helper, `mlx.metallib`, the Hub bundle and
 `model-package.json` in `<out>/package/`, the development package layout
@@ -568,6 +595,205 @@ flowchart TD
     R --> Copy
 ```
 
+### SG4 release promotion and formula
+
+Selected design (packet SG4, engineering, 2026-10-28). It completes the
+[release promotion contract](release-distribution.md#release-promotion-contract)
+for the first release. It reuses the SG1 script for the build and the NT-P1
+evidence for notarisation and the keg. A new operator script,
+`tools/release/asura-release`, checks every step before and after
+publication. **No script publishes.** Creating the tag and the GitHub release,
+uploading the assets and pushing the tap commit are manual owner commands
+(SGQ9) in `tools/release/README.md`. The scripts therefore cannot change a
+tag, a release or the tap when a check fails (HD10).
+
+#### Version, archive and checksums
+
+| Item | Value |
+| --- | --- |
+| Version source | `version` in `rust/crates/asura-cli/Cargo.toml`. `Info.plist` (`CFBundleShortVersionString`, `CFBundleVersion`), `asura --version`, the archive name, the tag and the formula URL must all equal it |
+| Tag | `v<version>` on the released source revision |
+| Release assets | Exactly two: `asura-<version>-macos-arm64.tar.gz` and `asura-<version>-macos-arm64.tar.gz.sha256` (one `shasum -a 256` line: 64 lower-case hex digits, two spaces, the archive name) |
+| Asset URL | `https://github.com/pidster/asura/releases/download/v<version>/asura-<version>-macos-arm64.tar.gz` |
+| Archive manifest | `LICENSE` and `Asura.app` with exactly: `Contents/Info.plist`, `Contents/CodeResources` (the stapled ticket, release only), `Contents/embedded.provisionprofile` (signed modes), `Contents/_CodeSignature/CodeResources`, `Contents/MacOS/asura`, `Contents/MacOS/asura-model`, `Contents/Resources/mlx.metallib`, `Contents/Resources/model-package.json` and `Contents/Resources/swift-transformers_Hub.bundle/` (within the BN1 limits, checked by its digest). No other file, no symbolic link and no special file. Exactly two Mach-O files: `asura` and `asura-model` |
+
+The archive therefore carries no model weight, credential, private key,
+`.p8` or `.p12` file, and no undeclared binary. The embedded profile is not
+secret ([credentials](#where-credentials-live)).
+
+#### `asura --version`
+
+Selected, required by the formula contract (release-distribution: "a
+no-state `--version` test"). `asura --version` prints the `asura-cli`
+version and a line feed on standard output, writes nothing to standard error
+and exits 0. The CLI parses it like `--help`: it returns before any runtime
+directory, log file, service, socket or Keychain access, so it creates no
+state under any `HOME` (HD8). `--logs` with `--version` is invalid (exit 2).
+[CF01](command-flows.md#cf01-process-entry-and-command-selection) shows the
+branch.
+
+The helper's `--version` is not run from an installed bundle. The shipped
+helper claims the App Sandbox, so starting it would create its container
+under `org.pidster.asura.model` (SG2), and Homebrew runs formula tests inside
+its own Seatbelt profile. The formula checks the helper by signature and
+digest instead. The SG1 step 5 check proves the helper's build identity before
+signing.
+
+#### SG4 asura-release modes
+
+Each mode is read-only except `formula`, which writes one new file, and
+`tap-test`, which installs into Homebrew and removes the install again. Each
+mode prints `PASS`, `FAIL` or `NOTE` lines and ends with a count line. Any
+`FAIL` gives exit status 1. A refused input gives
+`asura-release: <mode>: <reason>` and exit status 1 before any effect.
+
+| Mode | When | Checks and effects |
+| --- | --- | --- |
+| `preflight --version V` | Before the release build | `V` equals the `asura-cli` version; the working tree is clean; `HEAD` equals the tip of `main` on `origin` (`git ls-remote`, no fetch); tag `vV` is absent locally and on `origin`; no GitHub release `vV` exists; immutable releases are enabled for `pidster/asura` (`gh api repos/pidster/asura/immutable-releases`, HD12). Every check runs and reports, so the operator sees all failures at once |
+| `check --archive A --version V (--release --team-id T \| --ad-hoc)` | After `asura-bundle`, and on the downloaded asset | The `.sha256` file beside `A` matches; the name matches the mode; the archive extracts into a new temporary directory and holds exactly the manifest; deep strict `codesign` verification; `Info.plist` identifier and version; both executables carry the Hardened Runtime and the tracked entitlement lists for the mode, and no `get-task-allow`; the helper, `metallib` and Hub bundle digests equal `model-package.json`, and `asura` embeds the helper and Hub digests and the build ID; the extracted `asura --version` prints `V`. Release only: the signing authority is a Developer ID Application certificate of team `T` with a secure timestamp; the embedded profile is for team `T` and `T.org.pidster.asura`, not expired and grants no `get-task-allow`; `stapler validate` passes; `spctl` accepts it as `Notarized Developer ID`. It prints a record block (below) and counts embedded build-host paths as a `NOTE` ([open items](#sg4-open-items)) |
+| `formula --archive A --version V --out F` | After `check` passes | Writes `F` (which must not exist) from `tools/release/asura.rb.in` with the version and the archive SHA-256. The digest is computed from `A` and must equal the `.sha256` file |
+| `tap-test --formula F [--archive A] [--release --team-id T]` | Before publication with `--archive`; after publication without it | See [local tap test](#local-tap-test) |
+| `verify-release --version V --archive A --revision R` | After the owner publishes the release | `gh release view vV`: not a draft, `isImmutable` true, exactly the two assets; the tag `vV` points to `R`; the asset downloads over HTTPS with `curl` into a new temporary directory; its SHA-256 equals `A` and the published `.sha256` asset; `check --release` passes on the download |
+
+The record block holds: the version, the source revision (`git rev-parse
+HEAD`) and whether the tree is clean, the SHA-256 of `Cargo.lock` and
+`swift/model-helper/Package.resolved`, `rustc -V`, `swift --version`, the
+macOS build, the archive name and SHA-256, the build ID and the helper,
+`metallib` and Hub bundle digests, the signing authority chain, the team ID,
+and, in release mode, the notary submission ID and status read from
+`notary-submit.plist` beside the archive when present. It names identities by
+certificate name only and prints no secret. The operator keeps it with the
+release evidence; it is not a release asset.
+
+#### Local tap test
+
+Selected. Homebrew rules for every scripted install (NT-P1 anomaly: Homebrew
+updated itself during the probe install):
+
+- `HOMEBREW_NO_AUTO_UPDATE=1` is set for every `brew` call.
+- Before anything else, `$(brew --prefix)/bin/asura` must be absent, no
+  formula named `asura` may be installed, and the test tap must not exist.
+  Otherwise the mode refuses with no change.
+- Only the local tap `asura-release/local` is created
+  (`brew tap-new --no-git`). The owner's `pidster/tap` is never read or
+  changed.
+- Cleanup always runs, also after a failure or Ctrl-C: uninstall `asura`
+  if this run installed it, untap `asura-release/local`, and check that
+  `bin/asura` is absent.
+
+Steps:
+
+1. Write the tap formula. With `--archive`, the tap copy replaces only the
+   `url` line with a `file://` URL to the archive, and the mode checks that
+   no other line differs. Without `--archive`, the tap copy equals the
+   formula, so the install downloads the published HTTPS asset.
+2. HD5: install a copy whose `sha256` is wrong. The install must fail, and no
+   keg and no `bin/asura` link may exist afterwards. `asura` never runs, so
+   `.asura` cannot change.
+3. Install the correct formula, then `brew test` and `brew audit --strict`
+   (and `--online` without `--archive`).
+4. Keg checks: `bin/asura` resolves into the keg's `Asura.app`; deep strict
+   `codesign` verification; the digests equal `model-package.json`;
+   `bin/asura --version` prints the formula version. With `--release`: the
+   Developer ID authority and team `T`, `stapler validate` and `spctl` as in
+   `check`. The quarantine attributes of the Homebrew download and of the
+   keg are recorded as `NOTE` lines (open point 6).
+
+#### Formula
+
+Selected. `tools/release/asura.rb.in` is the tracked template; `formula`
+fills `@VERSION@` and `@SHA256@`. The generated file is
+`Formula/asura.rb` in `pidster/homebrew-tap`, beside `wisp.rb` and
+`daimon.rb`, in the same style.
+
+- Fields: `desc`, `homepage` `https://github.com/pidster/asura`, the asset
+  `url`, `sha256`, `license "MIT"`, `depends_on arch: :arm64` and
+  `depends_on macos: :golden_gate` (macOS 27, the symbol of Homebrew 7.0.11
+  and of the existing tap formulae).
+- `install`: `libexec.install "Asura.app"` and
+  `bin.install_symlink libexec/"Asura.app/Contents/MacOS/asura"`
+  ([bundle layout](#bundle-layout), KC-P2). Homebrew installs `LICENSE` into
+  the keg.
+- No `post_install`, `service`, `caveats` code or uninstall hook. The formula
+  never starts the service, creates `.asura`, migrates data or deletes user
+  data (release-distribution).
+- `test`: `asura --version` equals the version; `codesign --verify --deep
+  --strict` of `Asura.app`; the helper, `metallib` and Hub bundle digests
+  equal `model-package.json`. This is the offline package and resource check
+  that release-distribution requires; it opens no service and never runs the
+  helper.
+
+The tap `README.md` gains one table row for `asura`. The formula is published
+only after the steps in [SG-F10](#sg-f10-publication-and-tap) pass.
+
+#### SG-F9: release build and prepublication checks
+
+Selected design. Arrows show the next step; labelled arrows show a check
+result. Every "Hold" leaves the tags, the releases and the tap unchanged.
+
+```mermaid
+flowchart TD
+    Pre["asura-release preflight --version V"] --> PreOK{"Version, clean tree, HEAD at origin main, no tag, no release, immutability on?"}
+    PreOK -->|"Any FAIL"| H0["Hold: fix the cause, no build"]
+    PreOK -->|"All PASS"| Build["asura-bundle --release: build, sign, notarise, staple, archive"]
+    Build -->|"Stops before step=done"| H1["Hold: no archive; a new run needs a new output directory"]
+    Build -->|"step=done"| Check["asura-release check --release: manifest, signatures, profile, ticket, digests, version, record"]
+    Check -->|"Any FAIL"| H2["Hold: fix, new build, same version"]
+    Check -->|"All PASS"| Form["asura-release formula: asura.rb from the template and the archive SHA-256"]
+    Form --> Tap["asura-release tap-test --archive: local tap, file URL"]
+    Tap -->|"Any FAIL"| H2
+    Tap -->|"All PASS"| Ready["Ready for the owner to publish (SG-F10)"]
+```
+
+#### SG-F10: publication and tap
+
+Selected design. Arrows show the next step; labelled arrows show a check
+result. Steps whose label starts with "Owner" are manual owner commands
+(SGQ9); the scripts only check.
+
+```mermaid
+flowchart TD
+    Ready["SG-F9 passed"] --> Draft["Owner: gh release create vV --draft --target R with the two assets"]
+    Draft --> Pub["Owner: publish the draft"]
+    Pub --> Ver["asura-release verify-release: immutable, two assets, tag at R, HTTPS digest, check"]
+    Ver -->|"Any FAIL"| H3["Hold tap: release stays; a corrected artifact needs a new version (HD13)"]
+    Ver -->|"All PASS"| Tap2["asura-release tap-test without --archive: HTTPS asset, audit --online"]
+    Tap2 -->|"Any FAIL"| H3
+    Tap2 -->|"All PASS"| Push["Owner: commit Formula/asura.rb and the README row to pidster/homebrew-tap; push"]
+    Push --> Clean["Owner, clean host: brew install pidster/tap/asura, brew test, keg checks"]
+    Clean -->|FAIL| Revert["Owner: revert the tap commit to the prior formula; new version for a fix"]
+    Clean -->|PASS| Done["Release qualified for HD1"]
+```
+
+#### SG4 failure handling
+
+| Failure | Result |
+| --- | --- |
+| A preflight check fails (for example immutability disabled) | No build. The operator fixes the cause and runs preflight again |
+| `asura-bundle` stops, or `check` or the prepublication tap test fails | Nothing is published. A fixed build is a new build in a new output directory; the version may stay because no tag exists |
+| `notarytool --wait` is cancelled | Query the submission ID (`notarytool info`); never submit the same build again |
+| The draft or the publication fails | The owner deletes the draft (a draft is not immutable) and repeats; no tap change |
+| `verify-release` or the post-publication tap test fails | The published release stays. The tap keeps its prior formula. A corrected artifact needs a new version and tag (HD13) |
+| The clean-host install fails after the tap push | The owner reverts the tap commit with a new commit (no force push). A fix needs a new version |
+| A `tap-test` step fails or is cancelled | Cleanup still uninstalls and untaps; `bin/asura` must be absent afterwards |
+
+#### SG4 open items
+
+- **SG4-O1, embedded build-host paths (owner decision).** The NT-P1 `asura`
+  binary holds 1,614 strings with the build account's home path, mostly Cargo
+  registry source paths in panic locations, and `asura-model` holds 61. They
+  are not files and no code reads them, but they name the build account.
+  `check` counts them as a `NOTE`, not a `FAIL`. The owner decides whether
+  0.1.0 ships with them or whether a later packet adds path remapping (Rust
+  `--remap-path-prefix`, Swift and C `-file-prefix-map`). Remapping changes the
+  signed helper bytes, so it needs its own SG-V5 and NT-P1-style rerun.
+- **SG4-O2, immutable releases are disabled.** On 2026-10-28
+  `gh api repos/pidster/asura/immutable-releases` returned
+  `{"enabled":false}`. Preflight refuses until the owner enables it (HD12).
+- **Owner actions, not open design.** Publication (SGQ9); the offline
+  Gatekeeper check of NT-P1; the HTTPS quarantine record (open point 6),
+  which the first post-publication tap test gives; and the clean-host install.
+
 ## Service App Sandbox: no
 
 Selected (D-S1). Each row gives its evidence and its status.
@@ -626,9 +852,10 @@ apps. A custom Seatbelt profile would have to list them and keep them current.
 | EX14 provider credentials | A sandboxed bare executable cannot claim `keychain-access-groups` (no profile). The EX14 design must choose between a nested `AsuraModel.app` with its own profile and the service passing the credential over the private channel. | Recorded dependency, not decided here | — |
 
 Temporary-exception entitlements are acceptable for Developer ID. The Mac App
-Store reviews them; notarisation does not reject them. This is a reading of
-the documentation and is **unverified** until NT-P1 notarises a helper that
-claims them. If `home-relative-path` cannot express `~/.asura/run/` because the
+Store reviews them; notarisation does not reject them. NT-P1 verified this on
+2026-10-27: the notary service accepted a helper that claims the App Sandbox,
+`network.client` and both home-relative read-only exceptions, and its log
+lists no issue. If `home-relative-path` cannot express `~/.asura/run/` because the
 account home is not the container owner's home, the fallback is a read-only
 exception for the exact run directory. That is weaker, because the home path
 differs per user.
@@ -1249,8 +1476,9 @@ flowchart TD
   ([Notarizing macOS software](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)).
 - **Helper sandbox.** SG2 ships it (2026-10-23): it limits a compromised
   helper to reading models, its run directory and the Hub bundle, using the
-  network, and writing its container. EX-H1 is not recorded. If NT-P1 rejects
-  the sandboxed helper, SG-F2 ships it unsandboxed and EX-H1 is recorded.
+  network, and writing its container. EX-H1 is not recorded. NT-P1 accepted
+  the sandboxed helper (2026-10-27), so SG-F2 ends at "Release requirement
+  met".
 - **New residual SG-T3 (HS-P7).** The App Sandbox does not stop the helper
   reading the arguments and environment of other processes of the same user
   through `KERN_PROCARGS2` (process list and descriptor info are denied, these
@@ -1287,15 +1515,18 @@ flowchart TD
 | `Asura.app` | At most 64 files (selected; the current count is under 20) | SG1 release script |
 | Notarisation | One submission at a time; at most 75 per day (Apple) | Release operator |
 | Stapling retries | Paced 1, 2, 4, 8 … s, at most 60 s apart, no count limit | Release script |
+| Release assets | Exactly two: the archive and its `.sha256` file | SG4 `asura-release` |
+| Archive contents | The [manifest](#version-archive-and-checksums): two Mach-O files, at most 64 files in `Asura.app` (SG1), the Hub bundle within BN1 limits | SG4 `asura-release check` |
+| Scripted Homebrew installs | One at a time, local tap `asura-release/local` only, `HOMEBREW_NO_AUTO_UPDATE=1` | SG4 `asura-release tap-test` |
 
 ## Asynchronous execution
 
 | Rule | Application |
 | --- | --- |
 | AE-01 | No signing or notarisation code exists in the runtime. The runtime gains no new call on the reactor, control or render path |
-| AE-02 | Runtime blocking calls: `SecItemAdd`, `SecItemCopyMatching` and `SecItemDelete` with the data-protection flag run on the existing secret store worker thread only (IPC to securityd). So do the access group check (`SecTaskCreateFromSelf`, `SecTaskCopyValueForEntitlement`, once per worker) and the field evidence reads (`sysctl`, `stat` of `/dev/console`, `getaudit_addr`, once per failed call). The Hub bundle copy runs on the existing preparation worker. The helper's sandbox set-up runs inside the helper process at exec, under the existing model-owner supervision. Release-time blocking tools (`codesign`, `ditto`, `notarytool`, `stapler`, `spctl`) run only in the operator's release script, one at a time |
+| AE-02 | Runtime blocking calls: `SecItemAdd`, `SecItemCopyMatching` and `SecItemDelete` with the data-protection flag run on the existing secret store worker thread only (IPC to securityd). So do the access group check (`SecTaskCreateFromSelf`, `SecTaskCopyValueForEntitlement`, once per worker) and the field evidence reads (`sysctl`, `stat` of `/dev/console`, `getaudit_addr`, once per failed call). The Hub bundle copy runs on the existing preparation worker. The helper's sandbox set-up runs inside the helper process at exec, under the existing model-owner supervision. Release-time blocking tools (`codesign`, `ditto`, `notarytool`, `stapler`, `spctl`, and for SG4 `git ls-remote`, `gh`, `curl`, `tar` and `brew`) run only in the operator's release scripts, one at a time. `asura --version` returns before any runtime access |
 | AE-03 | See [limits](#limits). No new queue is added |
-| AE-04 | No time bound. Store calls end with a reply, cancel or shutdown. `notarytool --wait` ends with the service's reply or an operator cancel. Stapling uses pacing only. The Hub copy ends on completion, failure or the preparation cancel flag |
+| AE-04 | No time bound. Store calls end with a reply, cancel or shutdown. `notarytool --wait` ends with the service's reply or an operator cancel. Stapling uses pacing only. The Hub copy ends on completion, failure or the preparation cancel flag. The SG4 network reads (`git ls-remote`, `gh`, `curl`) and `brew` calls end with their reply or an operator cancel; `tap-test` cleanup runs after a cancel |
 | AE-05 | A notarisation submission is not repeated after an unknown outcome. The operator queries its ID. A rejected build is never re-signed in place; a new build gets a new digest |
 | AE-06 | Service start: the store worker reads its access group when it opens the store and makes its first list call after replay, as today. A `not_signed` result is recorded and does not delay start; later requests get it without a call |
 | AE-07 | Acceptance: with a data-protection call blocked by the test seam, the TUI stays responsive and Ctrl-C and Drop work (existing SS case, repeated on the signed qualification bundle). With the Hub copy blocked by the test seam, cancel ends preparation and control stays responsive |
@@ -1337,7 +1568,7 @@ requires:
 | KC-P2 | Does the group apply when `asura` starts through a symlink, and in its re-exec as the service? | Homebrew-style `bin/asura` link | Same results as KC-P1 | Owner |
 | KC-P3 | Data-protection availability over SSH, and before first unlock | SSH session to the qualification Mac | Records the status codes. Not run (owner, 2026-10-27); the [field evidence](#keychain-field-evidence) gathers it until a rerun | Owner |
 | KC-P4 | Status code inventory; no prompt on any call | Qualification bundle | [Status mapping](#status-mapping) confirmed or corrected | Owner |
-| NT-P1 | Notarise a zip of `Asura.app` with a sandboxed helper that claims temporary exceptions; staple; tar round trip; Homebrew install | Real release dry run to a private tap branch | Accepted; `stapler validate` passes after extraction; `codesign --verify --strict` passes in the keg; quarantine state recorded | Owner |
+| NT-P1 | Notarise a zip of `Asura.app` with a sandboxed helper that claims temporary exceptions; staple; tar round trip; Homebrew install | Real release build, local tap with a `file://` URL | Accepted; `stapler validate` passes after extraction; `codesign --verify --strict` passes in the keg; quarantine state recorded. **Pass** (2026-10-27, [results](#nt-p1-results-2026-10-27)); the offline Gatekeeper case is pending with the owner | Owner |
 
 ### SG0 results (ad hoc part, 2026-10-23)
 
@@ -1405,7 +1636,7 @@ password to use the signing key while building.
 
 | Probe | Result | Effect |
 | --- | --- | --- |
-| Profiles (open point 2) | All four profiles (development and Developer ID, for `org.pidster.asura` and for `org.pidster.asura.test`) carry `keychain-access-groups` = `<TeamID>.*` with no capability turned on. The development profiles list this Mac; the Developer ID profiles provision all devices. The macOS development profiles carry no `get-task-allow` | Open point 2 resolved: no Keychain Sharing capability is needed. The `get-task-allow` finding is an SG1 defect ([development builds](#development-builds-compared-with-release-builds)) |
+| Profiles (open point 2) | All four profiles (development and Developer ID, for `org.pidster.asura` and for `org.pidster.asura.test`) carry `keychain-access-groups` = `<TeamID>.*` with no capability turned on. The development profiles list this Mac; the Developer ID profiles provision all devices. The macOS development profiles carry no `get-task-allow` | Open point 2 resolved: no Keychain Sharing capability is needed. The `get-task-allow` finding was an SG1 defect, corrected by SG4 ([development builds](#development-builds-compared-with-release-builds)) |
 | KC-P1 | Pass. A Developer ID build adds, reads, lists and deletes data-protection items in the group. A rebuild with a different CDHash reads them. Apple Development and Developer ID builds of the team read and delete each other's items. An unsigned binary that names the group gets -34018 for list and for add. **Difference:** an unsigned binary that omits the group gets -25300 for list, not -34018 (F2) | SGQ4 confirmed. F2: every call names the group (D-S7) |
 | KC-P2 | Pass. A start through a Homebrew-style `bin/asura` symlink, by path and by `PATH`, keeps the entitlements, and the executable path resolves to the canonical bundle path. A `posix_spawn` re-exec with `POSIX_SPAWN_SETSID` in a new session reads, adds, lists and deletes in the group | The service and guardian re-exec keep the group. No design change |
 | KC-P3 A | Not run (SSH with a GUI login). Skipped by the owner on 2026-10-27, to revisit | -25308 stays unverified; field evidence (F3, D-S8) |
@@ -1424,6 +1655,46 @@ Findings that changed this design:
   the evidence: every Keychain error records its raw status and the session
   state (D-S8). -25308 is handled as `locked` and stays marked unverified.
 
+### NT-P1 results (2026-10-27)
+
+Run on the owner's Mac (Mac16,6, macOS 27.0 build 26A428) by a delegated
+agent at the owner's request, from the owner's runbook (Part 4). The build
+came from a clean worktree of `main` at `adc8b021`, with
+`asura-bundle --release`, the Developer ID Application identity of the team
+and the Developer ID profile for `org.pidster.asura`. Homebrew was 7.0.10 at
+the start. `security list-keychains -d user` listed only the login keychain
+before and after.
+
+| Step | Result |
+| --- | --- |
+| Build, sign, notarise, staple | Pass. Notary submission `cb307668-65e1-456e-95bc-ddef531ea530`: `Accepted`. The log has `issues: null`: no warning for the helper's App Sandbox and temporary-exception keys. Its ticket lists `Asura.app`, `asura`, `asura-model` and the Hub bundle |
+| Signed entitlements | `asura-model`: exactly the three SG2 keys. `asura`: the application identifier, the team identifier and the one access group `<TeamID>.org.pidster.asura`; no `get-task-allow` |
+| In the build directory | `stapler validate`, `codesign --verify --deep --strict` and `spctl --assess --type execute` (accepted, `source=Notarized Developer ID`) pass |
+| After the `.tar.gz` round trip | The archive SHA-256 matches its `.sha256` file; the archive holds `Asura.app` and `LICENSE`; the same three checks pass; quarantine count 0 |
+| Quarantined copy, network on | `spctl` accepts it as `Notarized Developer ID`; `asura --help` runs; no dialog seen |
+| Quarantined copy, network off | **Not run** (Wi-Fi off and on were skipped). The offline, stapled-ticket-only Gatekeeper check is pending with the owner |
+| Homebrew keg from a local tap (`file://` URL) | The same three checks pass in the keg; `bin/asura --help` runs through the symlink; quarantine count 0 in the keg; the Homebrew download cache file has only `com.apple.provenance` |
+| Helper SHA-256 | `cd1b2747…a8e360` at every stage: package, bundle, extraction and keg |
+| Clean-up | Uninstalled and untapped; `bin/asura` absent afterwards |
+
+Anomalies, and what SG4 does about them:
+
+- Homebrew updated itself (7.0.10 to 7.0.11) during `brew install`. Every
+  scripted install now sets `HOMEBREW_NO_AUTO_UPDATE=1`
+  ([local tap test](#local-tap-test)).
+- The script printed no literal `step=done` line, which the runbook expected.
+  `asura-bundle` now prints `asura-bundle: step=done` as its last line.
+- `cargo build` warned of an unused `Duration` import in
+  `asura-service/src/capture_worker.rs` without the `test-support` feature.
+  SG4 removes the warning.
+
+Effect on the design: the temporary-exception entitlements are acceptable
+for notarisation, so the helper App Sandbox stays (SG-F2 ends at "Release
+requirement met"). D-S4 (notarise a zip, staple the bundle, then archive) is
+verified through Homebrew extraction. The `file://` download got no
+quarantine, so open point 6 (HTTPS) stays open until the first
+post-publication tap test.
+
 ## Validation
 
 | ID | Requirement | Unit | Integration | End to end | Environment |
@@ -1437,6 +1708,7 @@ Findings that changed this design:
 | SG-V7 | RS5 | Test-support seam: production cannot select `Scratch`; platform unit tests refuse `Target::Default` when a group is found | After each qualification run, the test group lists empty; `cargo test` makes no data-protection add and no login keychain search | — | — |
 | SG-V8 | PC-I38 | — | PC-I38 unsigned (existing) | PC-I38-S signed; HR-P2 recorded | macOS 27 |
 | SG-V9 | Bundle lookup | Resource path resolution from `Contents/MacOS` | Copy step finds `Resources/mlx.metallib` and the Hub bundle | `--native-mlx` from the installed keg | Clean host |
+| SG-V11 | SG4: HD1, HD5, HD8, HD9, HD10, HD12, HD13 | `test-asura-bundle --static`: formula template fields and test block; `asura-release` holds no publishing command (HD10); refusal cases of every mode; `--version` and the `get-task-allow` profile cases. Cargo: `--version` parses before any runtime access and refuses `--logs` | `asura --version` exits 0 with the version under a Seatbelt profile that denies file writes and network (HD8). `asura-release check --ad-hoc` on the dry-run archive; `formula`; `tap-test --archive` with the ad hoc archive: the wrong-digest install fails with no keg and no link (HD5), then install, `brew test`, `brew audit --strict` and the keg checks (HD1, HD9 locally); `preflight` refuses on the current repository (immutability disabled: HD12) | Owner: `check --release`, `tap-test --archive --release`, publication, `verify-release` (HD12, HD13), HTTPS `tap-test`, clean-host install (HD1). NT-P1 for the notarised keg (HD9) | macOS 27, Homebrew 7.0.11, owner's Mac |
 | SG-V10 | BN1 | Digest over sorted (path, SHA-256) pairs, pinned to the `shasum` form; limit checks (17 files, 17 directories, depth 5, 1 MiB + 1 byte file, 1 MiB + 1 byte total rejected; the limits themselves accepted); empty file accepted; symlink, group-writable and control-character names rejected | Copy into a scratch run root and read by the copied helper; mismatch and absence fail before spawn; Core AI copies, system does not; cleanup leaves unknown entries; cancel during copy cleans owned copies; the service reports an MLX selection unavailable before spawn when the package bundle does not match its embedded digest | `conversation_flow --native-mlx` with a fixture model that has `model_type` and no `tokenizer_class` completes | macOS 27, real MLX model (BN-P1 fixture) |
 
 ## Delivery
@@ -1473,7 +1745,7 @@ flowchart TD
 | SG2a | HS-P8 probe (Seatbelt `process-info*` and `kern.procargs2` denial for the helper); `swift/model-helper` build: embed `Info.plist` (`CFBundleIdentifier` `org.pidster.asura.model`) in every helper build; the model inventory opens the asset root by its full path instead of walking from `/` | SG0 ad hoc results | HS-P1 and HS-P6 rerun with an ad hoc sandboxed helper; one Core AI cache for repeated spawns (two spawns create one cache directory) |
 | SG2 | Helper entitlement plist; threat model rows | SG1, SG2a | SG-V5, or EX-H1 recorded |
 | SG3 | `asura-platform/src/keychain*`, `asura-service/src/secret_store*`, `ServiceObservation` field 8 schema (fields 4 and 6 reserved) and its validation, the `secret_store.*` audit event fields (status, session; `stranded` removed), the owner's store wiring in `conversation/person_command.rs`, TUI `/status` and refusal text, the qualification binary and `tools/release/secret-store-qualification` with its entitlement list, secret store design | SG0-K, SGQ4–SGQ6 | SG-V6, SG-V7 |
-| SG4 | `tools/release/`, `pidster/homebrew-tap` formula | SG1, SG2, NT-P1 | HD1, HD5, HD9, HD10, HD12, HD13 |
+| SG4 | `tools/release/` (`asura-release`, `asura.rb.in`, the `get-task-allow` fix and `step=done` in `asura-bundle`, `test-asura-bundle`, README), `asura-cli` `--version` (`app.rs`, `tests/arguments.rs`) and CF01 in the command flows, the `pidster/homebrew-tap` formula (generated, published by the owner) | SG1, SG2, NT-P1 | SG-V11: HD1, HD5, HD8, HD9, HD10, HD12, HD13 |
 | SG5 | Qualification records | SG2, SG3, SG4 | SG-V4, SG-V8 and the release-distribution gates |
 
 BN1 and SG1 both own `asura-platform/src/model_process.rs` and
@@ -1492,7 +1764,7 @@ signing packet.
 | SG2a | Delivered (branch `sg2a`, 2026-10-23) | — |
 | SG2 | Delivered (branch `sg2`, 2026-10-23) | — ([delivery](#sg2-delivery)) |
 | SG3 | Delivered (2026-10-27) | — ([delivery](#sg3-delivery)); the signed qualification run (SGQ6) is the owner's |
-| SG4 | Not ready | NT-P1 |
+| SG4 | Ready (NT-P1 passed, 2026-10-27) | — ([SG4 design](#sg4-release-promotion-and-formula)); publication is the owner's |
 | SG5 | Not ready | SG3 and SG4 |
 
 ### SG1 delivery
@@ -1739,5 +2011,21 @@ profile finding is recorded for SG1 or SG4 and not acted on here. Diagrams
 SG-F7, SG-S1 and SG-F8 were rendered with the local Mermaid CLI (`mmdc -s 2`)
 into a temporary directory outside the repository and inspected. The design
 writer made no Keychain call and signed nothing for this revision.
+
+Updated 2026-10-28 for packet SG4, from the owner's NT-P1 record sheet and raw
+outputs (`ntp1-bundle.txt`, `ntp1-checks.txt`, `ntp1-brew.txt`,
+`ntp1-notary-log.json`), the KC-P1 development bundle (`dev-b1`: signed with
+`get-task-allow` under a profile without it), a read-only look at
+`pidster/homebrew-tap` (`wisp.rb`, `daimon.rb`, `README.md`) and
+`gh api repos/pidster/asura/immutable-releases`. Changed: the status block,
+the open items, the notarisation facts, the helper temporary-exception note,
+the development `get-task-allow` rule and the SG1 profile check, step 11,
+the new [SG4 release promotion and formula](#sg4-release-promotion-and-formula)
+section (SG-F9, SG-F10), the [NT-P1 results](#nt-p1-results-2026-10-27), the
+security bullet, limits, AE-02, AE-04, SG-V11, the SG4 owned paths and
+readiness. Diagrams SG-F9 and SG-F10, and CF01 in the
+[command flows](command-flows.md), were rendered with the local Mermaid CLI
+(`mmdc -s 2`) into a temporary directory outside the repository and
+inspected.
 
 Return to the [design index](README.md).

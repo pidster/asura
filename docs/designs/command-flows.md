@@ -32,6 +32,7 @@ flowchart TD
     Log -->|Failure| LF["Report log_unavailable: exit 3"]
     Log -->|Success| Kind{"Command"}
     Kind -->|"--help or -h"| Help["Print usage: exit 0"]
+    Kind -->|"--version"| Version["Print the asura-cli version: exit 0, no runtime access"]
     Kind -->|"init / project add / project list"| Setup["Normalize add path and attach: CF05 / CF06"]
     Setup -->|"Invalid local path"| Bad["Report error: exit 2"]
     Setup -->|"Owner or transport error"| SE["Report error: exit 3"]
@@ -44,7 +45,10 @@ flowchart TD
     Inspect -->|"Absent or other failure"| IE["Print unavailable reason and classified exit"]
 ```
 
-`--logs DIR` is rejected for the TUI, help, and private startup-notice mode.
+`--logs DIR` is rejected for the TUI, help, version, and private startup-notice mode.
+`--version` prints only the version, like `--help` opens no log, runtime directory,
+service or Keychain, and serves the formula test
+([SG4](release-signing.md#asura---version)).
 Duplicate or missing log arguments are invalid. JSON status emits a failure object
 when logging fails. Lifecycle classification returns 3 for unavailable, 4 for
 incompatible, 5 for unsafe runtime, and 6 for an unconfirmed outcome. A successfully

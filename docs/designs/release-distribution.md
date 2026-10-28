@@ -6,7 +6,9 @@ The exact Asura archive layout, signing/notarization procedure, formula update
 automation and service handover remain open. No release is implemented or
 qualified. The [release signing design](release-signing.md) (2026-10-23) now
 owns the signing, Hardened Runtime, notarisation and `Asura.app` layout
-contract. Upgrade, handover and migration sections are deferred until the first
+contract. Its packet SG4 (2026-10-28) selects the archive names, the release
+checks, the formula and the owner's publication steps for the first release
+([SG4](release-signing.md#sg4-release-promotion-and-formula)). Upgrade, handover and migration sections are deferred until the first
 release (owner, 2026-10-17). Before that release, no compatibility with older
 builds or data is required. Live build-mismatch detection stays in force: a
 control protocol mismatch reports `incompatible_protocol`, and the service checks
@@ -57,8 +59,10 @@ run with a temporary
 `HOME`, while Asura resolves the actual account home. I9 must therefore prove
 that every formula test performs no service startup or authority write. A
 version assertion alone is insufficient release evidence. The formula must
-also exercise one offline package/resource check without opening the service;
-D2/D7 must choose its exact command and expected result. The
+also exercise one offline package/resource check without opening the service.
+SG4 selects it: `codesign --verify --deep --strict` of `Asura.app` and the
+helper, `metallib` and Hub bundle digests against `model-package.json`
+([formula](release-signing.md#formula)). The
 formula must declare the supported architecture and macOS floor. It must not launch the
 service, initialize `.asura`, migrate authority, or delete user data in install,
 upgrade, test or uninstall hooks. An archive digest verifies downloaded bytes;
@@ -94,9 +98,10 @@ making the tap change. The tap
 formula is generated from that qualified version, asset URL and digest. Its
 audit, formula test and a clean-host installation against the published asset
 must pass before the tap commit is published. A failure after the release exists
-holds the tap update and retains the last published formula. D7 must specify
-the exact script, required checks,
-signing identity and publication permissions before this is ready.
+holds the tap update and retains the last published formula. SG4 specifies
+the script (`tools/release/asura-release`), the required checks, the signing
+identity and the publication permissions (owner only, SGQ9) in
+[SG-F9 and SG-F10](release-signing.md#sg-f9-release-build-and-prepublication-checks).
 
 ### Publication path
 
