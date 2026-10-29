@@ -28,7 +28,9 @@ stapled ticket and the signatures survived the archive and a Homebrew keg.
 Packet SG4 (2026-10-28) corrects the development `get-task-allow` profile
 check and selects the [release promotion and formula](#sg4-release-promotion-and-formula).
 SG4 delivered the scripts on 2026-10-28 ([SG4 delivery](#sg4-delivery)); nothing
-was published.
+was published. On 2026-10-29 the owner decided SG4-O1: the bundle build removes
+the build account's paths, and `check` fails on any that remain
+([build-host paths](#build-host-paths-sg4-o1)).
 
 What is fixed:
 
@@ -52,9 +54,10 @@ What is open:
   [Secure Enclave](#secure-enclave-open-item));
 - the NT-P1 offline Gatekeeper check (network off, stapled ticket only),
   which the owner runs ([NT-P1 results](#nt-p1-results-2026-10-27));
-- the owner decisions that SG4 records in
-  [SG4 open items](#sg4-open-items): embedded build-host paths and the first
-  publication.
+- the owner decision that SG4 records in
+  [SG4 open items](#sg4-open-items): the first publication. SG4-O1,
+  embedded build-host paths, is resolved
+  ([build-host paths](#build-host-paths-sg4-o1)).
 
 This design owns the signing and notarisation contract that
 [release distribution](release-distribution.md) leaves open. Packet SG3
@@ -133,6 +136,7 @@ Required behavior.
 | RS8 | Every blocking call must have an isolation owner, numeric limits and a loop-closure ending. No default time bound. | AE-01 to AE-07; owner, 2026-10-15 |
 | RS9 | The helper identity check (exact `build_id`, `schema_digest`, helper and `metallib` SHA-256) must stay. | release-distribution; HD14 |
 | RS10 | Only the owner signs and notarises, on the owner's Mac, for the first release. CI holds no signing secret. | SGQ9 |
+| RS11 | No file in a bundle that `asura-bundle` builds may hold the build account's home directory, the repository's absolute path or the account's user name as a path component. | Owner, 2026-10-29 (SG4-O1) |
 
 ## Terms
 
@@ -472,8 +476,9 @@ the archive. A new run needs a new output directory.
 2. **Generate.** A new random 32-byte build ID; `schema_digest` is the SHA-256
    of `contracts/model/v1/model.proto`. Write `BuildIdentity.swift` and
    `model.pb.swift` into the ignored `Sources/HelperCore/Generated/`.
-3. **Build the helper.** `swift build -c release --product asura-model`.
-   The products are `asura-model`, `swift-transformers_Hub.bundle` and
+3. **Build the helper.** `swift build -c release --product asura-model`,
+   with the path maps and `-Xlinker -S` of
+   [build-host paths](#build-host-paths-sg4-o1). The products are `asura-model`, `swift-transformers_Hub.bundle` and
    `mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib`, staged as
    `mlx.metallib`.
 4. **Stage and check limits.** Helper at most 128 MiB, `mlx.metallib` at most
@@ -492,12 +497,16 @@ the archive. A new run needs a new output directory.
    bundle digest ([encoding](#hub-bundle-digest-encoding)). Write the five
    lines of `.build/model-tools/package-identity.txt` and the staged
    `model-package.json` (`format` `0.1`).
-7. **Build the service.** `cargo build --release --locked -p asura-cli`.
-   `asura-service/build.rs` embeds the digests from step 6.
+7. **Build the service.** `cargo build --release --locked -p asura-cli` in
+   the repository, with the `--remap-path-prefix` values of
+   [build-host paths](#build-host-paths-sg4-o1) in
+   `CARGO_ENCODED_RUSTFLAGS`. `asura-service/build.rs` embeds the digests from
+   step 6.
 8. **Assemble** `Asura.app` ([bundle layout](#bundle-layout)) from the template
    `tools/release/Info.plist.in` (version from `asura-cli`), the staged files
    and, for a signed mode, the profile. Check: at most 64 files; the copied
-   helper, `mlx.metallib` and Hub bundle digests equal step 6.
+   helper, `mlx.metallib` and Hub bundle digests equal step 6; `host-paths`
+   finds no build-host path in any file (SG4-O1).
 9. **Sign the bundle.** `codesign` on `Asura.app` with the `asura` entitlements,
    without `--deep`, so nested code is not signed again. Check:
    `codesign --verify --deep --strict` passes; the entitlements of `asura` and
@@ -539,16 +548,16 @@ flowchart TD
     In["Mode and inputs"] --> Pre{"Host, inputs, generators, profile and clean tree valid for the mode?"}
     Pre -->|No| S0["Stop: refused, nothing built"]
     Pre -->|Yes| Gen["Generate build ID, BuildIdentity.swift and model.pb.swift"]
-    Gen --> SB["swift build -c release"]
+    Gen --> SB["swift build -c release with path maps, no debug map"]
     SB --> Lim{"Helper, metallib and Hub bundle within limits, no symlink?"}
     Lim -->|No| S1["Stop: limits"]
     Lim -->|Yes| Sig["Sign Hub bundle, then asura-model"]
     Sig --> HV{"Strict verify, identifier, runtime and bound Info.plist?"}
     HV -->|No| S2["Stop: helper signature"]
     HV -->|Yes| Hash["Hash signed files into package-identity.txt and model-package.json"]
-    Hash --> CB["cargo build --release: build.rs embeds digests"]
+    Hash --> CB["cargo build --release with remap prefixes: build.rs embeds digests"]
     CB --> Asm["Assemble Asura.app"]
-    Asm --> D1{"Copies equal recorded digests, at most 64 files?"}
+    Asm --> D1{"Copies equal recorded digests, at most 64 files, no build-host path?"}
     D1 -->|No| S3["Stop: assembly"]
     D1 -->|Yes| SA["Sign Asura.app without --deep"]
     SA --> AV{"Deep strict verify, entitlements, runtime, team and digests unchanged?"}
@@ -652,7 +661,7 @@ mode prints `PASS`, `FAIL` or `NOTE` lines and ends with a count line. Any
 | Mode | When | Checks and effects |
 | --- | --- | --- |
 | `preflight --version V` | Before the release build | `V` equals the `asura-cli` version; the working tree is clean; `HEAD` equals the tip of `main` on `origin` (`git ls-remote`, no fetch); tag `vV` is absent locally and on `origin`; no GitHub release `vV` exists; immutable releases are enabled for `pidster/asura` (`gh api repos/pidster/asura/immutable-releases`, HD12). Every check runs and reports, so the operator sees all failures at once |
-| `check --archive A --version V (--release --team-id T \| --ad-hoc)` | After `asura-bundle`, and on the downloaded asset | The `.sha256` file beside `A` matches; the name matches the mode; the archive extracts into a new temporary directory and holds exactly the manifest; deep strict `codesign` verification; `Info.plist` identifier and version; both executables carry the Hardened Runtime and the tracked entitlement lists for the mode, and no `get-task-allow`; the helper, `metallib` and Hub bundle digests equal `model-package.json`, and `asura` embeds the helper and Hub digests and the build ID; the extracted `asura --version` prints `V`. Release only: the signing authority is a Developer ID Application certificate of team `T` with a secure timestamp; the embedded profile is for team `T` and `T.org.pidster.asura`, not expired and grants no `get-task-allow`; `stapler validate` passes; `spctl` accepts it as `Notarized Developer ID`. It prints a record block (below) and counts embedded build-host paths as a `NOTE` ([open items](#sg4-open-items)) |
+| `check --archive A --version V (--release --team-id T \| --ad-hoc)` | After `asura-bundle`, and on the downloaded asset | The `.sha256` file beside `A` matches; the name matches the mode; the archive extracts into a new temporary directory and holds exactly the manifest; deep strict `codesign` verification; `Info.plist` identifier and version; both executables carry the Hardened Runtime and the tracked entitlement lists for the mode, and no `get-task-allow`; the helper, `metallib` and Hub bundle digests equal `model-package.json`, and `asura` embeds the helper and Hub digests and the build ID; the extracted `asura --version` prints `V`. Release only: the signing authority is a Developer ID Application certificate of team `T` with a secure timestamp; the embedded profile is for team `T` and `T.org.pidster.asura`, not expired and grants no `get-task-allow`; `stapler validate` passes; `spctl` accepts it as `Notarized Developer ID`. No file of the extracted archive holds the account home, the repository path or the user name as a path component ([build-host paths](#build-host-paths-sg4-o1)). It prints a record block (below) |
 | `formula --archive A --version V --out F` | After `check` passes | Writes `F` (which must not exist) from `tools/release/asura.rb.in` with the version and the archive SHA-256. The digest is computed from `A` and must equal the `.sha256` file |
 | `tap-test --formula F [--archive A] [--release --team-id T]` | Before publication with `--archive`; after publication without it | See [local tap test](#local-tap-test) |
 | `verify-release --version V --archive A --revision R` | After the owner publishes the release | `gh release view vV`: not a draft, `isImmutable` true, exactly the two assets; the tag `vV` points to `R`; the asset downloads over HTTPS with `curl` into a new temporary directory; its SHA-256 equals `A` and the published `.sha256` asset; `check --release` passes on the download |
@@ -778,17 +787,124 @@ flowchart TD
 | `verify-release` or the post-publication tap test fails | The published release stays. The tap keeps its prior formula. A corrected artifact needs a new version and tag (HD13) |
 | The clean-host install fails after the tap push | The owner reverts the tap commit with a new commit (no force push). A fix needs a new version |
 | A `tap-test` step fails or is cancelled | Cleanup still uninstalls and untaps; `bin/asura` must be absent afterwards |
+| `host-paths` finds a build-host path after assembly | `asura-bundle` stops at `assembly` before any signature; no archive. The operator finds the source in the report and fixes the build flags ([build-host paths](#build-host-paths-sg4-o1)) |
+| `check` reports a build-host path | `FAIL`; nothing is published. A fixed build is a new build |
+
+#### Build-host paths (SG4-O1)
+
+Selected design (packet SG4-O1, 2026-10-29). The owner decided on 2026-10-29
+that release 0.1.0 ships without build paths. Required behavior: no file in a
+bundle that `asura-bundle` builds, in any mode, holds the build account's
+home directory, the repository's absolute path, or the account's user name as
+a path component. This covers `asura`, `asura-model`, `mlx.metallib`, the Hub
+bundle and every other file in `Asura.app`.
+
+Where the paths came from. The counts are raw byte occurrences of the
+account home in each file of an ad hoc bundle built from `main` at `446d719`
+(2026-10-29). `strings -a` shows fewer, because it does not read the
+symbol string table in `__LINKEDIT`. The [SG4-O1 delivery](#sg4-o1-delivery)
+records the counts after the change.
+
+| File | Home path occurrences | Source |
+| --- | --- | --- |
+| `asura` | 1,801 (`strings -a`: 1,606 lines; the NT-P1 build had 1,614) | Panic and `tracing` locations that `rustc` writes from source paths: Cargo registry sources under `~/.cargo` (1,568), the `rust-src` component of the pinned toolchain under `~/.rustup` (231), and two generated Protobuf files in the repository's `target/` |
+| `asura-model` | 1,844 (`strings -a`: 61 lines) | The linker's debug map in the symbol table: `N_SO` source directories and `N_OSO` object file paths (1,783); C and C++ `__FILE__` strings from `xgrammar`, `mlx-c` and `fmt` in the SwiftPM checkouts (61) |
+| `mlx.metallib`, the Hub bundle, `Info.plist`, `model-package.json` | 0 | None. The Metal compiler embeds no source path, so it needs no flag |
+
+The mechanism. `asura-bundle` sets these flags for its own two builds only.
+No tracked Cargo or SwiftPM configuration changes, so `cargo test`, the
+development package and other builds are unchanged.
+
+| Build | Flags | Result in the shipped bytes |
+| --- | --- | --- |
+| Step 7, `cargo build --release` | `CARGO_ENCODED_RUSTFLAGS` with three `--remap-path-prefix` values: `$CARGO_HOME=/cargo`; `<sysroot>/lib/rustlib/src/rust=/rustc/<commit-hash>` (from `rustc --print sysroot` and `rustc -vV`, run in the repository so that `rust-toolchain.toml` selects the toolchain); the repository root `=/asura` | A panic location reads `/cargo/registry/src/index.crates.io-…/tokio-1.52.1/src/…:L:C`; standard library locations read `/rustc/<hash>/library/…`, as in the upstream toolchain; workspace crates keep their relative `rust/crates/…` paths; generated files read `/asura/target/release/build/…` |
+| Step 3, `swift build -c release` | `-Xcc -ffile-prefix-map=<root>=/asura`, `-Xswiftc -file-prefix-map -Xswiftc <root>=/asura`, and `-Xlinker -S`. When `--swift-scratch` is outside the repository, the same two maps also name `<scratch>=/swiftpm` | C and C++ `__FILE__` reads `/asura/.build/release-helper/checkouts/…` (or `/swiftpm/checkouts/…`); the helper carries no debug map; its symbol table keeps the function names that crash reports use |
+
+Rules for the flags:
+
+- `CARGO_ENCODED_RUSTFLAGS` takes precedence over `RUSTFLAGS` and any
+  `build.rustflags` configuration. An operator's `RUSTFLAGS` therefore does not
+  reach the bundle build. The script writes the values with the ASCII unit
+  separator, so a path with a space stays one argument.
+- When several `--remap-path-prefix` values match, `rustc` applies the last
+  one. The three prefixes do not overlap in a standard layout. When they do,
+  every choice still removes the home path.
+- A map is added only for a directory that is not inside another mapped
+  directory, so the order of the clang and Swift maps never decides the
+  result.
+- The flags change the Cargo fingerprint of `target/release`. A later plain
+  `cargo build --release` rebuilds; the script's build and the tests do not
+  share artifacts.
+- The build ID stays random for each build (SG1 step 2), so this change makes
+  no reproducible-build claim. It removes the dependence of the bytes on the
+  account and the checkout location. The build ID, schema and digest checks
+  are unchanged.
+
+Rejected:
+
+- **Cargo `trim-paths`.** Cargo 1.98.0 refuses `trim-paths` in a profile
+  without the nightly feature gate (verified on 2026-10-29).
+- **`-Xlinker -oso_prefix`.** It keeps a relative debug map, but nothing ships
+  or uses a `dSYM` for the helper. `-S` removes the map entirely.
+- **Rewriting bytes after the link** (`strip`, patching). The build must
+  produce the shipped bytes; a later edit is a second owner of the binary.
+
+The check. One tracked scanner, `tools/release/host-paths`, owns the rule. It
+reads every regular file under each path as raw bytes, never through
+`strings`. It reports a file that holds any of these:
+
+| Needle | Match |
+| --- | --- |
+| Account home | `$HOME` and the home directory from the user database, when either is followed by `/` or by a byte that cannot continue a file name, or ends the string |
+| Repository | The repository root (`pwd -P`), matched the same way |
+| User name | `/<user>` (from `id -un`) followed by `/` or by a byte that cannot continue a file name, or ending the string |
+
+Bytes that can continue a file name are ASCII letters, digits, `.`, `_` and
+`-`. The scanner refuses (exit 2) when `HOME` is empty or `/`, when the user
+name is empty, or when the repository path is not absolute. It prints one
+line for each file that holds a needle, with the count of each, and exits 1;
+it exits 0 when no file holds one. It never prints the matching bytes'
+context.
+
+Users of the scanner:
+
+- `asura-bundle` step 8 scans `Asura.app` after assembly and before any
+  signature. A hit stops the script at `assembly`, so a release never reaches
+  the notary service with a build path.
+- `asura-release check` scans the extracted archive (`Asura.app` and
+  `LICENSE`) and reports one `PASS` or `FAIL` line for the whole tree. The
+  former `NOTE` count is gone.
+
+Known limit: the owner's user name is also the GitHub owner of the
+repository. A future string such as `https://github.com/pidster/asura` in a
+shipped file would contain `/pidster/` and fail the check. No shipped file
+holds one today.
+
+#### SG-F11: build-host path removal and checks
+
+Selected design. Arrows show the next step; labelled arrows show a check
+result. Every "Stop" leaves no signature and no archive.
+
+```mermaid
+flowchart TD
+    Pre["asura-bundle preflight"] --> Maps["Compute maps: repository root, Swift scratch when outside it, CARGO_HOME, toolchain rust-src and commit hash"]
+    Maps --> SB["Step 3: swift build with -ffile-prefix-map, -file-prefix-map and -Xlinker -S"]
+    SB --> CB["Step 7: cargo build with CARGO_ENCODED_RUSTFLAGS remap prefixes"]
+    CB --> Asm["Step 8: assemble Asura.app"]
+    Asm --> Scan{"host-paths: any file holds the home, the repository or /user?"}
+    Scan -->|"Yes: report file and counts"| Stop["Stop at assembly: no signature, no archive"]
+    Scan -->|No| Sign["Steps 9 to 11: sign, notarise and staple (release), archive"]
+    Sign --> Chk["asura-release check extracts the archive"]
+    Chk --> Scan2{"host-paths over Asura.app and LICENSE: any hit?"}
+    Scan2 -->|Yes| Fail["FAIL: hold, nothing published"]
+    Scan2 -->|No| Pass["PASS: no build-host path"]
+```
 
 #### SG4 open items
 
-- **SG4-O1, embedded build-host paths (owner decision).** The NT-P1 `asura`
-  binary holds 1,614 strings with the build account's home path, mostly Cargo
-  registry source paths in panic locations, and `asura-model` holds 61. They
-  are not files and no code reads them, but they name the build account.
-  `check` counts them as a `NOTE`, not a `FAIL`. The owner decides whether
-  0.1.0 ships with them or whether a later packet adds path remapping (Rust
-  `--remap-path-prefix`, Swift and C `-file-prefix-map`). Remapping changes the
-  signed helper bytes, so it needs its own SG-V5 and NT-P1-style rerun.
+- **SG4-O1, embedded build-host paths: resolved.** The owner decided on
+  2026-10-29 to remove them before 0.1.0. See
+  [build-host paths](#build-host-paths-sg4-o1).
 - **SG4-O2, immutable releases are disabled.** On 2026-10-28
   `gh api repos/pidster/asura/immutable-releases` returned
   `{"enabled":false}`. Preflight refuses until the owner enables it (HD12).
@@ -1526,7 +1642,7 @@ flowchart TD
 | Rule | Application |
 | --- | --- |
 | AE-01 | No signing or notarisation code exists in the runtime. The runtime gains no new call on the reactor, control or render path |
-| AE-02 | Runtime blocking calls: `SecItemAdd`, `SecItemCopyMatching` and `SecItemDelete` with the data-protection flag run on the existing secret store worker thread only (IPC to securityd). So do the access group check (`SecTaskCreateFromSelf`, `SecTaskCopyValueForEntitlement`, once per worker) and the field evidence reads (`sysctl`, `stat` of `/dev/console`, `getaudit_addr`, once per failed call). The Hub bundle copy runs on the existing preparation worker. The helper's sandbox set-up runs inside the helper process at exec, under the existing model-owner supervision. Release-time blocking tools (`codesign`, `ditto`, `notarytool`, `stapler`, `spctl`, and for SG4 `git ls-remote`, `gh`, `curl`, `tar` and `brew`) run only in the operator's release scripts, one at a time. `asura --version` returns before any runtime access |
+| AE-02 | Runtime blocking calls: `SecItemAdd`, `SecItemCopyMatching` and `SecItemDelete` with the data-protection flag run on the existing secret store worker thread only (IPC to securityd). So do the access group check (`SecTaskCreateFromSelf`, `SecTaskCopyValueForEntitlement`, once per worker) and the field evidence reads (`sysctl`, `stat` of `/dev/console`, `getaudit_addr`, once per failed call). The Hub bundle copy runs on the existing preparation worker. The helper's sandbox set-up runs inside the helper process at exec, under the existing model-owner supervision. Release-time blocking tools (`codesign`, `ditto`, `notarytool`, `stapler`, `spctl`, and for SG4 `git ls-remote`, `gh`, `curl`, `tar` and `brew`) run only in the operator's release scripts, one at a time. So does `host-paths`, which reads each bundle file once (at most 128 MiB for the helper). `asura --version` returns before any runtime access |
 | AE-03 | See [limits](#limits). No new queue is added |
 | AE-04 | No time bound. Store calls end with a reply, cancel or shutdown. `notarytool --wait` ends with the service's reply or an operator cancel. Stapling uses pacing only. The Hub copy ends on completion, failure or the preparation cancel flag. The SG4 network reads (`git ls-remote`, `gh`, `curl`) and `brew` calls end with their reply or an operator cancel; `tap-test` cleanup runs after a cancel |
 | AE-05 | A notarisation submission is not repeated after an unknown outcome. The operator queries its ID. A rejected build is never re-signed in place; a new build gets a new digest |
@@ -1711,6 +1827,7 @@ post-publication tap test.
 | SG-V8 | PC-I38 | — | PC-I38 unsigned (existing) | PC-I38-S signed; HR-P2 recorded | macOS 27 |
 | SG-V9 | Bundle lookup | Resource path resolution from `Contents/MacOS` | Copy step finds `Resources/mlx.metallib` and the Hub bundle | `--native-mlx` from the installed keg | Clean host |
 | SG-V11 | SG4: HD1, HD5, HD8, HD9, HD10, HD12, HD13 | `test-asura-bundle --static`: formula template fields and test block; `asura-release` holds no publishing command (HD10); refusal cases of every mode; `--version` and the `get-task-allow` profile cases. Cargo: `--version` parses before any runtime access and refuses `--logs` | `asura --version` exits 0 with the version under a Seatbelt profile that denies file writes and network (HD8). `asura-release check --ad-hoc` on the dry-run archive; `formula`; `tap-test --archive` with the ad hoc archive: the wrong-digest install fails with no keg and no link (HD5), then install, `brew test`, `brew audit --strict` and the keg checks (HD1, HD9 locally); `preflight` refuses on the current repository (immutability disabled: HD12) | Owner: `check --release`, `tap-test --archive --release`, publication, `verify-release` (HD12, HD13), HTTPS `tap-test`, clean-host install (HD1). NT-P1 for the notarised keg (HD9) | macOS 27, Homebrew 7.0.11, owner's Mac |
+| SG-V12 | RS11, SG4-O1 | `test-asura-bundle --static`: `host-paths` reports the home inside a string and alone, the repository, `/<user>` under another prefix and a link target; it ignores near misses (another account's home, a longer user name, `org.<user>.asura`, the user name alone, `/cargo/…`, a longer repository name); it prints counts only; it refuses `HOME` empty or `/`, a relative repository, a missing path and no path (exit 2). `asura-release check` fails an archive whose `LICENSE` holds the home and passes the rule on a clean one; no `NOTE` remains | `test-asura-bundle --bundle` on a new dry run: an independent raw scan of every bundle file finds no `$HOME`, `/Users/`, repository path or `/<user>/`; `asura` holds `/cargo/registry/src/` and `/rustc/<commit>/library/` locations; the helper holds `/asura/…/checkouts/` (or `/swiftpm/checkouts/`) locations and no debug-map stab; `check --ad-hoc` passes the rule; the same archive with the home planted in `LICENSE` fails only the rule. `--sandbox` (SG-V5) on the remapped helper | A release build: notarised, stapled, `check --release` passes every check including the rule | macOS 27, Apple silicon, owner's Mac |
 | SG-V10 | BN1 | Digest over sorted (path, SHA-256) pairs, pinned to the `shasum` form; limit checks (17 files, 17 directories, depth 5, 1 MiB + 1 byte file, 1 MiB + 1 byte total rejected; the limits themselves accepted); empty file accepted; symlink, group-writable and control-character names rejected | Copy into a scratch run root and read by the copied helper; mismatch and absence fail before spawn; Core AI copies, system does not; cleanup leaves unknown entries; cancel during copy cleans owned copies; the service reports an MLX selection unavailable before spawn when the package bundle does not match its embedded digest | `conversation_flow --native-mlx` with a fixture model that has `model_type` and no `tokenizer_class` completes | macOS 27, real MLX model (BN-P1 fixture) |
 
 ## Delivery
@@ -1735,7 +1852,8 @@ flowchart TD
     SG3["SG3 secret store on the team Keychain"] --> SG5
     SG1 --> SG4["SG4 notarise, staple, formula (NT-P1)"]
     SG2 --> SG4
-    SG4 --> SG5["SG5 I9 qualification on the signed artifact"]
+    SG4 --> O1["SG4-O1 build-host paths removed, check fails on any"]
+    O1 --> SG5["SG5 I9 qualification on the signed artifact"]
 ```
 
 | Packet | Owned paths | Depends on | Delivers |
@@ -1748,6 +1866,7 @@ flowchart TD
 | SG2 | Helper entitlement plist; threat model rows | SG1, SG2a | SG-V5, or EX-H1 recorded |
 | SG3 | `asura-platform/src/keychain*`, `asura-service/src/secret_store*`, `ServiceObservation` field 8 schema (fields 4 and 6 reserved) and its validation, the `secret_store.*` audit event fields (status, session; `stranded` removed), the owner's store wiring in `conversation/person_command.rs`, TUI `/status` and refusal text, the qualification binary and `tools/release/secret-store-qualification` with its entitlement list, secret store design | SG0-K, SGQ4–SGQ6 | SG-V6, SG-V7 |
 | SG4 | `tools/release/` (`asura-release`, `asura.rb.in`, the `get-task-allow` fix and `step=done` in `asura-bundle`, `test-asura-bundle`, README), `asura-cli` `--version` (`app.rs`, `tests/arguments.rs`) and CF01 in the command flows, the `pidster/homebrew-tap` formula (generated, published by the owner) | SG1, SG2, NT-P1 | SG-V11: HD1, HD5, HD8, HD9, HD10, HD12, HD13 |
+| SG4-O1 | `tools/release/` (`host-paths`, the path maps in `asura-bundle`, the rule in `asura-release check`, `test-asura-bundle`, README), `swift/model-helper/README.md` | SG4, owner decision 2026-10-29 | SG-V12 |
 | SG5 | Qualification records | SG2, SG3, SG4 | SG-V4, SG-V8 and the release-distribution gates |
 
 BN1 and SG1 both own `asura-platform/src/model_process.rs` and
@@ -1767,6 +1886,7 @@ signing packet.
 | SG2 | Delivered (branch `sg2`, 2026-10-23) | — ([delivery](#sg2-delivery)) |
 | SG3 | Delivered (2026-10-27) | — ([delivery](#sg3-delivery)); the signed qualification run (SGQ6) is the owner's |
 | SG4 | Delivered (2026-10-28) | — ([delivery](#sg4-delivery)); publication, the release-mode checks and the clean-host install are the owner's |
+| SG4-O1 | Delivered (2026-10-29) | — ([delivery](#sg4-o1-delivery)) |
 | SG5 | Not ready | SG3 and SG4 |
 
 ### SG1 delivery
@@ -2079,5 +2199,21 @@ readiness. Diagrams SG-F9 and SG-F10, and CF01 in the
 (`mmdc -s 2`) into a temporary directory outside the repository and
 inspected. The [SG4 delivery](#sg4-delivery) record was added after the code
 and its checks; it changes no diagram.
+
+Updated 2026-10-29 for packet SG4-O1, after the owner's decision to remove
+build paths before 0.1.0. Evidence: raw byte scans of an ad hoc bundle from
+`446d719` and of the earlier dry run; `otool -l` and `nm -ap` of the helper;
+the installed tools (rustc 1.98.0 `88d9e12ae`, cargo 1.98.0, Apple Swift 6.4
+swiftlang-6.4.0.34.1 with clang-2100.3.34.1, ld-27037.1, Metal 32023.921,
+Xcode 27.1 27A9275); `rustc --help -v`, `swiftc -help-hidden`,
+`swift build --help` and `man ld` on this Mac; and a Cargo build that refused
+`trim-paths`. Documentation claims (help texts) are distinguished from the
+measured results in the [SG4-O1 delivery](#sg4-o1-delivery). Changed: the
+status block, RS11, SG1 steps 3, 7 and 8, SG-F4, the `check` row, the new
+[build-host paths](#build-host-paths-sg4-o1) section (SG-F11), SG4 failure
+handling and open items, AE-02, SG-V12, SG-P, the packet table and
+readiness. Diagrams SG-F4, SG-F11 and SG-P were rendered with the local
+Mermaid CLI (`mmdc -s 2`) into a temporary directory outside the repository
+and inspected.
 
 Return to the [design index](README.md).
