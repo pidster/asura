@@ -8,7 +8,10 @@ qualified. The [release signing design](release-signing.md) (2026-10-23) now
 owns the signing, Hardened Runtime, notarisation and `Asura.app` layout
 contract. Its packet SG4 (2026-10-28) selects the archive names, the release
 checks, the formula and the owner's publication steps for the first release
-([SG4](release-signing.md#sg4-release-promotion-and-formula)). Upgrade, handover and migration sections are deferred until the first
+([SG4](release-signing.md#sg4-release-promotion-and-formula)). Packet SG5
+(2026-10-29) ran HD5, HD8 and the local HD9 checks on a notarised keg; HD1,
+HD6, HD11, HD12 and HD13 remain open
+([SG5 results](release-signing.md#sg5-results-2026-10-29)). Upgrade, handover and migration sections are deferred until the first
 release (owner, 2026-10-17). Before that release, no compatibility with older
 builds or data is required. Live build-mismatch detection stays in force: a
 control protocol mismatch reports `incompatible_protocol`, and the service checks

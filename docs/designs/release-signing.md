@@ -30,7 +30,12 @@ check and selects the [release promotion and formula](#sg4-release-promotion-and
 SG4 delivered the scripts on 2026-10-28 ([SG4 delivery](#sg4-delivery)); nothing
 was published. On 2026-10-29 the owner decided SG4-O1: the bundle build removes
 the build account's paths, and `check` fails on any that remain
-([build-host paths](#build-host-paths-sg4-o1)).
+([build-host paths](#build-host-paths-sg4-o1)). Packet SG5 ran the I9
+qualification on signed code on 2026-10-29
+([SG5 results](#sg5-results-2026-10-29)): SG-V4, SG-V8 and the service-level
+secret store cases on the data-protection keychain pass, and a new notarised
+keg passes HD5, HD8 and the local HD9 checks. The keg's own service in the
+account home, publication and the clean host remain the owner's.
 
 What is fixed:
 
@@ -1367,7 +1372,9 @@ are input to that study; they select nothing.
   at start, and the `!!` launch environment cannot contain them. The effect on
   `!!` is small: PC-I38 already records that SIP removes `DYLD_*` when
   `/bin/sh` starts, so `!!` children never saw them. Probe HR-P2 records the
-  result, and the `!!` documentation states it.
+  result, and the `!!` documentation states it. Resolved: HR-P2 found that
+  dyld removes them, ad hoc with the `runtime` flag in SG0 and with a
+  Developer ID signature in SG5 ([results](#sg5-results-2026-10-29)).
 - The helper is spawned with only `LANG` and `LC_ALL`, so `DYLD_*` cannot reach
   it.
 
@@ -1995,7 +2002,55 @@ steps:
 | HD6, HD11 | Both start the keg's service in the account home |
 | HD1, HD12, HD13 | Publication and a clean host (SGQ9) |
 | HD2 | No unsupported host is available |
+| HD14 from a keg | It needs the keg's service with a helper from another build; its unit, integration and native cases stay unsigned |
 | SS-E1, SS-E2 on a signed binary | The TUI journey copies the binary out of its bundle, so it loses the profile |
+
+### SG5 results (2026-10-29)
+
+Run on the owner's Mac (macOS 27.0 26A428, Apple silicon, Homebrew 7.0.11)
+by a delegated agent with the owner's authority to sign with the team's
+Developer ID Application identity and to make one notary submission. The
+raw outputs are in the owner's records as `sg5-*.txt`. `security
+list-keychains -d user` listed only the login keychain before and after. No
+escapee fixture was alive afterwards. No push, tag, release, upload or tap
+change was made; `pidster/tap` and `pidster/homebrew-tap` were not touched.
+
+Signed artifacts:
+
+| Artifact | Signer | App ID and group | Used by |
+| --- | --- | --- | --- |
+| `AsuraQualification-exec_cmd_process.app` | Developer ID Application, team `LFQFWCB8Y3`, Hardened Runtime, no timestamp | `org.pidster.asura.test`, group `<TeamID>.org.pidster.asura.test` only, profile `test-devid` | S1 |
+| `AsuraQualification-person_command_flow.app`, with the unsandboxed development helper | As above | As above | S2, S3 |
+| HR-P2 fixture | Developer ID Application, Hardened Runtime, no entitlements | None | S4 |
+| Release `Asura.app` from `4d9263e` (clean tree) | Developer ID Application, secure timestamp, notarised and stapled | `org.pidster.asura`, production group; never started as a service | S5, S6 |
+
+| Run | Result | Evidence |
+| --- | --- | --- |
+| S1 | Pass after one test fix. The first run stopped at the escape helper: a copy of the signed binary taken out of its bundle was killed at launch, so `escaped-pid` was never written. The suite now runs every fixture copy as an ad hoc copy ([PC-I38 control](#pc-i38-control-and-pc-i38-s)); the rerun passed. EC-I1 to EC-I3, EC-I5 to EC-I11, EC-V-OLD (EC-I4), EC-D2, PC-I2 to PC-I5, PC-I22, PC-I29, PC-U50, OD1, OD2 (EC-I12), SDI-09 (`KERN_PROCARGS2` reads), J2T-05, J2T-06, EPG-I1, J1T-05 and J1T-07 passed with the signed guardian. PC-I37 skipped (network opt-in) | `sg5-s1-exec-cmd-process-attempt1.txt`, `sg5-s1-exec-cmd-process.txt` |
+| SG-V8, PC-I38, PC-I38-S | Pass. The ad hoc control loaded the library; the `!!` guardian never loaded it; the hardened guardian executable started with `DYLD_INSERT_LIBRARIES` in its own environment loaded nothing | `sg5-s1-exec-cmd-process.txt` |
+| S2 | Pass, every case, first run: PC-I1 to PC-I40 service cases, EC-I9 and EC-I10 through the service (the `ASURA_JOB` marker scan), and SS-I1 to SS-I11 on the scratch store, with the signed service and guardian | `sg5-s2-person-command-scratch.txt` |
+| S3 | Pass, first run. SS-I1, SS-I2, SS-I3, SS-I6, SS-I8, SS-I9, SS-I10 (256 test-group items counted) and SS-I11 passed on the data-protection keychain in `LFQFWCB8Y3.org.pidster.asura.test`; SS-I4, SS-I5 and SS-I7 were skipped as designed. Every other case also passed with the test-group store. `test-group-empty=yes` at the end of the run and again from `--purge-test-group` (0 items left to purge) | `sg5-s3-person-command-test-group.txt` |
+| S4, HR-P2 | Pass. With `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH` and `DYLD_PRINT_LIBRARIES` set, the Developer ID hardened fixture saw no `DYLD_` entry and dyld printed nothing; the ad hoc control saw both of its `DYLD_` entries | `sg5-hrp2.txt` |
+| S5 | Pass. Notary submission `54ea1de4-aebf-4438-8687-7a840ad44362`: `Accepted`; stapled; `step=done`. `check --release`: 52 passed, 0 failed, source `4d9263e` clean, `rustc 1.98.0`, archive SHA-256 `f063ad94…798ec25`, helper `97f2bccd…e801d4b3`. `tap-test --release`: 28 passed, 0 failed: `brew audit --strict`, HD5 (wrong digest fails, nothing installed), install, `brew test`, link into the keg, digests, `bin/asura --version`, Developer ID and timestamps of all three signed parts, `stapler validate`, Gatekeeper `Notarized Developer ID`, cleanup | `sg5-s5-bundle.txt`, `sg5-s5-check.txt`, `sg5-s5-formula.txt`, `sg5-s5-tap-test.txt` |
+| S6 | Pass. In the installed keg: deep strict signature, `stapler validate`, Gatekeeper `Notarized Developer ID`, `asura --version` 0.1.0, `host-paths` finds no build-host path. `test-asura-bundle --sandbox` on the keg's `Asura.app`: 32 passed, 0 skipped; HS-P7 denials; inventory, system, MLX (`mlx-community/Qwen3-1.7B-4bit`) and Ollama (`granite4.1:8b`) turns from the keg's helper code, `mlx.metallib` and Hub bundle; copy removal, crash and recovery. Uninstalled, untrusted and untapped; `bin/asura` absent | `sg5-s6-keg-journey.txt` |
+| Gate | `cargo fmt --all --check`, both clippy passes, `cargo test --workspace --all-features --no-fail-fast --locked`, `test-asura-bundle --static` (134 passed). The first workspace run failed nine native targets with `model_helper_unavailable`: the development helper was beside `target/debug`, not beside the test binaries in `target/debug/deps`. With the helper copied there, the nine targets were rerun alone and passed. `exec_cmd_process` was rerun unsigned after the fixture-copy fix and passed | `sg5-cargo-test.txt`, `sg5-cargo-test-rerun.txt`, `sg5-exec-cmd-process-unsigned.txt`, `sg5-bundle-static.txt` |
+
+No listed flake occurred. The SG3 signed qualification run (Q0 to Q7) passed
+on 2026-10-27 with the Developer ID identity and the test profile, and ended
+with `test-group-empty=yes` (owner record `sg3-qualification.txt`); SG5 did
+not repeat it.
+
+Gate map:
+
+| Gate | SG5 result |
+| --- | --- |
+| SG-V4 | Pass on the signed harness bundles (S1, S2) |
+| SG-V8 | Pass: PC-I38, PC-I38-S (S1), HR-P2 (S4) |
+| SG-V6 end to end, SS-I and SL5 | Pass on the data-protection keychain (S3), with SS-I4, SS-I5 and SS-I7 not applicable |
+| HD5, HD8 | Pass on the notarised archive (S5) |
+| HD9 | Pass for the keg checks, the path rule and executable resource lookup with an MLX turn from the keg's bytes (S5, S6). Not run: the keg's own `asura` as the service (owner decision) |
+| SG-V9 | Pass from the keg's bytes (S6), with `conversation_flow` as the service and the SG-V5 helper variant |
+| HD1, HD2, HD6, HD11, HD12, HD13, HD14 (keg) | Not run ([gates not run here](#sg5-gates-not-run-here)). HD14 keeps its unsigned unit, integration and native evidence |
 
 ## Validation
 
@@ -2004,12 +2059,12 @@ steps:
 | SG-V1 | RS1, RS2, D-S2 | Entitlement property lists parse; each lists only the allowed keys (a test reads the tracked files) | Release dry run: `codesign -d --entitlements` of the ad hoc build equals the expected list | NT-P1 on the release build | macOS 27, Apple silicon |
 | SG-V2 | D-S3, RS9 | — | Dry run: the helper and Hub bundle digests inside the bundle equal `package-identity.txt` after signing and after stapling | HD9, HD14 from the installed keg | Clean host |
 | SG-V3 | RS3, RS10 | A check that no tracked file matches `*.p12`, `*.p8`, `*.provisionprofile` or contains `BEGIN PRIVATE KEY` | The release script refuses without identity arguments; the dry run calls no real identity | — | — |
-| SG-V4 | D-S1, RS6 | — | SB-P1, SB-P2 and SB-P3 recorded | Existing EC and PC suites pass on the signed qualification bundle, including the `KERN_PROCARGS2` environment-marker scan | macOS 27 |
+| SG-V4 | D-S1, RS6 | — | SB-P1, SB-P2 and SB-P3 recorded | Existing EC and PC suites pass on the signed qualification bundle, including the `KERN_PROCARGS2` environment-marker scan. **Pass** (SG5 S1, S2, 2026-10-29, [results](#sg5-results-2026-10-29)) | macOS 27 |
 | SG-V5 | SGQ7 | — | HS-P1 to HS-P7 | Native system, MLX, Core AI and Ollama journeys with the sandboxed helper | macOS 27, real models |
-| SG-V6 | RS4, the team Keychain store | KC-U1 every dictionary kind sets the data-protection flag, the access group, `kSecAttrSynchronizable` false and UI fail, and none sets `kSecUseKeychain`; KC-U2 status mapping including -34018 as `not_signed` and -25308 as `locked`; KC-U3 no stranded fields in the observation, the schema or the audit event; KC-U4 access group rules (SG-F7); KC-U5 session decoding and the evidence on every failure reply; KC-U6 `not_signed` is terminal: later requests make no port call; SS-U7 extended | Unsigned negative case: `Target::Default` gives `not_signed` with no call, and list, read and delete naming an unentitled group give -34018; scratch file backend cases, with a denied delete now an orphan; TUI and audit carry the not_signed text and the evidence | Signed qualification run Q0 to Q7 with the test group; the group ends empty. SS-I and SL5 on a signed `asura` stay with SG5 | Qualification Mac (SGQ6) |
+| SG-V6 | RS4, the team Keychain store | KC-U1 every dictionary kind sets the data-protection flag, the access group, `kSecAttrSynchronizable` false and UI fail, and none sets `kSecUseKeychain`; KC-U2 status mapping including -34018 as `not_signed` and -25308 as `locked`; KC-U3 no stranded fields in the observation, the schema or the audit event; KC-U4 access group rules (SG-F7); KC-U5 session decoding and the evidence on every failure reply; KC-U6 `not_signed` is terminal: later requests make no port call; SS-U7 extended | Unsigned negative case: `Target::Default` gives `not_signed` with no call, and list, read and delete naming an unentitled group give -34018; scratch file backend cases, with a denied delete now an orphan; TUI and audit carry the not_signed text and the evidence | Signed qualification run Q0 to Q7 with the test group; the group ends empty (passed 2026-10-27). SS-I and SL5 on the data-protection keychain with a signed service: **pass** (SG5 S3, 2026-10-29), SS-I4, SS-I5 and SS-I7 not applicable | Qualification Mac (SGQ6) |
 | SG-V7 | RS5 | Test-support seam: production cannot select `Scratch`; platform unit tests refuse `Target::Default` when a group is found | After each qualification run, the test group lists empty; `cargo test` makes no data-protection add and no login keychain search | — | — |
-| SG-V8 | PC-I38 | — | PC-I38 unsigned (existing) | PC-I38-S signed; HR-P2 recorded | macOS 27 |
-| SG-V9 | Bundle lookup | Resource path resolution from `Contents/MacOS` | Copy step finds `Resources/mlx.metallib` and the Hub bundle | `--native-mlx` from the installed keg | Clean host |
+| SG-V8 | PC-I38 | — | PC-I38 unsigned (existing) | PC-I38-S signed; HR-P2 recorded. **Pass** (SG5 S1, S4, 2026-10-29) | macOS 27 |
+| SG-V9 | Bundle lookup | Resource path resolution from `Contents/MacOS` | Copy step finds `Resources/mlx.metallib` and the Hub bundle | `--native-mlx` from the installed keg. SG5 S6 (2026-10-29): MLX turn from the notarised keg's bytes with the SG-V5 helper variant and `conversation_flow` as the service, pass; the keg's own `asura` as the service is not run | Clean host |
 | SG-V11 | SG4: HD1, HD5, HD8, HD9, HD10, HD12, HD13 | `test-asura-bundle --static`: formula template fields and test block; `asura-release` holds no publishing command (HD10); refusal cases of every mode; `--version` and the `get-task-allow` profile cases. Cargo: `--version` parses before any runtime access and refuses `--logs` | `asura --version` exits 0 with the version under a Seatbelt profile that denies file writes and network (HD8). `asura-release check --ad-hoc` on the dry-run archive; `formula`; `tap-test --archive` with the ad hoc archive: the wrong-digest install fails with no keg and no link (HD5), then install, `brew test`, `brew audit --strict` and the keg checks (HD1, HD9 locally); `preflight` refuses on the current repository (immutability disabled: HD12) | Owner: `check --release`, `tap-test --archive --release`, publication, `verify-release` (HD12, HD13), HTTPS `tap-test`, clean-host install (HD1). NT-P1 for the notarised keg (HD9) | macOS 27, Homebrew 7.0.11, owner's Mac |
 | SG-V12 | RS11, SG4-O1 | `test-asura-bundle --static`: `host-paths` reports the home inside a string and alone, the repository, `/<user>` under another prefix and a link target; it ignores near misses (another account's home, a longer user name, `org.<user>.asura`, the user name alone, `/cargo/…`, a longer repository name); it prints counts only; it refuses `HOME` empty or `/`, a relative repository, a missing path and no path (exit 2). `asura-release check` fails an archive whose `LICENSE` holds the home and passes the rule on a clean one; no `NOTE` remains | `test-asura-bundle --bundle` on a new dry run: an independent raw scan of every bundle file finds no `$HOME`, `/Users/`, repository path or `/<user>/`; `asura` holds `/cargo/registry/src/` and `/rustc/<commit>/library/` locations; the helper holds `/asura/…/checkouts/` (or `/swiftpm/checkouts/`) locations and no debug-map stab; `check --ad-hoc` passes the rule; the same archive with the home planted in `LICENSE` fails only the rule. `--sandbox` (SG-V5) on the remapped helper | A release build: notarised, stapled, `check --release` passes every check including the rule | macOS 27, Apple silicon, owner's Mac |
 | SG-V10 | BN1 | Digest over sorted (path, SHA-256) pairs, pinned to the `shasum` form; limit checks (17 files, 17 directories, depth 5, 1 MiB + 1 byte file, 1 MiB + 1 byte total rejected; the limits themselves accepted); empty file accepted; symlink, group-writable and control-character names rejected | Copy into a scratch run root and read by the copied helper; mismatch and absence fail before spawn; Core AI copies, system does not; cleanup leaves unknown entries; cancel during copy cleans owned copies; the service reports an MLX selection unavailable before spawn when the package bundle does not match its embedded digest | `conversation_flow --native-mlx` with a fixture model that has `model_type` and no `tokenizer_class` completes | macOS 27, real MLX model (BN-P1 fixture) |
@@ -2071,7 +2126,7 @@ signing packet.
 | SG3 | Delivered (2026-10-27) | — ([delivery](#sg3-delivery)); the signed qualification run (SGQ6) is the owner's |
 | SG4 | Delivered (2026-10-28) | — ([delivery](#sg4-delivery)); publication, the release-mode checks and the clean-host install are the owner's |
 | SG4-O1 | Delivered (2026-10-29) | — ([delivery](#sg4-o1-delivery)) |
-| SG5 | Ready (design 2026-10-29, [SG5](#sg5-qualification-on-the-signed-artifact)) | — |
+| SG5 | Delivered (2026-10-29) | — ([delivery](#sg5-delivery)); the keg's own service in `~/.asura`, publication and the clean host stay with the owner ([gates not run here](#sg5-gates-not-run-here)) |
 
 ### SG1 delivery
 
@@ -2260,6 +2315,11 @@ read and delete, which returned -34018.
 | SS-E1, SS-E2 | End to end | `lifecycle --person-secrets` with the new locked text |
 | Qualification | Script | `secret-store-qualification --ad-hoc`: built, signed ad hoc without restricted entitlements, and the executable refused with no Keychain call. The signed run is the owner's (SGQ6) |
 
+Later: the owner's signed qualification run passed Q0 to Q7 on 2026-10-27,
+and SG5 ran SS-I on a signed service on 2026-10-29
+([SG5 results](#sg5-results-2026-10-29)). The limits below are as recorded
+at delivery.
+
 Proof limits: the signed qualification run (Q0 to Q7) has not run, so the
 data-protection add, read, list, delete, sweep and restart through Asura's own
 code, and whether `SecItemAdd` accepts `kSecUseAuthenticationUIFail` on the
@@ -2392,6 +2452,50 @@ Proof limits:
 - The user-name rule fails on any future `https://github.com/<user>/…` string
   ([known limit](#build-host-paths-sg4-o1)).
 
+### SG5 delivery
+
+Delivered 2026-10-29 on the SG5 worktree branch, on the owner's Mac, by a
+delegated agent. The results, artifacts and evidence files are in
+[SG5 results](#sg5-results-2026-10-29). One notary submission was made
+(`54ea1de4-aebf-4438-8687-7a840ad44362`, `Accepted`). Keychain items were
+written only by the S3 harness bundle, only in
+`LFQFWCB8Y3.org.pidster.asura.test`, and the group ended empty. No service
+signed with the production App ID was started, and `~/.asura` was not used.
+
+- `asura-service/src/conversation/person_command.rs`: the
+  [test-group store](#test-group-secret-store) selection, with the unit case
+  `test_group_home_gives_no_target_in_unit_tests`.
+- `asura-platform/src/keychain.rs`: `scratch::add_account` accepts
+  `Target::Default` only under the test group.
+- `asura-service/tests/person_command_flow.rs`: the test-group mode and
+  `--purge-test-group`.
+- `asura-platform/tests/exec_cmd_process.rs`: ad hoc fixture copies, the
+  PC-I38 control and PC-I38-S.
+- The harness scripts live with the owner's probe records (`src/` and
+  `sg5-scripts.txt`), not in the repository.
+
+Proof limits and residual risks:
+
+- The signed executable in S1 to S3 is a Cargo test binary that runs the
+  same service, guardian and store code as `asura`, with the same signature
+  flags. It is not the `asura` executable, and it ran with the test App ID.
+- The keg's own `asura` never ran as a service: it claims the production
+  group and resolves `~/.asura`. HD9 with the keg's service, HD6 and HD11
+  need an owner decision on a production-signed service run in the account
+  home ([gates not run here](#sg5-gates-not-run-here)).
+- S6 ran the keg's helper code re-signed as the SG-V5 variant, not the keg's
+  Developer ID helper signature: the shipped helper reads only the account
+  home.
+- SS-I4 and SS-I5 (locked keychain) and KC-P3 stay unverified; -25308 as
+  `locked` relies on field evidence. SS-E1 and SS-E2 ran only on the scratch
+  store, unsigned.
+- PT-H1 and SG-T3 stand: the helper App Sandbox does not stop same-user
+  `KERN_PROCARGS2` reads. SG-T1 (any team build reads the items) and SG-T2
+  stand.
+- Publication, `verify-release`, the HTTPS tap test, the offline Gatekeeper
+  check and the clean-host install (HD1, HD12, HD13) remain the owner's.
+  Immutable releases stay disabled (SG4-O2).
+
 ## Design verification
 
 Recorded on 2026-10-23. Written from the draft of the same day and the owner's
@@ -2474,5 +2578,16 @@ handling and open items, AE-02, SG-V12, SG-P, the packet table and
 readiness. Diagrams SG-F4, SG-F11 and SG-P were rendered with the local
 Mermaid CLI (`mmdc -s 2`) into a temporary directory outside the repository
 and inspected.
+
+Updated 2026-10-29 for packet SG5. Evidence: the owner's SG3 qualification
+record, `asura-platform/src/runtime.rs` (`account_home`), the person command
+owner's `store_target`, the `exec_cmd_process` and `person_command_flow`
+harnesses, `secret-store-qualification`, `test-asura-bundle --sandbox` and
+`asura-release tap-test`, and the SG5 runs. Changed: the status block, the
+new [SG5 section](#sg5-qualification-on-the-signed-artifact) (SG-F12), the
+SG5 results and delivery, SG-V4, SG-V6, SG-V8, SG-V9, the SG5 owned paths and
+readiness, and a note on the SG3 delivery. Diagram SG-F12 was rendered with
+Mermaid CLI 12.0.0 (`mmdc -s 2`) into a temporary directory outside the
+repository and inspected.
 
 Return to the [design index](README.md).
