@@ -787,6 +787,17 @@ checks both. The platform's own unit tests refuse `Target::Default` with
 `Invalid` when the access group check finds a group; an unsigned test binary
 gets `not_signed` with no Keychain call.
 
+SG5 adds one test-support selection (2026-10-29,
+[release signing](release-signing.md#test-group-secret-store)). A harness
+home whose `secret-store-keychain` file starts with
+`data-protection:test-group` gets `Target::Default` only in a test-support,
+non-unit-test build whose selected access group is
+`<TeamID>.org.pidster.asura.test`; otherwise it gets no target. Only a
+qualification harness bundle signed with the test App ID meets this, and the
+operator runs it outside `cargo test`, so testing rule 1 still holds for
+`cargo test`. `scratch::add_account` accepts `Target::Default` under the same
+group rule.
+
 ### Probe results (2026-10-22)
 
 Recorded by packet SS1-K on macOS 27.0 build 26A428 with

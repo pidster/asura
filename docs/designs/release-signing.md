@@ -1813,6 +1813,185 @@ verified through Homebrew extraction. The `file://` download got no
 quarantine, so open point 6 (HTTPS) stays open until the first
 post-publication tap test.
 
+## SG5 qualification on the signed artifact
+
+Selected design (packet SG5, engineering, 2026-10-29). SG5 runs the
+remaining I9 gates on signed code: SG-V4, SG-V8, the service-level secret
+store cases (SS-I, slice SL5) on the data-protection keychain, and the
+release-distribution gates that a local run can prove (HD5, HD8, HD9).
+
+### SG5 constraints
+
+Required behavior (SGQ6 and the owner's SG5 direction, 2026-10-29):
+
+- Only a build signed with the test App ID `org.pidster.asura.test` writes
+  Keychain items, and only in `<TeamID>.org.pidster.asura.test`. Every run
+  that touches the store ends with the test group purged and
+  `test-group-empty=yes`.
+- No run writes to `<TeamID>.org.pidster.asura`. No run starts a service
+  signed with the production App ID.
+- Every service run uses an isolated home under `/private/tmp`. No run uses
+  the account's `~/.asura`.
+- No `security` command runs, except `security list-keychains -d user`
+  before and after; it must list only the login keychain.
+
+`asura` resolves its home from the account database, not from `HOME`
+([runtime](#current-state)). The real `asura` service can therefore run only
+in the account's `~/.asura`. SG5 does not start it. Cargo test binaries run
+the same service, guardian and store code in an isolated home, so SG5 signs
+those binaries instead.
+
+### Qualification harness bundle
+
+Selected mechanism. A **qualification harness bundle**
+`AsuraQualification-<test>.app` holds one `harness = false` Cargo test
+binary of a `test-support` build. The operator's harness script, kept with
+the owner's probe records and not in the repository (like the probes),
+assembles and signs it:
+
+1. Copy the test binary to `Contents/MacOS/<test>`. For a binary that runs
+   model turns, copy the unsandboxed development helper to
+   `Contents/MacOS/asura-model`, and `mlx.metallib` and the Hub bundle to
+   `Contents/Resources` ([resource directory](#resource-directory-inside-the-bundle)).
+2. Write `Contents/Info.plist` with `CFBundleIdentifier`
+   `org.pidster.asura.test`, the same keys as the
+   [signed qualification run](#signed-qualification-run) bundle.
+3. Check the test App ID profile as `secret-store-qualification` does:
+   not expired, the team, the application identifier
+   `<TeamID>.org.pidster.asura.test`, and a group list that allows it. Embed
+   it as `Contents/embedded.provisionprofile`.
+4. Sign the bundle with the operator identity, `--options runtime`, no
+   timestamp and the entitlements of
+   `tools/release/entitlements/secret-store-qualification.plist`.
+5. Check: `codesign --verify --strict`; the signed entitlements equal the
+   list; the identifier is `org.pidster.asura.test`; the team identifier;
+   the `runtime` flag. A failed check stops that run before the binary
+   starts.
+
+The service child and the exec_cmd guardian are re-executions of
+`current_exe`, so both run as the signed, hardened executable with the test
+group (KC-P2 showed that a re-exec keeps the entitlements). This is the
+same code-signing state as a signed `asura`. It is not the `asura`
+executable itself; that is a proof limit.
+
+### SG5 runs
+
+Selected. The runs are sequential. Each saves its raw output to the owner's
+records as `sg5-*.txt`.
+
+| Run | What runs | Gates |
+| --- | --- | --- |
+| S1 | `exec_cmd_process` in its harness bundle | SG-V4: EC-I1 to EC-I13, the platform PC cases, the `KERN_PROCARGS2` environment-marker scan (EC-I9); SG-V8: PC-I38 and PC-I38-S |
+| S2 | `person_command_flow` in its harness bundle, scratch store | SG-V4: the service-level PC cases and EC-I9, EC-I10 with a signed guardian |
+| S3 | `person_command_flow` in its harness bundle, test-group store | SS-I on the data-protection keychain (below) |
+| S4 | HR-P2: a C fixture signed with the operator identity and the Hardened Runtime, no entitlements, prints the `DYLD_` entries of its environment | SG-V8 |
+| S5 | `asura-bundle --release` from a clean tree (one notary submission), `asura-release check --release`, `formula`, `tap-test --release` | HD5, HD8, HD9 keg checks, SG-V2, SG-V12 |
+| S6 | The S5 formula installed again from an equivalent local tap; `test-asura-bundle --sandbox` on the keg's `Asura.app` with `ASURA_TEST_MLX_ASSET`; uninstall and untap | HD9 and SG-V9: executable resource lookup and an MLX turn from the keg's bytes |
+
+S5 needs the notary submission. No notarised keg built after SG4-O1 exists:
+NT-P1's keg predates the path removal and `--version`, and the SG4-O1
+archive was checked but never installed. In S6 the service is
+`conversation_flow` and the helper is the SG-V5 test variant, because the
+shipped helper reads only the account home ([SG2 delivery](#sg2-delivery)).
+
+### PC-I38 control and PC-I38-S
+
+Selected (test change). PC-I38's control run used `current_exe`. A signed,
+hardened binary ignores `DYLD_INSERT_LIBRARIES`, so that control would fail
+in S1. The control now runs an ad hoc copy of the test binary, re-signed
+with `codesign --force --sign -` and no options, which has no Hardened
+Runtime. It loads the library in both an unsigned and a signed run.
+
+PC-I38-S runs when the test binary carries the `runtime` flag
+(`codesign -d --verbose=2`). The test starts `current_exe` (the guardian's
+executable) with `DYLD_INSERT_LIBRARIES` in its own environment. It must
+write no marker. An unsigned run prints that PC-I38-S does not apply.
+
+### Test-group secret store
+
+Selected (test-support seam). A harness home selects the store through its
+`secret-store-keychain` file ([person command owner](secret-store.md#test-support-seam)).
+The first line `data-protection:test-group` selects `Target::Default` only
+when all of these hold; otherwise the store has no target:
+
+1. the build has the `test-support` feature and is not a unit test build;
+2. the process's selected access group is the test group
+   (`data_protection::qualification::test_group`).
+
+A production build has no such path. A test-support binary signed with the
+production group gets no target. `keychain::scratch::add_account` also
+accepts `Target::Default` under the same group rule, for SS-I10's 256
+unrecognized items.
+
+`person_command_flow` runs in this mode when `ASURA_TEST_SECRET_STORE` is
+`test-group`. It refuses unless the test group is selected. It purges the
+test group before the first case and after each case. `--purge-test-group`
+purges it and prints `test-group-empty=yes` only when the final listing is
+empty; the harness runs it after S3 whether S3 passed or failed.
+
+| Case | Test group | Reason |
+| --- | --- | --- |
+| SS-I1, SS-I2, SS-I3, SS-I6, SS-I8, SS-I9, SS-I10, SS-I11 | Run | Same assertions as the scratch run; the item listing reads the test group |
+| SS-I4, SS-I5 | Not applicable | A test cannot lock the data-protection keychain. -25308 stays unverified (KC-P3) |
+| SS-I7 | Not applicable | Under SGQ4 any team build reads the item; KC-P1 recorded the cross-identity reads. The run checks SS-I6 for both inputs instead |
+
+#### SG-F12: SG5 run order
+
+Selected design. Arrows show the next step; labelled arrows show a result.
+A failed case is recorded and the next independent run continues.
+
+```mermaid
+flowchart TD
+    K0["security list-keychains -d user: login only"] --> P["Development helper package and test-support builds"]
+    P --> H["Harness bundles: test App ID, test group, runtime, test profile"]
+    H --> HC{"Strict verify, entitlements, identifier, team, runtime?"}
+    HC -->|No| Stop["Stop: run not started, record FAIL"]
+    HC -->|Yes| S1["S1 exec_cmd_process: EC, PC, PC-I38, PC-I38-S"]
+    S1 --> S2["S2 person_command_flow, scratch store"]
+    S2 --> S3["S3 person_command_flow, test-group store"]
+    S3 --> Purge["--purge-test-group: always"]
+    Purge --> E{"test-group-empty=yes?"}
+    E -->|No| Hold["Record FAIL; stop store runs; report"]
+    E -->|Yes| S4["S4 HR-P2 signed fixture"]
+    S4 --> S5["S5 release build, one notary submission, check, formula, tap-test"]
+    S5 -->|"Not Accepted"| NR["Record; no resubmission; S6 not run"]
+    S5 -->|Accepted| S6["S6 keg install, --sandbox journey with MLX, uninstall, untap"]
+    S6 --> K1["security list-keychains -d user: login only; no escapee fixture alive"]
+    NR --> K1
+    Hold --> K1
+```
+
+### SG5 failure handling and limits
+
+- A failed case is recorded with its output. A listed flake may be rerun
+  alone; the record names the rerun.
+- The test-group purge runs after S3 on every outcome. A purge that cannot
+  empty the group stops the store runs and is reported.
+- S5 makes at most one notary submission. An unknown outcome is queried with
+  `notarytool info`, never resubmitted (AE-05).
+- S6 refuses if `$(brew --prefix)/bin/asura` exists. It uses only the tap
+  `asura-release/local` with a `file://` URL and `HOMEBREW_NO_AUTO_UPDATE=1`.
+  It uninstalls, removes the trust entry and untaps on every outcome.
+- No step has a time bound (RS8). Each run ends with its result or an
+  operator cancel. The tests keep their own harness budgets.
+- The runtime is unchanged (AE-01 to AE-07). The seam adds one file read and
+  one entitlement read on the existing start-time read thread of a
+  test-support build.
+
+### SG5 gates not run here
+
+These need a production-signed `asura` service in the account's `~/.asura`,
+a publication or another host. SG5 records them as owner decisions or owner
+steps:
+
+| Gate | Why not here |
+| --- | --- |
+| HD9 with the keg's own `asura` as the service | The keg's `asura` claims the production group and uses `~/.asura` |
+| HD6, HD11 | Both start the keg's service in the account home |
+| HD1, HD12, HD13 | Publication and a clean host (SGQ9) |
+| HD2 | No unsupported host is available |
+| SS-E1, SS-E2 on a signed binary | The TUI journey copies the binary out of its bundle, so it loses the profile |
+
 ## Validation
 
 | ID | Requirement | Unit | Integration | End to end | Environment |
@@ -1867,7 +2046,7 @@ flowchart TD
 | SG3 | `asura-platform/src/keychain*`, `asura-service/src/secret_store*`, `ServiceObservation` field 8 schema (fields 4 and 6 reserved) and its validation, the `secret_store.*` audit event fields (status, session; `stranded` removed), the owner's store wiring in `conversation/person_command.rs`, TUI `/status` and refusal text, the qualification binary and `tools/release/secret-store-qualification` with its entitlement list, secret store design | SG0-K, SGQ4–SGQ6 | SG-V6, SG-V7 |
 | SG4 | `tools/release/` (`asura-release`, `asura.rb.in`, the `get-task-allow` fix and `step=done` in `asura-bundle`, `test-asura-bundle`, README), `asura-cli` `--version` (`app.rs`, `tests/arguments.rs`) and CF01 in the command flows, the `pidster/homebrew-tap` formula (generated, published by the owner) | SG1, SG2, NT-P1 | SG-V11: HD1, HD5, HD8, HD9, HD10, HD12, HD13 |
 | SG4-O1 | `tools/release/` (`host-paths`, the path maps in `asura-bundle`, the rule in `asura-release check`, `test-asura-bundle`, README), `swift/model-helper/README.md` | SG4, owner decision 2026-10-29 | SG-V12 |
-| SG5 | Qualification records | SG2, SG3, SG4 | SG-V4, SG-V8 and the release-distribution gates |
+| SG5 | Qualification records; the [test-group store](#test-group-secret-store) seam: `asura-service/src/conversation/person_command.rs` (`store_target`), `asura-platform/src/keychain.rs` (`scratch::add_account`), `asura-service/tests/person_command_flow.rs`; the [PC-I38 control](#pc-i38-control-and-pc-i38-s) in `asura-platform/tests/exec_cmd_process.rs`; secret store design | SG2, SG3, SG4, SG4-O1 | SG-V4, SG-V8, SS-I on the data-protection keychain, HD5, HD8, HD9 |
 
 BN1 and SG1 both own `asura-platform/src/model_process.rs` and
 `swift/model-helper/README.md`. They run in sequence, never at the same time.
@@ -1887,7 +2066,7 @@ signing packet.
 | SG3 | Delivered (2026-10-27) | — ([delivery](#sg3-delivery)); the signed qualification run (SGQ6) is the owner's |
 | SG4 | Delivered (2026-10-28) | — ([delivery](#sg4-delivery)); publication, the release-mode checks and the clean-host install are the owner's |
 | SG4-O1 | Delivered (2026-10-29) | — ([delivery](#sg4-o1-delivery)) |
-| SG5 | Not ready | SG3 and SG4 |
+| SG5 | Ready (design 2026-10-29, [SG5](#sg5-qualification-on-the-signed-artifact)) | — |
 
 ### SG1 delivery
 
