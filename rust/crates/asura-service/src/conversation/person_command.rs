@@ -82,7 +82,9 @@ pub(super) const CANCELLED: &str = "cancelled";
 /// (`Target::Default`, SG3). A test-support build, or this crate's unit
 /// tests, use the scratch keychain the harness names in
 /// `HOME/secret-store-keychain` (its path, then its password, one per
-/// line), `Target::Default` only for the account's own Asura home, and no
+/// line), `Target::Default` for a [`TEST_GROUP_STORE`] home only under the
+/// test access group (SG5), `Target::Default` for the account's own Asura
+/// home, and no
 /// target otherwise, so no test reaches the login or data-protection
 /// keychain (SSR6). Blocking (file read, account
 /// database): the start-time read thread only.
@@ -92,7 +94,11 @@ pub(super) fn store_target(runtime: &asura_platform::RuntimeDirectory) -> Option
         let home = runtime.scratch_home_for_test()?;
         if let Ok(text) = std::fs::read_to_string(home.join("secret-store-keychain")) {
             let mut lines = text.lines();
-            let path = std::path::PathBuf::from(lines.next()?);
+            let first = lines.next()?;
+            if first == TEST_GROUP_STORE {
+                return test_group_target();
+            }
+            let path = std::path::PathBuf::from(first);
             let password = Zeroizing::new(lines.next()?.to_owned());
             return Some(Target::Scratch { path, password });
         }
@@ -103,6 +109,32 @@ pub(super) fn store_target(runtime: &asura_platform::RuntimeDirectory) -> Option
     {
         let _ = runtime;
         Some(Target::Default)
+    }
+}
+
+/// The first line of a harness home's `secret-store-keychain` file that asks
+/// for the data-protection keychain under the test access group (SG5,
+/// `release-signing.md#test-group-secret-store`).
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) const TEST_GROUP_STORE: &str = "data-protection:test-group";
+
+/// `Target::Default` for a [`TEST_GROUP_STORE`] home, only in a
+/// test-support, non-unit-test build whose selected access group is
+/// `<TeamID>.org.pidster.asura.test`; otherwise no target. Blocking
+/// (entitlement read): the start-time read thread only.
+#[cfg(any(test, feature = "test-support"))]
+fn test_group_target() -> Option<Target> {
+    if cfg!(test) {
+        return None;
+    }
+    #[cfg(feature = "test-support")]
+    {
+        asura_platform::keychain::data_protection::qualification::test_group()
+            .map(|_| Target::Default)
+    }
+    #[cfg(not(feature = "test-support"))]
+    {
+        None
     }
 }
 

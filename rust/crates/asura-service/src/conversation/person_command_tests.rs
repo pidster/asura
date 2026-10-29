@@ -1101,3 +1101,29 @@ fn store_failures_refuse_and_audit_with_evidence() {
         .expect("valid audit event");
     }
 }
+
+/// SG5 test-group store seam: a unit test build never gets a target from a
+/// `data-protection:test-group` home, whatever its signature, so no unit
+/// test reaches the data-protection keychain (SSR6).
+#[test]
+fn test_group_home_gives_no_target_in_unit_tests() {
+    let nonce: String = asura_platform::random_id()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let path = std::path::PathBuf::from("/private/tmp").join(format!("asura-sg5-unit-{nonce}"));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&path)
+        .unwrap();
+    let runtime = asura_platform::RuntimeDirectory::scratch(&path, true).unwrap();
+    std::fs::write(
+        path.join("secret-store-keychain"),
+        format!("{TEST_GROUP_STORE}\n"),
+    )
+    .unwrap();
+    let target = store_target(&runtime);
+    drop(runtime);
+    std::fs::remove_dir_all(&path).unwrap();
+    assert!(target.is_none(), "a unit test got {target:?}");
+}

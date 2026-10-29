@@ -2104,10 +2104,26 @@ fn od2_outside_survivor_holds_output(home: &Path, person: &PersonHome) {
         println!("OD2 {tag}: kind 2 reason 15, capture continued after the shell exited");
     }
 }
+/// Whether `path` carries the Hardened Runtime flag (`codesign -d`).
+fn hardened(path: &Path) -> bool {
+    let out = std::process::Command::new("/usr/bin/codesign")
+        .args(["-d", "--verbose=2"])
+        .arg(path)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .any(|line| line.starts_with("CodeDirectory ") && line.contains("runtime"))
+}
+
 /// PC-I38: a `!!` launch environment with `DYLD_INSERT_LIBRARIES` naming a
 /// fixture library. The guardian never loads it; the variable is given
-/// only to the `/bin/sh` spawn. A control run of the same unsigned test
-/// binary with the variable in its own environment loads it.
+/// only to the `/bin/sh` spawn. A control run of an unsigned copy of this
+/// test binary (re-signed ad hoc with no options, so no Hardened Runtime)
+/// with the variable in its own environment loads it. PC-I38-S
+/// (release-signing.md#pc-i38-control-and-pc-i38-s): when this binary is
+/// signed with the Hardened Runtime, the guardian's executable started with
+/// the variable in its own environment loads nothing.
 fn pc_i38_dyld_launch_variable(home: &Path, person: &PersonHome) {
     let markers = home.join("pc-i38");
     fs::create_dir(&markers).unwrap();
@@ -2123,8 +2139,23 @@ fn pc_i38_dyld_launch_variable(home: &Path, person: &PersonHome) {
         .unwrap();
     assert!(built.success(), "fixture library build");
     let library_text = library.to_str().unwrap();
-    // Control: the variable in a process's own environment loads it.
-    let control = std::process::Command::new(std::env::current_exe().unwrap())
+    // Control: the variable in an unsigned process's own environment loads it.
+    let unsigned = home.join("pc-i38-control");
+    fs::copy(std::env::current_exe().unwrap(), &unsigned).unwrap();
+    let resigned = std::process::Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(&unsigned)
+        .output()
+        .unwrap();
+    assert!(
+        resigned.status.success(),
+        "ad hoc control copy: {resigned:?}"
+    );
+    assert!(
+        !hardened(&unsigned),
+        "the control copy has no Hardened Runtime"
+    );
+    let control = std::process::Command::new(&unsigned)
         .arg("--noop")
         .env("DYLD_INSERT_LIBRARIES", library_text)
         .spawn()
@@ -2135,6 +2166,25 @@ fn pc_i38_dyld_launch_variable(home: &Path, person: &PersonHome) {
         markers.join(format!("loaded.{control_pid}")).exists(),
         "control run loaded the fixture"
     );
+    // PC-I38-S: the signed guardian executable ignores the variable.
+    if hardened(&std::env::current_exe().unwrap()) {
+        let signed = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--noop")
+            .env("DYLD_INSERT_LIBRARIES", library_text)
+            .spawn()
+            .unwrap();
+        let pid = signed.id();
+        assert!(signed.wait_with_output().unwrap().status.success());
+        assert!(
+            !markers.join(format!("loaded.{pid}")).exists(),
+            "PC-I38-S: the hardened guardian executable loaded the library"
+        );
+        println!(
+            "PC-I38-S: the hardened guardian executable (pid {pid}) started with DYLD_INSERT_LIBRARIES loaded nothing"
+        );
+    } else {
+        println!("PC-I38-S not applicable: this binary has no Hardened Runtime");
+    }
     let mut job = person_job(
         home,
         Profile::PersonOutside1,

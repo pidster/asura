@@ -9,6 +9,12 @@
 //! (`exec-cmd-person-account`). A `!!` command gets a fixture launch
 //! environment whose HOME is the scratch home.
 //!
+//! With `ASURA_TEST_SECRET_STORE=test-group` (SG5, only in a qualification
+//! harness bundle signed with the test App ID, never under `cargo test`)
+//! the store is the data-protection keychain under the test access group;
+//! the run purges that group before and after each case and ends with
+//! `test-group-empty=yes`. `--purge-test-group` purges it alone.
+//!
 //! Cases (by name): `basic` (PC-I1, PC-I17), `refusals` (PC-U43 submit,
 //! PC-I31, refusals), `secrets` (SS-I1, PC-I28, SS-I11), `restart`
 //! (SS-I2, PC-I11, PC-I32, SDI-10), `orphan` (SS-I3), `locked` (SS-I4,
@@ -43,13 +49,48 @@ const PATH: &str = "/usr/bin:/bin";
 
 // ------------------------------------------------------------ the scratch env
 
-/// A scratch home with its service, scratch keychain and fixture account.
-/// Drop stops the service before it deletes the scratch keychain (testing
-/// rule 2), then the fixture removes the home.
+/// The SG5 test-group store mode (release-signing.md#test-group-secret-store):
+/// `ASURA_TEST_SECRET_STORE=test-group` puts every case's store on the
+/// data-protection keychain under `<TeamID>.org.pidster.asura.test`. Only a
+/// qualification harness bundle signed with the test App ID selects that
+/// group; any other binary refuses before a case starts. Unset or empty is
+/// the scratch store.
+fn test_group_mode() -> bool {
+    match std::env::var("ASURA_TEST_SECRET_STORE").as_deref() {
+        Ok("test-group") => true,
+        Ok("") | Err(std::env::VarError::NotPresent) => false,
+        Ok(other) => {
+            eprintln!("ASURA_TEST_SECRET_STORE must be test-group or unset, not {other:?}");
+            std::process::exit(2);
+        }
+        Err(error) => {
+            eprintln!("ASURA_TEST_SECRET_STORE: {error}");
+            std::process::exit(2);
+        }
+    }
+}
+/// The selected test group, or an error that names why the mode cannot run.
+fn test_group() -> Result<String> {
+    keychain::data_protection::qualification::test_group().ok_or_else(|| {
+        "the test-group store needs this binary signed with the test App ID and only the group <TeamID>.org.pidster.asura.test".into()
+    })
+}
+/// Deletes every item of the test group and checks the group lists empty.
+fn purge_test_group() -> Result<usize> {
+    test_group()?;
+    keychain::data_protection::qualification::purge_test_group()
+        .map_err(|e| format!("test group purge: {e:?}").into())
+}
+
+/// A scratch home with its service, store and fixture account. In the
+/// scratch mode Drop stops the service before it deletes the scratch
+/// keychain (testing rule 2); in the test-group mode it stops the service
+/// and purges the test group. Then the fixture removes the home.
 struct Env {
     fixture: Fixture,
     target: Option<Target>,
     keychain: PathBuf,
+    test_group: bool,
     /// The `!` command's fixture account home and `$TMPDIR`.
     account: PathBuf,
     tmpdir: PathBuf,
@@ -58,6 +99,31 @@ impl Env {
     fn new(label: &str) -> Result<Self> {
         let fixture = Fixture::new(label, CHILD)?;
         let home = fixture.home.clone();
+        let account = home.join("account");
+        let tmpdir = home.join("account-tmp");
+        for dir in [&account, &tmpdir] {
+            std::fs::create_dir(dir)?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        write_private(
+            &home.join("exec-cmd-person-account"),
+            &format!("{}\n{}\n", account.display(), tmpdir.display()),
+        )?;
+        if test_group_mode() {
+            purge_test_group()?;
+            write_private(
+                &home.join("secret-store-keychain"),
+                "data-protection:test-group\n",
+            )?;
+            return Ok(Self {
+                fixture,
+                target: Some(Target::Default),
+                keychain: home.join("no-scratch.keychain"),
+                test_group: true,
+                account,
+                tmpdir,
+            });
+        }
         let keychain = home.join("scratch.keychain");
         let password: String = asura_platform::random_id()
             .iter()
@@ -69,20 +135,11 @@ impl Env {
             &home.join("secret-store-keychain"),
             &format!("{}\n{password}\n", keychain.display()),
         )?;
-        let account = home.join("account");
-        let tmpdir = home.join("account-tmp");
-        for dir in [&account, &tmpdir] {
-            std::fs::create_dir(dir)?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        }
-        write_private(
-            &home.join("exec-cmd-person-account"),
-            &format!("{}\n{}\n", account.display(), tmpdir.display()),
-        )?;
         Ok(Self {
             fixture,
             target: Some(target),
             keychain,
+            test_group: false,
             account,
             tmpdir,
         })
@@ -124,6 +181,13 @@ impl Env {
 impl Drop for Env {
     fn drop(&mut self) {
         let _ = self.fixture.stop();
+        if self.test_group {
+            // Each case leaves the test group empty for the next one.
+            if let Err(error) = purge_test_group() {
+                eprintln!("{error}");
+            }
+            return;
+        }
         if let Some(target) = self.target.take()
             && self.keychain.exists()
         {
@@ -773,6 +837,12 @@ fn orphan() -> Result<()> {
 /// locked at dispatch waits at the lane head with `keychain_locked`, and
 /// runs once the keychain is unlocked (the paced recheck).
 fn locked() -> Result<()> {
+    if test_group_mode() {
+        println!(
+            "SKIP SS-I4 SS-I5 (test group): a test cannot lock the data-protection keychain; -25308 stays unverified (KC-P3)"
+        );
+        return Ok(());
+    }
     let mut env = Env::new("pc-locked")?;
     env.start()?;
     let (project, directory) = env.project("project")?;
@@ -851,6 +921,26 @@ fn lost() -> Result<()> {
                 input,
             })
             .map_err(|e| format!("delete: {e:?}"))?;
+    }
+    if env.test_group {
+        // SG5: SS-I7 does not apply (SGQ4: any team build reads the item);
+        // both inputs check SS-I6 on the data-protection keychain.
+        env.start()?;
+        for input in [missing, denied] {
+            decide(&env, input, RESUME)?;
+            wait_for(Duration::from_secs(30), "secrets_lost", || {
+                entry(&env, project, input)
+                    .is_ok_and(|e| e.hold_reason.as_deref() == Some("secrets_lost"))
+            })?;
+            assert!(!intent_committed(&env, input)?);
+            decide(&env, input, DROP)?;
+            assert_eq!(entry(&env, project, input)?.state, Some(6), "dropped");
+        }
+        assert!(env.items()?.is_empty(), "no item left");
+        println!(
+            "PASS SS-I6 (test group): items deleted outside Asura held secrets_lost and dropped; SKIP SS-I7: under SGQ4 any team build reads the item (KC-P1)"
+        );
+        return Ok(());
     }
     // Another binary identity writes the second input's item.
     let password = std::fs::read_to_string(env.home().join("secret-store-keychain"))?
@@ -2775,6 +2865,31 @@ fn main() {
         }
         return;
     }
+    if args.get(1).map(String::as_str) == Some("--purge-test-group") {
+        // SG5: the harness runs this after the test-group run on every outcome.
+        match purge_test_group() {
+            Ok(deleted) => {
+                println!("purged {deleted} items");
+                println!("test-group-empty=yes");
+                return;
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                println!("test-group-empty=no");
+                std::process::exit(1);
+            }
+        }
+    }
+    let test_group_run = test_group_mode();
+    if test_group_run {
+        match test_group().and_then(|group| Ok((group, purge_test_group()?))) {
+            Ok((group, deleted)) => println!("test-group store: group {group}, purged {deleted}"),
+            Err(error) => {
+                eprintln!("person command flow refused: {error}");
+                std::process::exit(3);
+            }
+        }
+    }
     let selected: Vec<&str> = args[1..]
         .iter()
         .map(String::as_str)
@@ -2813,6 +2928,15 @@ fn main() {
         if let Err(error) = case() {
             eprintln!("person command flow case {name} FAILED: {error}");
             std::process::exit(1);
+        }
+    }
+    if test_group_run {
+        match purge_test_group() {
+            Ok(_) => println!("test-group-empty=yes"),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
         }
     }
     println!("person command flow qualification passed");

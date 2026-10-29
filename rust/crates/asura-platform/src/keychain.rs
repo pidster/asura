@@ -699,17 +699,21 @@ pub mod scratch {
 
     /// Adds one item under `service_name(installation)` with any non-empty
     /// `account`, so tests can write accounts outside the item contract
-    /// (SS-W9). Opens only a scratch target and uses the same pre-check, add
-    /// and status mapping as [`Keychain::add`].
+    /// (SS-W9). Opens a scratch target, or `Target::Default` only when this
+    /// process's selected access group is the test group (SG5, SS-I10 on
+    /// the data-protection keychain), and uses the same pre-check, add and
+    /// status mapping as [`Keychain::add`].
     pub fn add_account(
         target: &Target,
         installation: &[u8; 16],
         account: &str,
         data: &[u8],
     ) -> Result<Added, Failure> {
-        let Target::Scratch { .. } = target else {
-            return Err(Failure::Invalid);
-        };
+        match target {
+            Target::Scratch { .. } => {}
+            Target::Default if super::data_protection::qualification::test_group().is_some() => {}
+            Target::Default => return Err(Failure::Invalid),
+        }
         if account.is_empty() || account.contains('\0') {
             return Err(Failure::Invalid);
         }
