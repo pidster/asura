@@ -133,6 +133,14 @@ check_archive() { # ARCHIVE VERSION KIND TEAM
     contents=$app/Contents
     check 'top level holds exactly Asura.app and LICENSE' [ "$(ls -A "$x" | LC_ALL=C sort | tr '\n' ' ')" = 'Asura.app LICENSE ' ]
     check 'no link or special file' [ -z "$(find "$x" ! -type f ! -type d)" ]
+    # SG4-O1 (owner, 2026-10-29): no file may name the build host
+    # (release-signing.md#build-host-paths-sg4-o1).
+    if report=$(/usr/bin/python3 -I "$release/host-paths" --repository "$root" "$x/Asura.app" "$x/LICENSE" 2>&1); then
+        pass 'no file holds the account home, the repository path or the user name (SG4-O1)'
+    else
+        bad 'no file holds the account home, the repository path or the user name (SG4-O1)'
+        printf '%s\n' "$report" | sed 's/^/  /'
+    fi
     required='LICENSE Asura.app/Contents/Info.plist Asura.app/Contents/_CodeSignature/CodeResources Asura.app/Contents/MacOS/asura Asura.app/Contents/MacOS/asura-model Asura.app/Contents/Resources/mlx.metallib Asura.app/Contents/Resources/model-package.json Asura.app/Contents/Resources/swift-transformers_Hub.bundle/Contents/Info.plist'
     signed='Asura.app/Contents/CodeResources Asura.app/Contents/embedded.provisionprofile'
     for path in $required; do check "manifest: $path" [ -f "$x/$path" ]; done
@@ -188,11 +196,6 @@ check_archive() { # ARCHIVE VERSION KIND TEAM
         "$contents/MacOS/asura" "$(plutil -extract helper_sha256 raw -o - "$manifest")" \
         "$(plutil -extract hub_bundle_sha256 raw -o - "$manifest")" "$(plutil -extract build_id raw -o - "$manifest")"
     check "asura --version prints $v" [ "$("$contents/MacOS/asura" --version 2>/dev/null)" = "$v" ]
-    # SG4-O1: build-host paths are counted, not refused (owner decision).
-    for binary in asura asura-model; do
-        n=$(strings -a "$contents/MacOS/$binary" | grep -cF "$HOME/" || :)
-        note "$binary holds $n strings with the build account home path (SG4-O1)"
-    done
     record "version $v"
     record "archive $base sha256 $(sha "$a")"
     record "source revision $(git -C "$root" rev-parse HEAD) clean=$([ -z "$(git -C "$root" status --porcelain)" ] && echo yes || echo no)"

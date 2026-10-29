@@ -95,6 +95,28 @@ case "$out" in /*) ;; *) out=$(pwd -P)/$out ;; esac
 [ -d "$(dirname -- "$out")" ] || fail 'the parent of the output directory must exist'
 scratch=${scratch:-$root/.build/release-helper}
 case "$scratch" in /*) ;; *) scratch=$(pwd -P)/$scratch ;; esac
+mkdir -p "$scratch" && scratch=$(cd "$scratch" && pwd -P) || fail "cannot create the Swift scratch directory $scratch"
+# SG4-O1 (release-signing.md#build-host-paths-sg4-o1): the compilers write
+# source paths into the binaries. Map every build-host directory to a fixed
+# name, for these two builds only; host-paths checks the result in step 8.
+case "${HOME:-/}" in /) fail 'HOME must name the build account home' ;; esac
+cargo_home=${CARGO_HOME:-$HOME/.cargo}
+[ -d "$cargo_home" ] && cargo_home=$(cd "$cargo_home" && pwd -P) || fail "CARGO_HOME is not a directory: $cargo_home"
+sysroot=$(cd "$root" && rustc --print sysroot) && [ -d "$sysroot/lib/rustlib" ] || fail 'cannot read the rustc sysroot'
+commit=$(cd "$root" && rustc -vV | sed -n 's/^commit-hash: //p')
+printf '%s\n' "$commit" | grep -Eqx '[0-9a-f]{40}' || fail 'cannot read the rustc commit hash'
+for dir in "$root" "$scratch" "$cargo_home" "$sysroot"; do
+    case "$dir" in *=*|*"$(printf '\037')"*) fail "a build directory holds '=' or a unit separator: $dir" ;; esac
+done
+us=$(printf '\037')
+rust_maps="--remap-path-prefix=$cargo_home=/cargo$us--remap-path-prefix=$sysroot/lib/rustlib/src/rust=/rustc/$commit$us--remap-path-prefix=$root=/asura"
+# Positional parameters hold the Swift flags, so a path with a space stays
+# one argument. A scratch directory inside the repository needs no own map.
+set -- -Xcc "-ffile-prefix-map=$root=/asura" -Xswiftc -file-prefix-map -Xswiftc "$root=/asura" -Xlinker -S
+case "$scratch/" in
+    "$root"/*) ;;
+    *) set -- "$@" -Xcc "-ffile-prefix-map=$scratch=/swiftpm" -Xswiftc -file-prefix-map -Xswiftc "$scratch=/swiftpm" ;;
+esac
 version=$(sed -n 's/^version = "\([0-9][0-9.]*\)"$/\1/p' "$root/rust/crates/asura-cli/Cargo.toml" | head -n 1)
 [ -n "$version" ] || fail 'cannot read the asura-cli version'
 
@@ -228,9 +250,9 @@ done
 # --- 3. Build the helper ----------------------------------------------------
 step='helper build'
 swift build -c release --package-path "$root/swift/model-helper" --scratch-path "$scratch" \
-    --product asura-model || fail 'swift build failed'
+    --product asura-model "$@" || fail 'swift build failed'
 bin=$(swift build -c release --package-path "$root/swift/model-helper" --scratch-path "$scratch" \
-    --show-bin-path) || fail 'cannot find the Swift products'
+    --show-bin-path "$@") || fail 'cannot find the Swift products'
 
 # --- 4. Stage and check limits ----------------------------------------------
 step=stage
@@ -288,7 +310,11 @@ require_digests() {
 
 # --- 7. Build the service ---------------------------------------------------
 step='service build'
-CARGO_TARGET_DIR=$root/target cargo build --manifest-path "$root/Cargo.toml" --release --locked -p asura-cli ||
+# CARGO_ENCODED_RUSTFLAGS wins over RUSTFLAGS and build.rustflags (SG4-O1).
+# The build runs in the repository, so rust-toolchain.toml selects the
+# toolchain whose sysroot the map names.
+(cd "$root" && CARGO_ENCODED_RUSTFLAGS=$rust_maps CARGO_TARGET_DIR=$root/target \
+    cargo build --manifest-path "$root/Cargo.toml" --release --locked -p asura-cli) ||
     fail 'cargo build failed'
 [ "$(cat "$identity_file")" = "$(printf '%s\n' "$build_id" "$schema" "$helper_sha" "$metallib_sha" "$hub_sha")" ] ||
     fail 'package-identity.txt changed during the build'
@@ -307,6 +333,9 @@ copy "$pkg/swift-transformers_Hub.bundle" "$app/Contents/Resources/swift-transfo
 require_digests "$app/Contents/MacOS" 'assembled copy' "$app/Contents/Resources"
 count=$(find "$app" -type f | wc -l | tr -d ' ')
 [ "$count" -le 64 ] || fail "Asura.app holds $count files (64 allowed)"
+# SG4-O1: no build-host path may reach a signature or the notary service.
+/usr/bin/python3 -I "$root/tools/release/host-paths" --repository "$root" "$app" >&2 ||
+    fail 'Asura.app holds a build-host path (files above); fix the path maps'
 
 # --- 9. Sign the bundle, without --deep -------------------------------------
 step='bundle signature'

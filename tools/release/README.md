@@ -10,6 +10,7 @@ profile.
 | --- | --- |
 | `asura-bundle` | The package script: `--ad-hoc` (dry run), `--development` or `--release` |
 | `asura-release` | Release promotion checks and the formula (SG4): `preflight`, `check`, `formula`, `tap-test`, `verify-release`. It never publishes |
+| `host-paths` | The SG4-O1 scanner: reports any file that holds the account home, the repository path or the user name as a path component. `asura-bundle` and `asura-release check` run it |
 | `asura.rb.in` | The Homebrew formula template for `pidster/homebrew-tap` (`Formula/asura.rb`) |
 | `test-asura-bundle` | Checks: `--static` (tracked files and refusals), `--bundle APP` (an ad hoc bundle), `--sandbox APP` (the helper App Sandbox with an ad hoc bundle, SG-V5) |
 | `sandbox-probe.c` | The SG-V5 negative fixture that `--sandbox` builds and signs with the helper's sandbox list |
@@ -88,6 +89,29 @@ succeeds or you press Ctrl-C.
 
 A successful run ends with the line `asura-bundle: step=done`. A run that
 stops earlier wrote no archive.
+
+## Build-host paths (SG4-O1)
+
+The compilers write source paths into the binaries. `asura-bundle` maps them
+to fixed names for its own two builds
+([design](../../docs/designs/release-signing.md#build-host-paths-sg4-o1)):
+
+- `cargo build`: `--remap-path-prefix` in `CARGO_ENCODED_RUSTFLAGS` maps
+  `$CARGO_HOME` to `/cargo`, the toolchain's `rust-src` to
+  `/rustc/<commit-hash>` and the repository to `/asura`. This setting replaces
+  any `RUSTFLAGS` of yours for the bundle build. A later plain
+  `cargo build --release` rebuilds `target/release`.
+- `swift build`: `-ffile-prefix-map` (C and C++) and `-file-prefix-map`
+  (Swift) map the repository to `/asura`, and a `--swift-scratch` outside it
+  to `/swiftpm`; `-Xlinker -S` leaves out the debug map.
+
+After assembly, and before any signature, `host-paths` scans every file of
+`Asura.app`; a hit stops the script at `assembly`. `asura-release check`
+runs the same scanner on the extracted archive. To scan a bundle yourself:
+
+```sh
+/usr/bin/python3 -I tools/release/host-paths --repository "$PWD" .build/bundles/dry-run-1/Asura.app
+```
 
 ## Outputs
 
@@ -189,7 +213,6 @@ Owner prerequisites, once:
 - Enable immutable releases for `pidster/asura` (repository Settings >
   General > Releases). `preflight` refuses until
   `gh api repos/pidster/asura/immutable-releases` reports `"enabled": true`.
-- Decide SG4-O1 (embedded build-host paths, reported as `NOTE` by `check`).
 
 Below, `V` is the `asura-cli` version, `T` the team ID and `R` the released
 commit. Use a clean worktree of `main` at `R`, as for NT-P1.

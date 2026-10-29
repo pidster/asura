@@ -41,7 +41,10 @@ Before a standard SwiftPM build, the root build owner must:
 
 `tools/release/asura-bundle` performs steps 1 to 6 for a signed or ad hoc
 `Asura.app` ([SG1 package script](../../docs/designs/release-signing.md#sg1-package-script)).
-It signs the Hub bundle and then the helper before it hashes them, and leaves
+It builds the helper with the build-host path maps and without a debug map
+([SG4-O1](../../docs/designs/release-signing.md#build-host-paths-sg4-o1)), so
+the shipped helper names no build account or checkout path. It signs the Hub
+bundle and then the helper before it hashes them, and leaves
 the development package layout in `<out>/package/`. In `Asura.app` the helper
 is `Contents/MacOS/asura-model`, beside `asura`, and `mlx.metallib` and the
 Hub bundle are in `Contents/Resources`. The service reads them from

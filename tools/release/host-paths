@@ -1,0 +1,88 @@
+#!/usr/bin/python3 -I
+"""Report files that name the build host (release signing design, SG4-O1:
+docs/designs/release-signing.md#build-host-paths-sg4-o1).
+
+    host-paths --repository ROOT PATH...
+
+Reads every regular file under each PATH as raw bytes (never through
+`strings`, which skips the symbol string table) and counts three needles:
+
+- home: $HOME and the account home from the user database;
+- repository: ROOT, the repository's absolute path;
+- user: /<user name> as a path component.
+
+A needle matches only when the next byte cannot continue a file name (an
+ASCII letter, digit, '.', '_' or '-'), so /Users/pidster2 is not the home
+/Users/pidster. A symbolic link's target text is scanned as well.
+
+Prints one line for each file that holds a needle and exits 1; exits 0 when
+no file holds one; exits 2 on an unusable input, before reading any file.
+It prints counts only, never the bytes around a match.
+"""
+import os
+import pwd
+import re
+import sys
+
+NAME_BYTE = rb"(?![A-Za-z0-9._-])"
+
+
+def refuse(message):
+    print("host-paths: " + message, file=sys.stderr)
+    sys.exit(2)
+
+
+def main(argv):
+    if len(argv) < 3 or argv[0] != "--repository":
+        refuse("usage: host-paths --repository ROOT PATH...")
+    repository, paths = argv[1], argv[2:]
+    if not repository.startswith("/") or repository.rstrip("/") == "":
+        refuse("the repository path must be absolute and not /")
+    account = pwd.getpwuid(os.getuid())
+    homes = {h.rstrip("/") for h in (os.environ.get("HOME", ""), account.pw_dir)}
+    if "" in homes:
+        refuse("HOME and the account home must be set and must not be /")
+    user = account.pw_name
+    if not user or "/" in user:
+        refuse("the user name is empty or invalid")
+    for path in paths:
+        if not os.path.lexists(path):
+            refuse("no such file or directory: " + path)
+    needles = [
+        ("home", re.compile(b"|".join(re.escape(h.encode()) for h in sorted(homes)) + NAME_BYTE)),
+        ("repository", re.compile(re.escape(repository.rstrip("/").encode()) + NAME_BYTE)),
+        ("user", re.compile(b"/" + re.escape(user.encode()) + NAME_BYTE)),
+    ]
+
+    def files(path):
+        if os.path.islink(path) or not os.path.isdir(path):
+            yield path
+            return
+        for base, dirs, names in os.walk(path):
+            dirs.sort()
+            for name in dirs:
+                if os.path.islink(os.path.join(base, name)):
+                    yield os.path.join(base, name)
+            for name in sorted(names):
+                yield os.path.join(base, name)
+
+    found = 0
+    for path in paths:
+        parent = os.path.dirname(os.path.abspath(path).rstrip("/"))
+        for name in files(path):
+            if os.path.islink(name):
+                data = os.readlink(name).encode()
+            elif os.path.isfile(name):
+                with open(name, "rb") as handle:
+                    data = handle.read()
+            else:
+                continue
+            counts = [(label, len(pattern.findall(data))) for label, pattern in needles]
+            if any(n for _, n in counts):
+                found += 1
+                print("%s: %s" % (os.path.relpath(name, parent), ", ".join("%s %d" % c for c in counts)))
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

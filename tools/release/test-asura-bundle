@@ -2,10 +2,12 @@
 # Checks for the SG1 package script (release-signing.md#validation).
 #
 #   test-asura-bundle --static         SG-V1 and SG-V3 unit checks of the tracked
-#                                      files; SG-V3 refusal checks of the script
-#   test-asura-bundle --bundle APP     SG-V1 and SG-V2 checks of an assembled
-#                                      ad hoc Asura.app (from asura-bundle --ad-hoc),
-#                                      and the SG4 check of its dry-run archive
+#                                      files; SG-V3 refusal checks of the script;
+#                                      SG-V12 host-paths cases
+#   test-asura-bundle --bundle APP     SG-V1, SG-V2 and SG-V12 checks of an
+#                                      assembled ad hoc Asura.app (from
+#                                      asura-bundle --ad-hoc), and the SG4 check
+#                                      of its dry-run archive
 #   test-asura-bundle --sandbox APP    SG-V5 checks of the helper App Sandbox with
 #                                      an ad hoc Asura.app: a test-only signed
 #                                      variant, the HS-P7 negative fixture and the
@@ -224,7 +226,79 @@ EOF
     refuses 'qualification signed ad hoc' 'named identity' \
         "$qualification" --signed --out "$out" --identity - --team-id ABCDE12345 --profile "$scratch/profile"
     sg4_static_checks
+    host_paths_static_checks
     rm -rf "$scratch"
+}
+
+# SG4-O1 (release-signing.md#build-host-paths-sg4-o1): the scanner's needles,
+# near misses and refusals, and its use by asura-release check. Uses $scratch
+# from static_checks.
+host_paths_static_checks() {
+    scan() { /usr/bin/python3 -I "$release/host-paths" "$@"; }
+    user=$(id -un)
+    h=$scratch/host-paths
+    mkdir -p "$h/clean" "$h/hits"
+    # Near misses: another account's home, a longer user name, a reverse-DNS
+    # name, the user name inside a word or alone, a remapped location, and a
+    # longer name beside the (stand-in) repository /opt/asura-repo.
+    printf 'org.%s.asura\0/Users/%s2/x\0/opt/%sx/y\0%s\0/cargo/registry/src/a.rs\0/opt/asura-repo-other/z\0' \
+        "$user" "$user" "$user" "$user" > "$h/clean/near-misses.bin"
+    # Hits: the home inside a longer string, the home alone, the repository,
+    # the user name as a component under another prefix, and a link target.
+    printf 'panic at %s/.cargo/registry/src/a.rs:1:2\0' "$HOME" > "$h/hits/home.bin"
+    printf '\0%s\0' "$HOME" > "$h/hits/home-alone.bin"
+    printf '/opt/asura-repo/target/release/build/x/out/a.rs\0/opt/asura-repo\0' > "$h/hits/repository.bin"
+    printf 'x/opt/%s/src\0/var/%s\0' "$user" "$user" > "$h/hits/user.bin"
+    ln -s "$HOME/elsewhere" "$h/hits/link"
+    set +e
+    out=$(scan --repository /opt/asura-repo "$h/clean" 2>&1); status=$?
+    set -e
+    check 'host-paths: near misses are not build-host paths (exit 0, no report)' sh -c '[ "$1" -eq 0 ] && [ -z "$2" ]' sh "$status" "$out"
+    set +e
+    out=$(scan --repository /opt/asura-repo "$h/hits" "$h/clean" 2>&1); status=$?
+    set -e
+    expect_line() { check "host-paths reports $1" sh -c 'printf "%s\n" "$1" | grep -Fqx -- "$2"' sh "$out" "$2"; }
+    check 'host-paths: hits exit 1' [ "$status" -eq 1 ]
+    expect_line 'the home in a longer string' 'hits/home.bin: home 1, repository 0, user 1'
+    expect_line 'the home alone' 'hits/home-alone.bin: home 1, repository 0, user 1'
+    expect_line 'the repository path' 'hits/repository.bin: home 0, repository 2, user 0'
+    expect_line 'the user name as a path component' 'hits/user.bin: home 0, repository 0, user 2'
+    expect_line 'a link target' 'hits/link: home 1, repository 0, user 1'
+    check 'host-paths reports only the planted files' [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 5 ]
+    check 'host-paths prints counts, never the matching text' sh -c '! printf "%s\n" "$1" | grep -Fq -e registry -e /opt/' sh "$out"
+    printf '%s/x.rs\0' "$root" > "$h/real-repository.bin"
+    set +e
+    out=$(scan --repository "$root" "$h/real-repository.bin" 2>&1); status=$?
+    set -e
+    check 'host-paths reports this repository path' sh -c '[ "$1" -eq 1 ] && printf "%s\n" "$2" | grep -Fq ", repository 1,"' sh "$status" "$out"
+    refuses_scan() { # LABEL ARGS... -> exit 2 before reading any file
+        label=$1; shift
+        set +e
+        message=$("$@" 2>&1); status=$?
+        set -e
+        check "host-paths refuses: $label" sh -c '[ "$1" -eq 2 ] && printf "%s" "$2" | grep -q "^host-paths: "' sh "$status" "$message"
+    }
+    refuses_scan 'HOME set to /' env HOME=/ /usr/bin/python3 -I "$release/host-paths" --repository "$root" "$h/hits"
+    refuses_scan 'HOME empty' env HOME= /usr/bin/python3 -I "$release/host-paths" --repository "$root" "$h/hits"
+    refuses_scan 'a relative repository' scan --repository asura "$h/hits"
+    refuses_scan 'a missing path' scan --repository "$root" "$h/none"
+    refuses_scan 'no path' scan --repository "$root"
+    # asura-release check runs the scanner over the extracted archive: a
+    # planted LICENSE fails it; a clean one passes it.
+    for kind in planted clean; do
+        a=$h/$kind/asura-9.9.9-macos-arm64-adhoc-unstapled.tar.gz
+        mkdir -p "$h/$kind/tree/Asura.app/Contents"
+        printf 'x\n' > "$h/$kind/tree/Asura.app/Contents/Info.plist"
+        if [ "$kind" = planted ]; then printf 'built in %s/src\n' "$HOME" > "$h/$kind/tree/LICENSE"; else printf 'MIT\n' > "$h/$kind/tree/LICENSE"; fi
+        tar -czf "$a" -C "$h/$kind/tree" Asura.app LICENSE
+        (cd "$h/$kind" && shasum -a 256 "$(basename "$a")" > "$(basename "$a").sha256")
+        "$release/asura-release" check --ad-hoc --version 9.9.9 --archive "$a" > "$h/$kind/check.txt" 2>&1 || :
+    done
+    rule='no file holds the account home, the repository path or the user name (SG4-O1)'
+    check 'check FAILs an archive whose LICENSE holds the home' grep -Fqx "FAIL $rule" "$h/planted/check.txt"
+    check 'check names the planted file and its counts' grep -Fqx '  LICENSE: home 1, repository 0, user 1' "$h/planted/check.txt"
+    check 'check PASSes the path rule on a clean archive' grep -Fqx "PASS $rule" "$h/clean/check.txt"
+    check 'check prints no build-host NOTE any more' sh -c '! grep -q "^NOTE .*SG4-O1" "$1" "$2"' sh "$h/planted/check.txt" "$h/clean/check.txt"
 }
 
 # SG4 (release-signing.md#sg4-release-promotion-and-formula): the formula
@@ -342,6 +416,29 @@ bundle_checks() {
     check 'asura binary embeds the helper and Hub bundle digests' /usr/bin/python3 -I -c \
         'import sys; data = open(sys.argv[1], "rb").read(); sys.exit(0 if all(bytes.fromhex(h) in data for h in sys.argv[2:]) else 1)' \
         "$contents/MacOS/asura" "$(field helper_sha256)" "$(field hub_bundle_sha256)" "$(field build_id)"
+    # SG4-O1 (release-signing.md#build-host-paths-sg4-o1): a raw-byte scan,
+    # independent of host-paths, of every file; then the mechanism evidence.
+    check 'SG4-O1: no file holds the home, /Users/, the repository or /<user>/' /usr/bin/python3 -I -c '
+import os, sys
+needles = [n.encode() for n in sys.argv[2:]]
+found = []
+for base, dirs, names in os.walk(sys.argv[1]):
+    for name in names:
+        path = os.path.join(base, name)
+        data = os.readlink(path).encode() if os.path.islink(path) else open(path, "rb").read()
+        hits = ["%s x%d" % (n.decode(), data.count(n)) for n in needles if n in data]
+        if hits:
+            found.append(os.path.relpath(path, sys.argv[1]) + ": " + ", ".join(hits))
+for line in found:
+    print("  " + line)
+sys.exit(1 if found else 0)' "$app" "$HOME" /Users/ "$root" "/$(id -un)/"
+    commit=$(cd "$root" && rustc -vV | sed -n 's/^commit-hash: //p')
+    check 'SG4-O1: asura panic locations name /cargo/registry/src/' sh -c 'LC_ALL=C grep -aq "/cargo/registry/src/index.crates.io-" "$1"' sh "$contents/MacOS/asura"
+    check 'SG4-O1: asura standard library locations name /rustc/<commit>/library/' sh -c 'LC_ALL=C grep -aq "/rustc/$2/library/" "$1"' sh "$contents/MacOS/asura" "$commit"
+    check 'SG4-O1: helper C and C++ locations name /asura/ or /swiftpm/ checkouts' sh -c \
+        'LC_ALL=C grep -aqE "/(asura/\.build/[^/]+|swiftpm)/checkouts/" "$1"' sh "$contents/MacOS/asura-model"
+    check 'SG4-O1: helper carries no debug map (no N_SO or N_OSO stab)' sh -c \
+        '! nm -ap "$1" | grep -Eq "^[0-9a-f]+ - [0-9a-f]+ [0-9a-f]+ +(SO|OSO|SOL) "' sh "$contents/MacOS/asura-model"
     # SG4: the dry-run archive beside the bundle passes the ad hoc archive check
     # (manifest, signatures, digests, asura --version) and yields a formula.
     version=$(value CFBundleShortVersionString "$contents/Info.plist")
@@ -355,6 +452,20 @@ bundle_checks() {
         fi
         check 'asura-release formula from the dry-run archive' \
             "$release/asura-release" formula --version "$version" --archive "$archive" --out "$log/asura.rb"
+        check 'SG4-O1: check passes the build-host path rule' \
+            grep -Fqx 'PASS no file holds the account home, the repository path or the user name (SG4-O1)' "$log/check.txt"
+        # SG4-O1: the same archive with the home planted in LICENSE (outside
+        # the signed bundle) fails exactly one check, the build-host path rule.
+        mkdir "$log/tree" "$log/planted"
+        tar -xzf "$archive" -C "$log/tree"
+        printf 'built in %s\n' "$HOME" >> "$log/tree/LICENSE"
+        COPYFILE_DISABLE=1 tar --no-mac-metadata -czf "$log/planted/$(basename "$archive")" -C "$log/tree" Asura.app LICENSE
+        (cd "$log/planted" && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
+        "$release/asura-release" check --ad-hoc --version "$version" --archive "$log/planted/$(basename "$archive")" \
+            > "$log/planted.txt" 2>&1 || :
+        check 'SG4-O1: a planted home path fails only the build-host path rule' \
+            [ "$(grep '^FAIL' "$log/planted.txt")" = 'FAIL no file holds the account home, the repository path or the user name (SG4-O1)' ]
+        check 'SG4-O1: the report names LICENSE' grep -Fqx '  LICENSE: home 1, repository 0, user 1' "$log/planted.txt"
         rm -rf "$log"
     else
         bad "no dry-run archive beside the bundle: $archive"
@@ -562,7 +673,7 @@ case "${1:-}" in
     --static) [ "$#" -eq 1 ] || { echo "$0 --static" >&2; exit 2; }; static_checks ;;
     --bundle) [ "$#" -eq 2 ] && [ -d "$2" ] || { echo "$0 --bundle PATH/Asura.app" >&2; exit 2; }; bundle_checks "$2" ;;
     --sandbox) [ "$#" -eq 2 ] && [ -d "$2" ] || { echo "$0 --sandbox PATH/Asura.app" >&2; exit 2; }; sandbox_checks "$2" ;;
-    *) sed -n '2,20p' "$0" >&2; exit 2 ;;
+    *) sed -n '2,21p' "$0" >&2; exit 2 ;;
 esac
 printf '%s passed, %s failed, %s skipped\n' "$passed" "$failed" "$skipped"
 [ "$failed" -eq 0 ]
