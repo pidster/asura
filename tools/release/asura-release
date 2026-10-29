@@ -201,7 +201,8 @@ check_archive() { # ARCHIVE VERSION KIND TEAM
     record "source revision $(git -C "$root" rev-parse HEAD) clean=$([ -z "$(git -C "$root" status --porcelain)" ] && echo yes || echo no)"
     record "Cargo.lock sha256 $(sha "$root/Cargo.lock")"
     [ ! -f "$root/swift/model-helper/Package.resolved" ] || record "Package.resolved sha256 $(sha "$root/swift/model-helper/Package.resolved")"
-    record "rustc $(rustc -V 2>/dev/null || echo unavailable)"
+    # In the repository, so that rust-toolchain.toml selects the build toolchain.
+    record "rustc $( (cd "$root" && rustc -V) 2>/dev/null || echo unavailable)"
     record "swift $(swift --version 2>/dev/null | head -n 1 || echo unavailable)"
     record "macOS $(sw_vers -productVersion) build $(sw_vers -buildVersion)"
     for key in build_id helper_sha256 metallib_sha256 hub_bundle_sha256; do

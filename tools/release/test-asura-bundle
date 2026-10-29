@@ -452,6 +452,8 @@ sys.exit(1 if found else 0)' "$app" "$HOME" /Users/ "$root" "/$(id -un)/"
         fi
         check 'asura-release formula from the dry-run archive' \
             "$release/asura-release" formula --version "$version" --archive "$archive" --out "$log/asura.rb"
+        check 'check records the pinned rustc of rust-toolchain.toml' grep -Fq \
+            "RECORD rustc rustc $(sed -n 's/^channel = "\(.*\)"$/\1/p' "$root/rust-toolchain.toml") " "$log/check.txt"
         check 'SG4-O1: check passes the build-host path rule' \
             grep -Fqx 'PASS no file holds the account home, the repository path or the user name (SG4-O1)' "$log/check.txt"
         # SG4-O1: the same archive with the home planted in LICENSE (outside
