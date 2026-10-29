@@ -2133,6 +2133,81 @@ Proof limits:
 - `asura --version` under Homebrew's own test sandbox ran for the ad hoc keg
   only.
 
+### SG4-O1 delivery
+
+Delivered 2026-10-29 on the SG4-O1 worktree branch, on the owner's Mac
+(macOS 27.0 26A428, Apple silicon), by a delegated agent with the owner's
+authority to sign with the team's Developer ID Application identity and to
+make one notary submission. `security list-keychains -d user` listed only the
+login keychain before and after. No tag, GitHub release, push or tap change
+was made; `~/.asura` was used only by the SG-V5 journey's isolated homes.
+
+- `tools/release/host-paths`: the scanner of
+  [build-host paths](#build-host-paths-sg4-o1).
+- `tools/release/asura-bundle`: the path maps for steps 3 and 7, the cargo
+  build inside the repository, and the step 8 scan before any signature.
+- `tools/release/asura-release`: `check` runs the scanner after extraction,
+  as a `PASS` or `FAIL` line; the `NOTE` count is gone. The `rustc` record now
+  runs in the repository: run elsewhere, it named the account's default
+  toolchain (1.99.0), not the pinned 1.98.0 that built the release.
+- `tools/release/test-asura-bundle`, `tools/release/README.md`,
+  `swift/model-helper/README.md`.
+
+Raw byte occurrences of the account home, before (ad hoc build of
+`446d719`) and after (ad hoc build of the delivered scripts, and the
+notarised release build of `6810afe`). `/Users/`, the repository path and
+`/<user>/` were also zero in every file after the change.
+
+| File | Before | After, ad hoc | After, release |
+| --- | --- | --- | --- |
+| `asura` | 1,801 (`strings -a`: 1,606) | 0 | 0 |
+| `asura-model` | 1,844 (`strings -a`: 61) | 0 | 0 |
+| `mlx.metallib` | 0 | 0 (digest unchanged, `0214ad23…`) | 0 |
+| Hub bundle (7 files), `Info.plist`, `model-package.json`, `_CodeSignature`, `LICENSE` | 0 | 0 | 0 |
+| `CodeResources` (ticket), `embedded.provisionprofile` | — | — | 0 |
+
+Measured effect of each flag (verified on this Mac):
+
+- `--remap-path-prefix`: `asura` holds 81 strings with
+  `/cargo/registry/src/index.crates.io-…/<crate>-<version>/src/….rs:L` and
+  standard library locations `/rustc/88d9e12ae…/library/…`; the generated
+  Protobuf files read `/asura/target/release/build/…`; workspace crates keep
+  `rust/crates/…`. These are the forms a panic message prints. No panic was
+  triggered in `asura` itself.
+- `-Xlinker -S`: the helper holds no `N_SO`, `N_OSO` or `N_SOL` stab (3,565
+  before) and shrinks from 53,358,208 to 45,159,328 bytes.
+- `-Xcc -ffile-prefix-map`: the 61 C and C++ `__FILE__` strings read
+  `/asura/.build/release-helper/checkouts/…`.
+- `-Xswiftc -file-prefix-map`: no measured effect on the shipped bytes, because
+  the baseline held no Swift source path outside the debug map. It is kept so
+  that Swift debug information in the intermediates carries no build path;
+  this rests on the `swiftc -help-hidden` text, not on a measurement.
+- Documentation claims taken from help texts: `rustc --help -v` lists
+  `--remap-path-prefix` and `--remap-path-scope`; `swift build --help` lists
+  `-Xcc`, `-Xcxx`, `-Xswiftc` and `-Xlinker`; `man ld` describes `-S` and
+  `-oso_prefix`. Cargo 1.98.0 refused `trim-paths` (measured).
+
+| Case | Layer | Evidence |
+| --- | --- | --- |
+| SG-V12 | Unit | `test-asura-bundle --static`: 134 passed (115 before; 15 scanner cases and 4 `check` wiring cases added) |
+| SG-V12 | Integration | `test-asura-bundle --bundle` on a fresh dry run from `193e19c`: 45 passed. The independent scan, the mechanism checks, `check --ad-hoc` (39 passed), the pinned `rustc` record and the planted `LICENSE` case pass. The same checks on the `446d719` dry run fail as expected (independent scan, `/cargo/` locations, helper checkouts, debug map, `check`) |
+| SG-V5 | Integration, end to end | `test-asura-bundle --sandbox` on the remapped dry run, with `mlx-community/Qwen3-1.7B-4bit` and a local Ollama serving `granite4.1:8b`: 32 passed, 0 skipped. HS-P7 denials, inventory, system, MLX and Ollama turns, copy removal, crash and recovery all pass |
+| SG-V12, HD9 | End to end | `asura-bundle --release` from the clean tree at `6810afe`: notary submission `733dcb2b-4782-4941-8bb0-7e3efd5e8ca1` `Accepted`; stapled; `step=done`. `asura-release check --release --team-id LFQFWCB8Y3 --version 0.1.0`: 52 passed, 0 failed, including the path rule, `stapler validate`, Gatekeeper `Notarized Developer ID` and `asura --version` |
+
+Proof limits:
+
+- The release archive was checked but not tap-tested, published or installed
+  on a clean host; those steps remain the owner's.
+- The release `check` record shows `rustc 1.99.0`, because that run used the
+  code before the record fix; the build itself used the pinned 1.98.0
+  (`rust-toolchain.toml`, cargo run inside the repository).
+- No development-mode bundle was built in this packet. It shares steps 3, 7
+  and 8 with the ad hoc and release modes.
+- No Rust or Swift source changed, so `cargo test` and `swift test` were not
+  run; `cargo fmt --check` and both clippy passes ran.
+- The user-name rule fails on any future `https://github.com/<user>/…` string
+  ([known limit](#build-host-paths-sg4-o1)).
+
 ## Design verification
 
 Recorded on 2026-10-23. Written from the draft of the same day and the owner's
