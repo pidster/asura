@@ -1900,7 +1900,12 @@ Selected (test change). PC-I38's control run used `current_exe`. A signed,
 hardened binary ignores `DYLD_INSERT_LIBRARIES`, so that control would fail
 in S1. The control now runs an ad hoc copy of the test binary, re-signed
 with `codesign --force --sign -` and no options, which has no Hardened
-Runtime. It loads the library in both an unsigned and a signed run.
+Runtime. It loads the library in both an unsigned and a signed run. Every
+other copy of the test binary that `exec_cmd_process` runs as a fixture
+(the escape helper and the `KERN_PROCARGS2` probe helper) is made the same
+way. A copy outside the harness bundle has no profile, so a copy that kept
+the restricted entitlements would be killed at launch (observed in the first
+S1 run, 2026-10-29).
 
 PC-I38-S runs when the test binary carries the `runtime` flag
 (`codesign -d --verbose=2`). The test starts `current_exe` (the guardian's

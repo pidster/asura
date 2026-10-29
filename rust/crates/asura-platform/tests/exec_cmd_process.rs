@@ -360,11 +360,7 @@ fn qualification() {
     assert_eq!(result.reason, None);
     assert_eq!(result.total[0], 70_000_000);
     println!("J1T-07 platform: 70,000,000 bytes, no output stop");
-    fs::copy(
-        std::env::current_exe().unwrap(),
-        f.0.join("project/escape-helper"),
-    )
-    .unwrap();
+    unsigned_copy(&f.0.join("project/escape-helper"));
     let result = run(
         &f.0,
         "./escape-helper --escape & sleep 0.1; exit 0",
@@ -1168,11 +1164,7 @@ fn secret_variables(home: &Path) {
         !outside_guardian && !guardian_ps,
         "same-user read of the guardian found the value"
     );
-    fs::copy(
-        std::env::current_exe().unwrap(),
-        home.join("project/procargs-helper"),
-    )
-    .unwrap();
+    unsigned_copy(&home.join("project/procargs-helper"));
     let probe = run(
         home,
         &format!(
@@ -2104,6 +2096,25 @@ fn od2_outside_survivor_holds_output(home: &Path, person: &PersonHome) {
         println!("OD2 {tag}: kind 2 reason 15, capture continued after the shell exited");
     }
 }
+/// Copies this test binary to `path` and re-signs the copy ad hoc with no
+/// options: no Hardened Runtime and no entitlements. In an SG5 harness
+/// bundle the binary claims restricted entitlements that only the bundle's
+/// profile allows, so a copy that kept them would be killed at launch
+/// (release-signing.md#pc-i38-control-and-pc-i38-s).
+fn unsigned_copy(path: &Path) {
+    fs::copy(std::env::current_exe().unwrap(), path).unwrap();
+    let resigned = std::process::Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        resigned.status.success(),
+        "ad hoc fixture copy: {resigned:?}"
+    );
+    assert!(!hardened(path), "the fixture copy has no Hardened Runtime");
+}
+
 /// Whether `path` carries the Hardened Runtime flag (`codesign -d`).
 fn hardened(path: &Path) -> bool {
     let out = std::process::Command::new("/usr/bin/codesign")
@@ -2141,20 +2152,7 @@ fn pc_i38_dyld_launch_variable(home: &Path, person: &PersonHome) {
     let library_text = library.to_str().unwrap();
     // Control: the variable in an unsigned process's own environment loads it.
     let unsigned = home.join("pc-i38-control");
-    fs::copy(std::env::current_exe().unwrap(), &unsigned).unwrap();
-    let resigned = std::process::Command::new("/usr/bin/codesign")
-        .args(["--force", "--sign", "-"])
-        .arg(&unsigned)
-        .output()
-        .unwrap();
-    assert!(
-        resigned.status.success(),
-        "ad hoc control copy: {resigned:?}"
-    );
-    assert!(
-        !hardened(&unsigned),
-        "the control copy has no Hardened Runtime"
-    );
+    unsigned_copy(&unsigned);
     let control = std::process::Command::new(&unsigned)
         .arg("--noop")
         .env("DYLD_INSERT_LIBRARIES", library_text)
