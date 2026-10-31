@@ -21,9 +21,10 @@ The Rust workspace and the supervised Swift model helper, selected in
 Remaining allocation, repository layout and interoperation require detailed design
 under the [architecture and design plan](plans/architecture-and-design.md) before scaffolding.
 
-Asura inverts the delegation relationship of sibling project Daimon's MCP role:
-the local system coordinates work and calls remote AI when appropriate. Daimon
-is a reference, not an inherited architecture or dependency.
+Asura inverts the delegation relationship of sibling project Wisp's MCP role:
+the local system coordinates work and calls remote AI when appropriate. Wisp
+(formerly Daimon; [wisp.pidster.com](https://wisp.pidster.com)) is a
+reference, not an inherited architecture or dependency.
 
 ## Control and execution boundaries
 
