@@ -683,7 +683,7 @@ section. Recommendations are the reports' recommendations, not decisions.
 | AD-22 | Ask Apple whether PCC Foundation Models is available to Developer ID apps | Ask | [R-DIST] §12 item 4, §13 item 5 |
 | AD-23 | Accept the "zero model access" claim wording and its stated limits | Adopt | [R-SEC] §16 |
 | AD-24 | Treat an envelope approval (DF1) as an authorized policy change, not a per-action approval | This draft proposes yes | This document, DF1; [security policy brief](security-policy-brief.md#proposed-authorization-contract) |
-| AD-25 | Model context egress (DF2) as a Cedar action over data classes, destinations and projects under EX13 | This draft proposes yes; no report models it | This document, DF2 |
+| AD-25 | Model context egress (DF2) as a Cedar action over data classes, destinations and projects under EX13 | **Decided by the owner, 2026-10-31: yes, policy decides.** Every piece of context is classified (by Asura's deterministic code and the on-device classifiers) before it leaves the Mac; a Cedar policy decides which data classes may go to which remote model for each project; denied context stays on the device | This document, DF2 |
 | AD-26 | Adopt the evidence gate as a release rule: no differentiator is enabled by default without current evidence | This draft proposes yes | This document |
 
 Settled by existing rules, not open: [R-SEC] OD-13 asks to confirm that the wire
