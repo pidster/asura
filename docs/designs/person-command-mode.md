@@ -119,7 +119,7 @@ two owner decisions: a `!` command is a tool job, and the
 | PCR10 | Writes are allowed only to the project, `$TMPDIR` and the fixed cache list `~/.cargo`, `~/.rustup`, `~/.cache`, `~/Library/Caches`, `~/.npm`. Shell configuration files, `~/.ssh` and other dotfiles remain read-only. Amended on 2026-10-22 (OD1): the command may also write its own empty Asura-private job scratch directory, so the escapee marker works for `!` as for model jobs. HOME and `$TMPDIR` stay the person's. The directory is deleted when the job ends. The command reaches it only by its path: no variable names it, and a `!` command cannot list `~/.asura/tmp`. |
 | PCR11 | A person command has no timeout. Ctrl-C while it runs sends TERM to its process group, then KILL after a grace period of 2 s (PC8). A second Ctrl-C kills at once. `/cancel` also stops it. With nothing running, Ctrl-C keeps its current quit behavior. |
 | PCR12 | A person command queues behind a running model turn in the existing managed input queue. It runs when its turn comes, so the model never sees the workspace change mid-turn. |
-| PCR13 | On the next turn the model receives a notice: command, directory, exit status, line and byte counts, and the job handle. The context composer chooses how much output that request shows ([model view](tool-output-views.md#required-behavior)). The wording says the person ran it, not the model. |
+| PCR13 | On the next turn the model receives a notice: command, directory, exit status, line and byte counts, and the job handle. The context composer chooses how much output that request shows ([model view](tool-output-views.md#required-behavior)). The wording says the person ran it, not the model. Revised by the owner on 2026-10-31: a tainted job's notice omits the exit status and counts ([tainted person jobs](#owner-revision-of-2026-10-31-tainted-person-jobs)). |
 | PCR14 | The job retains the complete output of both streams, under the job controller's retention quota and expiry. Journal records hold a payload reference, digests and a summary, never output text. |
 | PCR15 | The log shows the output folded, with the darker amber stripe. It shows the last lines and offers a key to see the rest. The job viewer pages through all retained output. |
 | PCR16 | `!` commands share the prompt recall history. Recalling one restores command mode. Help `?` entries are not recorded. |
@@ -1701,6 +1701,33 @@ Person-specific rules that J5 applies:
   entries to the J5 reference form (PC4). No size in this design limits the
   notice.
 
+### Owner revision of 2026-10-31: tainted person jobs
+
+Required behavior (owner, 2026-10-31, decision T1 of the
+[context composer](context-composer.md#owner-decisions)): "Asura sees" is not
+"a model sees". A person command that ran with stored secret variables
+(`$ASURA_SECRET_<n>`) or with the whole-command variable received a raw
+secret value, so its output and streams are **tainted**. The composer never
+places tainted content in model input, and omits its exit status, line and
+byte counts and durations. This revises two decisions only where secrets are
+involved:
+
+- **PC10.** The model's `job status`, `job read` and `job wait` of a tainted
+  person job return `private` and read nothing; its `job list` row shows the
+  handle, origin, `private` and the command excerpt only. Untainted person
+  jobs keep PC10 unchanged.
+- **PCR13.** A tainted job's notice entry keeps the person label, the stored
+  command (placeholders, never a value), the directory and the handle. It
+  shows `result: private (…)` instead of the exit status, and no output line
+  or view.
+
+The person keeps every view of the job: the log fold, `/jobs` and the job
+viewer show its output and facts. The decision is a deterministic check of the
+job's kind 31 record, defined in the
+[taint exclusion hook](context-composer.md#taint-exclusion-hook). A `!!`
+command's launch environment alone does not taint it (open question O3 there).
+The wider secrets decisions remain pending.
+
 ## Failure handling and recovery
 
 Proposed mechanism unless marked otherwise. "Effects unknown" means the
@@ -2423,7 +2450,9 @@ resolved on 2026-10-20. Each entry records the rejected options.
     jobs in its conversation. `cancel` of a person job returns `not_permitted`.
     Reading lets the model page beyond the composer's view; stopping the
     person's command stays with the person. Rejected: model cancel of person
-    jobs, and notice-only access without stream reads.
+    jobs, and notice-only access without stream reads. Revised by the owner on
+    2026-10-31 for tainted jobs only: see
+    [tainted person jobs](#owner-revision-of-2026-10-31-tainted-person-jobs).
 11. **PC11 — Expand key in the log.** Selected by the owner on 2026-10-14:
     Enter or Space on the entry opens the job viewer at the end of stdout. The
     log keeps the 8-line fold. Output can be very large, the viewer already
@@ -2432,7 +2461,9 @@ resolved on 2026-10-20. Each entry records the rejected options.
 12. **PC12 — Model view before the context composer exists.** Selected by the
     owner on 2026-10-14: until the composer places output, the notice entry
     carries no output text, and the model reads the streams with `job read`
-    under PC10. Model job results use the same interim rule. Rejected: waiting
+    under PC10. Model job results use the same interim rule. Lifted by context
+    composer slices CC2 (model job results) and CC3 (notices), 2026-10-31.
+    Rejected: waiting
     for the composer before shipping `!`, and an interim fixed output tail.
 
 13. **PC13 — Unsandboxed `!!` commands.** Selected by the owner on

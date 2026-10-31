@@ -3973,7 +3973,7 @@ TCR-O5). Encodings follow the existing codec.
 | --- | --- | --- | --- |
 | 1–3 | operation, generation, ordinal | ID, u64, u32 | The operation's pending `run` kind 14 with operation code 10–16; ordinal 1–200 |
 | 4 | status | u8 | Wire `ToolStatus` 1–7, fixed by field 5 |
-| 5 | outcome | u8 | 1 `ok`, 2 `not_found`, 3 `not_permitted`, 4 `busy`, 5 `cancelled`, 6 `unavailable`, 7 `limit` |
+| 5 | outcome | u8 | 1 `ok`, 2 `not_found`, 3 `not_permitted`, 4 `busy`, 5 `cancelled`, 6 `unavailable`, 7 `limit`, 8 `private` (T1, 2026-10-31) |
 | 6 | job ID | ID | Zero for code 10 (derived), for code 11, and with outcome `not_found`; otherwise a job of the turn's conversation |
 | 7 | body | By operation code, never stored | Below |
 
@@ -3986,6 +3986,7 @@ TCR-O5). Encodings follow the existing codec.
 | `cancelled` | 6 cancelled | 10, 11, 12, 13, 14, 16 |
 | `unavailable` | 4 unavailable | 11–16 |
 | `limit` | 7 limit | 16 |
+| `private` | 2 denied | 12, 13, 14: the job is tainted ([taint exclusion hook](context-composer.md#taint-exclusion-hook)); no body |
 
 **State block** (codes 10, 12, 14 and 15 with outcome `ok`, and code 10 with
 `cancelled`):
@@ -3997,6 +3998,11 @@ TCR-O5). Encodings follow the existing codec.
 | reason numbers | 3 × u8 | For `agent_slots` and `service_slots`: running, limit, awaiting cleanup; for `pending_installs`: the count; otherwise 0 |
 | elapsed | u64 | Milliseconds since the spawned notice; 0 before spawn and for state 9 |
 | stdout bytes, stderr bytes | u64 each | Stored bytes (the readable watermark) at the snapshot; 0 for state 9 |
+
+From CC2 (2026-10-31) the state block and the wait block each end with a
+view block: a count byte, 0 to 3, and that many ranges in the page block form.
+Only codes 10, 12 and 14 with outcome `ok` have ranges; the [kind 29 view
+block](context-composer.md#kind-29-view-block) gives the sizes and rules.
 
 State 9 is reported only when the job's kind 28 committed before this record
 (J3-E7). Its outcome, exit, elapsed time, bytes, lines and capture state are
@@ -4281,6 +4287,7 @@ activity row are unchanged.
 | `limit` | `limit: this job has no room for more notes` |
 | `cancelled` (codes 11–16) | `cancelled` |
 | Note `ok` | `note: recorded on job <handle>` |
+| `private` (codes 12–14, T1) | `private: the person ran this job with a secret value; its output, result and counts are not shown to you` |
 
 Every result stays within the 16,384-byte per-result limit (L21, kept): a page
 is at most 8,192 bytes of text plus a header under 512 bytes; a list is at most
@@ -6079,6 +6086,35 @@ fidelity with the stored S and live count, a reference turn carries none, and
 revision 3 changes the manifest digest; J5T-12 (integration, PC-I13 later
 turn) a later turn's history holds both earlier inputs with their notices,
 before and after a restart.
+
+### Composer revision 4: views and taint (2026-10-31)
+
+The [context composer's CC2 and CC3 details](context-composer.md#cc2-and-cc3-implementation-details)
+amend the texts above; that design is their one source.
+
+- **Views (lifts PC12).** A handle delivery, `status` or `wait` result of
+  outcome `ok` may end with an output excerpt sized by stage A; a notice entry
+  at full fidelity may be followed by one sized from the turn's leftover
+  budget. Both use the [view text](context-composer.md#cc2-stage-a-sizing):
+  every output line is a `  | ` continuation line, so the notice line rule
+  above still holds. A `job read` page is capped at
+  `min(limit, max(512, remaining − 512))` source bytes.
+- **Tainted jobs (T1).** A person job whose kind 31 has secret variables or
+  the whole-command variable is tainted. Its notice entry keeps the label,
+  `command:`, `directory:` and `job:` lines; `result:` reads
+  `private (the command received a secret value; its output, result and counts are not shown to you)`
+  and no `output:` line follows. Its reference line, also in a later turn's
+  rebuilt notice, is `[job <handle>: <origin>, private]`. Its `job list` row is
+  `- <handle> · <origin> · private · <excerpt>`; `status`, `read` and `wait`
+  record outcome `private` without a page read or a wait.
+- **Manifest.** A tainted entry's `job_notice` segment has fidelity 5 and a
+  trailing taint source byte; each placed excerpt range adds a `job_output`
+  segment (kind 7) after its entry. Kind 21's composition block gains
+  `notice_views` (u8) after `notice_live`: bit `i` marks entry `i` (oldest
+  first) with a view. Replay accepts any value; reconstruction reads it.
+- **Prior-notice read.** `PriorSettlement` gains `received_secret`, taken from
+  the kind 31 that the read already opens for the outside flag, so the
+  reference line of a tainted prior entry is the private form.
 
 ### J5 failure handling
 

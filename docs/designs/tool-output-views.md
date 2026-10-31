@@ -124,7 +124,7 @@ its classification under the principles above.
 | ID | Limit | Current value | Class | Owner after review |
 | --- | --- | --- | --- | --- |
 | L20 | Calls per turn | 200, plus one over-limit record (owner, 2026-10-18; was 8) | Evidence | Trace classifier; turn closure mapping |
-| L21 | Per-result bytes | 16,384 | Remove | Composer for the model view; journal references for records |
+| L21 | Per-result bytes | 16,384 | Remove | Composer for the model view; journal references for records. From CC2 (2026-10-31) the composer sizes job-mode results; kind 15 results keep 16,384 until tools adopt jobs; `ToolResult.text` keeps 16,384 as the transport unit of one message ([stage A sizing](context-composer.md#cc2-stage-a-sizing)) |
 | L22 | Result bytes per turn | None (removed, owner, 2026-10-18; was 65,536) | Removed | — |
 | L23 | Memory-create headroom | None (removed with L22, owner, 2026-10-18; was 256 B) | Removed | — |
 | L24 | Request caps | None (removed, owner, 2026-10-19; was 1024 first, then 512, or the caller's cap with a 2048 ceiling). The model writes until it stops or its window is full | Removed | — |
