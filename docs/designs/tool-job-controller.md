@@ -6131,7 +6131,9 @@ follows (selected, engineering):
   before the job starts. It does not wait for the yield window, because its
   result could show nothing the model may see. As soon as the job's kind 26
   commits (JR13), it appends kind 29 with outcome `private` and no body. The
-  rendered text holds the private line and the handle. A turn that ends
+  rendered text holds the private line and the handle. The outcome fixes
+  status 2, so the helper presents the result as a denied tool result; the
+  text says that the command runs as the named job. A turn that ends
   before delivery still cancels the job (TJ-04), and the call still records
   `private`. The job then runs on as any delivered job.
 - **Later calls.** `job status`, `job read` and `job wait` of the job record

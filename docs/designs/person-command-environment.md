@@ -18,6 +18,7 @@ answers. Protocol numbering remains `0.1`; journal format remains `1`.
 | ENV1 | Asura builds the environment of `!` and `!!` commands. It does not pass the person's captured shell environment. The environment is a fixed base list, toolchain variables, per-project declared non-secret variables in project configuration, and secrets only by explicit reference: a stored secret variable, which is raw delivery and makes the job tainted under T1. Shell variables not on the list are not passed. A deterministic secret scanner (rules and entropy, no model) checks the captured shell environment. Flagged names are reported to the person, by name only and never by value, with an offer to store them as a secret. The person sees which variables a command got, by name and source, and "variable X was not passed" hints. Remove the captured launch environment from the secret item contract and the code, with no compatibility | This document; [person command mode](person-command-mode.md#owner-revision-of-2026-10-31-allow-list-environment); [secret store](secret-store.md#payload) |
 | ENV2 | Decide whether `!!` keeps any difference from `!` beyond the sandbox, and record it | [`!` and `!!`](#-and--differences) |
 | ENV3 | The single-source-of-truth rule wins over context composer D5: manifests are recomputed from the journal and the retained streams, not stored as payload objects. Build nothing for it | [Context composer](context-composer.md#composition-manifest) |
+| AD-7 (person commands) | `!` commands are the person's own commands; the person can run them in a terminal outside Asura, so locking the network down inside Asura gains nothing. `!` and `!!` get no network lockdown or proxy restriction. PC3 stays: `SSH_AUTH_SOCK` is passed, as an explicit allow-list entry. The proxy-only network for model jobs is a separate decision for the broker work; not built here | [Base list](#base-list); [person command mode](person-command-mode.md#scope) |
 | ENV4 | A model `exec_cmd` that receives SL3 or SL7 secret variables is tainted under T1, exactly like a person command. This is interim: the later broker work (AD-4) forbids raw delivery to model jobs | [Context composer](context-composer.md#taint-exclusion-hook); [tool job controller](tool-job-controller.md#model-jobs-with-secret-variables-2026-10-31) |
 
 ## Scope
@@ -173,8 +174,16 @@ the value; "terminal" means the TUI supplies it from the captured environment.
 | `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME` | Terminal | Path class |
 
 The XDG names are listed because Git, `gh` and many other tools read their
-configuration through them. `SSH_AUTH_SOCK` stays as PC3 selected it; the
-broker study's concern about the person's own agent is the later broker work.
+configuration through them.
+
+`SSH_AUTH_SOCK` is an explicit entry (owner, 2026-10-31, AD-7 for person
+commands, which keeps PC3). A person command is the person's own command,
+which the person could run in a terminal outside Asura with the same agent,
+so withholding the agent socket inside Asura gains nothing; passing it lets
+`git push`, `ssh` and signing with keys in the person's agent work. The same
+decision gives `!` and `!!` no network lockdown or proxy restriction. The
+broker study's concern about the person's own agent applies to model jobs,
+whose proxy-only network is a separate decision for the later broker work.
 
 ### Toolchain list
 
@@ -259,8 +268,8 @@ personCommands:
 
 The leaf `personCommands.environment.<project ID>` sets a project's whole
 mapping; `{}` removes it. `set personCommands` takes the whole mapping, as
-for `allowOutsideSandbox`. A flagged value refuses the set with
-`config_secret_value`, whose text names the variable and never the value. A
+for `allowOutsideSandbox`. A flagged value refuses the set with the token
+`config_secret_value`, which names no variable and no value. A
 configuration file whose declared value the scanner flags is invalid, as for
 any invalid value, so a hand-edited file cannot add a secret either.
 
@@ -444,9 +453,9 @@ flowchart TD
 
 Required behavior PE-R7 to PE-R9. Selected (engineering) presentation.
 
-**Launch report.** The TUI shows the report once per session, the first time
-the person enters command or outside mode, when the scan flagged at least one
-variable:
+**Launch report.** The TUI shows the report in its notice line, once per
+session, the first time the person enters command or outside mode after the
+scan ended, when the scan flagged at least one variable:
 
 ```text
 Not passed to ! and !! commands because they may be secrets: GITHUB_TOKEN (github-token), OPENAI_API_KEY (openai-key), BUILD_SIGNING (high-entropy). Asura never shows their values.
@@ -465,7 +474,8 @@ header, before any output:
 env  Asura HOME USER LOGNAME SHELL TMPDIR TERM GIT_TERMINAL_PROMPT · terminal PATH LANG SSH_AUTH_SOCK · toolchain CARGO_HOME RUSTUP_HOME · project RUST_LOG · secret ASURA_SECRET_1
 ```
 
-A `!!` entry adds `· job ASURA_JOB_<handle>`. The line wraps at the log width.
+A `!!` entry adds `· job ASURA_JOB_<handle>`. The line follows the stripe and
+the `!!` warning, and wraps at the log width.
 It names the variables Asura set up for the command; the setup thread can
 still drop `SSH_AUTH_SOCK` and `SHELL` when they do not qualify, as the base
 list states.
@@ -535,7 +545,7 @@ Selected (engineering) within protocol `0.1`. Schemas change in place.
 | Field | Change |
 | --- | --- |
 | 8 `search_path` | Both modes. The client PATH, at most 4,096 bytes |
-| 9 `environment` | Both modes. Terminal variables only: names from the terminal table, each at most once. Wire shape: at most 64 entries, names 1–64 bytes, values at most 4,096 bytes |
+| 9 `environment` | Both modes. Terminal variables only: names from the terminal table, each at most once. Wire shape: at most 39 entries (the table's size), names 1–64 bytes, values at most 4,096 bytes |
 | 11 `launch_environment` | Removed; `reserved 11`. The `LaunchVariable` message is removed |
 
 `QueueRefusal` value 3 `ENVIRONMENT_TOO_LARGE` is removed (`reserved 3`): a
@@ -584,8 +594,9 @@ Schemas change in place within format `1`.
 | 12 | terminal variables | u8 count, then entries | 0–39 entries in increasing name code: u8 name code 1–39, u16 value length, value. Each value passes its class. Both modes |
 | 23 | declared variables | u8 count, then entries | 0–32 entries in increasing name byte order: u8 name length 1–64, name, u16 value length 1–1,024, value. Names follow the declared-name rule; names and values total at most 4,096 bytes |
 
-The request digest covers fields 11, 12 and 23, each in its field encoding,
-in that order after cwd. The maximum payload is 44,142 bytes: the former
+Field 23 is encoded directly after field 12, so the record and the request
+digest share one encoding. The request digest covers fields 11, 12 and 23,
+each in its field encoding, in that order after cwd. The maximum payload is 44,142 bytes: the former
 22,570, less 634 for the former field 12, plus 18,013 for field 12
 (1 + 39 × 3 + 17,895) and 4,193 for field 23 (1 + 32 × 3 + 4,096). The
 maximum frame is 44,326 bytes, below the 65,536-byte journal frame.
@@ -758,5 +769,31 @@ TUI `person.rs`, `asura-storage/src/config.rs` and the kind 31 codec. Wisp's
 `SecretScanner.swift` was read at commit `825bd3e` as design input; it has no
 entropy rule. Diagrams PE-O1, PE-F1, PE-Q1 and PE-F2 were rendered with the
 local Mermaid CLI at scale 2 into a temporary directory and inspected.
+
+### Implementation verification (2026-10-31)
+
+Implemented behavior, verified on macOS with the debug build:
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all --check`; `cargo clippy` with `-D warnings`, with and without `--all-features` | Pass |
+| `cargo test --workspace --all-features --no-fail-fast --locked` | Pass, except `--path-guard` inside the `lifecycle` suite in the first run (Esc reached the log while a held `!!make` started under load); the `lifecycle` suite rerun alone passed, with all PTY journeys |
+| PE-U1 to PE-U14, PE-I1 to PE-I4, CC-I18, CC-I19 | Pass |
+| PTY journeys `--person-commands`, `--person-outside` (PE-E1, PE-E2), `--person-model`, `--person-restart`, `--person-secrets`, `--path-guard`, `--context-views` (CC-E8), `--job-notices` | Pass |
+| `conversation_flow --native-exec-cmd-tools` (system model) | Pass, one run |
+| After the runs: `security list-keychains -d user` | The login keychain only |
+
+The `--person-*` journeys create their keychains through the lifecycle
+fixture's Security framework path (`--create-scratch-keychain`, with
+`--lock-scratch-keychain`, `--unlock-scratch-keychain` and
+`--scratch-keychain-services`); they run no `security` command.
+
+The PTY harness presses Enter again while the TUI shows "Checking this
+terminal's environment; press Enter again", because a debug build's launch
+scan can outlast the first keypress under load.
+
+Not verified: the store-as-secret offer (ENV-O1 is open, so no store action
+exists); toolchain names other than those a fixture sets; a terminal whose
+values exceed the class bounds in a real session.
 
 Return to the [design index](README.md).

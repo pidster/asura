@@ -53,6 +53,17 @@ and the environment sections below, which now point to it. A `!!` command
 differs from a `!` command in its environment only by the job marker (ENV2).
 The `!!` launch environment is no longer stored in the Keychain.
 
+Owner decision of 2026-10-31 (AD-7 for person commands): `!` commands are
+the person's own commands. The person can always run them in a terminal
+outside Asura, so locking the network down inside Asura gains nothing. `!`
+and `!!` commands get no network lockdown and no proxy restriction: PCR7's
+network access stays, and the person profile keeps `(allow network*)` with
+only the Asura control socket denied (PX3). PC3's `SSH_AUTH_SOCK` stays: the
+[allow-list environment](person-command-environment.md#base-list) passes it
+to both modes as an explicit entry, so `git push` and `ssh` with keys in the
+person's agent work as in the terminal. A proxy-only network for model jobs
+is a separate decision for the later broker work; nothing here builds it.
+
 ## Scope
 
 A person can type `!` at the start of the composer to switch it to command mode.
