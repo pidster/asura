@@ -665,7 +665,7 @@ section. Recommendations are the reports' recommendations, not decisions.
 | AD-4 | Forbid raw delivery to model-originated jobs; SL7 becomes a "store and bind?" prompt | Forbid | [R-SEC] §17 OD-4 |
 | AD-5 | A stage-2 on-device model over stage-1-redacted paste text? | Only when the destination is a remote model | [R-SEC] §17 OD-5, §12.1 |
 | AD-6 | Provider keys through the Asura proxy instead of the helper (changes EX14 and EX8) | Proxy | [R-SEC] §17 OD-6, §6.6 |
-| AD-7 | Model job network only to the per-job proxy port when brokers ship; the same for `!`; PC3 `SSH_AUTH_SOCK` pass-through | Model jobs yes; `!` optional per project | [R-SEC] §17 OD-7, §3 |
+| AD-7 | Model job network only to the per-job proxy port when brokers ship; the same for `!`; PC3 `SSH_AUTH_SOCK` pass-through | **Person commands decided by the owner, 2026-10-31:** `!` and `!!` are the person's own commands, which they can always run in a terminal outside Asura, so Asura does not lock their network down; PC3 `SSH_AUTH_SOCK` pass-through stays. Model jobs: open, with the broker work | [R-SEC] §17 OD-7, §3 |
 | AD-8 | Owner of Secure Enclave keys: Rust in the service, or a small class A Swift signer (not the helper) | Either; not the helper | [R-SEC] §17 OD-8 |
 | AD-9 | Commit signing by model jobs: person key with Touch ID per use, a separate agent key, or none | Separate agent key | [R-SEC] §17 OD-9 |
 | AD-10 | Secret reference syntax | No reference for brokered use; named references in messages; prefixed variables only for raw delivery | [R-SEC] §17 OD-10, §12.2 |
