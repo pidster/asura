@@ -12,8 +12,10 @@ The owner asked on 2026-10-31 to build CC2, then CC3, and approved the
 [loop closure](loop-closure.md#decisions) decision 6, and CC5 for a memory
 selection design; see [delivery](#dependencies-and-delivery).
 [CC1 implementation details](#cc1-implementation-details) record what code
-inspection added. One part of D5 is not built and waits for the owner: see
-[open items](#open-items) (O1). Values marked "proposed" in tables are
+inspection added. The owner answered O1, O2 and O3 on 2026-10-31
+([owner decisions](#owner-decisions), ENV3 and ENV4): manifests are
+recomputed, not stored (D5 is revised), model jobs with secret variables are
+tainted (taint source 2), and the `!!` launch environment no longer exists. Values marked "proposed" in tables are
 engineering choices made under the decisions and remain open to measured
 revision. Protocol numbering remains `0.1`; journal format remains `1`.
 
@@ -172,6 +174,15 @@ Owner-approved revision (owner, 2026-10-31):
 | ID | Decision | Applied mechanism |
 | --- | --- | --- |
 | T1 | A composer-side taint hook for CC2 and CC3. Output and streams of any job or person command that received a raw secret value are tainted; today that is a person command with stored secret variables. The composer never composes tainted content into model input, and omits exit status, line and byte counts and durations. The manifest records the exclusion as a reference fact. The decision is a deterministic Asura check over the journal's job records. This revises PC10 and the PCR13 counts only where secrets are involved. The wider secrets decisions (the study's OD-1 to OD-13) stay pending; the hook must let a later taint design extend it. | [Taint exclusion hook](#taint-exclusion-hook); [person command mode](person-command-mode.md#owner-revision-of-2026-10-31-tainted-person-jobs) |
+
+Owner decisions of 2026-10-31 that resolve the CC2 and CC3 questions
+([person command environment](person-command-environment.md#owner-decisions-2026-10-31)):
+
+| ID | Decision | Applied mechanism |
+| --- | --- | --- |
+| ENV3 | The single-source-of-truth rule wins over D5: manifests are recomputed from the journal and the retained streams, not stored as separate payload objects. Build nothing for it. Resolves O1 | [Composition manifest](#composition-manifest) |
+| ENV4 | A model `exec_cmd` that receives SL3 or SL7 secret variables is tainted under T1, exactly like a person command. Interim: the later broker work (AD-4) forbids raw delivery to model jobs. Resolves O2 | [Taint exclusion hook](#taint-exclusion-hook), source 2 |
+| ENV1 | Asura builds the environment of `!` and `!!` commands from an allow-list; the `!!` launch environment is removed. Resolves O3 | [Person command environment](person-command-environment.md) |
 
 ## Selected mechanism
 
@@ -745,20 +756,25 @@ job received a raw secret value. Today one source exists:
 | Taint source (code) | Record and fields | Meaning |
 | --- | --- | --- |
 | `person_secret_values` (1) | Kind 31 field 14–15 `number_kinds` not empty, or field 17 bit 1 `whole_command` | The person command ran with stored secret variables `$ASURA_SECRET_<n>` or with the whole-command variable `ASURA_SECRET_COMMAND` (secret store, SL5) |
+| `model_secret_values` (2) | Kind 14 with operation `exec_cmd` and `number_kinds` not empty, or `whole_command` set (ENV4, 2026-10-31) | The model's command ran with SL3 secret variables or the SL7 whole-command variable |
 
-Model jobs (kind 14) are not tainted today (O2), and a `!!` launch
-environment alone is not a taint source (O3). Taint is per job and permanent:
-nothing a later record holds clears it.
+Source 2 is interim: the broker work (AD-4) will forbid raw delivery to model
+jobs. A model call's `number_kinds` lists the secret variables of its
+rewrite, or the numbered values of its SL7 display text; for an `exec_cmd`
+call both mean that the job received a raw value. Since 2026-10-31 no `!!`
+launch environment exists (ENV1). Taint is per job and permanent: nothing a
+later record holds clears it.
 
-**One deterministic check.** Storage owns the predicate
-`PersonCommandQueued::received_secret_values` over the kind 31 fields above.
-`JobCommand::received_secret_values` applies it to a job's command source (false
-for kind 14). Every read that hands job facts to the composer carries the flag
+**One deterministic check.** Storage owns the predicates
+`PersonCommandQueued::received_secret_values` over the kind 31 fields above and
+`ToolCall::received_secret_values` over the kind 14 fields.
+`JobCommand::received_secret_values` applies the one that matches a job's
+command source. Every read that hands job facts to the composer carries the flag
 from that predicate: each `NoticeSettlement` (through its command source), each
 `PriorSettlement` (`received_secret`, read from the kind 31 that the prior-notice
-read already opens for the outside flag) and each `JobListing`
+read already opens for the outside flag, or, for a model job, from its kind 14) and each `JobListing`
 (`received_secret`, from the command source frame the listing read already
-opens for the excerpt). The service's `context::taint` module maps the flag to
+opens for the excerpt). The service's `context::taint` module maps the flag and the job's origin to
 `Taint::Tainted(TaintSource)`. The value is derived at each read and never
 stored, so replay and reconstruction recompute it (single source of truth). No
 model output, classifier or summary is an input (TN4).
@@ -770,9 +786,10 @@ and the handle.
 
 | Surface | Untainted | Tainted |
 | --- | --- | --- |
-| Turn notice entry (J5) | Full entry, with a CC3 view | The person label, `command:`, `directory:`, `result: private (the command received a secret value; its output, result and counts are not shown to you)`, `job:`; no `output:` line and no view |
+| Turn notice entry (J5) | Full entry, with a CC3 view | The origin label, `command:`, `directory:`, `result: private (the command received a secret value; its output, result and counts are not shown to you)`, `job:`; no `output:` line and no view |
+| Handle delivery of a model `exec_cmd` (code 10, source 2) | State block after the yield window, with a stage A view | Kind 29 outcome `private` with no body, delivered as soon as the job's kind 26 commits, with no yield wait; text `private: this command received a secret value; its output, result and counts are not shown to you` and the `job:` handle line |
 | Reference form of an entry, and a prior turn's rebuilt notice | `[job <handle>: <origin>, <outcome>; stdout N bytes; stderr N bytes…]` | `[job <handle>: <origin>, private]` |
-| `job status`, `job read`, `job wait` (codes 12 to 14) | State block, page or wait result, with a stage A view | Kind 29 outcome `private` with no body; text `private: the person ran this job with a secret value; its output, result and counts are not shown to you`. No page read and no wait starts |
+| `job status`, `job read`, `job wait` (codes 12 to 14) | State block, page or wait result, with a stage A view | Kind 29 outcome `private` with no body; text `private: this job received a secret value; its output, result and counts are not shown to you`. No page read and no wait starts |
 | `job list` row (code 11) | Handle, origin, state, byte counts, excerpt | `- <handle> · <origin> · private · <excerpt>` |
 | `job cancel`, `job note` | Unchanged (`not_permitted` for a person job; a note is recorded) | Unchanged: neither result shows output or a fact the job produced |
 | Live line of the notice (J5-E4) | Counts unsettled jobs | Unchanged: it counts jobs, not output (the timing limit below) |
@@ -799,14 +816,18 @@ would place.
 flowchart TD
     Job["Job named by a notice, a prior notice or a job call"] --> Src{"Command source record read?"}
     Src -->|"No: unreadable"| Repair["Existing repair path: authority_repair_required or unavailable; never assume untainted"]
-    Src -->|"Kind 14, model job"| Clean["Untainted"]
+    Src -->|"Kind 14, model job"| MVars{"exec_cmd with number_kinds non-empty or whole_command?"}
+    MVars -->|No| Clean["Untainted"]
+    MVars -->|Yes| MTaint["Tainted: model_secret_values (2)"]
     Src -->|"Kind 31, person job"| Vars{"number_kinds non-empty or whole_command?"}
     Vars -->|No| Clean
-    Vars -->|Yes| Taint["Tainted: person_secret_values"]
+    Vars -->|Yes| Taint["Tainted: person_secret_values (1)"]
+    MTaint --> Surface
     Clean --> Place["Place under the normal rules: outcome, counts, views"]
     Taint --> Surface{"Surface?"}
     Surface -->|"Notice or prior notice"| Excl["Private entry or reference line; fidelity 5 segment with the taint code"]
     Surface -->|"status, read or wait"| Priv["Kind 29 outcome private; no page read, no wait"]
+    Surface -->|"Model exec_cmd handle delivery"| Deliver["Kind 29 outcome private, no body, no yield wait"]
     Surface -->|"list"| Row["Private row: handle, origin, private, excerpt"]
     Surface -->|"cancel or note"| Same["Unchanged result"]
 ```
@@ -816,9 +837,11 @@ flowchart TD
 Required behavior: D5 and D10, satisfying CCR11 and CCR12. The manifest carries
 no tool output text (CCR4) and holds no output (D10).
 
-- After J1 the manifest is an immutable payload object; the journal binds its
-  digest and the composer revision. **Not built in CC2; see O1 in
-  [open items](#open-items).**
+- Revised 2026-10-31 (ENV3, owner): the single-source-of-truth rule wins over
+  D5. A manifest is never stored as a separate payload object. It is
+  recomputed from the journal records and the retained streams that hold
+  every one of its facts; the journal binds its digest and the composer
+  revision. Nothing is built for a stored body.
 - Before J1 (CC1), `TurnAccepted` carries the manifest digest, the composer
   revision and the four budget inputs `E`, `R`, `S` and `k`, about 16 bytes
   (D5; N1, owner, 2026-10-14). The manifest body is not stored. With the budget
@@ -1021,30 +1044,17 @@ capacity record's defaults, probe and configuration schema (provider design),
 and the removal of the Ollama clamp L26 (provider design). The clamp was removed
 on 2026-10-20: an Ollama model's window in CC1 is its full reported maximum.
 
-Owner questions raised by CC2 and CC3 (2026-10-31). None blocks the slices;
-each states what is built until the owner answers.
+Owner questions raised by CC2 and CC3 (2026-10-31), answered by the owner the
+same day:
 
-- **O1: manifest bodies as payload objects (D5).** D5 says the manifest is a
-  payload object once J1 exists, and the CC2 slice text repeated it. The
-  owner's rule for this work is a single source of truth, with derived values
-  recomputed on replay. From CC2 every manifest fact is in a journal record
-  (N1 budget inputs, kind 29 view ranges, kind 21 `notice_views`) or in the
-  retained streams, so a stored body would be a second copy of derived data.
-  Built: no manifest body is stored; the journal binds the digest as in CC1.
-  Owner question: confirm that the single-source rule supersedes D5's
-  payload object, or ask for the body to be stored as well.
-- **O2: model jobs with secret variables.** A model `exec_cmd` whose command
-  held a detected secret runs with SL3 secret variables (or the SL7
-  whole-command variable). Its process receives the raw value. T1 names
-  person commands with stored secret variables as the taint source today, and
-  the study's OD-4 (raw delivery for model jobs) is pending. Built: model jobs
-  are never tainted; the hook's `TaintSource` enumeration is where a model
-  source would be added.
-- **O3: the `!!` launch environment.** A `!!` command receives the TUI's whole
-  launch environment, which the secret store keeps, and which may hold tokens
-  that Asura did not detect. It is not a "stored secret variable", so T1 does
-  not taint it. Built: a `!!` command is tainted only when it has secret
-  variables, as a `!` command is.
+- **O1: manifest bodies as payload objects (D5).** Answered by ENV3: the
+  single-source rule supersedes D5's payload object. Manifests are recomputed
+  from the journal and the retained streams; no body is stored.
+- **O2: model jobs with secret variables.** Answered by ENV4: a model
+  `exec_cmd` that receives SL3 or SL7 secret variables is tainted (source 2),
+  as an interim rule until AD-4 forbids raw delivery to model jobs.
+- **O3: the `!!` launch environment.** Answered by ENV1: Asura builds an
+  allow-list environment for both modes, and no launch environment exists.
 
 ## Dependencies and delivery
 
@@ -1387,7 +1397,7 @@ One writer owns each packet's paths in order: CC2-S, CC2-C, CC3-S, CC3-C.
 turn (stage A).** Size each job-mode result at the callback from the remaining
 budget, replacing L21 for those results ([stage A
 sizing](#cc2-stage-a-sizing)). Uses D8. Records each view in its kind 29.
-Manifest bodies as payload objects (D5) are not built (O1). Lifts PC12 for
+Manifest bodies are recomputed, never stored (ENV3). Lifts PC12 for
 model job results in the same turn. Includes the [taint exclusion
 hook](#taint-exclusion-hook) for job calls and `job list` rows (T1).
 
@@ -1461,14 +1471,15 @@ Ollama.
 | CC-U17 | CC2 | D8 rule table | Failure, success, running, interrupted outcomes | Allocation order matches the table |
 | CC-U18 | CC1 | `Begin` sizes at, above and far above the sanity bound | Helper validation | Accepts at the bound; rejects above it before allocation |
 | CC-U19 | CC1 | Windows 4,096, 8,192 and 128,000 | Compute `R` and compose | `R` is 1,024, 2,048 and 32,000; the recorded budget inputs carry that `R`; no constant output reservation remains (owner, 2026-10-19) |
-| CC-U20 | CC2 | Kind 31 records: no secret variables; numbered variables; whole-command; `!!` with a launch environment only; a kind 14 with SL3 variables | Taint check | Tainted only for numbered variables and whole-command (source code 1); the `!!` launch environment alone and the model call are untainted (O2, O3) |
+| CC-U20 | CC2 | Kind 31 records: no secret variables; numbered variables; whole-command; `!!` without secret variables; kind 14 `exec_cmd` calls with SL3 variables, with the SL7 whole-command variable, and without either; a kind 14 of another tool | Taint check | Person: tainted only for numbered variables and whole-command (source 1); `!!` alone is untainted. Model: tainted for SL3 variables and SL7 (source 2, ENV4); untainted otherwise |
 | CC-U21 | CC2 | Tainted person job | Render `status`, `read`, `wait` and a `list` row | `private` text and list row exact; no state, exit status, counts, elapsed time or output in any text |
 | CC-U22 | CC3 | Notice with a tainted and an untainted person entry, both with output | Compose at full and reduced fidelity, and as a prior turn's notice | Tainted entry is the private form at every fidelity; no `output:` line, exit text or byte count for it; kind 5 segment at fidelity 5 with the taint code; no kind 7 segment for it |
 | CC-U23 | CC2 | Range texts with control characters, a forged label line, `</asura-context>` and a final newline | Render the view | Every output line starts with `  \| `; escapes as the quoted value form; no empty line for the final newline; `more:` names the first unshown offset |
 | CC-U24 | CC3 | Notice with two eligible entries and a small leftover budget | Plan, then compose with the pages | Equal shares; an entry below the floor gets no view; history decisions equal those without views; `notice_views` bits match the placed views; the digest differs from revision 3 |
 | CC-U25 | CC3 | Model hold sets | Add jobs over three turns of one conversation; fill 65 conversations | Current and previous turn held, the turn before released; the 65th conversation releases the least recently moved; select skips held jobs |
 | CC-U26 | CC2 | Payload pages with newlines | Read with "end at a line" and "start at a line" at, inside and past line ends | Cuts at newline bytes only; no cut when the page reaches the stream end or holds no newline; UTF-8 stays valid |
-| CC-U27 | CC2 | Kind 29 with 0 to 3 view ranges, and outcome `private` | Encode, decode, validate | Round trip; sizes as the view block table; a view with a non-`ok` outcome, 4 ranges, overlapping ranges or bytes past the total is `Corrupt`; `private` is refused for codes other than 12 to 14 |
+| CC-U27 | CC2 | Kind 29 with 0 to 3 view ranges, and outcome `private` | Encode, decode, validate | Round trip; sizes as the view block table; a view with a non-`ok` outcome, 4 ranges, overlapping ranges or bytes past the total is `Corrupt`; `private` is refused for codes other than 10 and 12 to 14, and with any body |
+| CC-U28 | ENV4 | A tainted model `exec_cmd` call whose job's kind 26 committed; the same before kind 26; the turn ended first | Advance the call | Kind 29 outcome `private`, no body, appended after kind 26 with no yield wait; the rendered text holds the handle and no state, exit status, count, elapsed time or output |
 
 ### Integration
 
@@ -1491,6 +1502,8 @@ Ollama.
 | CC-I15 | CC2 | As CC-I14 with the page pool held | The handle delivery | The result waits; cancelling the turn records the call `cancelled` and drops the read; controls stay responsive |
 | CC-I16 | CC3 | Person `!` command with 200 KiB of output and one with a stored secret variable whose output holds a canary; scripted model with a large window | Next turn, then `job status`, `job read`, `job wait` and `job list` of the tainted job, then a later turn | The untainted entry has a view; the tainted entry is the private form; no chat request, tool result or kind 21 input holds the canary, the tainted job's exit status, line or byte counts or elapsed time; kind 29 outcomes are `private`; a raw-byte sweep of every request the helper sent finds no canary |
 | CC-I17 | CC3 | CC-I16's journal | Restart and recompose the turn | Same input digest from the budget inputs, `notice_views` and the streams; the taint is recomputed from kind 31 |
+| CC-I18 | ENV4 | Real service, scripted loopback model; the model runs `exec_cmd` with a synthetic token in its command, and the command prints a canary and the token; a later turn | The handle delivery, then `job status`, `job read`, `job wait` and `job list` of that job, then the next turn's notice | Delivery and the three calls record outcome `private`; the list row is the private form; the notice entry is private; a raw-byte sweep of every chat request the model received and every kind 21 and kind 29 frame finds no token, no SHA-256 hex digest of the token, no canary, no exit status line and no line or byte count of the job |
+| CC-I19 | ENV4 | CC-I18's journal | Restart and recompose the later turn | The rebuilt notice reference line is private; the taint is recomputed from kind 14 |
 
 ### End-to-end
 
@@ -1503,6 +1516,7 @@ Ollama.
 | CC-E5 | CC1 | Composition and transfer while storage or helper stalls | Type and cancel in the TUI | Draft and cancel stay responsive; the turn reports its state truthfully |
 | CC-E6 | CC1 | Model whose window exceeds 64 KiB of text | Paste a long document, then ask about its start | Input above 64 KiB is accepted and answered; manifest shows the full document |
 | CC-E7 | CC3 | TUI with the scripted model; person `!` command with a stored secret variable | Next turn, then the model asks `job read` | The person sees the output in the job viewer; the model's notice and `job read` result are private; the answer reaches the TUI; no model request holds the output |
+| CC-E8 | ENV4 | TUI with the scripted model; the model runs `exec_cmd` with a synthetic token in its command that prints a canary | The turn, then the model asks `job read` | The person sees the output in the job viewer; the model's handle delivery and `job read` are private; the answer reaches the TUI; no model request holds the token, its digest, the canary, the exit status or the counts |
 
 The end-to-end cases CC-E3, CC-E4 and CC-E7 use the PTY harness with the
 scripted loopback model (`--context-views`), which drives the real TUI,

@@ -639,7 +639,7 @@ The person types `!!` and a command. Asura runs it "like my terminal" (owner,
 2026-10-19), following Wisp's ADR 0064 amendment:
 
 - `/bin/sh -c COMMAND` with no Seatbelt profile, under the existing guardian;
-- the TUI's whole launch environment, unchanged;
+- the TUI's whole launch environment, unchanged (superseded on 2026-10-31 by the [allow-list environment](person-command-environment.md), ENV1: a `!!` command now receives the same built environment as a `!` command);
 - stdin `/dev/null`, no TTY, its own process group, the person stop and kill
   path, and no timeout;
 - no confirmation: typing `!!` is the approval;
@@ -665,7 +665,7 @@ full authority. Labels name the threats below.
 ```mermaid
 flowchart TD
     Person["Person types !! and a command"] --> TUI["TUI outside mode: red box, !! marker, warning"]
-    TUI -->|"command, cwd, launch environment (PT12)"| Svc["Service: switch check, queue, person grant"]
+    TUI -->|"command, cwd, PATH, allow-listed variables (PT12)"| Svc["Service: switch check, queue, person grant"]
     Svc -->|"kind 31 and job records, no environment"| Journal[("Journal")]
     Svc -->|"spawn, no sandbox-exec"| Cmd["/bin/sh -c command and children"]
     Cmd -->|"output, secrets replaced at capture (EX4)"| Retained[("Retained job streams")]
@@ -686,7 +686,7 @@ flowchart TD
 | PX3 | Does not hold. Without a sandbox, Asura cannot deny reads, writes or connections under `~/.asura`, or the control socket. Project registration checks still apply, because they do not depend on the sandbox. Accepted under EXD-1. |
 | PX4 | Applies unchanged. The `!!` notice and `job read` access follow the same egress rule. |
 | PX5 | Applies unchanged. Outside mode shows the split commands and hidden characters as command mode does. |
-| PX6 | Applies unchanged. Output is filtered at capture in Asura's capture path, which a `!!` job uses. The command rewrite applies, with the whole-command variable instead of a refusal (EX4 amendment, owner 2026-10-20). The launch environment lives only in the command's Keychain item (EXD-2). |
+| PX6 | Applies unchanged. Output is filtered at capture in Asura's capture path, which a `!!` job uses. The command rewrite applies, with the whole-command variable instead of a refusal (EX4 amendment, owner 2026-10-20). The launch environment lives only in the command's Keychain item (EXD-2). Amended 2026-10-31 (ENV1): no launch environment exists; only allow-listed, unflagged variables reach the command. |
 
 #### Threats for `!!`
 
@@ -695,7 +695,7 @@ flowchart TD
 | PT9 | A `!!` command, or code it runs, changes Asura's state: journals, `config.yaml`, retained output, the control socket. It can turn `personCommands.allowOutsideSandbox` back on, corrupt or append journal files, kill the service, or submit control requests as the person. | None that prevents it. The journal's existing corruption checks detect damaged frames when next read. The switch is read at submit and setup, so a changed file takes effect only through the normal configuration path. | Accepted by the owner, 2026-10-19 (EXD-1), as Wisp accepts the same exposure of `~/.wisp`. The person typed the line; it has the authority of a command typed in their own terminal. |
 | PT10 | The person runs `!!` when they meant `!` | Outside mode needs a deliberate second `!` at position 0. The box is red, the marker is `!!`, the hint row says `run OUTSIDE the sandbox`, and the log shows the warning before the command can run. Backspace steps back to `!`. | A person who ignores these signals runs the command unconfined, as in their terminal. |
 | PT11 | Model output persuades the person to type `!!` (PT1 for `!!`) | The PT1 controls apply: no copy path from model output into any command mode; recall holds only person text; a message that starts with `!!` is sent as a message and never runs. | As PT1. |
-| PT12 | The launch environment holds tokens and reaches the service | The service writes it only to the command's Keychain item (EXD-2), never to the journal, audit, logs or payloads. The item is deleted at settlement or Drop. Output that prints an environment value is filtered at capture. | The environment is at rest in the Keychain while the command waits. A token the scanner misses can be stored in output, as PT5 states. |
+| PT12 | The launch environment holds tokens and reaches the service. Resolved on 2026-10-31 by the [allow-list environment](person-command-environment.md#security) (ENV1): the TUI sends only listed terminal variables that the scanner did not flag, so a terminal token no longer reaches the service, the Keychain or the command | The service writes it only to the command's Keychain item (EXD-2), never to the journal, audit, logs or payloads. The item is deleted at settlement or Drop. Output that prints an environment value is filtered at capture. | The environment is at rest in the Keychain while the command waits. A token the scanner misses can be stored in output, as PT5 states. |
 | PT13 | An escapee from a `!!` job (EX5) runs on after settlement | The [escapee control design](escapee-control.md#attribution-the--unsandboxed-job) covers the outside profile: the guardian attributes `!!` descendants by the owned process group and a per-job `ASURA_JOB` environment marker read with `KERN_PROCARGS2`. Found survivors are left running and counted, as a terminal leaves them (EC-D1, decided under the existing owner rule PC13 "like my terminal", following Wisp, and EXD-1); model and `!` jobs still kill their escapees. The sandbox marker does not apply because `!!` has no Seatbelt profile. | A `setsid` escapee from `!!` that also scrubs its environment carries no marker and cannot be reattributed. Accepted under EXD-1: a `!!` command has the person's full authority, like a detached background process started in their terminal. |
 
 PT3 (egress) and PT2 (planted content) apply with the sandbox removed. PT4

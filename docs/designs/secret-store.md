@@ -57,6 +57,15 @@ signing-specific rules; this document links to them. Packet SG3 delivered
 this on 2026-10-27 ([SG3 delivery](release-signing.md#sg3-delivery)); the
 signed qualification run is the owner's.
 
+Revision of 2026-10-31 (owner decision
+[ENV1](person-command-environment.md#owner-decisions-2026-10-31)): Asura builds
+the environment of `!` and `!!` commands from an allow-list, so no item holds
+an environment. The payload's launch environment section and flag bit 1 are
+removed, with no compatibility; the largest payload is 8,307 bytes. A `!!`
+command has an item only when its command holds a secret, as a `!` command
+does. Earlier text that names the `!!` launch environment describes the
+superseded design.
+
 ## Scope
 
 The secret store holds values that must not enter any Asura record but must
@@ -65,9 +74,11 @@ reach a later execution:
 - the per-execution secret variables of a rewritten person command
   ([secret detection](secret-detection.md#environment-path));
 - the whole raw command of a person command run through the
-  [whole-command variable](secret-detection.md#whole-command-variable) (SO5);
-- the TUI launch environment of a `!!` command
-  ([outside environment](person-command-mode.md#outside-profile-environment)).
+  [whole-command variable](secret-detection.md#whole-command-variable) (SO5).
+
+Until 2026-10-31 it also held the TUI launch environment of a `!!` command;
+the [allow-list environment](person-command-environment.md) removed that
+(ENV1).
 
 Objectives:
 
@@ -102,7 +113,7 @@ its job's later output deletion.
 
 | ID | Rule |
 | --- | --- |
-| SSR1 | A person command's secret values, whole-command value and `!!` launch environment are stored in one macOS Keychain item before any journal record refers to them. |
+| SSR1 | A person command's secret values and whole-command value are stored in one macOS Keychain item before any journal record refers to them. Revised 2026-10-31 (ENV1): the `!!` launch environment is no longer stored. |
 | SSR2 | After a restart, a held person command that the person resumes runs with the stored values, read from its item at dispatch. |
 | SSR3 | The item is deleted when its command's job settles (kind 28 committed), when its input is dropped (kind 13 Drop committed), when its kind 31 append is rejected, or when dispatch finds it mismatched. A startup sweep deletes items the journal does not reference as live. |
 | SSR4 | When the Keychain is locked, unavailable or denies access, the person sees why. Asura never falls back to writing values to disk, and never shows a Keychain prompt. |
@@ -132,7 +143,7 @@ its job's later output deletion.
 | `Failure` to reply mapping, request queue, worker thread, item payload codec, binding check, sweep, item count and unrecognized count, the `not_signed` terminal state, the field evidence on every failure reply | Module `asura-service::secret_store` (`secret_store.rs`, `secret_store/{codec,port,worker,qualification}.rs`), declared `pub mod secret_store;` so the integration tests reach it | SS1-S; SG3 |
 | When to write and read | Conversation owner (`asura-service/src/conversation.rs`): `put` at submit, `get` at dispatch | Calls the store |
 | When to delete | Conversation owner: on `JobEvent::Settled` for a person-origin job (after kind 28 commits), after a kind 13 Drop commits, after a definite kind 31 rejection, and on a dispatch `mismatch` | Calls the store; the job controller never calls it |
-| Values in flight to the spawn | Existing secret detection environment path and guardian; the launch environment through the [person environment descriptor](person-command-mode.md#platform-changes) | P1 |
+| Values in flight to the spawn | Existing secret detection environment path and guardian | P1 |
 | Item count and sweep state in the service status | Service observer (`ServiceObservation` field 8, [operations](#operations-and-audit)) | P3-E; SG3 removes the stranded fields |
 | What the person sees | TUI, from queue refusal and waiting reasons ([control API](person-command-mode.md#control-api-additions)) | New reason texts |
 
@@ -194,7 +205,7 @@ scratch (test) item call passes the status pre-check first.
 ```mermaid
 flowchart TB
     subgraph TUIP["TUI process"]
-        Sub["Command submit: command, launch environment for !!"]
+        Sub["Command submit: command with any secret"]
     end
     subgraph SVC["Service process"]
         Own["Conversation owner: rewrite, kind 31, dispatch, Drop, delete on settlement"]
@@ -240,7 +251,7 @@ Selected (engineering) unless marked otherwise.
 | Synchronizable | `false`, set explicitly in every production call |
 | Access control | Production: any build signed by the team that claims the group reads and deletes the item (SGQ4, KC-P1); another program gets -34018. Tests: the scratch file's default ACL binds read to the writer's cdhash and delete to its executable file name (probes SS-P2 (b), SS-P3) |
 | Accessibility class | Production: `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (KQ1). Tests: not available on a file keychain |
-| Data | The payload below, at most 55,413 bytes |
+| Data | The payload below, at most 8,307 bytes |
 
 The service and account attributes bind an item to one installation and one
 input. The payload binds it again by digest, so an item copied under another
@@ -258,29 +269,25 @@ versions, trailing bytes and any bound violation.
 | --- | --- |
 | version | u8, `1` |
 | binding | 32 bytes: SHA-256 over ASCII `asura.secret-item`, one zero byte, installation ID, project ID, conversation ID, input ID and the kind 31 request digest |
-| flags | u8: bit 0 whole-command value present; bit 1 `!!` launch environment present; other bits 0 |
+| flags | u8: bit 0 whole-command value present; other bits 0 (bit 1, the removed launch environment, must be 0) |
 | secret variables | u8 count 0–16; each entry u8 number 1–16, u16 length, value bytes. Count 0 when bit 0 is set (the whole-command variable is used alone) |
 | whole-command value | When bit 0: u16 length 1–8192, raw command bytes |
-| launch environment | When bit 1: u16 count 0–1,024; each entry u16 name length 1–1,024, name, u32 value length, value |
 | value digest key | 32 random bytes, used for the keyed duplicate-retry digest |
 
 Bounds: secret variable values at most 8,192 bytes in total, as secret
-detection requires; whole-command value at most 8,192 bytes; launch
-environment at most 1,024 entries and 40,960 bytes of names and values
-([OD4](person-command-mode.md#owner-decisions-of-2026-10-22)). The largest
-payload is 55,413 bytes: 1 version, 32 binding, 1 flags, 8,241 for 16 numbered
-variables (1 + 16 × 3 + 8,192; the whole-command form needs at most 8,195),
-47,106 for the launch environment (2 + 1,024 × 6 + 40,960) and 32 for the key.
-Probe SS-P1 confirmed a 131,072-byte value round trip, so the item size has
+detection requires; whole-command value at most 8,192 bytes. The largest
+payload is 8,307 bytes: 1 version, 32 binding, 1 flags, 8,241 for 16 numbered
+variables (1 + 16 × 3 + 8,192; the whole-command form needs at most 8,195)
+and 32 for the key (revised 2026-10-31, ENV1; it was 8,307 with the launch
+environment). Probe SS-P1 confirmed a 131,072-byte value round trip, so the item size has
 margin.
 
 The whole-command variable's detected values are not stored as a separate
 list. Dispatch re-plans them from the stored raw command
 ([dispatch read](#ordering-rules), rule 4).
 
-MAX_ITEM_BYTES in `asura_platform::keychain` is 55,413, the same number. The
-sum above was checked again on 2026-10-22: 1 + 32 + 1 + 8,241 + 47,106 + 32
-= 55,413.
+MAX_ITEM_BYTES in `asura_platform::keychain` is 8,307, the same number:
+1 + 32 + 1 + 8,241 + 32 = 8,307 (2026-10-31).
 
 At most 256 secret items exist per installation. A submit that would create
 the 257th is refused with `secret_store_full`. The
@@ -306,8 +313,8 @@ Selected (engineering, 2026-10-22, SS1-K gap 5).
 - **Read bound.** `get` copies the whole item data; the Security framework
   gives no way to bound a read before the copy. Only team-signed builds with
   the access group can write an item the service reads, and `add` refuses data
-  over 55,413 bytes, so an item Asura wrote is never larger. The service payload codec
-  is the one owner of the payload bound: it rejects any data over 55,413
+  over 8,307 bytes, so an item Asura wrote is never larger. The service payload codec
+  is the one owner of the payload bound: it rejects any data over 8,307
   bytes, and the reply is `mismatch`. The platform does not check the read
   size a second time.
 - **Attribute size.** In production only a team-signed build with the group
@@ -615,7 +622,7 @@ the queue entry's waiting reason.
 | Delete denied (scratch backend only) | Item kept as an orphan; counted in audit as a failed delete; retried by the next sweep |
 | Unrecognized item under the service | Counted toward the 256-item limit and reported; never read or deleted |
 | List returns 257 items | Count reported as 257 ("more than 256"); `put` refused with `full`; the sweep repeats while each pass deletes an item |
-| Item data over 55,413 bytes | The codec rejects it: `mismatch`, held with `secrets_lost`, item deleted |
+| Item data over 8,307 bytes | The codec rejects it: `mismatch`, held with `secrets_lost`, item deleted |
 | Keychain stalls inside securityd | The worker waits without a time bound. Later requests queue, then `busy`. Control, cancel, Drop records and other conversations stay responsive |
 | Shutdown while a request is in flight | Shutdown does not wait for the worker. The ordering rules keep records consistent: an unreferenced item is an orphan, a referenced one is still valid |
 | The item is deleted outside Asura | Treated as missing |
@@ -627,8 +634,8 @@ The [release signing failure handling](release-signing.md#failure-handling)
 owns the signing-related rows (profile, SSH, before first unlock).
 
 A command with no detected secret, a `!` command with no secret, and a model
-call never touch the Keychain. A `!!` command always has a launch environment,
-so every `!!` command needs the Keychain.
+call never touch the Keychain. A `!!` command needs the Keychain only when its command holds a secret
+(revised 2026-10-31, ENV1).
 
 ## Asynchronous execution
 
@@ -638,7 +645,7 @@ Mapping to [AE-01–AE-07](../engineering.md#asynchronous-execution-and-recovery
 | --- | --- |
 | AE-01 | Every Security framework call runs on the one retained secret store worker thread. The reactor, control handlers and rendering never call it. |
 | AE-02 | Blocking calls, all on the worker thread: `SecItemAdd`, `SecItemCopyMatching`, `SecItemDelete` and `SecKeychainSetUserInteractionAllowed` (IPC to securityd, can wait); `SecTaskCreateFromSelf` and `SecTaskCopyValueForEntitlement` (once, at open); the evidence reads `sysctl`, `stat` of `/dev/console` and `getaudit_addr` (once per failed call); in tests `SecKeychainGetStatus`, `SecKeychainCreate`, `SecKeychainOpen`, `SecKeychainLock` and `SecKeychainDelete`. |
-| AE-03 | Queue: 16 requests, then `busy`. One request runs at a time. Deletes after settlement join the same queue; if it is full, the delete is left for the next sweep. Items: 256 per installation, counting every listed item. List: at most 257 attribute results per call, no item data. Read: one item's data, at most 55,413 bytes for any item this build can read; the codec rejects more. Payload: 55,413 bytes. Evidence: one status and four fixed-size session fields per failure reply. |
+| AE-03 | Queue: 16 requests, then `busy`. One request runs at a time. Deletes after settlement join the same queue; if it is full, the delete is left for the next sweep. Items: 256 per installation, counting every listed item. List: at most 257 attribute results per call, no item data. Read: one item's data, at most 8,307 bytes for any item this build can read; the codec rejects more. Payload: 8,307 bytes. Evidence: one status and four fixed-size session fields per failure reply. |
 | AE-04 | No time bound. A request ends by its reply. A submitter that stops waiting (client cancel or disconnect) leaves the request to finish; its result is applied or swept. A stalled securityd is a stalled dependency: the store reports `busy` and everything else continues. The locked-at-dispatch recheck is pacing (1, 1, 2, 3, 5 … s, at most 60 s) and ends nothing. |
 | AE-05 | Values are read at each dispatch, never relaunched after an unknown outcome. Orphans are reconciled against replay. |
 | AE-06 | Startup: the worker disables Keychain user interaction for the process and reads the access group when it opens the store on its own thread, then sweeps after replay. A `not_signed` open does not delay start. Shutdown: admission closes; the worker is not awaited. |
@@ -816,7 +823,7 @@ SS1-K report facts (2026-10-22, packet report; not re-run by the design
 writer): re-run step R2 found that deleting an item written by
 `keychain_fixture` returns -25244, mapped to `denied`. Scratch keychain
 creation and `SecKeychainDelete` worked with user interaction disabled.
-`MAX_ITEM_BYTES` is 55,413, which matches the payload arithmetic.
+`MAX_ITEM_BYTES` is 8,307, which matches the payload arithmetic.
 
 After SS-P3, `security find-generic-password` (read only) searched the login
 keychain for the probe's service attribute and label and found neither; the
@@ -845,7 +852,7 @@ mapping and a scratch keychain only:
 
 | ID | Case | Required result |
 | --- | --- | --- |
-| SS-U1 | Payload codec at every bound (16 variables of 8,192 bytes in total; whole-command 8,192; 1,024 launch entries and 40,960 bytes), plus one over each; unknown version; trailing bytes; maximum payload 55,413 bytes | Exact round trip; each invalid form rejected |
+| SS-U1 | Payload codec at every bound (16 variables of 8,192 bytes in total; whole-command 8,192; flag bit 1 refused), plus one over each; unknown version; trailing bytes; maximum payload 8,307 bytes | Exact round trip; each invalid form rejected |
 | SS-U2 | Binding digest vectors; an item read under another input or installation | `mismatch` |
 | SS-U3 | SS1-K, platform, scratch backend. Status mapping with fixture codes, including -25293 and -25308 with status flags `0x2` and `0x7`, -25244, -25294, -25300 after a pre-check of 0 and a list -25300, and a non-zero pre-check | Each `Failure` as the revised table lists, carrying the call's raw status; no item call after a non-zero pre-check |
 | SS-U4 | P3-E. Ordering: put failure, put then append rejected, append uncertain, `JobEvent::Settled`, Drop | No record before `stored`; delete only after the deciding record; uncertain keeps the item |
@@ -872,7 +879,7 @@ can prove alone.
 
 | ID | Case | Required result |
 | --- | --- | --- |
-| SS-W1 | Put, get, delete and list a 55,413-byte payload | Exact values; `absent` on a second delete; zero items listed afterwards |
+| SS-W1 | Put, get, delete and list a 8,307-byte payload | Exact values; `absent` on a second delete; zero items listed afterwards |
 | SS-W2 | Lock the scratch keychain; get and put; list and delete | `locked`; list and delete succeed while locked |
 | SS-W3 | Scratch backend. Fixture binary (`secret_store_fixture`) writes an item under the same service and account; get | `denied`; no dialog |
 | SS-W4 | Block the worker inside a Keychain call (seam) | The 17th request gets `busy`; the caller's reactor fixture stays responsive |
@@ -931,7 +938,7 @@ read or written.
 
 | ID | Case | Required result |
 | --- | --- | --- |
-| SS-I1 | Submit `!` with a rewritten secret and a whole-command secret, and `!!` with a fixture environment | One item each before kind 31; journal raw-byte sweep finds no value |
+| SS-I1 | Submit `!` with a rewritten secret and a whole-command secret, and `!!` with a secret in its command | One item each before kind 31; a `!!` command without a secret has no item; journal raw-byte sweep finds no value |
 | SS-I2 | Queue them behind a model turn; kill the service; restart; Resume each | Each runs with its real values after dispatch reads the item; items deleted after settlement |
 | SS-I3 | Kill the service between put and append (test seam) | Restart sweep deletes the orphan |
 | SS-I4 | Lock the scratch keychain; submit; unlock; submit again | `secret_store_locked`, nothing journaled; second submit runs |
@@ -1084,7 +1091,7 @@ is `secret_store_fixture`, as [fixture binary](#fixture-binary) states.
 | Locked-at-dispatch pacing | `secret_store::Recheck`, an alias of the shared [`Fibonacci`](#shared-pacing-helper-pace-1) helper: 1, 1, 2, 3, 5, 8 s and so on, at most 60 s apart; the owner resets it when the command leaves the wait |
 
 **Codec.** Secret variable numbers are strictly ascending. Each secret value
-is at least 1 byte. A launch environment value may be empty; a name may not.
+is at least 1 byte.
 These add to the [payload](#payload) bounds, which are unchanged.
 
 **Left to P3-E.** SS1-S delivers the store and the worker layer only. These
@@ -1145,7 +1152,7 @@ timeout; the type needs no peek method.
 | 2 The second status call is in the platform | Recorded under [status mapping](#status-mapping); SS1-S uses the [`KeychainPort` seam](#worker-seam-for-tests); SS-U3 and SS-U9 are SS1-K cases |
 | 3 The fixture binary is in `asura-platform` | A thin `secret_store_fixture` binary in `asura-service` over the shared `fixture_main()` ([fixture binary](#fixture-binary)) |
 | 4 Unrecognized accounts have no delete call | Counted and reported, never deleted ([unrecognized items](#unrecognized-items)) |
-| 5 `list` and `get` memory | List at most 257 results; the codec rejects data over 55,413 bytes ([bounds](#item-count-and-memory-bounds)) |
+| 5 `list` and `get` memory | List at most 257 results; the codec rejects data over 8,307 bytes ([bounds](#item-count-and-memory-bounds)) |
 | 6 Copies inside the Security framework | Residual [SS-T8](execution-threat-model.md#secret-store-at-rest), owner-accepted (EXD-3, 2026-10-22); Secure Enclave replacement after release signing (I9). Revised 2026-10-23 (SGQ8): the team Keychain store does not remove these copies; the Secure Enclave item stays open for later study ([release signing](release-signing.md#secure-enclave-open-item)) |
 | 7 Probe facts | Recorded in [probe results](#probe-results-2026-10-22) |
 

@@ -3986,7 +3986,7 @@ TCR-O5). Encodings follow the existing codec.
 | `cancelled` | 6 cancelled | 10, 11, 12, 13, 14, 16 |
 | `unavailable` | 4 unavailable | 11–16 |
 | `limit` | 7 limit | 16 |
-| `private` | 2 denied | 12, 13, 14: the job is tainted ([taint exclusion hook](context-composer.md#taint-exclusion-hook)); no body |
+| `private` | 2 denied | 10, 12, 13, 14: the job is tainted ([taint exclusion hook](context-composer.md#taint-exclusion-hook)); no body. Code 10 since 2026-10-31 ([model jobs with secret variables](#model-jobs-with-secret-variables-2026-10-31)) |
 
 **State block** (codes 10, 12, 14 and 15 with outcome `ok`, and code 10 with
 `cancelled`):
@@ -4287,7 +4287,8 @@ activity row are unchanged.
 | `limit` | `limit: this job has no room for more notes` |
 | `cancelled` (codes 11–16) | `cancelled` |
 | Note `ok` | `note: recorded on job <handle>` |
-| `private` (codes 12–14, T1) | `private: the person ran this job with a secret value; its output, result and counts are not shown to you` |
+| `private` (codes 12–14, T1) | `private: this job received a secret value; its output, result and counts are not shown to you` (revised 2026-10-31: origin-neutral, since model jobs can be tainted) |
+| `private` (code 10, ENV4) | `private: this command received a secret value; its output, result and counts are not shown to you`, then the `job:` handle line |
 
 Every result stays within the 16,384-byte per-result limit (L21, kept): a page
 is at most 8,192 bytes of text plus a header under 512 bytes; a list is at most
@@ -6115,6 +6116,36 @@ amend the texts above; that design is their one source.
 - **Prior-notice read.** `PriorSettlement` gains `received_secret`, taken from
   the kind 31 that the read already opens for the outside flag, so the
   reference line of a tainted prior entry is the private form.
+
+### Model jobs with secret variables (2026-10-31)
+
+Owner decision ENV4 ([person command environment](person-command-environment.md#owner-decisions-2026-10-31)):
+a model `exec_cmd` that receives SL3 secret variables or the SL7
+whole-command variable is tainted under T1, exactly like a person command.
+The [taint exclusion hook](context-composer.md#taint-exclusion-hook) is the
+one rule (source 2). This is interim: the broker work (AD-4) will forbid raw
+delivery to model jobs. The job controller and the job tool apply it as
+follows (selected, engineering):
+
+- **Handle delivery (code 10).** The call knows its taint from its own kind 14
+  before the job starts. It does not wait for the yield window, because its
+  result could show nothing the model may see. As soon as the job's kind 26
+  commits (JR13), it appends kind 29 with outcome `private` and no body. The
+  rendered text holds the private line and the handle. A turn that ends
+  before delivery still cancels the job (TJ-04), and the call still records
+  `private`. The job then runs on as any delivered job.
+- **Later calls.** `job status`, `job read` and `job wait` of the job record
+  `private`; its `job list` row is the private form; `job cancel` and
+  `job note` are unchanged.
+- **Notices.** The job's J5 notice entry and its reference line in later
+  turns are the private forms. The prior-notice read opens the job's kind 14
+  for the flag.
+- **Replay (JR12).** Kind 29 with outcome `private` and code 10 has no body;
+  any body is `Corrupt`. Replay does not recompute taint: it checks forms
+  only, as for codes 12 to 14.
+
+The person sees the job's output and facts in the job viewer and `/jobs`, as
+for any job.
 
 ### J5 failure handling
 

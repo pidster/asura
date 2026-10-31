@@ -1407,6 +1407,16 @@ Tests:
 | SDI-12 | Integration | Real service, guardian and sandbox: a model call with a single-quoted fixture token runs and prints through `eval`; kind 14 has decision `run`, bit 1 and no value; a raw-byte sweep of journal, payloads, audit and `ps` argument vectors finds no value |
 | SDE-06 | End to end | A deterministic model fixture issues `printf %s '<fixture token>' \| shasum -a 256`; the printed digest matches the fixture token's digest, proving the real value ran; the TUI shows the filtered command; no record holds the token |
 
+## Environment scanner
+
+Added 2026-10-31 (owner decision ENV1). The
+[person command environment](person-command-environment.md#environment-scanner)
+design adds `asura_platform::secrets::environment`, which checks the TUI's
+captured environment and declared configuration values. Its rule stage is
+this rule set, unchanged, run in whole-buffer mode over `NAME=value`. Its
+entropy stage applies only to environment values; SD1 and ADR 0031 still
+exclude generic entropy detection from tool output.
+
 ## Follow-up designs
 
 No owner decision remains open for this design. These follow-ups are recorded:

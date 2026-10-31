@@ -45,6 +45,14 @@ and the secret store is durable in the macOS Keychain
 commands resume after a restart. The owner decided its Keychain questions
 KQ1–KQ3 the same day.
 
+Owner revision of 2026-10-31 ([ENV1](person-command-environment.md#owner-decisions-2026-10-31)):
+Asura builds the environment of `!` and `!!` commands from an allow-list. The
+[person command environment](person-command-environment.md) design is
+canonical for it. It supersedes PC3, OD4, the `!!` launch environment of PCR21
+and the environment sections below, which now point to it. A `!!` command
+differs from a `!` command in its environment only by the job marker (ENV2).
+The `!!` launch environment is no longer stored in the Keychain.
+
 ## Scope
 
 A person can type `!` at the start of the composer to switch it to command mode.
@@ -57,7 +65,7 @@ log and the job viewer. The model receives a notice on its next turn.
 A second `!` typed at the start in command mode switches to unsandboxed command
 mode, shown as `!!`. Enter then queues an unsandboxed person command. It runs
 like a command typed in the person's own terminal: `/bin/sh -c` with no
-Seatbelt profile and the TUI's environment. Everything else is the same as for
+Seatbelt profile. Everything else is the same as for
 `!`: the queue, the tool job, retention, secret filtering, the log, the viewer
 and the notice.
 
@@ -114,7 +122,7 @@ two owner decisions: a `!` command is a tool job, and the
 | PCR5 | In command mode the whole input box, including its half-block strips, uses command amber `#E8B577`. The marker and text are bold black `#000000`. A sent command's log line is a stripe in `#745A3C` with light text. |
 | PCR6 | A `!` command runs as a tool job with a person execution profile. It is a special case of the exec_cmd tool's execution path, not of the model's tool contract. Amended on 2026-10-20 (PC14): `!` and `!!` both run through the exec_cmd tool function, the same `asura-platform::exec_cmd` request, guardian and spawn path as the model's exec_cmd tool; `!` with a sandbox, `!!` without. |
 | PCR7 | For a `!` command the Seatbelt sandbox stays, and network access is allowed. Amended on 2026-10-19 (PC13): a `!!` command runs with no sandbox under PCR21. |
-| PCR8 | The command receives the person's PATH and HOME, not the model's fixed PATH and scratch HOME. Reads are allowed across the person's home, including `~/.ssh`. |
+| PCR8 | The command receives the person's PATH and HOME, not the model's fixed PATH and scratch HOME. Reads are allowed across the person's home, including `~/.ssh`. Amended on 2026-10-31 (ENV1): both modes receive the [allow-list environment](person-command-environment.md). |
 | PCR9 | The working directory is the TUI launch directory when it is inside the selected project; otherwise it is the project root. Each command runs in its own shell; `!cd` does not persist. |
 | PCR10 | Writes are allowed only to the project, `$TMPDIR` and the fixed cache list `~/.cargo`, `~/.rustup`, `~/.cache`, `~/Library/Caches`, `~/.npm`. Shell configuration files, `~/.ssh` and other dotfiles remain read-only. Amended on 2026-10-22 (OD1): the command may also write its own empty Asura-private job scratch directory, so the escapee marker works for `!` as for model jobs. HOME and `$TMPDIR` stay the person's. The directory is deleted when the job ends. The command reaches it only by its path: no variable names it, and a `!` command cannot list `~/.asura/tmp`. |
 | PCR11 | A person command has no timeout. Ctrl-C while it runs sends TERM to its process group, then KILL after a grace period of 2 s (PC8). A second Ctrl-C kills at once. `/cancel` also stops it. With nothing running, Ctrl-C keeps its current quit behavior. |
@@ -133,7 +141,7 @@ except where a rule below replaces them.
 | ID | Rule |
 | --- | --- |
 | PCR20 | `!` typed at cursor position 0 in command mode, with no selection, switches to outside mode. The prompt marker becomes `!!`. In outside mode `!` is always text. A paste at position 0 steps up one mode for each leading `!`, at most two: `!!x` pasted into an empty message box gives outside mode with text `x`, and `!!!x` gives outside mode with text `!x`. A paste of `! !x` gives command mode with text ` !x`, which runs sandboxed. Backspace at position 0 with no selection steps back one mode, from outside mode to command mode, and keeps the text. |
-| PCR21 | A `!!` command runs as a person job with the outside profile: `/bin/sh -c COMMAND` with no Seatbelt profile, under the existing guardian. It receives the TUI's environment as read at TUI launch, unchanged, plus the per-job marker `ASURA_JOB_<jobhex>=1` and any EX4 secret variables. Stdin is `/dev/null`; there is no TTY. It runs in its own process group. Stop, kill and the absent timeout follow PCR11. PCR8 and PCR10 do not apply: the command reads and writes whatever the person's account can. |
+| PCR21 | A `!!` command runs as a person job with the outside profile: `/bin/sh -c COMMAND` with no Seatbelt profile, under the existing guardian. It receives the [allow-list environment](person-command-environment.md) of a `!` command (amended 2026-10-31, ENV1 and ENV2; it received the TUI's whole launch environment before), plus the per-job marker `ASURA_JOB_<jobhex>=1` and any EX4 secret variables. Stdin is `/dev/null`; there is no TTY. It runs in its own process group. Stop, kill and the absent timeout follow PCR11. PCR8 and PCR10 do not apply: the command reads and writes whatever the person's account can. |
 | PCR28 | Owner, 2026-10-22 (OD2). When a `!!` command's shell has exited but a survivor, detached or still in the shell's process group (PQ3, decided under PC13), holds its stdout or stderr, the job stays `Draining` and capture continues, so Asura never causes the survivor's EPIPE. The command's queue entry completes and its lane advances. The job stays live in `/jobs` as `shell exited · N background processes writing`. It settles when the survivor closes the pipes, or when the person cancels it. A cancel stops capture and settles the job; it does not kill the survivor (EC-D1), which may then get EPIPE on its next write. See [`!!` survivors](#outside-survivors-and-lane-release). |
 | PCR22 | Typing `!!` is the approval. There is no confirmation, classifier or prompt. Before the command runs, its log entry shows `running OUTSIDE the sandbox, as you typed it: it may write anywhere you can` in alert colour `#FF6B6B`, bold. |
 | PCR23 | The configuration key `personCommands.allowOutsideSandbox`, default `true`, enables `!!`. When it is `false`, the service refuses a `!!` command with `outside_sandbox_off` and the hint "type it after a single ! to run it in the sandbox". Only the person sets the key, through [configuration commands](config-commands.md). |
@@ -170,7 +178,7 @@ scheduler, queue, payload store or journal.
 | Behavior | Canonical owner | Change |
 | --- | --- | --- |
 | Mode switch, styling, recall, Ctrl-C mapping, log fold | Rust TUI (`asura-cli/src/tui`) | New composer modes (command and outside) and log entry |
-| Launch environment for `!!` | Rust TUI, read once at launch | New in-memory copy |
+| Captured environment, launch scan, environment line and hints | Rust TUI, read once at launch ([person command environment](person-command-environment.md#ownership)) | In-memory copy; launch scan thread |
 | `personCommands.allowOutsideSandbox` | Configuration owner ([config commands](config-commands.md)) | New key |
 | Job viewer, job list and cancel | TUI job worker and viewer from job packet J4 | Kill escalation |
 | Submit transport | Existing serial queue sender | New typed request |
@@ -211,7 +219,7 @@ flowchart TB
         Owner["Conversation owner: queue, dispatch, person grant"]
         Ctl["Job controller: slot, capture, settlement"]
         Cfg["Config: personCommands.allowOutsideSandbox"]
-        Store["Secret store worker: Keychain items for command secrets and !! environment"]
+        Store["Secret store worker: Keychain items for command secrets"]
         J[("Format-1 journal")]
         P[("Retained job streams")]
     end
@@ -231,8 +239,7 @@ flowchart TB
         All[("Anything the account can reach, ~/.asura included")]
     end
     Helper["Swift model helper"]
-    Mode -->|"Enter (!): command, cwd, PATH, PC3 names"| Send
-    Mode -->|"Enter (!!): command, cwd, launch environment"| Send
+    Mode -->|"Enter (! or !!): command, cwd, PATH, terminal variables"| Send
     Mode -->|"Ctrl-C, /cancel, open viewer"| JobW
     Send <-->|"command submit / queue reply"| API
     JobW <-->|"JobRead, JobObserve, JobCancel / pages, state"| API
@@ -535,10 +542,10 @@ behavior where marked PCR, otherwise a selected mechanism.
 | Exec and read roots | `/bin`, `/usr/bin`, `/sbin`, `/usr/sbin`, `/usr/lib`, `/usr/share`, `/System`, project, scratch | Model roots, plus home (PCR8), `$TMPDIR`, cache list, the fixed system roots and the developer directory ([person profile](#person-seatbelt-profile)) | Anything the account can read (PCR21) |
 | Write roots | Project and private job scratch | Project, `$TMPDIR`, existing cache-list directories (PCR10), private job scratch (OD1) | Anything the account can write, `~/.asura` included (PCR21, [EXD-1](execution-threat-model.md#unsandboxed-person-commands)) |
 | Network | None | Allowed (PCR7); `~/.asura` and the control socket denied (PX3) | Allowed; the control socket is reachable |
-| PATH | `/usr/bin:/bin:/usr/sbin:/sbin` | The TUI's PATH, sent with each submit and sanitized (PCR8, PC2) | The TUI launch environment's PATH, unchanged |
-| HOME | Private job scratch | Account home (PCR8) | The TUI launch environment's HOME, unchanged |
-| TMPDIR | Private job scratch | The person's per-user temporary directory (PCR10) | The TUI launch environment's TMPDIR, unchanged |
-| Other variables | `LC_ALL=C`, `LANG=C`; EX4 secret variables | Fixed allow-list plus the SSH agent socket (PC3) and EX4 secret variables | The whole TUI launch environment, `ASURA_JOB_<jobhex>=1` and EX4 secret variables; see [outside environment](#outside-profile-environment) |
+| PATH | `/usr/bin:/bin:/usr/sbin:/sbin` | The TUI's PATH, sent with each submit and sanitized (PCR8, PC2) | Same as person (ENV2) |
+| HOME | Private job scratch | Account home (PCR8) | Same as person (ENV2) |
+| TMPDIR | Private job scratch | The person's per-user temporary directory (PCR10) | Same as person (ENV2) |
+| Other variables | `LC_ALL=C`, `LANG=C`; EX4 secret variables | The [allow-list environment](person-command-environment.md#the-allow-list): base, toolchain and declared variables, then EX4 secret variables | The same allow-list environment, `ASURA_JOB_<jobhex>=1`, then EX4 secret variables |
 | Environment transport | Fixed in the guardian; secret variables in the guardian's own environment | [Person environment descriptor](#platform-changes) FD 11, applied only to the final `/bin/sh` spawn; secret variables as for the model | Same as person |
 | Working directory | Model-chosen project-relative `cwd`, default root | Launch directory if inside the project, else root (PCR9) | Same as person (PCR9) |
 | Stdin, TTY | `/dev/null`; no TTY | Same | Same |
@@ -551,140 +558,32 @@ behavior where marked PCR, otherwise a selected mechanism.
 | Output | Retained streams under the job controller (J1, J2) | Same (PCR14) | Same; capture continues after shell exit while a survivor holds a pipe (OD2) |
 | Output growth | Job retention quota with growing reservation, expiry and `CapturePaused` | Same | Same |
 | Concurrency | Job slots per agent and service (AQ1) | Same; one person job per main-agent lane (PC9) | Same |
-| Durable record | Kind 14, then kinds 26–29 (J2, J3) | Kind 31, then kinds 26–28 with person origin | Same as person, with the outside flag; no environment journaled |
+| Durable record | Kind 14, then kinds 26–29 (J2, J3) | Kind 31 with the non-secret environment, then kinds 26–28 with person origin | Same as person, with the outside flag |
 | Model disclosure | Kind 29 result in the same turn; J5 notice | J5 person notice on the next turn; output by the composer's view, or by `job read` until the composer exists (PC12) | Same as person; notice adds `, outside the sandbox,` (PCR24) |
 | Audit | Job audit events, profile `model-1` | Job audit events with origin `person`, profile `person-1` | Same, profile `person-outside-1`, `outside_sandbox` true |
 
 ### Environment and how PATH and HOME reach the service
 
-Verified behavior (code inspection, 2026-10-13): the service process is spawned
-with only `LANG=C` and `LC_ALL=C` (`asura-platform/src/startup.rs:311-312`). It
-has no PATH or HOME of its own. A service started by one terminal also serves
-later TUIs from other shells. The service therefore cannot supply the person's
-PATH from its own environment.
-
-Proposed mechanism; the source of PATH was selected in PC2:
-
-1. The TUI reads `PATH` from its own environment once at launch. This is an
-   in-memory read.
-2. Each command submit carries that PATH. The request digest covers it.
-3. The service sanitizes it: at most 4096 bytes and 64 entries; no NUL; it
-   drops empty and relative entries, because they resolve against the project
-   directory. It keeps the remaining order. An empty result rejects the submit
-   with `path_invalid`.
-4. Kind 31 stores the sanitized PATH, so a held command can resume after a
-   restart without a client resupplying it.
-5. The setup worker resolves HOME from the account database with the existing
-   `account_home` lookup (`asura-platform/src/runtime.rs:255`). The client never
-   supplies HOME. This prevents a client from pointing HOME at another tree.
-6. The setup worker resolves `$TMPDIR` with `confstr(_CS_DARWIN_USER_TEMP_DIR)`.
-7. The service never adopts the client's PATH into its own environment. It
-   never logs PATH or writes it to audit.
-
-Other variables (PC3, selected):
-
-| Variable | Source and check |
-| --- | --- |
-| `TMPDIR` | Setup worker, as above |
-| `USER`, `LOGNAME` | Setup worker, from the account database entry that supplies HOME |
-| `TERM` | Fixed `dumb` |
-| `GIT_TERMINAL_PROMPT` | Fixed `0` |
-| `LANG`, `LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, `LC_TIME` | Client, when set; each value at most 64 bytes of ASCII letters, digits, `_`, `-`, `.` and `@` |
-| `SSH_AUTH_SOCK` | Client, when set; an absolute path of at most 103 bytes with no NUL. The setup worker checks with `lstat` that it names a socket; otherwise the variable is dropped and the command still runs. |
-| `ASURA_SECRET_<n>` | Service only, never the client. Set when EX4 secret detection rewrites the command (PCR19): the real value, held in memory for that one execution, then dropped. Never journaled, audited or reused across commands. The [secret detection design](secret-detection.md#environment-path) defines the bounds: n is 1–16, values total at most 8192 bytes, and a guardian preamble stops child processes inheriting them. |
-
-The client sends only names from this table, excluding the service-set
-`ASURA_SECRET_<n>` variables. The service rejects any other client name with
-`environment_invalid`. Every other inherited variable is absent, as in
-the model profile. The guardian still closes every inherited descriptor.
+Superseded on 2026-10-31 by the [person command environment](person-command-environment.md)
+(ENV1, ENV2). That design is canonical for both modes: the base list (PATH
+sanitized under PC2; HOME, USER, LOGNAME and SHELL from the account database;
+TMPDIR from `confstr`; fixed TERM and GIT_TERMINAL_PROMPT; locale names, TZ,
+`SSH_AUTH_SOCK` and XDG directories from the TUI), the toolchain list, the
+project's declared variables and the secret variables. The service has no
+PATH of its own (`startup.rs:311-312`), so the TUI still sends PATH and the
+terminal variables with each submit. Kind 31 records them, so a held command
+resumes after a restart without a client and without a Keychain call.
 
 ### Outside profile environment
 
-Required behavior: PCR21. A `!!` command receives the environment the person's
-terminal gave the TUI, as Wisp passes its own `environ`. Wisp runs in the
-person's terminal, so its environment is that terminal's. Asura's service has no
-such environment (`startup.rs:311-312`), so the TUI supplies it. Selected
-mechanism (revised 2026-10-22):
-
-1. The TUI copies its whole environment once at launch, in memory, beside
-   the PATH it already reads. A `!!` submit carries that copy. The TUI never
-   writes it to disk or a log.
-2. The service checks only form, not content: each name is 1–1,024 bytes with
-   no `=` and no NUL; each value has no NUL; at most 1,024 entries; names and
-   values total at most 40,960 bytes (OD4,
-   [frame bound](#submit-frame-bound)). A larger environment refuses the
-   submit with `environment_too_large`; the draft and mode stay. Duplicate
-   names, any name that starts with `ASURA_SECRET_` (the numbered variables
-   and `ASURA_SECRET_COMMAND`) and any name that starts with `ASURA_JOB_`
-   refuse with `environment_invalid`, because the service sets those names.
-3. The service does not sanitize PATH, resolve HOME or TMPDIR, or apply the
-   PC3 allow-list. The person's terminal does none of these.
-4. The service writes the environment, with any command secrets, to the
-   input's Keychain item in the [secret store](secret-store.md) before kind
-   31 (PC15). Kind 31, job records, audit and logs never hold it, because a
-   terminal environment commonly holds tokens and EX4 forbids a stored copy of
-   a secret in Asura records. Dispatch reads the item and moves the values
-   into the job admission. The conversation owner deletes the item after the
-   job's settlement, a Drop or a rejected append.
-5. An exact retry compares a keyed digest of the environment with the one in
-   the item; a different environment under the same request ID conflicts.
-   When the item no longer exists, the kind 31 request digest alone decides
-   ([secret store ordering rule 6](secret-store.md#ordering-rules)).
-6. After a restart the queued `!!` command is `Held` (MQ07R). Resume moves it
-   back to `Queued` without a Keychain call. Dispatch reads its item and runs
-   it with the stored environment. A missing or mismatched item holds it with
-   `secrets_lost`; a denied read holds it with `secret_store_denied`; a locked
-   or unavailable Keychain leaves it waiting at the lane head with a paced
-   recheck ([secret store failures](secret-store.md#failure-handling)). Every
-   `!!` command needs the Keychain, because it always has an environment.
-7. The slot setup worker sends the validated entries to the guardian through
-   the [person environment descriptor](#platform-changes) (FD 11). The
-   guardian never adopts them into its own environment: they apply only to the
-   final `/bin/sh` spawn, so `DYLD_*`, `Malloc*` and similar variables never
-   affect the Asura binary. The guardian appends `ASURA_JOB_<jobhex>=1`, where
-   `<jobhex>` is the 32 lowercase hexadecimal digits of the job ID, and then
-   the EX4 secret variables from its own environment. The secret detection
-   preamble and guardian erasure apply unchanged. The guardian still closes
-   every inherited descriptor; those descriptors are Asura's, not the
-   terminal's.
-
-The environment is the TUI's at launch, not at Enter. Unlike an interactive
-shell, `!!export X=1` does not change later commands, because each command runs
-in its own shell (PCR9). One Keychain item holds at most 55,413 bytes, and
-an installation has at most 256 items ([item contract](secret-store.md#keychain-item-contract)).
-
-#### Submit frame bound
-
-Decided on 2026-10-22 under the no-protocol-change rule (OD4): the frame stays
-64 KiB, so the environment bound is recomputed to fit one control frame with
-the largest command. The envelope body is limited to 65,536 bytes
-(`MAX_FRAME_BYTES`, `asura-control/src/lib.rs:12`); the 12-byte frame header
-is outside it.
-
-| Part | Worst-case bytes |
-| --- | --- |
-| Envelope fields 1–3: two 16-byte IDs (18 each) and the request counter (11) | 47 |
-| Envelope body tag for field 68 (2) and its length (3) | 5 |
-| Submit fields 1–3: three 16-byte IDs | 54 |
-| Field 4 expected generation | 11 |
-| Fields 5 and 10 flags | 4 |
-| Field 6 command: tag, 2-byte length, 8,192 bytes | 8,195 |
-| Field 7 cwd: tag, 2-byte length, 1,024 bytes | 1,027 |
-| Fixed total | 9,343 |
-| Room for field 11 entries | 56,193 |
-
-Each `LaunchVariable` entry costs at most 11 bytes beyond its name and value:
-the entry tag (1) and length (at most 3), the name tag (1) and length (at most
-2), and the value tag (1) and length (at most 3). With 1,024 entries the
-headers cost at most 11,264 bytes. The bound of 40,960 bytes of names and
-values therefore gives at most 52,224 bytes of entries, 3,969 bytes below the
-room. A `!` submit is far smaller: PATH 4,096 bytes and 9 PC3 entries.
-
-Codec test PC-U49 encodes a submit at every maximum together: 8,192-byte
-command, 1,024-byte cwd, maximal IDs and counter, 1,024 entries whose names
-and values total exactly 40,960 bytes with the largest varint lengths, and
-checks that the envelope body is at most 65,536 bytes. It then checks that
-1,025 entries and 40,961 bytes each refuse with `environment_too_large`.
+Superseded on 2026-10-31 (ENV2). A `!!` command receives the same allow-list
+environment as a `!` command, plus `ASURA_JOB_<jobhex>=1`; see
+[`!` and `!!` differences](person-command-environment.md#-and--differences).
+The TUI no longer sends its launch environment, the service no longer stores
+it in the Keychain, and OD4's 40,960-byte launch environment bound and the
+`environment_too_large` refusal are removed. The submit frame bound is
+recomputed in the [control API](person-command-environment.md#control-api)
+of that design.
 
 ### Working directory
 
@@ -905,22 +804,20 @@ message ConversationQueueCommandSubmit {
   optional bool new_conversation = 5;
   optional string command = 6;      // 1-8192 UTF-8 bytes, no NUL
   optional string cwd = 7;          // project-relative, "." for root, 1-1024 bytes
-  optional string search_path = 8;  // `!` only: client PATH, at most 4096 bytes
-  repeated PersonEnvironment environment = 9;  // `!` only: PC3 client names, at most 9
+  optional string search_path = 8;  // both modes: client PATH, at most 4096 bytes
+  repeated PersonEnvironment environment = 9;  // both modes: terminal variables, at most 64 on the wire
   optional bool outside_sandbox = 10;          // true for a `!!` command
-  repeated LaunchVariable launch_environment = 11;  // `!!` only: at most 1,024 entries, 40,960 bytes
+  reserved 11;                                 // the removed `!!` launch environment (ENV1)
 }
 message PersonEnvironment { optional string name = 1; optional string value = 2; }
-message LaunchVariable { optional bytes name = 1; optional bytes value = 2; }
 ```
 
-Field rules: with `outside_sandbox` absent or false, `launch_environment` must be
-empty and fields 8 and 9 follow the `!` rules. With `outside_sandbox` true,
-fields 8 and 9 must be absent and `launch_environment` follows the
-[outside environment](#outside-profile-environment) bounds; it may be empty.
-Any other combination refuses with `environment_invalid`. `LaunchVariable`
-uses bytes because a terminal environment need not be UTF-8; the codec checks
-the outside environment bounds only. Codecs apply strict presence, size,
+Field rules (revised 2026-10-31, ENV1): fields 8 and 9 follow the
+[allow-list](person-command-environment.md#control-api) in both modes; the
+service refuses a field 9 entry outside the terminal table, failing its class,
+flagged by the scanner or repeated with `environment_invalid`. The accepted
+reply carries the [environment facts](person-command-environment.md#reply-facts).
+Codecs apply strict presence, size,
 direction and unknown-field validation before admission, as for every 0.1
 message.
 
@@ -978,7 +875,7 @@ enum QueueRefusal {
   QUEUE_REFUSAL_UNSPECIFIED = 0;
   QUEUE_REFUSAL_OUTSIDE_SANDBOX_OFF = 1;
   QUEUE_REFUSAL_ENVIRONMENT_INVALID = 2;
-  QUEUE_REFUSAL_ENVIRONMENT_TOO_LARGE = 3;
+  reserved 3;  // ENVIRONMENT_TOO_LARGE, removed with the launch environment (ENV1)
   QUEUE_REFUSAL_PATH_INVALID = 4;
   QUEUE_REFUSAL_CWD_INVALID = 5;
   QUEUE_REFUSAL_SECRET_STORE_LOCKED = 6;
@@ -1043,22 +940,17 @@ Codec rules (P3-C, 2026-10-23):
   `SETTLED`, `shell_exited` only as true and only in `DRAINING`.
 - `SecretStoreStatus` fields are optional; counts are at most 257. Fields 4
   and 6 (stranded items) are reserved since SG3.
-- One owner checks the environment form: `asura_control::person::environment_refusal`
-  (size first: more than 1,024 entries or 40,960 bytes is
-  `environment_too_large`; any other form fault is `environment_invalid`). The
-  client applies it before sending and answers a refused environment locally,
-  so an environment too large for one frame still gets its refusal; the service
-  applies the same function at submit. The wire limit of `launch_environment`
-  is the frame bound (32,768 entries), so a count above 1,024 is a refusal, not
-  a wire fault.
+- The environment check has one owner, `asura_platform::exec_cmd::environment`
+  (revised 2026-10-31, ENV1). The control crate checks wire shape only; the
+  client builds field 9 with the same table, so it never needs a local
+  environment refusal.
 
 TUI texts for refusals:
 
 | Refusal | Text |
 | --- | --- |
 | `outside_sandbox_off` | "Running outside the sandbox is turned off (personCommands.allowOutsideSandbox is false). Type it after a single ! to run it in the sandbox." |
-| `environment_invalid` | "This terminal's environment cannot be passed to a command (invalid or reserved variable name)." |
-| `environment_too_large` | "This terminal's environment is too large to pass to a command (at most 1,024 variables and 40 KiB)." |
+| `environment_invalid` | "This command's environment could not be built (a variable has an invalid value)." |
 | `path_invalid` | "PATH has no usable absolute entry." |
 | `cwd_invalid` | "The working directory cannot be used for commands." |
 | `secret_store_*` | The [secret store](secret-store.md#failure-handling) texts; `secret_store_busy` reads "The Keychain is busy. Press Enter again." |
@@ -1313,8 +1205,8 @@ as SL5 requires.
 | 8 | command | string | 1–8,192 bytes, no NUL. The rewrite, or exactly `eval "$ASURA_SECRET_COMMAND"` when field 17 bit 1 is set. Never a secret value |
 | 9 | display command | string | Empty unless field 17 bit 1; then 1–8,192 bytes of display-redacted text, cut at 8,192 with field 17 bit 0 |
 | 10 | cwd | string | 1–1,024 bytes, the PCR9 rules |
-| 11 | search path | string | `!`: 1–4,096 bytes, sanitized. `!!`: empty |
-| 12 | client environment | u8 count, then entries | `!`: 0–9 entries in increasing name code: u8 name code (1 `LANG`, 2 `LC_ALL`, 3 `LC_COLLATE`, 4 `LC_CTYPE`, 5 `LC_MESSAGES`, 6 `LC_MONETARY`, 7 `LC_NUMERIC`, 8 `LC_TIME`, 9 `SSH_AUTH_SOCK`), u8 value length, value (codes 1–8: 1–64 bytes of the PC3 characters; code 9: 1–103 bytes, absolute). `!!`: count 0 |
+| 11 | search path | string | 1–4,096 bytes, sanitized; both modes (ENV1) |
+| 12 | terminal variables | u8 count, then entries | Both modes: 0–39 entries in increasing [name code](person-command-environment.md#terminal-table): u8 name code 1–39, u16 value length, value passing its class (revised 2026-10-31, ENV1) |
 | 13 | initial order revision | u64 | As kind 18 |
 | 14 | number count | u16 | 0–16 for a rewrite; 0–256 with field 17 bit 1 (kind 14 field 15) |
 | 15 | number kinds | count × u8 | Entry i is the secret kind (1–33) of `$ASURA_SECRET_<i>` (kind 14 field 16) |
@@ -1325,27 +1217,29 @@ as SL5 requires.
 | 20 | fallback reason | u8 | 0 unless field 17 bit 1; then the rewrite's refusal code, not 1, 12 or 14 (kind 14 field 21) |
 | 21 | fallback kind | u8 | 0 or a secret kind 1–33 (kind 14 field 22) |
 | 22 | fallback word | u16 | 0, or the 1-based word index 1–4,096 (kind 14 field 23) |
+| 23 | declared variables | u8 count, then entries | 0–32 entries in increasing name byte order: u8 name length 1–64, name, u16 value length 1–1,024, value; at most 4,096 bytes of names and values ([declared variables](person-command-environment.md#declared-variables), ENV1) |
 
-The maximum payload is 22,570 bytes: 105 bytes of IDs, digest, generation and
-flags; 8,196 for the command; 8,196 for the display text; 1,028 for the cwd;
-4,100 for the search path; 634 for the client environment (1 + 8 × 66 + 105);
-8 for the order revision; and 303 for fields 14–22 (2 + 256 + 4 + 1 + 4 + 32 +
-1 + 1 + 2). The maximum frame is 22,754 bytes, below the 65,536-byte journal
-frame. These are decode upper bounds: fields 8 and 9 cannot both be full in a
+The maximum payload is 44,142 bytes (revised 2026-10-31, ENV1): 105 bytes of
+IDs, digest, generation and flags; 8,196 for the command; 8,196 for the
+display text; 1,028 for the cwd; 4,100 for the search path; 18,013 for the
+terminal variables (1 + 39 × 3 + 17,895); 8 for the order revision; 303 for
+fields 14–22 (2 + 256 + 4 + 1 + 4 + 32 + 1 + 1 + 2); and 4,193 for the
+declared variables (1 + 32 × 3 + 4,096). The maximum frame is 44,326 bytes,
+below the 65,536-byte journal frame. These are decode upper bounds: fields 8 and 9 cannot both be full in a
 valid record, so the largest valid record is smaller. PC-U20 tests the bound
 and the reachable maxima (P2, 2026-10-23).
 
-A secret item exists exactly when field 14 is not 0, field 17 bit 1 is set or
-field 7 bit 1 is set. Replay does not check the Keychain; dispatch does.
+A secret item exists exactly when field 14 is not 0 or field 17 bit 1 is set
+(revised 2026-10-31: a `!!` command alone no longer has one). Replay does not check the Keychain; dispatch does.
 
 The request digest is SHA-256 over: the kind number 31 (u8), project ID,
 conversation ID (the zero ID when field 7 bit 0 asks for a new conversation,
 because the service picks a fresh ID on each try and an exact retry must still
 match), expected generation, queue flags, command, display command,
-cwd, search path and client environment, each in its field encoding, in that
-order. An exact retry returns the original input ID; changed fields under the
-same request ID conflict. The secret values and the `!!` launch environment
-are compared by the keyed digest in the Keychain item instead
+cwd, search path, terminal variables and declared variables, each in its
+field encoding, in that order. An exact retry returns the original input ID;
+changed fields under the same request ID conflict. The secret values are
+compared by the keyed digest in the Keychain item instead
 ([secret store ordering rule 6](secret-store.md#ordering-rules)).
 
 Ledger and checkpoint. Kind 31 is a normal record, not a closure record, and
@@ -1434,7 +1328,7 @@ No new process type or supervisor is added.
 | Grace | Selected by the profile token: `person-1` and `person-outside-1` 2 s (PC8); `model-1` keeps 500 ms. |
 | Notice reasons | Delivered by J2 for every profile: kind 2 reason 2 `cancel` for a `T` stop and 11 `kill` for `K`. P1 adds kind 2 reasons 14 `escapees_left_running` and 15 `escapees_hold_output`, valid only for `person-outside-1` ([escapee control](escapee-control.md#guardian-status-notice-extensions)). The controller, not the guardian, records `person_stop` or `person_kill`. |
 | Person environment descriptor | FD 11 for both person profiles; see below. The guardian's own environment still accepts only `ASURA_SECRET_*` entries |
-| Child environment | Person: the FD 11 entries (sanitized PATH, account HOME, `TMPDIR`, `USER`, `LOGNAME`, `TERM=dumb`, `GIT_TERMINAL_PROMPT=0`, PC3 variables), then EX4 secret variables. Outside: the FD 11 entries (the launch environment as sent), then `ASURA_JOB_<jobhex>=1`, then EX4 secret variables. Model: unchanged |
+| Child environment | Person and outside: the FD 11 entries (the [allow-list environment](person-command-environment.md)), then, for outside only, `ASURA_JOB_<jobhex>=1`, then EX4 secret variables (revised 2026-10-31). Model: unchanged |
 | Root descriptors | Person: FDs 12–19 for the variable roots of the [person profile](#person-seatbelt-profile), in the order the FD 11 root table lists; validated like FDs 7–9 (directory, opened with no-follow), with effective-UID ownership required for roles 1, 2 and 4 only, because the developer directory (role 3) may be root-owned. A failed check is setup reason 7 `denied`. Outside: none |
 | Job scratch | FD 9, as for every profile. `person-1` grants it for writing (OD1) and uses it as the escapee marker; `person-outside-1` does not use it |
 | Outside spawn | For `PersonOutside` the guardian spawns `/bin/sh -c COMMAND` without `sandbox-exec` and compiles no profile. Lease, process group, descriptor closing, stop bytes, grace and reaping are the person profile's |
@@ -1465,15 +1359,14 @@ whose rejection of a descriptor for secret values is unchanged.
 - Frame: u32 length of the rest; u8 root count 0–8 and one role byte per root
   descriptor (1 home, 2 `$TMPDIR`, 3 developer directory, 4 cache; roles 1 and
   2 exactly once and first for `person-1`; count 0 for `person-outside-1`);
-  u16 entry count 0–1,024; each entry u16 name length 1–1,024, name, u32 value
+  u16 entry count 0–128; each entry u16 name length 1–64, name, u32 value
   length, value. Names and values total at most 40,960 bytes, so the frame is
-  at most 47,119 bytes (4 + 1 + 8 + 2 + 1,024 × 6 + 40,960).
-- Guardian entry checks: no NUL in a name or value, no `=` in a name, no
-  duplicate name, and no name that starts with `ASURA_SECRET_` or `ASURA_JOB_`.
-  For `person-1` the names must be exactly the PC3 set listed in
-  [environment](#environment-and-how-path-and-home-reach-the-service), with
-  PATH, HOME and `TMPDIR` present. For `person-outside-1` any other name is
-  allowed.
+  at most 41,743 bytes (4 + 1 + 8 + 2 + 128 × 6 + 40,960); revised
+  2026-10-31 (ENV1).
+- Guardian entry checks, the same for both profiles since 2026-10-31: the
+  [FD 11 rules](person-command-environment.md#fd-11-frame) of the allow-list
+  (name form, no duplicate, no `ASURA_SECRET_` or `ASURA_JOB_` name, class
+  checks for terminal table names, PATH, HOME and `TMPDIR` present).
 - The guardian zeroizes the frame buffer after the spawn, as it does for the
   secret entries.
 
@@ -1578,7 +1471,7 @@ sequenceDiagram
     participant P as Payload adapter
     participant G as Guardian and sandbox
     participant M as Model helper
-    U->>U: Enter in command or outside mode: stage command, cwd, PATH or launch environment
+    U->>U: Enter in command or outside mode: stage command, cwd, PATH and terminal variables
     U->>C: Local outbox row, stable request ID
     C->>S: ConversationQueueCommandSubmit
     S->>S: Validate bounds, project, PATH or environment, lane, !! switch
@@ -1725,7 +1618,8 @@ The person keeps every view of the job: the log fold, `/jobs` and the job
 viewer show its output and facts. The decision is a deterministic check of the
 job's kind 31 record, defined in the
 [taint exclusion hook](context-composer.md#taint-exclusion-hook). A `!!`
-command's launch environment alone does not taint it (open question O3 there).
+command receives no launch environment since 2026-10-31 (ENV1), so open
+question O3 there is closed.
 The wider secrets decisions remain pending.
 
 ## Failure handling and recovery
@@ -1743,7 +1637,7 @@ command may have changed files.
 | `!!` submit with `personCommands.allowOutsideSandbox` false | Refused with `outside_sandbox_off` and the hint to use `!`; nothing is queued; draft and outside mode kept |
 | Switch turned off while a `!!` command is queued | The controller reads it at slot grant; kind 28 not started, reason 20 `outside_sandbox_off`; nothing runs; the item is deleted |
 | Switch turned off while a `!!` command runs | The command continues; the person stops it (the switch is checked at submit and slot grant only) |
-| `!!` launch environment over the bounds | Refused with `environment_too_large` or `environment_invalid`; draft and mode kept |
+| A terminal variable is invalid or flagged | Not passed; the command runs ([environment failures](person-command-environment.md#failure-handling)) |
 | Service restart with a queued `!!` command or a queued command with secrets | `Held`; Resume returns it to `Queued` with no Keychain call; dispatch reads the item and runs it (PC15). A missing or mismatched item holds it with `secrets_lost`, a denied read with `secret_store_denied`; a locked or unavailable Keychain leaves it waiting with a paced recheck |
 | Keychain locked, denied, unavailable, full or busy at submit | Refused with the matching `secret_store_*` refusal; draft and mode kept; nothing journaled; never a disk fallback |
 | `!!` shell exits while a detached survivor holds its output | The job stays `Draining` and keeps capturing; the lane advances; `/jobs` shows `shell exited · N background processes writing` (OD2) |
@@ -1781,7 +1675,7 @@ the person path adds.
 | Call | Owner and isolation | Limit |
 | --- | --- | --- |
 | Read PATH at TUI launch | TUI startup, in memory | 4096 bytes |
-| Copy the launch environment | TUI startup, in memory | The process environment, already in memory; the submit bound is 1,024 entries and 40,960 bytes |
+| Copy and scan the captured environment | TUI launch scan thread ([environment](person-command-environment.md#asynchronous-execution)) | 1,024 variables and 1 MiB |
 | Secret store `put`, `get`, `delete` | Secret store worker thread ([secret store](secret-store.md#asynchronous-execution)) | 16 queued requests, then refusal or a wait with `keychain_busy`; no time bound |
 | FD 11 environment frame write | Job slot setup thread, nonblocking writes polled at 100 ms pacing with the setup cancel check | At most 47,119 bytes; ends on completion, guardian exit or cancel |
 | `readlink` of `/var/db/xcode_select_link` | Job slot setup thread | One call; no time bound; ends on reply |
@@ -1809,8 +1703,7 @@ how much output is retained or shown to the model.
 | Command | 1–8192 UTF-8 bytes |
 | cwd | 1–1024 bytes |
 | PATH | 4096 bytes, 64 entries |
-| PC3 client environment | 9 names; values 64 bytes, socket path 103 bytes |
-| `!!` launch environment | 1,024 entries; names 1–1,024 bytes; names and values 40,960 bytes in total, so the submit fits one 64 KiB control frame ([frame bound](#submit-frame-bound)) |
+| Terminal and declared variables | 39 terminal names, 17,895 value bytes; 32 declared variables, 4,096 bytes ([allow-list](person-command-environment.md#the-allow-list)) |
 | FD 11 environment frame | 47,119 bytes; at most 8 root descriptors (FDs 12–19) |
 | Kind 31 | 22,570-byte payload, 22,754-byte frame |
 | Secret store items | One per person command with values; at most 55,413 bytes each and 256 per installation ([secret store](secret-store.md)) |
@@ -1865,9 +1758,9 @@ design implements its required controls:
   model text and `!` commands cannot. The switch `personCommands.allowOutsideSandbox`
   turns it off. The threat model records the accepted exposure, including
   `~/.asura` and the control socket ([EXD-1](execution-threat-model.md#unsandboxed-person-commands)).
-- For `!`, PATH loses empty and relative entries, and HOME comes from the
-  account database, not the client. For `!!`, the launch environment passes
-  unchanged and is never stored.
+- For both modes, PATH loses empty and relative entries, HOME comes from the
+  account database, and only the allow-list reaches the command
+  ([person command environment](person-command-environment.md#security)).
 - The notice labels the action as the person's and the output as untrusted.
 - Journal records and audit never contain output. Audit never contains the
   command or PATH.
@@ -1931,8 +1824,8 @@ required result. Unit tests use deterministic fixtures. Integration tests use
 real `sandbox-exec`, real processes, the real journal and the real payload
 adapter in private scratch homes. End-to-end tests drive the real TUI through
 `tests/tui_pty.py` against an isolated service. No test uses the account's live
-service. No test touches the account's `~/.asura`: `!!` tests run with a scratch
-HOME in the TUI launch environment and a scratch Asura home, because a `!!`
+service. No test touches the account's `~/.asura`: `!` and `!!` tests run with the
+fixture account home seam and a scratch Asura home, because a `!!`
 command can write anywhere the test account can. The job controller's TJ cases cover the shared job machinery; these
 cases cover the person path.
 
@@ -1961,7 +1854,7 @@ cases cover the person path.
 | PC-U19 | PATH with empty, relative, NUL and oversized entries | Empty and relative entries dropped; NUL or oversize rejects |
 | PC-U30 | Splitter table: quotes, escapes, continuation, `$(…)`, backticks, subshells, each operator, unclosed quote, heredoc | Top-level commands match the fixture; unparseable input returns one unsplit block |
 | PC-U31 | Draft `make; rm -rf build`, then `echo "a⏎b"`, then `cmd \⏎ --flag`, then three lines | Two carets and one rule; one command; one command; three carets, two rules and `3 commands will run` |
-| PC-U29 | Environment with an unlisted name, a bad `LANG` value, a relative or 104-byte `SSH_AUTH_SOCK` | Unlisted name and bad values reject with `environment_invalid`; service-sourced names never come from the client |
+| PC-U29 | Environment with an unlisted name, a bad `LANG` value, a relative or 104-byte `SSH_AUTH_SOCK` (revised 2026-10-31: see PE-U3 and PE-U10) | The TUI does not send the unlisted name or the bad values; a client that sends them is refused with `environment_invalid`; service-set names never come from the client |
 | PC-U20 | Kind 31 codec at every field bound and the 22,570-byte maximum payload (22,754-byte frame); each invalid field; person-origin job records | Exact round trip; each invalid form `Corrupt`; digest order; job ID vectors; no output or environment field |
 | PC-U21 | Replay PR1–PR7: person job intent without kind 31, for a dropped input, for a non-head input, with a mismatched profile; a later lane dispatch before an earlier person input's kind 26; a Drop after kind 26; a later dispatch after a kind 26 with no kind 28 | Each invalid order rejects the stream; the last is accepted (OD2) |
 | PC-U22 | J5 person notice entry for each outcome, reason 20, survivors left running and each capture state (shared with J5T-06) | J5 labels exact; counts and handle present; no output text |
@@ -1980,15 +1873,15 @@ cases cover the person path.
 | PC-U38 | Buffer render in outside mode, with a hidden character | Box and strips `#D27068`; marker `!!` and text bold `#000000`; hidden mark black `█`; hint row reads `run OUTSIDE the sandbox` and counts the hidden character |
 | PC-U39 | Staged `!!` row and settled `!!` entry | Header stripe `#693834` with `!! <command>`; the PCR22 warning line in `#FF6B6B` bold on both; queue panel `>> !! <excerpt>`; `/jobs` row `!!` |
 | PC-U40 | Recall holds a message, a `!` command and a `!!` command; step through | Each restores its own mode |
-| PC-U41 | Submit codec: `outside_sandbox` with fields 8 or 9 present; without it and a launch environment; duplicate names; a name with `=`; a NUL value; `ASURA_SECRET_1`, `ASURA_SECRET_COMMAND`, `ASURA_JOB_x`; 1,025 entries; 40,961 bytes; a non-UTF-8 value | Each invalid form refuses with `environment_invalid` or `environment_too_large`; the non-UTF-8 value is accepted |
+| PC-U41 | Submit codec (revised 2026-10-31): field 11 present; more than 64 environment entries; an oversized name or value | Each is a wire fault; the refusal enum has no value 3 |
 | PC-U42 | Kind 31 codec with the outside flag; replay of a person job intent whose profile ID disagrees with the flag | Round trip holds no environment field; mismatch rejects the stream |
 | PC-U43 | Switch `false` at submit; `true` at submit then `false` at slot grant; `false` after spawn | `outside_sandbox_off` refusal; kind 26 then kind 28 `not_started` reason 20 with no setup and the slot released; the running job continues |
 | PC-U44 | Person notice for a `!!` job | First label line includes `, outside the sandbox,`; other lines as PC-U22 |
 | PC-U45 | Audit events for a `!!` job's start, cancel and settlement, and for a refused `!!` submit | Each carries `outside_sandbox: true`; none carries command, cwd, environment or output |
-| PC-U46 | Guardian argument building for `PersonOutside` | argv is `/bin/sh -c COMMAND` with no `sandbox-exec` and no profile; envp is the FD 11 launch environment, then `ASURA_JOB_<jobhex>=1` with the job's 32 hex digits, then the secret variables; the preamble is present when secret variables exist; the guardian's own environment holds no launch entry |
+| PC-U46 | Guardian argument building for `PersonOutside` | argv is `/bin/sh -c COMMAND` with no `sandbox-exec` and no profile; envp is the FD 11 allow-list environment, then `ASURA_JOB_<jobhex>=1` with the job's 32 hex digits, then the secret variables; the preamble is present when secret variables exist; the guardian's own environment holds no FD 11 entry |
 | PC-U48 | `!` and `!!` submits with a single-quoted token, a token in `sh -c "…"`, and 17 tokens (PC14) | Each is accepted, not refused; kind 31 holds `eval "$ASURA_SECRET_COMMAND"`, the variable name and the display-only text; no record or reply holds a token |
-| PC-U49 | Submit at every maximum together ([frame bound](#submit-frame-bound)) | Envelope body at most 65,536 bytes; 1,025 entries and 40,961 bytes refuse with `environment_too_large` |
-| PC-U50 | FD 11 frame codec in the guardian: each bound, a short frame, trailing bytes, a `person-1` frame with a non-PC3 name or without HOME, a role table with home missing, 9 roots | Exact parse; each invalid form gives setup-failed reason 5; no command runs |
+| PC-U49 | Submit at every maximum together ([control API](person-command-environment.md#control-api)) | Envelope body at most 65,536 bytes |
+| PC-U50 | FD 11 frame codec in the guardian: each bound, a short frame, trailing bytes, a frame with a reserved name, a bad name or without HOME, for both profiles; a role table with home missing, 9 roots | Exact parse; each invalid form gives setup-failed reason 5; no command runs |
 | PC-U51 | Person profile generation with a scratch directory, a developer directory outside the fixed roots, one inside `/Applications`, and a missing cache | Scratch write rule present (OD1); developer descriptor only for the outside target; missing cache omitted; no command or client text in the profile |
 | PC-U52 | Developer directory selection: link to `/Applications/Xcode.app/…`, link to `/opt/dev`, no link with and without `/Library/Developer/CommandLineTools`, relative link | No descriptor; role 3 descriptor; CommandLineTools covered by `/Library`, or omitted; omitted |
 | PC-U53 | Controller with a `!!` fixture slot: kind 5, kind 6 count 2, kind 2 reason 15, then capture EOF; same then person cancel; same with reason 14 | `ShellExited` emitted once for reason 15 and never for 14; job `Draining` with slot held; EOF settles `exited`, capture `complete`, escapees 2; cancel writes kind 27, calls `close_capture`, settles capture `incomplete` reason 7 |
@@ -2025,12 +1918,12 @@ cases cover the person path.
 | PC-I19 | Command writes 100 MiB across both streams within quota | Both streams retained whole; byte and line counts exact; no journal record holds output bytes (TV1, TV2) |
 | PC-I20 | Quota held full by pinned output; command floods stdout | Expiry attempted, then `CapturePaused`; no bytes dropped; cancel ends it |
 | PC-I21 | Model turn after a person job | Model `list`, `status`, `read` and `wait` succeed on it; `cancel` returns `not_permitted` and the job keeps running |
-| PC-I23 | Real service in a scratch Asura home; TUI-side launch environment fixture with scratch `HOME`, `TMPDIR` and a marker variable; `!!` writes a file in a scratch directory outside every person-profile root, and `!` tries the same write | The `!!` write succeeds; the `!` write is denied; the `!!` command sees the marker variable, the fixture HOME and PATH unchanged, stdin at EOF and no TTY |
+| PC-I23 | Real service in a scratch Asura home; fixture account home and TMPDIR; a TUI-side captured environment with an unlisted marker variable; `!!` writes a file in a scratch directory outside every person-profile root, and `!` tries the same write | The `!!` write succeeds; the `!` write is denied; the `!!` command sees the fixture account HOME and a sanitized PATH, not the marker variable (ENV1), stdin at EOF and no TTY |
 | PC-I24 | `!!` command ignoring TERM; Ctrl-C, then Ctrl-C | Same results as PC-I7 and PC-I8; group settled |
 | PC-I25 | `!!` runs 90 s | No deadline stop; finishes normally |
 | PC-I26 | Kill the service while a `!!` command runs | Guardian stops the group; recovery records `Interrupted`; no relaunch |
 | PC-I27 | Model turn active; submit a `!!` command | Waits in the queue; runs after the terminal commit |
-| PC-I28 | `!!` prints a fixture secret and receives a fixture token in its command; launch environment holds a fixture token | Retained streams, journal, viewer and model view hold placeholders; the command runs with the real value through one variable; no journal frame, audit line or payload contains the environment token |
+| PC-I28 | `!!` prints a fixture secret and receives a fixture token in its command; the captured environment holds a fixture token | Retained streams, journal, viewer and model view hold placeholders; the command runs with the real value through one variable; the environment token never reaches the command, and no journal frame, audit line or payload contains it |
 | PC-I29 | `!!` with `/usr/bin/sandbox-exec` made unavailable through the test seam | The `!!` command runs; a `!` command is not started with `sandbox_unavailable` |
 | PC-I30 | `!!` writes the scratch Asura home's `config.yaml` and connects to the scratch control socket | Both succeed, confirming the EXD-1 exposure; no test touches the account's `~/.asura` |
 | PC-I31 | Switch set to `false` through `/config set` on a real service | A new `!!` submit is refused; a `!` submit runs; setting it back to `true` lets `!!` run |
@@ -2041,7 +1934,7 @@ cases cover the person path.
 | PC-I40 | `!!sh -c 'nohup sh -c "for i in 1 2 3 4 5; do echo n \$i; sleep 1; done" &'` (stays in the shell's group, no new session); then the same command with `!` (PQ3) | `!!`: the shell exits; kind 6 count 1 and kind 2 reason 15; the background process is never signalled, all five lines are captured, the lane advances at shell exit, and the job settles on EOF with escapees 1. `!`: the group is stopped at shell exit; at most the first line is captured; the job settles without survivors |
 | PC-I36 | `!` command starts the new-session escapee fixture that writes to `$TMPDIR` (OD1, EC-E2 integration) | The escapee is attributed through the job scratch marker, frozen and killed; the job settles with `cleanup_confirmed`; a write to the job scratch from the command succeeds; the scratch is deleted after settlement |
 | PC-I37 | PC-P1 mach probe steps with the final list (network steps run with `ASURA_TEST_NETWORK=1`) | Each step passes; remaining denials are recorded, not asserted |
-| PC-I38 | `!!` launch environment holding `DYLD_INSERT_LIBRARIES` naming a fixture library that writes a marker file when loaded | An ordinary launch variable reaches the `/bin/sh` child; the guardian process never loads the library (no marker from the guardian PID); a control run of an unsigned fixture binary does load it. SIP removes `DYLD_*` for protected binaries such as `/bin/sh`, so the child cannot see that variable. This run stays unsigned; the signed case PC-I38-S and probes HR-P1 and HR-P2 belong to [release signing](release-signing.md#dyld_-and-pc-i38) |
+| PC-I38 | `DYLD_INSERT_LIBRARIES` declared for the project (revised 2026-10-31), naming a fixture library that writes a marker file when loaded | An ordinary FD 11 variable reaches the `/bin/sh` child; the guardian process never loads the library (no marker from the guardian PID); a control run of an unsigned fixture binary does load it. SIP removes `DYLD_*` for protected binaries such as `/bin/sh`, so the child cannot see that variable. This run stays unsigned; the signed case PC-I38-S and probes HR-P1 and HR-P2 belong to [release signing](release-signing.md#dyld_-and-pc-i38) |
 | PC-I39 | Model exec_cmd job and `!` job in one project; `/execution project off` (ES-08) | The model job stops with `execution_off`; the `!` job continues and settles normally |
 
 ### End to end
@@ -2060,7 +1953,7 @@ cases cover the person path.
 | PC-E10 | `/jobs` after a command | The person job is listed with `!` and opens in the viewer |
 | PC-E12 | Paste a three-line command containing U+202E | The `!` marker on the first row, two carets and two rules (P4 command view); a red block where U+202E is; hint counts commands and hidden characters; the command runs with the original bytes |
 | PC-E11 | `!yes \| head -c 50000000` | The fold keeps showing the newest lines while running; TUI input stays responsive |
-| PC-E13 | Type `!`, `!`, then `touch <outside fixture path>/made` (the literal path: a `!` command gets only the PC3 variables, so a variable would be empty in PC-E14), Enter, with the fixture directory outside every person-profile root | Box turns `#D27068` with marker `!!`; the log shows `!! touch …`, then the warning line before output; the file exists; exit 0 |
+| PC-E13 | Type `!`, `!`, then `touch <outside fixture path>/made` (the literal path: an unlisted variable is not passed, ENV1), Enter, with the fixture directory outside every person-profile root | Box turns `#D27068` with marker `!!`; the log shows `!! touch …`, then the warning line before output; the file exists; exit 0 |
 | PC-E14 | Same command after one Backspace at position 0 | Amber command mode; the `!` run reports `Operation not permitted`; the file does not exist |
 | PC-E15 | `personCommands.allowOutsideSandbox` false; type `!!ls`, Enter | The refusal message names the key and suggests `!`; draft and outside mode kept |
 | PC-E16 | `!!sleep 600`; Ctrl-C; then `!!sleep 600`; Ctrl-C twice | Stopped by you; killed by you; TUI still running |
@@ -2403,7 +2296,8 @@ resolved on 2026-10-20. Each entry records the rejected options.
    terminals. Rejected: a PATH captured at service start, and reading PATH from
    the person's login shell, which runs dotfiles outside the sandbox and can
    block.
-3. **PC3 — Additional environment variables.** Selected by the owner on
+3. **PC3 — Additional environment variables.** Superseded on 2026-10-31 by
+   the [allow-list environment](person-command-environment.md) (ENV1). Selected by the owner on
    2026-10-14: the fixed allow-list in
    [the environment section](#environment-and-how-path-and-home-reach-the-service)
    plus a validated `SSH_AUTH_SOCK`, so `git push` with passphrase keys in the
@@ -2528,7 +2422,7 @@ resolved on 2026-10-20. Each entry records the rejected options.
 | OD1 | A `!` command may write to its own empty Asura-private job scratch directory, so the EX5 `sandbox_check` marker works for `!` as for model jobs. HOME and `$TMPDIR` are unchanged. The directory is deleted when the job ends. Applied in PCR10, the [person profile](#person-seatbelt-profile), PX3 and [escapee control](escapee-control.md) | Owner |
 | OD2 | When a `!!` command's shell and owned group have exited but a detached survivor still holds its output, the job stays `Draining` and capture continues, so Asura never causes the survivor's EPIPE. The queue entry completes and the lane advances. The job stays live in `/jobs` with the survivor count. It settles on the survivor's EOF, or on a person cancel, which stops capture without killing the survivor. It keeps its slot; restart settles it `interrupted`. Applied in PCR28 and [`!!` survivors](#outside-survivors-and-lane-release) | Owner ("commands run inside a Job, can't the Job handle this?") |
 | OD3 | The PCR18 build and test path warning is designed now as its own packet P5, in the [execution path guard](execution-path-guard.md). P4 TUI code may merge, but capability 8 is not advertised until P5 passes | Owner |
-| OD4 | A too-large `!!` launch environment is refused with `environment_too_large` at a bound that fits one 64 KiB control frame with the largest command: 1,024 variables and 40,960 bytes ([frame bound](#submit-frame-bound)) | Decided under the no-protocol-change rule |
+| OD4 | Superseded on 2026-10-31 by ENV1, which removes the launch environment. A too-large `!!` launch environment is refused with `environment_too_large` at a bound that fits one 64 KiB control frame with the largest command: 1,024 variables and 40,960 bytes ([frame bound](#submit-frame-bound)) | Decided under the no-protocol-change rule |
 
 Engineering choices of the same revision, each marked "selected
 (engineering)" where it is specified: the FD 11 environment descriptor; the
@@ -2639,8 +2533,10 @@ the [secret store](secret-store.md#readiness-audit-resolution-2026-10-22).
 - **Journal the `!!` environment so a held command can resume.** Rejected: a
   terminal environment commonly holds tokens, and EX4 forbids a stored copy of
   a secret.
-- **Send only PATH and the PC3 names for `!!`.** Rejected: the owner asked for
-  terminal behavior, and Wisp passes its whole environment.
+- **Send only PATH and the PC3 names for `!!`.** Rejected on 2026-10-19: the
+  owner asked for terminal behavior, and Wisp passes its whole environment.
+  Revised on 2026-10-31 (ENV1, ENV2): both modes now receive one allow-list
+  environment.
 - **Keep the model profile for person commands.** Rejected: toolchains, Git
   and network would fail, which defeats the feature.
 - **Run person commands on the exec_cmd tool's retained worker, outside the job
@@ -2699,5 +2595,11 @@ SS1-K2, marked SS1-K delivered and extended SS1-S and P4 for the
 Keychain payload bound of 55,413 bytes uses the OD4 environment bound of
 1,024 entries and 40,960 bytes, as the secret store's arithmetic shows. PCM-P2
 was rendered with Mermaid CLI and inspected. No code or test was run.
+
+Recorded on 2026-10-31: owner decisions ENV1 and ENV2 replace PC3, OD4 and
+the `!!` launch environment with the [allow-list environment](person-command-environment.md).
+PCM-O1 and PCM-Q1 changed; every diagram of this document was rendered with
+the local Mermaid CLI at scale 2 into a temporary directory outside the
+repository and inspected.
 
 Return to the [design index](README.md).
