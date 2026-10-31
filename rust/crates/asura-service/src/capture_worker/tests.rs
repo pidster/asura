@@ -545,6 +545,7 @@ fn ledger_stored(home: &Home, payload: Id) -> u64 {
             offset: 0,
             limit: 1,
             scope: None,
+            lines: asura_storage::payload::Lines::Any,
         },
     )
     .total

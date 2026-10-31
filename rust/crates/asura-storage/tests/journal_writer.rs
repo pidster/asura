@@ -1770,6 +1770,7 @@ fn j3_result(ordinal: u32, job: Id, body: JobResultBody) -> JobResult {
         status: 1,
         outcome: JobResultOutcome::Ok,
         job,
+        view: Vec::new(),
         body,
     }
 }

@@ -51,6 +51,21 @@ impl PageState {
     }
 }
 
+/// Where a page may cut at a line (context-composer.md, excerpt shape):
+/// both cuts fall just after a newline byte, so UTF-8 stays valid.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Lines {
+    /// UTF-8 snapping only (the J3 page).
+    #[default]
+    Any,
+    /// A head range: the page ends after its last newline, unless it
+    /// reaches the end of the stored bytes or holds no newline.
+    EndAtLine,
+    /// A tail range: the page starts after its first newline, unless it
+    /// starts at offset 0 or holds no newline after its first byte.
+    StartAtLine,
+}
+
 /// One page request. `scope` binds the request to the operation that owns
 /// the payload; another operation is `denied`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +74,42 @@ pub struct PageRequest {
     pub offset: u64,
     pub limit: usize,
     pub scope: Option<Id>,
+    pub lines: Lines,
+}
+
+/// Applies the line option to a snapped window `bytes[skip..skip + length]`
+/// whose first byte is at source offset `start`; `reaches_end` is true when
+/// the window ends at the stored total. Returns the new `(skip, length)`.
+pub(crate) fn cut_lines(
+    bytes: &[u8],
+    skip: usize,
+    length: usize,
+    start: u64,
+    reaches_end: bool,
+    lines: Lines,
+) -> (usize, usize) {
+    let window = &bytes[skip..skip + length];
+    match lines {
+        Lines::Any => (skip, length),
+        Lines::EndAtLine => {
+            if reaches_end {
+                return (skip, length);
+            }
+            match window.iter().rposition(|b| *b == b'\n') {
+                Some(at) => (skip, at + 1),
+                None => (skip, length),
+            }
+        }
+        Lines::StartAtLine => {
+            if start == 0 {
+                return (skip, length);
+            }
+            match window.iter().position(|b| *b == b'\n') {
+                Some(at) if at + 1 < length => (skip + at + 1, length - at - 1),
+                _ => (skip, length),
+            }
+        }
+    }
 }
 
 /// One page. `start` is the actual start after snapping forward to a UTF-8
@@ -263,6 +314,15 @@ fn read_held(
     // written yet.
     let open_end = watermark.is_some() && request.offset + filled as u64 >= total;
     let (skip, length) = snap(&buffer, limit, open_end);
+    let reaches_end = request.offset + (skip + length) as u64 >= total;
+    let (skip, length) = cut_lines(
+        &buffer,
+        skip,
+        length,
+        request.offset + skip as u64,
+        reaches_end,
+        request.lines,
+    );
     // The delivered text never exceeds 8,192 bytes; the next offset records
     // the source bytes the text consumed.
     let (text, consumed) = bounded_text(&buffer[skip..skip + length], TEXT_LIMIT);
@@ -507,6 +567,33 @@ impl Drop for PagePool {
         self.close();
     }
 }
+/// A page hold for scratch homes (test-support only): while the file
+/// `page-hold` exists in the installed home, each taken request waits on
+/// its worker, as [`PagePool::hold_for_test`] holds it in process
+/// (context-composer.md, CC-I3 and CC-I15).
+#[cfg(feature = "test-support")]
+pub mod gate {
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    static FILE: OnceLock<PathBuf> = OnceLock::new();
+
+    /// Arms the hold file of `home` for this process.
+    pub fn install_file_gate(home: &Path) {
+        let _ = FILE.set(home.join("page-hold"));
+    }
+    /// Test pacing only: waits while the hold file exists and the pool is
+    /// open.
+    pub(super) fn wait(shared: &super::Shared) {
+        let Some(path) = FILE.get() else {
+            return;
+        };
+        while path.exists() && !super::lock(shared).closed {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
 fn worker(shared: &Shared, model_only: bool) {
     loop {
         let job = {
@@ -535,6 +622,8 @@ fn worker(shared: &Shared, model_only: bool) {
                 queue = shared.work.wait(queue).unwrap_or_else(|e| e.into_inner());
             }
         }
+        #[cfg(feature = "test-support")]
+        gate::wait(shared);
         // A request withdrawn before its read began is skipped.
         if !job.slot.withdrawn() {
             let page = read_page(&shared.store, job.request);
@@ -724,5 +813,46 @@ mod tests {
                 "stale_cursor"
             ]
         );
+    }
+
+    /// CC-U26: the line options cut only just after a newline byte.
+    #[test]
+    fn cc_u26_line_options_cut_after_newlines_only() {
+        let bytes = b"one\ntwo\nthree";
+        let all = bytes.len();
+        // Any: unchanged.
+        assert_eq!(cut_lines(bytes, 0, all, 4, false, Lines::Any), (0, all));
+        // A head range that does not reach the end stops after its last
+        // newline; one that reaches the end keeps everything.
+        assert_eq!(cut_lines(bytes, 0, all, 0, false, Lines::EndAtLine), (0, 8));
+        assert_eq!(
+            cut_lines(bytes, 0, all, 0, true, Lines::EndAtLine),
+            (0, all)
+        );
+        // No newline: no cut.
+        assert_eq!(cut_lines(b"abc", 0, 3, 0, false, Lines::EndAtLine), (0, 3));
+        // A tail range starts after its first newline unless at offset 0.
+        assert_eq!(
+            cut_lines(bytes, 0, all, 7, true, Lines::StartAtLine),
+            (4, all - 4)
+        );
+        assert_eq!(
+            cut_lines(bytes, 0, all, 0, true, Lines::StartAtLine),
+            (0, all)
+        );
+        // A newline as the last byte: no cut (the page would be empty).
+        assert_eq!(
+            cut_lines(b"ab\n", 0, 3, 5, true, Lines::StartAtLine),
+            (0, 3)
+        );
+        // The cut respects the snapped skip.
+        assert_eq!(
+            cut_lines(b"\x80x\ny", 1, 3, 9, true, Lines::StartAtLine),
+            (3, 1)
+        );
+        // UTF-8 after the cut stays whole: a multi-byte scalar follows.
+        let text = "a\n\u{e9}b".as_bytes();
+        let (skip, len) = cut_lines(text, 0, text.len(), 3, true, Lines::StartAtLine);
+        assert!(std::str::from_utf8(&text[skip..skip + len]).is_ok());
     }
 }

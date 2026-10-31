@@ -130,6 +130,7 @@ fn page(store: &PayloadStore, payload: Id, offset: u64, limit: usize) -> Page {
             offset,
             limit,
             scope: None,
+            lines: asura_storage::payload::Lines::Any,
         },
     )
 }
@@ -338,6 +339,7 @@ fn j1t_10_page_states_offsets_and_scope() {
                 offset: 0,
                 limit: 64,
                 scope: Some(scope),
+                lines: asura_storage::payload::Lines::Any,
             },
         )
     };
@@ -481,6 +483,7 @@ fn pool_fixture() -> (Fixture, PagePool, PageRequest) {
         offset: 0,
         limit: 64,
         scope: None,
+        lines: asura_storage::payload::Lines::Any,
     };
     (f, pool, request)
 }
@@ -516,6 +519,7 @@ fn j34e_page_reply_wakes_the_reactor_after_it_is_stored() {
                 offset: 0,
                 limit: 64,
                 scope: None,
+                lines: asura_storage::payload::Lines::Any,
             },
             Origin::Client,
         )
@@ -538,6 +542,7 @@ fn j34e_model_reserved_page_reads_zero_frees_both_workers() {
         offset: 0,
         limit: 64,
         scope: None,
+        lines: asura_storage::payload::Lines::Any,
     };
     let pool = PagePool::start(f.store.clone(), 0, None).unwrap();
     pool.hold_for_test(true);
@@ -838,6 +843,7 @@ impl Journal {
             status: JobResultOutcome::Ok.status(),
             outcome: JobResultOutcome::Ok,
             job: [0; 16],
+            view: Vec::new(),
             body: JobResultBody::State(JobSnapshot {
                 state: JobRunState::Running,
                 numbers: [0; 3],

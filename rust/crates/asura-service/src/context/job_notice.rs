@@ -290,7 +290,26 @@ fn entry(s: &Settlement<'_>) -> Result<Entry, NoticeError> {
 /// 3. The result is split at each newline; the first line follows
 ///    `field: `, each later line follows `  | `.
 pub(crate) fn quoted(field: &str, value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len() + field.len() + 2);
+    let escaped = escaped(value);
+    let mut out = String::with_capacity(escaped.len() + field.len() + 3);
+    for (index, line) in escaped.split('\n').enumerate() {
+        if index == 0 {
+            out.push_str(field);
+            out.push_str(": ");
+        } else {
+            out.push_str("  | ");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Steps 1 and 2 of the quoted value form: backslash runs before `u{` or
+/// an escaped character are doubled, and each character of the escaped set
+/// becomes `\u{H}`. Newlines stay; the caller splits at them.
+pub(crate) fn escaped(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
     let mut run = 0usize;
     let mut chars = value.chars().peekable();
     while let Some(c) = chars.next() {
@@ -309,18 +328,7 @@ pub(crate) fn quoted(field: &str, value: &str) -> String {
         }
     }
     escaped.extend(std::iter::repeat_n('\\', run));
-    let mut out = String::with_capacity(escaped.len() + field.len() + 3);
-    for (index, line) in escaped.split('\n').enumerate() {
-        if index == 0 {
-            out.push_str(field);
-            out.push_str(": ");
-        } else {
-            out.push_str("  | ");
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
+    escaped
 }
 
 /// The escaped set `X` of the quoted value form: every general category Cc

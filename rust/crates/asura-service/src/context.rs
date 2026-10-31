@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 
 mod job_notice;
+pub(crate) mod taint;
+pub(crate) mod view;
 pub(crate) use job_notice::{Notice, NoticeError, NoticeInputs, Settlement};
 
 /// Versions the composition rules and the manifest encoding. Revision 2
@@ -51,6 +53,19 @@ pub(crate) struct Budget {
     pub bytes_per_token_milli: u32,
 }
 impl Budget {
+    /// The budget inputs a kind 21 recorded (N1).
+    pub(crate) fn of(composition: &Composition) -> Self {
+        Self {
+            window_tokens: composition.window_tokens,
+            output_reservation: composition.output_reservation,
+            overhead_tokens: composition.overhead_tokens,
+            bytes_per_token_milli: composition.bytes_per_token_milli,
+        }
+    }
+    /// `W` in bytes; 0 when `B ≤ 0`.
+    pub(crate) fn byte_budget(&self) -> u64 {
+        self.bytes().unwrap_or(0)
+    }
     /// `W = (E − R − S) × k`, in bytes; `None` when `B ≤ 0`.
     fn bytes(&self) -> Option<u64> {
         let tokens = u64::from(self.window_tokens)

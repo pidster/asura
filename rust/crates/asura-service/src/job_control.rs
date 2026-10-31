@@ -1370,6 +1370,7 @@ impl ViewWork {
                             offset,
                             limit: limit as usize,
                             scope: None,
+                            lines: asura_storage::payload::Lines::Any,
                         },
                     )
                 })

@@ -1608,8 +1608,37 @@ impl JobResult {
                 && (1..=MAX_RECORDED_CALLS).contains(&self.ordinal)
                 && self.status == self.outcome.status()
                 && (self.outcome != O::NotFound || self.job == [0; 16])
-                && body,
+                && body
+                && self.view_valid(),
         )
+    }
+    /// View block rules (context-composer.md, kind 29 view block): only on
+    /// a state or wait body with outcome `ok`; at most 3 ranges, each a
+    /// valid page block; ranges of one stream do not overlap.
+    fn view_valid(&self) -> bool {
+        if self.view.is_empty() {
+            return true;
+        }
+        let form = matches!(self.body, JobResultBody::State(_) | JobResultBody::Wait(..));
+        if !form || self.outcome != JobResultOutcome::Ok || self.view.len() > MAX_JOB_VIEW_RANGES {
+            return false;
+        }
+        if !self.view.iter().all(JobPage::valid) {
+            return false;
+        }
+        for (index, a) in self.view.iter().enumerate() {
+            for b in &self.view[index + 1..] {
+                if a.stream == b.stream
+                    && a.source_len > 0
+                    && b.source_len > 0
+                    && a.start < b.next_offset()
+                    && b.start < a.next_offset()
+                {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 fn write_snapshot(w: &mut Writer, s: &JobSnapshot) {
@@ -1644,19 +1673,16 @@ fn job_result_fields(w: &mut Writer, p: &JobResult) {
     w.bytes(&p.job);
     match &p.body {
         JobResultBody::None => {}
-        JobResultBody::State(s) => write_snapshot(w, s),
+        JobResultBody::State(s) => {
+            write_snapshot(w, s);
+            write_view(w, &p.view);
+        }
         JobResultBody::Wait(s, end) => {
             write_snapshot(w, s);
             w.byte(*end as u8);
+            write_view(w, &p.view);
         }
-        JobResultBody::Page(page) => {
-            w.byte(page.stream as u8);
-            w.u64(page.start);
-            w.u32(page.source_len);
-            w.u64(page.total);
-            w.byte(page.state as u8);
-            w.bytes(&page.digest);
-        }
+        JobResultBody::Page(page) => write_page(w, page),
         JobResultBody::List { more, entries } => {
             w.byte(entries.len() as u8);
             w.byte(u8::from(*more));
@@ -1671,6 +1697,45 @@ fn job_result_fields(w: &mut Writer, p: &JobResult) {
         }
     }
 }
+fn write_page(w: &mut Writer, page: &JobPage) {
+    w.byte(page.stream as u8);
+    w.u64(page.start);
+    w.u32(page.source_len);
+    w.u64(page.total);
+    w.byte(page.state as u8);
+    w.bytes(&page.digest);
+}
+fn read_page(r: &mut Reader<'_>) -> Result<JobPage> {
+    Ok(JobPage {
+        stream: OutputStream::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?,
+        start: r.u64()?,
+        source_len: r.u32()?,
+        total: r.u64()?,
+        state: JobPageState::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?,
+        digest: r.array()?,
+    })
+}
+/// The view block: a count byte and that many page blocks.
+fn write_view(w: &mut Writer, view: &[JobPage]) {
+    w.byte(view.len() as u8);
+    for page in view {
+        write_page(w, page);
+    }
+}
+fn read_view(r: &mut Reader<'_>, ranges: usize) -> Result<Vec<JobPage>> {
+    require(r.byte()? as usize == ranges)?;
+    (0..ranges).map(|_| read_page(r)).collect()
+}
+/// The number of view ranges a state (`wait` false) or wait body of
+/// `size` bytes holds, if the size is one.
+fn view_ranges(size: usize, wait: bool) -> Option<usize> {
+    let base = if wait {
+        JOB_WAIT_BLOCK
+    } else {
+        JOB_STATE_BLOCK
+    };
+    (0..=MAX_JOB_VIEW_RANGES).find(|&n| size == base + job_view_block(n))
+}
 fn read_job_result(r: &mut Reader<'_>) -> Result<JobResult> {
     let operation = r.array()?;
     let generation = r.u64()?;
@@ -1678,25 +1743,24 @@ fn read_job_result(r: &mut Reader<'_>) -> Result<JobResult> {
     let status = r.byte()?;
     let outcome = JobResultOutcome::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
     let job = r.array()?;
-    // The body form is read by its size; the sizes are distinct.
-    let body = match r.bytes.len() - r.offset {
+    // The body form is read by its size; the sizes are distinct (a state
+    // or wait body ends with its view block).
+    let size = r.bytes.len() - r.offset;
+    let mut view = Vec::new();
+    let body = match size {
         0 => JobResultBody::None,
-        JOB_STATE_BLOCK => JobResultBody::State(read_snapshot(r)?),
-        JOB_WAIT_BLOCK => {
+        JOB_PAGE_BLOCK => JobResultBody::Page(read_page(r)?),
+        size if view_ranges(size, false).is_some() => {
             let snapshot = read_snapshot(r)?;
-            JobResultBody::Wait(
-                snapshot,
-                WaitEnd::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?,
-            )
+            view = read_view(r, view_ranges(size, false).unwrap_or(0))?;
+            JobResultBody::State(snapshot)
         }
-        JOB_PAGE_BLOCK => JobResultBody::Page(JobPage {
-            stream: OutputStream::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?,
-            start: r.u64()?,
-            source_len: r.u32()?,
-            total: r.u64()?,
-            state: JobPageState::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?,
-            digest: r.array()?,
-        }),
+        size if view_ranges(size, true).is_some() => {
+            let snapshot = read_snapshot(r)?;
+            let end = WaitEnd::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
+            view = read_view(r, view_ranges(size, true).unwrap_or(0))?;
+            JobResultBody::Wait(snapshot, end)
+        }
         size => {
             let count = r.byte()? as usize;
             require(count <= MAX_JOB_LIST_ENTRIES && size == 2 + count * JOB_LIST_ENTRY)?;
@@ -1722,6 +1786,7 @@ fn read_job_result(r: &mut Reader<'_>) -> Result<JobResult> {
         outcome,
         job,
         body,
+        view,
     };
     value.validate()?;
     Ok(value)
@@ -5011,6 +5076,7 @@ mod tests {
             status: outcome.status(),
             outcome,
             job,
+            view: Vec::new(),
             body,
         }
     }
@@ -5103,7 +5169,10 @@ mod tests {
                     [0; 16],
                     JobResultBody::State(snapshot),
                 )));
-                assert_eq!(bytes.len(), JOB_RESULT_FIXED + JOB_STATE_BLOCK);
+                assert_eq!(
+                    bytes.len(),
+                    JOB_RESULT_FIXED + JOB_STATE_BLOCK + job_view_block(0)
+                );
                 assert_eq!((bytes[46], bytes[47]), (state.code(), state.reason_code()));
             }
             for end in [WaitEnd::NewOutput, WaitEnd::Time] {
@@ -5112,8 +5181,11 @@ mod tests {
                     [3; 16],
                     JobResultBody::Wait(snapshot, end),
                 )));
-                assert_eq!(bytes.len(), JOB_RESULT_FIXED + JOB_WAIT_BLOCK);
-                assert_eq!(bytes[bytes.len() - 1], end as u8);
+                assert_eq!(
+                    bytes.len(),
+                    JOB_RESULT_FIXED + JOB_WAIT_BLOCK + job_view_block(0)
+                );
+                assert_eq!(bytes[bytes.len() - 2], end as u8);
             }
         }
         for end in [WaitEnd::Settled, WaitEnd::AlreadySettled] {
@@ -5204,13 +5276,14 @@ mod tests {
             (O::Cancelled, 6, "cancelled"),
             (O::Unavailable, 4, "unavailable"),
             (O::Limit, 7, "limit"),
+            (O::Private, 2, "private"),
         ];
         for (index, (outcome, status, name)) in table.into_iter().enumerate() {
             assert_eq!(O::from_code(index as u8 + 1), Some(outcome));
             assert_eq!((outcome.status(), outcome.as_str()), (status, name));
         }
         assert_eq!(O::from_code(0), None);
-        assert_eq!(O::from_code(8), None);
+        assert_eq!(O::from_code(9), None);
         // Allowed codes per outcome (the outcome table).
         use ToolOperation as T;
         let codes = [
@@ -5236,6 +5309,7 @@ mod tests {
         assert_eq!(allowed(O::Cancelled), vec![10, 11, 12, 13, 14, 16]);
         assert_eq!(allowed(O::Unavailable), vec![11, 12, 13, 14, 15, 16]);
         assert_eq!(allowed(O::Limit), vec![16]);
+        assert_eq!(allowed(O::Private), vec![12, 13, 14]);
         for outcome in O::ALL {
             assert!(!outcome.allows(T::ReadFile) && !outcome.allows(T::CreateNote));
         }
@@ -5503,7 +5577,7 @@ mod tests {
         for len in [
             JOB_RESULT_FIXED - 1,
             JOB_RESULT_FIXED + 1,
-            JOB_RESULT_FIXED + 31,
+            JOB_RESULT_FIXED + 32,
         ] {
             let mut bytes = good.clone();
             bytes.resize(len, 0);
@@ -5524,6 +5598,118 @@ mod tests {
         bytes.push(0);
         assert_eq!(decode_record(29, &bytes), Err(ReplayError::Corrupt));
     }
+    /// CC-U27: the kind 29 view block and outcome `private`
+    /// (context-composer.md, kind 29 view block).
+    #[test]
+    fn cc_u27_kind_29_view_block_and_private() {
+        use JobResultOutcome as O;
+        let range = |stream, start, len: u32| JobPage {
+            stream,
+            start,
+            source_len: len,
+            total: 10_000,
+            state: JobPageState::Complete,
+            digest: if len == 0 { [0; 32] } else { [9; 32] },
+        };
+        for n in 0..=MAX_JOB_VIEW_RANGES {
+            let view: Vec<JobPage> = (0..n)
+                .map(|i| range(OutputStream::Stdout, i as u64 * 1000, 100))
+                .collect();
+            for body in [
+                JobResultBody::State(snapshot29(JobRunState::Running)),
+                JobResultBody::Wait(snapshot29(JobRunState::Running), WaitEnd::NewOutput),
+            ] {
+                let wait = matches!(body, JobResultBody::Wait(..));
+                let mut p = result29(O::Ok, [3; 16], body);
+                p.view = view.clone();
+                let bytes = round_job(r29(p));
+                let base = if wait {
+                    JOB_WAIT_BLOCK
+                } else {
+                    JOB_STATE_BLOCK
+                };
+                assert_eq!(bytes.len(), JOB_RESULT_FIXED + base + job_view_block(n));
+            }
+        }
+        // The largest payload is still the full list block.
+        assert!(JOB_WAIT_BLOCK + job_view_block(MAX_JOB_VIEW_RANGES) < MAX_JOB_LIST_BLOCK);
+        let invalid = |p: JobResult| assert_eq!(payload(&r29(p)), Err(ReplayError::Corrupt));
+        let state = || {
+            result29(
+                O::Ok,
+                [3; 16],
+                JobResultBody::State(snapshot29(JobRunState::Running)),
+            )
+        };
+        // Four ranges.
+        let mut p = state();
+        p.view = (0..4)
+            .map(|i| range(OutputStream::Stdout, i * 1000, 10))
+            .collect();
+        invalid(p);
+        // Overlapping ranges of one stream.
+        let mut p = state();
+        p.view = vec![
+            range(OutputStream::Stdout, 0, 100),
+            range(OutputStream::Stdout, 50, 100),
+        ];
+        invalid(p);
+        // The same offsets on two streams do not overlap.
+        let mut p = state();
+        p.view = vec![
+            range(OutputStream::Stdout, 0, 100),
+            range(OutputStream::Stderr, 0, 100),
+        ];
+        round_job(r29(p));
+        // Bytes past the total.
+        let mut p = state();
+        p.view = vec![range(OutputStream::Stdout, 9_950, 100)];
+        invalid(p);
+        // A view needs outcome `ok` and a state or wait body.
+        let mut p = result29(
+            O::Cancelled,
+            [0; 16],
+            JobResultBody::State(snapshot29(JobRunState::Running)),
+        );
+        p.view = vec![range(OutputStream::Stdout, 0, 10)];
+        invalid(p);
+        let mut p = result29(
+            O::Ok,
+            [3; 16],
+            JobResultBody::Page(page29(JobPageState::Live, 1)),
+        );
+        p.view = vec![range(OutputStream::Stdout, 0, 10)];
+        invalid(p);
+        // An unreadable range holds no bytes.
+        let mut p = state();
+        p.view = vec![JobPage {
+            state: JobPageState::Expired,
+            ..range(OutputStream::Stdout, 0, 0)
+        }];
+        round_job(r29(p.clone()));
+        p.view[0].source_len = 5;
+        p.view[0].digest = [9; 32];
+        invalid(p);
+        // Outcome `private`: status 2, no body, codes 12 to 14 only.
+        let private = result29(O::Private, [3; 16], JobResultBody::None);
+        assert_eq!(private.status, 2);
+        round_job(r29(private));
+        for code in [
+            ToolOperation::JobStatus,
+            ToolOperation::JobRead,
+            ToolOperation::JobWait,
+        ] {
+            assert!(O::Private.allows(code));
+        }
+        for code in [
+            ToolOperation::ExecCmd,
+            ToolOperation::JobList,
+            ToolOperation::JobCancel,
+            ToolOperation::JobNote,
+        ] {
+            assert!(!O::Private.allows(code));
+        }
+    }
     /// TJ-26, J3T-17: kind 29 has no text field; its size depends only on
     /// the body form and the entry count.
     #[test]
@@ -5537,9 +5723,9 @@ mod tests {
         ] {
             let size = match &body {
                 JobResultBody::None => 0,
-                JobResultBody::State(_) => 29,
+                JobResultBody::State(_) => 30,
                 JobResultBody::Page(_) => 54,
-                _ => 30,
+                _ => 31,
             };
             let bytes = round_job(r29(result29(O::Ok, [3; 16], body)));
             assert_eq!(bytes.len(), 46 + size);

@@ -15,6 +15,8 @@
 //! No wait here has a time bound of its own. The yield window and the
 //! `wait` `seconds` are caller-given bounds that the controller keeps;
 //! every other wait ends on its reply or the turn's end (then `cancelled`).
+use crate::context::taint::Taint;
+use crate::context::view::{self, RangePlan, Shape, StageA};
 use crate::job_controller::{
     AgentKey, CancelReply, JobController, JobReason, Requester, WaitEnding, WaitStart,
 };
@@ -51,6 +53,9 @@ pub(super) struct Env<'a> {
     pub generation: u64,
     pub conversation: Id,
     pub now: Instant,
+    /// The turn's stage A budget inputs for this call (context-composer.md,
+    /// CC2 stage A sizing).
+    pub stage: StageA,
 }
 
 /// The project identity recheck of a `job` command, from the tool executor.
@@ -84,9 +89,12 @@ struct Known {
     whole_command: bool,
     settled: Option<Box<JobSettled>>,
     retention: JobRetentionSummary,
+    /// The taint decision from the job's command source (T1).
+    taint: Taint,
 }
 
 /// One rendered job (owned; [`job_text::JobView`] borrows it).
+#[derive(Clone)]
 struct Shown {
     job: Id,
     origin: job_text::Origin,
@@ -94,6 +102,20 @@ struct Shown {
     command: String,
     whole_command: bool,
     settled: Option<Box<JobSettled>>,
+    /// A tainted job's list row (T1).
+    private: bool,
+}
+
+/// A stage A view being read before kind 29 (CC2): the planned ranges,
+/// the read in flight, the ranges read so far, and the result and jobs to
+/// render once the reads end.
+struct ViewRead {
+    ranges: Vec<RangePlan>,
+    next: usize,
+    ticket: Option<(Ticket, RangePlan)>,
+    read: Vec<(JobPage, String)>,
+    result: JobResult,
+    shown: Vec<Shown>,
 }
 
 enum Step {
@@ -117,6 +139,8 @@ enum Step {
         known: u64,
         live: bool,
     },
+    /// The ranges of a stage A view on the pool, one at a time (CC2).
+    View(Box<ViewRead>),
     /// A kind 30 model note to append / in flight.
     Note(journal::Record),
     Noting(journal::Record),
@@ -427,6 +451,7 @@ impl JobCall {
                 }
             }
             Step::Page { .. } => self.page(env),
+            Step::View(_) => self.view_step(env),
             _ => {}
         }
     }
@@ -520,6 +545,7 @@ impl JobCall {
             whole_command: records.command.whole_command(),
             settled: records.listing.settled.clone(),
             retention: records.listing.retention,
+            taint: Taint::of(&records.command),
         };
         self.known = Some(known);
         if let Some((ending, snapshot)) = self.refresh.take() {
@@ -530,6 +556,17 @@ impl JobCall {
 
     /// Codes 12-16 once the job's facts are known.
     fn dispatch(&mut self, env: &mut Env) {
+        // T1: a tainted job's status, page and wait are private; nothing
+        // is read and no wait starts (context-composer.md, taint hook).
+        let tainted = self.known.as_ref().is_some_and(|k| k.taint.is_tainted());
+        if tainted
+            && matches!(
+                self.code,
+                ToolOperation::JobStatus | ToolOperation::JobRead | ToolOperation::JobWait
+            )
+        {
+            return self.outcome(env, O::Private);
+        }
         let settled = self.known.as_ref().is_some_and(|k| k.settled.is_some());
         let person = self
             .known
@@ -665,6 +702,7 @@ impl JobCall {
                 whole_command: self.whole_command,
                 settled: Some(Box::new(facts)),
                 retention: JobRetentionSummary::default(),
+                taint: Taint::Clean,
             });
         }
         true
@@ -776,8 +814,10 @@ impl JobCall {
             PageRequest {
                 payload,
                 offset,
-                limit: limit as usize,
+                // The composer's page cap (CC2 stage A sizing, rule 3).
+                limit: env.stage.page_cap(limit) as usize,
                 scope: None,
+                lines: asura_storage::payload::Lines::Any,
             },
             payload::Origin::Model,
         ) {
@@ -922,6 +962,7 @@ impl JobCall {
                 command: listing.excerpt,
                 whole_command: false,
                 settled: listing.settled,
+                private: listing.received_secret,
             });
         }
         let result = self.kind_29(env, O::Ok, [0; 16], JobResultBody::List { more, entries });
@@ -949,8 +990,171 @@ impl JobCall {
             Ending::State => (O::Ok, self.job, JobResultBody::State(snapshot)),
         };
         let result = self.kind_29(env, outcome, job, body);
-        let shown = self.shown(Some(env));
-        self.render(env, result, shown.into_iter().collect(), None);
+        let shown: Vec<Shown> = self.shown(Some(env)).into_iter().collect();
+        if !self.start_view(env, &result, &shown, snapshot) {
+            self.render(env, result, shown, None);
+        }
+    }
+
+    /// Plans a stage A view for a code 10, 12 or 14 `ok` result (CC2) and
+    /// submits its first range; false when the result gets no view.
+    fn start_view(
+        &mut self,
+        env: &mut Env,
+        result: &JobResult,
+        shown: &[Shown],
+        snapshot: JobSnapshot,
+    ) -> bool {
+        if result.outcome != O::Ok
+            || !matches!(
+                self.code,
+                ToolOperation::ExecCmd | ToolOperation::JobStatus | ToolOperation::JobWait
+            )
+            || self.ended
+            || env.pages.is_none()
+        {
+            return false;
+        }
+        let Some(job) = shown.first() else {
+            return false;
+        };
+        if job.private {
+            return false;
+        }
+        let (shape, totals) = match job.settled.as_deref() {
+            Some(facts) if snapshot.state == JobRunState::Settled => (
+                Shape::settled(facts),
+                [
+                    facts.stdout.capture.stored_bytes,
+                    facts.stderr.capture.stored_bytes,
+                ],
+            ),
+            _ if snapshot.state == JobRunState::Settled || snapshot.state.before_spawn() => {
+                return false;
+            }
+            _ => (
+                Shape::Running,
+                [snapshot.stdout_bytes, snapshot.stderr_bytes],
+            ),
+        };
+        if totals == [0, 0] {
+            return false;
+        }
+        let Ok(fixed) = self.render_text(env, result, shown, None, &[]) else {
+            return false;
+        };
+        let Some(budget) = env.stage.view_budget(fixed.len() as u64) else {
+            return false;
+        };
+        let ranges = view::plan(shape, totals, budget);
+        if ranges.is_empty() {
+            return false;
+        }
+        self.step = Step::View(Box::new(ViewRead {
+            ranges,
+            next: 0,
+            ticket: None,
+            read: Vec::new(),
+            result: result.clone(),
+            shown: shown.to_vec(),
+        }));
+        self.view_step(env);
+        true
+    }
+
+    /// Advances the view reads: polls the read in flight, then submits the
+    /// next range; renders once every range is read or a read stops.
+    fn view_step(&mut self, env: &mut Env) {
+        let ended = self.ended;
+        let job = self.job;
+        let Step::View(read) = &mut self.step else {
+            return;
+        };
+        loop {
+            if let Some((ticket, plan)) = &read.ticket {
+                if ended {
+                    // Dropping the ticket withdraws the read (WB1).
+                    read.ticket = None;
+                    break;
+                }
+                let Some(reply) = ticket.poll() else {
+                    return;
+                };
+                let plan = *plan;
+                read.ticket = None;
+                match view_page(plan, reply) {
+                    Some((page, text, go_on)) => {
+                        read.read.push((page, text));
+                        if !go_on {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            if ended || read.next >= read.ranges.len() {
+                break;
+            }
+            let plan = read.ranges[read.next];
+            read.next += 1;
+            let Some(pages) = env.pages else {
+                break;
+            };
+            let payload = payload::job_payloads(env.installation, job)[stream_index(plan.stream)];
+            match pages.submit(
+                PageRequest {
+                    payload,
+                    offset: plan.offset,
+                    limit: plan.limit as usize,
+                    scope: None,
+                    lines: plan.lines,
+                },
+                payload::Origin::Model,
+            ) {
+                Ok(ticket) => read.ticket = Some((ticket, plan)),
+                // The pool is busy or closed: later ranges are dropped.
+                Err(_) => break,
+            }
+        }
+        let Step::View(read) = std::mem::replace(&mut self.step, Step::Done) else {
+            return;
+        };
+        let ViewRead {
+            read,
+            result,
+            shown,
+            ..
+        } = *read;
+        self.render_view(env, result, shown, read);
+    }
+
+    /// Renders a result with its view; drops the last range while the text
+    /// exceeds the stage A cap, and records only the kept ranges.
+    fn render_view(
+        &mut self,
+        env: &Env,
+        mut result: JobResult,
+        shown: Vec<Shown>,
+        mut read: Vec<(JobPage, String)>,
+    ) {
+        let cap = env.stage.cap();
+        while !read.is_empty() {
+            let texts: Vec<&str> = read.iter().map(|(_, t)| t.as_str()).collect();
+            result.view = read.iter().map(|(p, _)| *p).collect();
+            match self.render_text(env, &result, &shown, None, &texts) {
+                Ok(text) if text.len() as u64 <= cap => {
+                    self.result = Some(result);
+                    self.text = Some(text);
+                    self.step = Step::Result;
+                    return;
+                }
+                _ => {
+                    read.pop();
+                }
+            }
+        }
+        result.view = Vec::new();
+        self.render(env, result, shown, None);
     }
 
     /// A result without a body (codes 11-16).
@@ -988,6 +1192,7 @@ impl JobCall {
             status: outcome.status(),
             outcome,
             job,
+            view: Vec::new(),
             body,
         }
     }
@@ -1006,6 +1211,7 @@ impl JobCall {
                 command: self.command.clone(),
                 whole_command: self.whole_command,
                 settled: self.known.as_ref().and_then(|k| k.settled.clone()),
+                private: false,
             });
         }
         let known = self.known.as_ref()?;
@@ -1016,18 +1222,21 @@ impl JobCall {
             command: known.command.clone(),
             whole_command: known.whole_command,
             settled: known.settled.clone(),
+            private: known.taint.is_tainted(),
         })
     }
 
     /// Renders the text of `result`; a result that its records cannot
     /// render becomes `unavailable` (codes 11-16).
-    fn render(
-        &mut self,
+    /// The text of `result` for `shown`, or the renderer's error.
+    fn render_text(
+        &self,
         env: &Env,
-        result: JobResult,
-        shown: Vec<Shown>,
-        page_text: Option<String>,
-    ) {
+        result: &JobResult,
+        shown: &[Shown],
+        page_text: Option<&str>,
+        view_texts: &[&str],
+    ) -> Result<String, job_text::RenderError> {
         let views: Vec<job_text::JobView> = shown
             .iter()
             .map(|s| job_text::JobView {
@@ -1038,23 +1247,33 @@ impl JobCall {
                 whole_command: s.whole_command,
                 settled: s.settled.as_deref(),
                 cursors: env.cursors.of(&s.job),
+                private: s.private,
             })
             .collect();
         let list = self.code == ToolOperation::JobList;
-        let input = Render {
+        job_text::render(&Render {
             code: self.code,
-            result: &result,
+            result,
             job: if list { None } else { views.first().copied() },
             entries: if list { &views } else { &[] },
-            page_text: page_text.as_deref(),
-        };
-        let text = match job_text::render(&input) {
+            page_text,
+            view_texts,
+        })
+    }
+
+    fn render(
+        &mut self,
+        env: &Env,
+        result: JobResult,
+        shown: Vec<Shown>,
+        page_text: Option<String>,
+    ) {
+        let text = match self.render_text(env, &result, &shown, page_text.as_deref(), &[]) {
             Ok(text) => text,
             Err(error) => {
                 tracing::warn!(?error, "job_result_unrendered");
                 if self.code != ToolOperation::ExecCmd && result.outcome != O::Unavailable {
                     let fallback = self.kind_29(env, O::Unavailable, self.job, JobResultBody::None);
-                    drop(views);
                     return self.render(env, fallback, Vec::new(), None);
                 }
                 UNRENDERED.to_owned()
@@ -1064,6 +1283,54 @@ impl JobCall {
         self.text = Some(text);
         self.step = Step::Result;
     }
+}
+
+/// One view range's reply: the range in the page block form, its delivered
+/// text, and whether later ranges may still be read. `None` stops the view
+/// with no range for this reply (pool shutdown, `busy`, `denied`, a stale
+/// offset, an empty page).
+fn view_page(plan: RangePlan, reply: PageReply) -> Option<(JobPage, String, bool)> {
+    let PageReply::Page(page) = reply else {
+        return None;
+    };
+    let state = match page.state {
+        PageState::Live => JobPageState::Live,
+        PageState::Complete => JobPageState::Complete,
+        PageState::Incomplete => JobPageState::Incomplete,
+        PageState::UnverifiedPrefix => JobPageState::UnverifiedPrefix,
+        PageState::Expired => JobPageState::Expired,
+        PageState::Missing => JobPageState::Missing,
+        PageState::Corrupt => JobPageState::Corrupt,
+        PageState::Deleted => JobPageState::Deleted,
+        PageState::StaleCursor | PageState::Busy | PageState::Denied => return None,
+    };
+    if !state.readable() {
+        // An unreadable state is recorded as a 0-byte range; later ranges
+        // are dropped.
+        let unreadable = JobPage {
+            stream: plan.stream,
+            start: plan.offset.min(page.total),
+            source_len: 0,
+            total: page.total,
+            state,
+            digest: [0; 32],
+        };
+        return Some((unreadable, String::new(), false));
+    }
+    let source_len = u32::try_from(page.next_offset.saturating_sub(page.start)).ok()?;
+    if source_len == 0 {
+        return None;
+    }
+    let digest: [u8; 32] = Sha256::digest(page.text.as_bytes()).into();
+    let range = JobPage {
+        stream: plan.stream,
+        start: page.start,
+        source_len,
+        total: page.total.max(page.start + u64::from(source_len)),
+        state,
+        digest,
+    };
+    Some((range, page.text, true))
 }
 
 #[cfg(test)]
@@ -1083,6 +1350,7 @@ mod tests {
             status: O::Ok.status(),
             outcome: O::Ok,
             job: [0; 16],
+            view: Vec::new(),
             body: JobResultBody::State(settled_snapshot()),
         });
         call.text = Some("settled".into());

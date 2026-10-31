@@ -317,6 +317,7 @@ pub fn run_jobs(
                         offset: 0,
                         limit: 8192,
                         scope: None,
+                        lines: asura_storage::payload::Lines::Any,
                     },
                 );
                 job.pages.push(page);
@@ -949,6 +950,7 @@ impl JobHarness {
                 status: journal::JobResultOutcome::Ok.status(),
                 outcome: journal::JobResultOutcome::Ok,
                 job: [0; 16],
+                view: Vec::new(),
                 body: journal::JobResultBody::State(journal::JobSnapshot {
                     state: journal::JobRunState::Starting,
                     numbers: [0; 3],

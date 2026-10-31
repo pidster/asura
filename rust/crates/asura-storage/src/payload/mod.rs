@@ -7,9 +7,11 @@ mod recovery;
 mod store;
 pub use asura_platform::payload_io::PayloadError;
 pub use id::{ObjectKind, job_payloads, payload_id};
+#[cfg(feature = "test-support")]
+pub use pages::gate as page_gate;
 pub use pages::{
-    Origin, PAGE_LIMIT, PAGE_QUEUE, Page, PagePool, PageReply, PageRequest, PageState, TEXT_LIMIT,
-    Ticket, read_page,
+    Lines, Origin, PAGE_LIMIT, PAGE_QUEUE, Page, PagePool, PageReply, PageRequest, PageState,
+    TEXT_LIMIT, Ticket, read_page,
 };
 pub use recovery::{
     FACT_BATCH, Known, RecoveryError, RecoveryReport, known_calls, recover, recover_known,

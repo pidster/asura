@@ -1166,7 +1166,9 @@ Rules:
    view when the job has stored bytes. The owner first renders the result
    without a view (text `T`). With `cap = min(share, 16,384)`, a view is
    planned only when `cap − T ≥ 512 + 328` (the floor plus the view's fixed
-   lines). The source budget is `V = cap − T − 328`; the
+   lines). The source budget is `V = ⌊(cap − T − 328) × 4 ÷ 5⌋`: the last
+   fifth is room for the continuation prefixes and escapes of ordinary
+   lines. The
    [allocation rule](#excerpt-shape) gives at most 3 ranges. Codes 15 and 16,
    other outcomes and a job with no stored bytes get no view.
 2. **Read before record.** The ranges are read one at a time on the page pool
@@ -1286,7 +1288,8 @@ stays at reference fidelity (revision 3), so later turns never repeat output
    used, are divided equally among the eligible entries: entries at full
    fidelity, untainted, with stored bytes above 0. An entry whose share is
    below `512 + 328` gets no view. Each other entry gets the D8 ranges for
-   `share − 328` source bytes, from its kind 28 sizes and outcome.
+   `⌊(share − 328) × 4 ÷ 5⌋` source bytes, from its kind 28 sizes and
+   outcome.
 2. **Read.** The owner reads the planned ranges in entry order, one at a time,
    on the page pool with model origin. A view is all or nothing: if a range
    cannot be read (pool busy or closed, or an unreadable state), the entry's

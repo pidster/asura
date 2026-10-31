@@ -256,6 +256,7 @@ impl Journal {
                             command: Locator::NONE,
                             excerpt: journal::command_excerpt(&command),
                             retention: Default::default(),
+                            received_secret: false,
                         },
                         command: match intent.origin {
                             JobOrigin::Model { .. } => {

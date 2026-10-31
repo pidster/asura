@@ -316,6 +316,8 @@ pub fn call(name: &str, arguments: Value) -> Step {
 pub struct Model {
     pub endpoint: String,
     stop: Arc<AtomicBool>,
+    /// The context length `/api/show` reports (tokens); 32,768 by default.
+    context: Arc<std::sync::atomic::AtomicU64>,
     requests: Arc<Mutex<Vec<Value>>>,
     script: Arc<Mutex<std::collections::VecDeque<Step>>>,
     thread: Option<thread::JoinHandle<()>>,
@@ -328,7 +330,13 @@ impl Model {
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let script = Arc::new(Mutex::new(std::collections::VecDeque::new()));
-        let (token, log, steps) = (stop.clone(), requests.clone(), script.clone());
+        let context = Arc::new(std::sync::atomic::AtomicU64::new(32768));
+        let (token, log, steps, window) = (
+            stop.clone(),
+            requests.clone(),
+            script.clone(),
+            context.clone(),
+        );
         let thread = thread::spawn(move || {
             while !token.load(Ordering::Acquire) {
                 let (mut socket, _) = match listener.accept() {
@@ -342,14 +350,16 @@ impl Model {
                 let _ = socket.set_nonblocking(false);
                 let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
                 let (log, steps) = (log.clone(), steps.clone());
+                let window = window.load(Ordering::Acquire);
                 thread::spawn(move || {
-                    let _ = serve(&mut socket, &log, &steps);
+                    let _ = serve(&mut socket, &log, &steps, window);
                 });
             }
         });
         Ok(Self {
             endpoint,
             stop,
+            context,
             requests,
             script,
             thread: Some(thread),
@@ -360,6 +370,14 @@ impl Model {
         script.clear();
         script.extend(steps.iter().cloned());
         self.requests.lock().unwrap().clear();
+    }
+    /// Sets the context length the next `/api/show` reports.
+    pub fn set_context(&self, tokens: u64) {
+        self.context.store(tokens, Ordering::Release);
+    }
+    /// Every chat request received since the last script, in order.
+    pub fn requests(&self) -> Vec<Value> {
+        self.requests.lock().unwrap().clone()
     }
     /// Every `tool` message content of the last request, in order.
     pub fn tool_messages(&self) -> Vec<String> {
@@ -411,6 +429,7 @@ fn serve(
     socket: &mut std::net::TcpStream,
     log: &Mutex<Vec<Value>>,
     steps: &Mutex<std::collections::VecDeque<Step>>,
+    context: u64,
 ) -> std::io::Result<()> {
     let mut request = Vec::new();
     let (header_end, length) = loop {
@@ -438,7 +457,7 @@ fn serve(
     let body = &request[header_end + 4..header_end + 4 + length];
     if request.starts_with(b"POST /api/show ") {
         let payload = json!({"capabilities": ["completion", "tools"],
-            "model_info": {"fixture.context_length": 32768}})
+            "model_info": {"fixture.context_length": context}})
         .to_string();
         return write!(
             socket,
@@ -476,6 +495,7 @@ fn serve(
 /// The child service of a test binary.
 pub fn child(home: &Path) -> Result<()> {
     asura_platform::journal_gate::install_file_gate(home);
+    asura_storage::payload::page_gate::install_file_gate(home);
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_target(false)

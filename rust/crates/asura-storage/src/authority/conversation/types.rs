@@ -765,6 +765,14 @@ impl PersonCommandQueued {
     pub fn has_secret_item(&self) -> bool {
         !self.number_kinds.is_empty() || self.whole_command || self.outside_sandbox
     }
+    /// The taint rule (context-composer.md, taint exclusion hook; owner
+    /// decision T1, 2026-10-31): the job received a raw secret value from
+    /// stored secret variables or the whole-command variable. The `!!`
+    /// launch environment alone does not count. The one deterministic
+    /// check; every reader derives the flag from this record.
+    pub fn received_secret_values(&self) -> bool {
+        !self.number_kinds.is_empty() || self.whole_command
+    }
 }
 /// The replay facts of a kind 31 input. Every value except the frames is
 /// derived from kind 31 and the job records.
@@ -1832,6 +1840,12 @@ pub const JOB_LIST_ENTRY: usize = 37;
 pub const JOB_STATE_BLOCK: usize = 29;
 pub const JOB_WAIT_BLOCK: usize = JOB_STATE_BLOCK + 1;
 pub const JOB_PAGE_BLOCK: usize = 54;
+/// Excerpt ranges per kind 29 view block (CC2).
+pub const MAX_JOB_VIEW_RANGES: usize = 3;
+/// The view block after a state or wait body: a count byte and the ranges.
+pub const fn job_view_block(ranges: usize) -> usize {
+    1 + ranges * JOB_PAGE_BLOCK
+}
 pub const MAX_JOB_LIST_BLOCK: usize = 2 + MAX_JOB_LIST_ENTRIES * JOB_LIST_ENTRY;
 /// Maximum kind 29 payload: the fixed fields and a full list block.
 pub const MAX_JOB_RESULT_PAYLOAD: usize = JOB_RESULT_FIXED + MAX_JOB_LIST_BLOCK;
@@ -1862,9 +1876,12 @@ pub enum JobResultOutcome {
     Cancelled = 5,
     Unavailable = 6,
     Limit = 7,
+    /// The job is tainted (context-composer.md, taint exclusion hook): no
+    /// output, outcome or count of it is shown to a model.
+    Private = 8,
 }
 impl JobResultOutcome {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Ok,
         Self::NotFound,
         Self::NotPermitted,
@@ -1872,12 +1889,14 @@ impl JobResultOutcome {
         Self::Cancelled,
         Self::Unavailable,
         Self::Limit,
+        Self::Private,
     ];
     pub fn from_code(code: u8) -> Option<Self> {
         Self::ALL.get(usize::from(code).checked_sub(1)?).copied()
     }
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Private => "private",
             Self::Ok => "ok",
             Self::NotFound => "not_found",
             Self::NotPermitted => "not_permitted",
@@ -1892,7 +1911,7 @@ impl JobResultOutcome {
         match self {
             Self::Ok => 1,
             Self::NotFound => 3,
-            Self::NotPermitted => 2,
+            Self::NotPermitted | Self::Private => 2,
             Self::Busy | Self::Unavailable => 4,
             Self::Cancelled => 6,
             Self::Limit => 7,
@@ -1910,6 +1929,7 @@ impl JobResultOutcome {
             Self::Busy => code == T::JobRead,
             Self::Cancelled => job && code != T::JobCancel,
             Self::Limit => code == T::JobNote,
+            Self::Private => matches!(code, T::JobStatus | T::JobRead | T::JobWait),
         }
     }
 }
@@ -2236,6 +2256,11 @@ pub struct JobResult {
     /// `not_found`; otherwise a job of the turn's conversation.
     pub job: Id,
     pub body: JobResultBody,
+    /// The view block of a state or wait body (context-composer.md, kind 29
+    /// view block): at most [`MAX_JOB_VIEW_RANGES`] excerpt ranges in the
+    /// page block form, in allocation order. Empty for every other body,
+    /// and for codes and outcomes without a view.
+    pub view: Vec<JobPage>,
 }
 /// Kind 30 field 2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2379,6 +2404,9 @@ pub struct JobListing {
     /// empty when the source holds no command.
     pub excerpt: String,
     pub retention: JobRetentionSummary,
+    /// The taint flag from the command source
+    /// ([`JobCommand::received_secret_values`]), read with the excerpt.
+    pub received_secret: bool,
 }
 /// Entries one turn's job notice shows (J5a, J5-E3).
 pub const NOTICE_ENTRIES: usize = 8;
@@ -2413,6 +2441,10 @@ pub struct PriorSettlement {
     pub sequence: u64,
     /// Kind 31 field 7 bit 1 for a person job (`!!`); false for a model job.
     pub outside_sandbox: bool,
+    /// The taint flag of the person job's kind 31
+    /// ([`PersonCommandQueued::received_secret_values`]); false for a model
+    /// job.
+    pub received_secret: bool,
 }
 /// The notice inputs of a prior turn: its range `(after, through]`, at
 /// most [`MAX_NOTICE_SETTLEMENTS`] settlements newest first, and the live
@@ -2474,6 +2506,13 @@ impl JobCommand {
     /// Always false for a model job.
     pub fn outside_sandbox(&self) -> bool {
         self.person().is_some_and(|c| c.outside_sandbox)
+    }
+    /// The taint rule over this command source
+    /// ([`PersonCommandQueued::received_secret_values`]); false for a model
+    /// job (context-composer.md, open question O2).
+    pub fn received_secret_values(&self) -> bool {
+        self.person()
+            .is_some_and(PersonCommandQueued::received_secret_values)
     }
 }
 /// The notice inputs of one turn (J5 binding point): the cursor range

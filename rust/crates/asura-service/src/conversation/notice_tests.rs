@@ -122,6 +122,7 @@ fn settlement(n: u64, sequence: u64, arguments: &str) -> NoticeSettlement {
             command: Locator::NONE,
             excerpt: String::new(),
             retention: Default::default(),
+            received_secret: false,
         },
         command: asura_storage::authority::conversation::JobCommand::Model(Box::new(call(
             n, arguments,
@@ -307,6 +308,7 @@ fn prior_inputs(notice: &JobNotice) -> PriorNotice {
                 digest: s.listing.settled_digest.unwrap(),
                 sequence: s.listing.settled_frame.sequence,
                 outside_sandbox: s.command.outside_sandbox(),
+                received_secret: s.command.received_secret_values(),
             })
             .collect(),
     }

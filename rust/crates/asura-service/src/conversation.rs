@@ -4933,6 +4933,7 @@ impl Owner {
         let Some(active) = &mut self.active else {
             return;
         };
+        let stage = Self::stage_a(active);
         let Some(job) = active.tool.as_mut().and_then(|t| t.job.as_mut()) else {
             return;
         };
@@ -4949,6 +4950,7 @@ impl Owner {
             generation: active.turn.generation,
             conversation: active.turn.conversation,
             now,
+            stage,
         };
         if ended {
             job.turn_ended();
@@ -4966,6 +4968,25 @@ impl Owner {
             }
         }
         job.advance(&mut env);
+    }
+    /// The stage A budget inputs of the active turn's pending call
+    /// (context-composer.md, CC2 stage A sizing): `W` from the kind 21
+    /// budget inputs, the composed input, the result texts already sent and
+    /// the measured output so far.
+    fn stage_a(active: &Active) -> crate::context::view::StageA {
+        let budget = crate::context::Budget::of(&active.turn.composition);
+        crate::context::view::StageA {
+            budget: budget.byte_budget(),
+            input: active.input.len() as u64,
+            delivered: active
+                .tool_cache
+                .iter()
+                .map(|(_, _, wire)| wire.text.as_deref().map_or(0, str::len) as u64)
+                .sum(),
+            output_tokens: active.measurements.output.unwrap_or(0),
+            milli: budget.bytes_per_token_milli,
+            ordinal: active.tool.as_ref().map_or(1, |tool| tool.ordinal),
+        }
     }
     /// Kind 29 committed: the result text goes to the helper, unless the
     /// turn ended (TCR-D8); `tool.finished` follows the commit (J3T-20).

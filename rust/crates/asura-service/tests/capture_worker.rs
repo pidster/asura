@@ -590,6 +590,7 @@ fn quota_expiry() -> Result<()> {
             offset: 0,
             limit: 100,
             scope: None,
+            lines: asura_storage::payload::Lines::Any,
         },
     );
     assert_eq!(page.state, PageState::Expired);
@@ -630,6 +631,7 @@ fn pages() -> Result<()> {
             offset: 4021,
             limit: 3000,
             scope: None,
+            lines: asura_storage::payload::Lines::Any,
         },
     );
     wait_installed(&home, outcome)?;
@@ -640,6 +642,7 @@ fn pages() -> Result<()> {
             offset: 4021,
             limit: 3000,
             scope: None,
+            lines: asura_storage::payload::Lines::Any,
         },
     );
     assert_eq!(before_install.text, after.text);
@@ -652,6 +655,7 @@ fn pages() -> Result<()> {
         offset: 0,
         limit: 10,
         scope: None,
+        lines: asura_storage::payload::Lines::Any,
     };
     let held = pool
         .submit(request, Origin::Client)

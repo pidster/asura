@@ -1617,6 +1617,8 @@ impl Replay {
             _ => false,
         };
         require(body)?;
+        // The view block: only codes 10, 12 and 14 carry ranges (CC2).
+        require(p.view.is_empty() || matches!(code, T::ExecCmd | T::JobStatus | T::JobWait))?;
         // Field 6: zero for codes 10 and 11 and with `not_found`; otherwise
         // a job of the conversation (JR15).
         let named = !matches!(code, T::ExecCmd | T::JobList) && p.outcome != O::NotFound;
@@ -2816,6 +2818,7 @@ impl Replay {
             command,
             excerpt,
             retention: self.job_retention_summary(job, index)?,
+            received_secret: source.received_secret_values(),
         };
         Ok(Some((listing, source)))
     }
@@ -3146,17 +3149,17 @@ impl Replay {
             _ => return Err(ReplayError::Corrupt),
         };
         settled.numbers = Vec::new();
-        // A person job's kind 31, read for its outside flag only and
-        // dropped at once (owner decision, option A).
-        let outside_sandbox = match intent.origin {
-            JobOrigin::Model { .. } => false,
+        // A person job's kind 31, read for its outside flag and its taint
+        // flag only and dropped at once (owner decision, option A; T1).
+        let (outside_sandbox, received_secret) = match intent.origin {
+            JobOrigin::Model { .. } => (false, false),
             JobOrigin::Person { input } => {
                 let frame = self.input_frame(input, index)?;
                 match index.frame(&frame)? {
                     Record::PersonCommandQueued(person)
                         if person.input == input && person.conversation == conversation =>
                     {
-                        person.outside_sandbox
+                        (person.outside_sandbox, person.received_secret_values())
                     }
                     _ => return Err(ReplayError::Corrupt),
                 }
@@ -3169,6 +3172,7 @@ impl Replay {
             digest,
             sequence,
             outside_sandbox,
+            received_secret,
         })
     }
     /// Projects and conversations named by the active operation or an

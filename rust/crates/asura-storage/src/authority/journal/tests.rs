@@ -1082,6 +1082,7 @@ fn handle(operation: Id, generation: u64, ordinal: u32) -> Record {
         status: 1,
         outcome: JobResultOutcome::Ok,
         job: [0; 16],
+        view: Vec::new(),
         body: JobResultBody::State(JobSnapshot {
             state: JobRunState::Running,
             numbers: [0; 3],
@@ -1552,6 +1553,7 @@ fn j4t_03_listing_merges_runs_delta_and_live_and_checkpoint_keeps_the_model_note
         status: 1,
         outcome: JobResultOutcome::Ok,
         job: second,
+        view: Vec::new(),
         body: JobResultBody::None,
     })))
     .unwrap();
@@ -1766,6 +1768,7 @@ fn reference_facts(notice: &JobNotice) -> Vec<PriorSettlement> {
                 digest: s.listing.settled_digest.unwrap(),
                 sequence: s.listing.settled_frame.sequence,
                 outside_sandbox: s.command.outside_sandbox(),
+                received_secret: s.command.received_secret_values(),
             }
         })
         .collect()

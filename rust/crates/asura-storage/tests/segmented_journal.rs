@@ -1458,6 +1458,7 @@ fn j2_job_command(
             status: 1,
             outcome: JobResultOutcome::Ok,
             job: [0; 16],
+            view: Vec::new(),
             body: JobResultBody::State(JobSnapshot {
                 state: JobRunState::Running,
                 numbers: [0; 3],
@@ -1784,6 +1785,7 @@ fn j4t_03_twenty_jobs_over_three_rolls_listed_by_scope_and_page() {
             status: 1,
             outcome: JobResultOutcome::Ok,
             job: x_jobs[0],
+            view: Vec::new(),
             body: JobResultBody::None,
         })))
         .unwrap();

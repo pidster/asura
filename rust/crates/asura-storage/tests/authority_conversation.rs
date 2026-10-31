@@ -1757,6 +1757,7 @@ fn result29_at(
         status: outcome.status(),
         outcome,
         job,
+        view: Vec::new(),
         body,
     }))
 }
@@ -2542,9 +2543,9 @@ fn tcr_u17_no_fact_is_stored_twice() {
         assert!(!contains(&settled, value), "kind 28 holds a derived value");
     }
     assert!(!contains(&settled, &RULE_SET_DIGEST));
-    // Kind 29 of a handle delivery: 46 fixed bytes and the 29-byte state
-    // block; no text field exists.
-    assert_eq!(results[0].len(), 46 + 29);
+    // Kind 29 of a handle delivery: 46 fixed bytes, the 29-byte state
+    // block and an empty view block (one count byte); no text field exists.
+    assert_eq!(results[0].len(), 46 + 29 + 1);
     // Kind 28 has no rule-set fields: 40 fixed bytes, two streams of 109
     // bytes (no kinds or spans), the number list header, the four counters
     // and the settled time.
@@ -3435,8 +3436,8 @@ fn j3t_03_jr12_outcome_table_and_body_per_operation_code() {
         }
     }
     // ok 7, not_found 5, not_permitted 1, busy 1, cancelled 6,
-    // unavailable 6, limit 1.
-    assert_eq!(accepted, 7 + 5 + 1 + 1 + 6 + 6 + 1);
+    // unavailable 6, limit 1, private 3.
+    assert_eq!(accepted, 7 + 5 + 1 + 1 + 6 + 6 + 1 + 3);
     // An allowed outcome with another code's body is Corrupt.
     for (op, body) in [
         (
