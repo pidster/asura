@@ -122,10 +122,9 @@ fn submit_body(project: Id, conversation: Option<(Id, u64)>, command: &str, outs
         new_conversation: Some(conversation.is_none()),
         command: Some(command.into()),
         cwd: Some(".".into()),
-        search_path: (!outside).then(|| "/usr/bin:/bin".into()),
+        search_path: Some("/usr/bin:/bin".into()),
         environment: Vec::new(),
         outside_sandbox: outside.then_some(true),
-        launch_environment: Vec::new(),
     })
 }
 
@@ -546,6 +545,7 @@ fn pc_u56_waiting_reasons_and_paced_recheck() {
         cwd: ".".into(),
         search_path: String::new(),
         environment: Vec::new(),
+        declared: Vec::new(),
         order_revision: 1,
         number_kinds: Vec::new(),
         unnumbered: 0,
@@ -716,6 +716,7 @@ fn pc_u57_dispatch_read_outcomes_hold() {
             cwd: ".".into(),
             search_path: String::new(),
             environment: Vec::new(),
+            declared: Vec::new(),
             order_revision: 1,
             number_kinds: Vec::new(),
             unnumbered: 0,
@@ -742,14 +743,7 @@ fn pc_u57_dispatch_read_outcomes_hold() {
         None,
         now,
     );
-    let changed = owner.person_start(
-        record(inputs[3]),
-        Some(Secrets {
-            launch_environment: Some(Vec::new()),
-            ..Default::default()
-        }),
-        now,
-    );
+    let changed = owner.person_start(record(inputs[3]), Some(Secrets::default()), now);
     for dispatch in [&missing, &mismatch, &denied, &changed] {
         assert!(matches!(dispatch, Dispatch::Holding));
     }
@@ -801,13 +795,142 @@ fn path_sanitizer() {
     assert_eq!(sanitize_path(None), None);
 }
 
+/// PE-U10 (person-command-environment.md, control API and reply facts):
+/// the submit check of the terminal variables against the allow-list for
+/// both modes, the declared variables from the configuration recorded with
+/// the command, no item for a `!!` command without a secret, and the
+/// reply's environment facts. No value appears in a reply.
+#[test]
+fn pe_u10_submit_environment_check_and_reply_facts() {
+    let mut h = H::new();
+    let project = h.project();
+    let with = |env: &[(&str, &str)], outside: bool| {
+        let mut body = submit_body(project, None, "true", outside);
+        if let Body::ConversationQueueCommandSubmit(v) = &mut body {
+            v.environment = env
+                .iter()
+                .map(|(n, val)| pb::PersonEnvironment {
+                    name: Some((*n).into()),
+                    value: Some((*val).into()),
+                })
+                .collect();
+        }
+        body
+    };
+    // A synthetic high-entropy value in a listed word-class variable.
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    let flagged: String = (0..48)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            alphabet[(x % 62) as usize] as char
+        })
+        .collect();
+    for (label, env) in [
+        ("not in the table", vec![("HOME", "/x")]),
+        ("repeated", vec![("LANG", "C"), ("LANG", "C")]),
+        ("class", vec![("LANG", "en GB")]),
+        ("flagged", vec![("RUSTUP_TOOLCHAIN", flagged.as_str())]),
+    ] {
+        for outside in [false, true] {
+            let reply = h.send(with(&env, outside));
+            let Some(Body::ConversationQueueReply(value)) = reply.body else {
+                panic!("{label}: {reply:?}");
+            };
+            assert_eq!(
+                value.refusal,
+                Some(pb::QueueRefusal::EnvironmentInvalid as i32),
+                "{label}"
+            );
+            assert!(value.command_environment.is_none());
+            assert!(!format!("{value:?}").contains(&flagged));
+        }
+    }
+    // Declared variables from the configuration (a persisted set).
+    let declared = std::collections::BTreeMap::from([(
+        project,
+        vec![("RUST_LOG".to_owned(), "debug".to_owned())],
+    )]);
+    h.j().owner().set_person_environment(declared);
+    // A `!!` command without a secret needs no Keychain: this harness has
+    // none, and the submit is accepted (ENV1).
+    let reply = h.send(with(
+        &[("CARGO_HOME", "/Users/fixture/.cargo"), ("LANG", "C")],
+        true,
+    ));
+    let Some(Body::ConversationQueueReply(value)) = reply.body else {
+        panic!("{reply:?}");
+    };
+    let input: Id = value
+        .accepted_input_id
+        .clone()
+        .and_then(|v| v.try_into().ok())
+        .unwrap_or_else(|| panic!("refused: {value:?}"));
+    assert!(!h.j().owner().persons.items.contains(&input), "no item");
+    let facts = value.command_environment.expect("facts");
+    assert_eq!(facts.terminal_names, Some(1 | 1 << 14));
+    assert_eq!(facts.project_names, ["RUST_LOG"]);
+    assert_eq!((facts.secret_variables, facts.secret_command), (None, None));
+    // The pure facts of a kind 31 with secret variables and with the
+    // whole-command variable.
+    let mut person = PersonCommandQueued {
+        request: [1; 16],
+        digest: [0; 32],
+        input: [2; 16],
+        project,
+        conversation: [3; 16],
+        expected_generation: 0,
+        new_conversation: true,
+        outside_sandbox: false,
+        command: "echo \"$ASURA_SECRET_1\" \"$ASURA_SECRET_2\"".into(),
+        display_command: String::new(),
+        cwd: ".".into(),
+        search_path: "/bin".into(),
+        environment: vec![(9, "/tmp/agent".into())],
+        declared: Vec::new(),
+        order_revision: 1,
+        number_kinds: vec![journal::SecretKind::GithubToken; 2],
+        unnumbered: 0,
+        command_cut: false,
+        whole_command: false,
+        rule_set_revision: 1,
+        rule_set_digest: [1; 32],
+        fallback: None,
+    };
+    let facts = command_environment(&person);
+    assert_eq!(facts.terminal_names, Some(1 << 8));
+    assert_eq!(
+        (facts.secret_variables, facts.secret_command),
+        (Some(2), None)
+    );
+    person.whole_command = true;
+    let facts = command_environment(&person);
+    assert_eq!(
+        (facts.secret_variables, facts.secret_command),
+        (None, Some(true))
+    );
+    assert_eq!(
+        client_entries(&PersonCommandQueued {
+            declared: vec![("RUST_LOG".into(), "debug".into())],
+            ..person
+        }),
+        [
+            (b"SSH_AUTH_SOCK".to_vec(), b"/tmp/agent".to_vec()),
+            (b"RUST_LOG".to_vec(), b"debug".to_vec())
+        ]
+    );
+}
+
 /// The audit names: every `QueueRefusal` maps to its member, and every
 /// writer error to a named member (exhaustive matches); refusal replies
 /// carry the typed refusal and the |OSStatus| only for
 /// `secret_store_unavailable`.
 #[test]
 fn refusal_names_are_exhaustive() {
-    for value in 1..=13 {
+    // Value 3 is reserved since ENV1.
+    for value in (1..=13).filter(|v| *v != 3) {
         let refusal = pb::QueueRefusal::try_from(value).unwrap();
         let named = queue_refusal(refusal).expect("named");
         assert_eq!(typed_refusal(named), Some(refusal));
@@ -866,6 +989,7 @@ fn stored_rewrite_replans() {
         cwd: ".".into(),
         search_path: "/usr/bin".into(),
         environment: Vec::new(),
+        declared: Vec::new(),
         order_revision: 1,
         number_kinds: planned.number_kinds.clone(),
         unnumbered: planned.unnumbered,
@@ -948,7 +1072,9 @@ fn pc_u54_message_turn_after_release() {
 fn p3e2_exact_retry_after_the_checkpoint_writes_no_item() {
     let mut h = H::with_keychain();
     let project = h.project();
-    let body = submit_body(project, None, "brew upgrade", true);
+    // ENV1: a `!!` command has an item only with a secret in its command.
+    let token = ["ghp_", &"rT7".repeat(12)].concat();
+    let body = submit_body(project, None, &format!("brew upgrade \"{token}\""), true);
     let input = h.accepted(body.clone());
     assert!(h.j().owner().persons.items.contains(&input), "its item");
     let job = h.run(input);

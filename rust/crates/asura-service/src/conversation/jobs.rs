@@ -33,6 +33,8 @@ pub(super) struct Started {
     pub limits: JobLimits,
     pub execution: ExecutionSetting,
     pub outside: bool,
+    /// `personCommands.environment` (ENV1).
+    pub declared: asura_storage::config::DeclaredVariables,
     pub store: Option<asura_platform::keychain::Target>,
 }
 impl Started {
@@ -43,11 +45,19 @@ impl Started {
             limits: JobLimits::default(),
             execution: ExecutionSetting::default(),
             outside: true,
+            declared: Default::default(),
             store: None,
         }
     }
 }
 type ReadSlot = Arc<Mutex<Option<Read>>>;
+/// The outside switch, the declared variables and the secret store target of
+/// a successful start-time read.
+type Person = (
+    bool,
+    asura_storage::config::DeclaredVariables,
+    Option<asura_platform::keychain::Target>,
+);
 
 /// One read of `jobs.*` and `execution.*` on a retained worker thread
 /// (AE-02: the configuration file read blocks). It has no time bound;
@@ -77,11 +87,14 @@ fn read_configuration(runtime: RuntimeDirectory, cancel: &AtomicBool) -> Read {
         asura_storage::config::execution_setting(runtime.clone(), cancel).map_err(|_| ())?;
     let outside =
         asura_storage::config::allow_outside_sandbox(runtime.clone(), cancel).map_err(|_| ())?;
+    let declared =
+        asura_storage::config::person_environment(runtime.clone(), cancel).map_err(|_| ())?;
     let store = super::person_command::store_target(&runtime);
     Ok(Started {
         limits,
         execution,
         outside,
+        declared,
         store,
     })
 }
@@ -102,7 +115,7 @@ pub(super) struct Jobs {
     execution: Option<ExecutionSetting>,
     /// The outside switch and secret store target the read returned, for
     /// the owner to take once.
-    person: Option<(bool, Option<asura_platform::keychain::Target>)>,
+    person: Option<Person>,
     /// The limits read thread could not start or failed; logged once per
     /// run of failures.
     failing: bool,
@@ -256,6 +269,7 @@ impl Jobs {
                     limits,
                     execution,
                     outside,
+                    declared,
                     store,
                 })) => {
                     self.read = None;
@@ -282,7 +296,7 @@ impl Jobs {
                     self.control = Some(JobControl::new(limits.client_viewers));
                     self.controller = Some(controller);
                     self.execution = Some(execution);
-                    self.person = Some((outside, store));
+                    self.person = Some((outside, declared, store));
                 }
                 Some(Err(())) => {
                     self.read = None;
@@ -334,9 +348,7 @@ impl Jobs {
     }
     /// The outside switch and the secret store target of the successful
     /// read, once.
-    pub(super) fn take_person(
-        &mut self,
-    ) -> Option<(bool, Option<asura_platform::keychain::Target>)> {
+    pub(super) fn take_person(&mut self) -> Option<Person> {
         self.person.take()
     }
     /// Ended controller waits since the last call, oldest first.

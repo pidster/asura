@@ -116,7 +116,13 @@ impl Fixture {
                 outside_sandbox: self.outside[i],
                 command: &self.commands[i],
                 directory: &self.directories[i],
-                taint: super::super::taint::Taint::from_flag(self.tainted.contains(&i)),
+                taint: super::super::taint::Taint::from_flag(
+                    self.tainted.contains(&i),
+                    matches!(
+                        self.intents[i].origin,
+                        asura_storage::authority::conversation::JobOrigin::Person { .. }
+                    ),
+                ),
             })
             .collect()
     }

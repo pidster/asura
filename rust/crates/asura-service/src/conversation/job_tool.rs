@@ -172,6 +172,9 @@ pub(super) struct JobCall {
     /// The stored command and the SL7 flag of the call's kind 14 (code 10).
     command: String,
     whole_command: bool,
+    /// Code 10: the call's kind 14 shows that its job receives secret
+    /// variables (ENV4): the delivery is `private` with no yield wait.
+    tainted: bool,
     step: Step,
     known: Option<Known>,
     /// The turn ended (cancel, steer, terminal or helper exit).
@@ -227,6 +230,8 @@ fn stream_index(stream: OutputStream) -> usize {
 
 impl JobCall {
     /// A model `exec_cmd` call whose start the controller accepted as `job`.
+    /// `tainted` is the call's kind 14 taint flag
+    /// (`ToolCall::received_secret_values`, ENV4).
     pub(super) fn exec(
         ordinal: u32,
         job: Id,
@@ -234,11 +239,13 @@ impl JobCall {
         yield_seconds: u32,
         command: String,
         whole_command: bool,
+        tainted: bool,
     ) -> Self {
         let mut call = Self::new(ToolOperation::ExecCmd, None, ordinal, job, agent);
         call.yield_seconds = yield_seconds;
         call.command = command;
         call.whole_command = whole_command;
+        call.tainted = tainted;
         call
     }
     /// A `job` tool command (codes 11-16).
@@ -269,6 +276,7 @@ impl JobCall {
             yield_seconds: 0,
             command: String::new(),
             whole_command: false,
+            tainted: false,
             step: Step::Intent,
             known: None,
             ended: false,
@@ -457,6 +465,17 @@ impl JobCall {
     }
 
     fn start(&mut self, env: &mut Env) {
+        if self.code == ToolOperation::ExecCmd && self.tainted {
+            // ENV4: the delivery shows nothing the job produced, so it does
+            // not wait for the yield window. A turn that already ended still
+            // cancels the job (TJ-04). Kind 29 waits for kind 26 (JR13).
+            if self.ended
+                && let Some(jobs) = env.jobs.as_deref_mut()
+            {
+                let _ = jobs.cancel(self.job, Requester::Model, JobReason::TurnEnded, false);
+            }
+            return self.private_delivery(env);
+        }
         if self.code == ToolOperation::ExecCmd {
             let Some(jobs) = env.jobs.as_deref_mut() else {
                 // The controller accepted this job: it exists.
@@ -1157,8 +1176,19 @@ impl JobCall {
         self.render(env, result, shown, None);
     }
 
+    /// The handle delivery of a tainted model call (ENV4): outcome
+    /// `private`, no body, no view.
+    fn private_delivery(&mut self, env: &mut Env) {
+        let result = self.kind_29(env, O::Private, [0; 16], JobResultBody::None);
+        let shown = self.shown(Some(env));
+        self.render(env, result, shown.into_iter().collect(), None);
+    }
+
     /// A result without a body (codes 11-16).
     fn outcome(&mut self, env: &mut Env, outcome: O) {
+        if self.code == ToolOperation::ExecCmd && self.tainted {
+            return self.private_delivery(env);
+        }
         if self.code == ToolOperation::ExecCmd {
             // Code 10 records `ok` or `cancelled` with a state block.
             let snapshot = self.live_snapshot(env).unwrap_or_else(finalizing);
@@ -1211,7 +1241,7 @@ impl JobCall {
                 command: self.command.clone(),
                 whole_command: self.whole_command,
                 settled: self.known.as_ref().and_then(|k| k.settled.clone()),
-                private: false,
+                private: self.tainted,
             });
         }
         let known = self.known.as_ref()?;
@@ -1342,7 +1372,7 @@ mod tests {
             conversation: [3; 16],
             agent: 0,
         };
-        let mut call = JobCall::exec(1, job, agent, 0, "true".into(), false);
+        let mut call = JobCall::exec(1, job, agent, 0, "true".into(), false, false);
         call.result = Some(JobResult {
             operation: [1; 16],
             generation: 1,

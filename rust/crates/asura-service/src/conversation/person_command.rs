@@ -23,11 +23,12 @@ use crate::job_controller::{
     Admission, AgentKey, JobEvent, JobState, Origin, Pacing, Profile, Requester, StartRequest,
 };
 use crate::secret_store::{
-    self, DeleteReply, EnvironmentEntry, GetReply, Polled, PutReply, Refused, SecretValue, Secrets,
-    Store, StoreFailure, SweepReport, Ticket,
+    self, DeleteReply, GetReply, Polled, PutReply, Refused, SecretValue, Secrets, Store,
+    StoreFailure, SweepReport, Ticket,
 };
 use crate::tools;
 use asura_control::pb;
+use asura_platform::exec_cmd::environment as env;
 use asura_platform::keychain::Target;
 use asura_platform::secrets::{
     self, JobRedaction, Plan, RefusalCode, RuleSet, SecretVariable, WHOLE_COMMAND,
@@ -37,8 +38,7 @@ use asura_storage::audit::{
     SecretStoreReply as StoreReply,
 };
 use asura_storage::authority::conversation::{
-    self as journal, ClientVariable, Id, InputKind, InputStatus, JobBlockReason, JobRunState,
-    PersonCommandQueued,
+    self as journal, Id, InputKind, InputStatus, JobBlockReason, JobRunState, PersonCommandQueued,
 };
 use asura_storage::authority::writer;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -53,9 +53,6 @@ use zeroize::Zeroizing;
 const SUBMITS: usize = 2 * secret_store::QUEUE_BOUND;
 /// Dropped inputs whose kind 31 waits to be read for the item decision.
 const CHECKS: usize = 16;
-/// The `!` PATH bounds (PC2).
-const MAX_PATH_BYTES: usize = asura_control::person::MAX_SEARCH_PATH_BYTES;
-const MAX_PATH_ENTRIES: usize = 64;
 /// The |OSStatus| a refusal carries when this runtime has no Keychain
 /// target or the store worker could not start: `errSecNotAvailable`
 /// (-25291, "no keychain is available").
@@ -138,29 +135,81 @@ fn test_group_target() -> Option<Target> {
     }
 }
 
-/// The PC2 PATH sanitizer: at most 4,096 bytes and no NUL, empty and
-/// relative entries dropped, order kept, at most 64 entries left. `None`
+/// The PC2 PATH sanitizer of the allow-list owner, for both modes. `None`
 /// is `path_invalid`.
 pub(super) fn sanitize_path(path: Option<&str>) -> Option<String> {
-    let path = path?;
-    if path.len() > MAX_PATH_BYTES || path.contains('\0') {
-        return None;
-    }
-    let kept: Vec<&str> = path.split(':').filter(|e| e.starts_with('/')).collect();
-    if kept.is_empty() || kept.len() > MAX_PATH_ENTRIES {
-        return None;
-    }
-    Some(kept.join(":"))
+    env::sanitize_path(path?.as_bytes())
 }
 
-/// The submit refusal of a `QueueRefusal` (exhaustive; audit names).
+/// The terminal variables of a submit (person-command-environment.md,
+/// control API): each name in the terminal table, once, with a value that
+/// passes its class, in name code order. `None` is `environment_invalid`.
+fn terminal_variables(v: &pb::ConversationQueueCommandSubmit) -> Option<Vec<(u8, String)>> {
+    let mut out: Vec<(u8, String)> = Vec::with_capacity(v.environment.len());
+    for entry in &v.environment {
+        let name = entry.name.as_deref()?;
+        let value = entry.value.as_ref()?;
+        let terminal = env::terminal(name.as_bytes())?;
+        if !env::class_valid(terminal.class, value.as_bytes())
+            || out.iter().any(|(code, _)| *code == terminal.code)
+        {
+            return None;
+        }
+        out.push((terminal.code, value.clone()));
+    }
+    out.sort_by_key(|(code, _)| *code);
+    Some(out)
+}
+
+/// The environment facts of an accepted command (person command
+/// environment, reply facts): names and sources from its kind 31, never a
+/// value.
+pub(super) fn command_environment(person: &PersonCommandQueued) -> pb::CommandEnvironment {
+    pb::CommandEnvironment {
+        terminal_names: Some(
+            person
+                .environment
+                .iter()
+                .fold(0u64, |bits, (code, _)| bits | 1 << (code - 1)),
+        ),
+        project_names: person.declared.iter().map(|(n, _)| n.clone()).collect(),
+        secret_variables: (!person.whole_command && !person.number_kinds.is_empty())
+            .then_some(person.number_kinds.len() as u32),
+        secret_command: person.whole_command.then_some(true),
+    }
+}
+
+/// The client variables of a person start: the terminal variables by name,
+/// then the declared variables, from kind 31.
+fn client_entries(person: &PersonCommandQueued) -> Vec<(Vec<u8>, Vec<u8>)> {
+    person
+        .environment
+        .iter()
+        .filter_map(|(code, value)| {
+            Some((
+                env::by_code(*code)?.name.as_bytes().to_vec(),
+                value.as_bytes().to_vec(),
+            ))
+        })
+        .chain(
+            person
+                .declared
+                .iter()
+                .map(|(n, v)| (n.as_bytes().to_vec(), v.as_bytes().to_vec())),
+        )
+        .collect()
+}
+
+/// The submit refusal of a `QueueRefusal` (exhaustive; audit names). The
+/// service no longer needs it at run time (no client-side refusal arrives
+/// since ENV1); the unit test keeps the audit names exhaustive.
+#[cfg(test)]
 pub(super) fn queue_refusal(refusal: pb::QueueRefusal) -> Option<Refusal> {
     use pb::QueueRefusal as Q;
     Some(match refusal {
         Q::Unspecified => return None,
         Q::OutsideSandboxOff => Refusal::OutsideSandboxOff,
         Q::EnvironmentInvalid => Refusal::EnvironmentInvalid,
-        Q::EnvironmentTooLarge => Refusal::EnvironmentTooLarge,
         Q::PathInvalid => Refusal::PathInvalid,
         Q::CwdInvalid => Refusal::CwdInvalid,
         Q::SecretStoreLocked => Refusal::SecretStoreLocked,
@@ -230,7 +279,6 @@ fn typed_refusal(refusal: Refusal) -> Option<pb::QueueRefusal> {
     Some(match refusal {
         Refusal::OutsideSandboxOff => Q::OutsideSandboxOff,
         Refusal::EnvironmentInvalid => Q::EnvironmentInvalid,
-        Refusal::EnvironmentTooLarge => Q::EnvironmentTooLarge,
         Refusal::PathInvalid => Q::PathInvalid,
         Refusal::CwdInvalid => Q::CwdInvalid,
         Refusal::SecretStoreLocked => Q::SecretStoreLocked,
@@ -442,6 +490,9 @@ pub(super) struct Persons {
     /// The outside switch (`personCommands.allowOutsideSandbox`), shared
     /// with the controller's slot-grant check.
     switch: Arc<AtomicU8>,
+    /// The declared variables by project (`personCommands.environment`):
+    /// `None` until the start-time read or a persisted set.
+    declared: Option<asura_storage::config::DeclaredVariables>,
     submits: Vec<Submit>,
     pub(super) dispatches: BTreeMap<Id, Dispatch>,
     /// Inputs of released `!!` jobs (OD2), in memory only.
@@ -477,6 +528,7 @@ impl Default for Persons {
             target: None,
             store_failed: false,
             switch: Arc::new(AtomicU8::new(SWITCH_UNKNOWN)),
+            declared: None,
             submits: Vec::new(),
             dispatches: BTreeMap::new(),
             released: BTreeSet::new(),
@@ -677,7 +729,6 @@ fn planned(plan: Plan) -> Planned {
                         })
                         .collect(),
                     whole_command: None,
-                    launch_environment: None,
                 },
                 display: String::new(),
                 command: rewrite.command,
@@ -701,31 +752,12 @@ fn planned(plan: Plan) -> Planned {
                 secrets: Secrets {
                     variables: Vec::new(),
                     whole_command: Some(Zeroizing::new(whole.command.value().to_vec())),
-                    launch_environment: None,
                 },
                 display,
                 command: WHOLE_COMMAND.into(),
             }
         }
     }
-}
-
-/// The client variables of a `!` submit in kind 31 name-code order.
-fn client_variables(v: &pb::ConversationQueueCommandSubmit) -> Vec<(ClientVariable, String)> {
-    let mut out: Vec<(ClientVariable, String)> = v
-        .environment
-        .iter()
-        .filter_map(|e| {
-            let name = e.name.as_deref()?;
-            let code = asura_control::person::CLIENT_VARIABLES
-                .iter()
-                .position(|n| *n == name)?;
-            let variable = ClientVariable::from_code(u8::try_from(code + 1).ok()?)?;
-            Some((variable, e.value.clone()?))
-        })
-        .collect();
-    out.sort_by_key(|(variable, _)| *variable as u8);
-    out
 }
 
 /// The kind 3 queue entry of a person command: its kind 31 lane facts, the
@@ -864,6 +896,7 @@ impl Owner {
                 cwd: value.cwd.clone().unwrap_or_default(),
                 search_path: String::new(),
                 environment: Vec::new(),
+                declared: Vec::new(),
                 order_revision: 0,
                 number_kinds: Vec::new(),
                 unnumbered: 0,
@@ -895,24 +928,18 @@ impl Owner {
         let Some(Body::ConversationQueueCommandSubmit(value)) = submit.request.body.as_ref() else {
             return Err(Refusal::InvalidRequest.into());
         };
-        // Form checks first: the shared environment owner, then the cwd
-        // form and the PATH (P3-C codec rules, PCR9, PC2).
-        if let Some(refusal) = asura_control::person::environment_refusal(value) {
-            return Err(queue_refusal(refusal)
-                .unwrap_or(Refusal::EnvironmentInvalid)
-                .into());
-        }
+        // Form checks first: the terminal variables against the allow-list
+        // (person-command-environment.md), the cwd form and the PATH, for
+        // both modes (PCR9, PC2, ENV1).
+        let environment =
+            terminal_variables(value).ok_or(Refusing::from(Refusal::EnvironmentInvalid))?;
         let outside = value.outside_sandbox == Some(true);
         let cwd = value.cwd.as_deref().unwrap_or_default();
         if !asura_control::person::cwd_form_valid(cwd) {
             return Err(Refusal::CwdInvalid.into());
         }
-        let search_path = if outside {
-            String::new()
-        } else {
-            sanitize_path(value.search_path.as_deref())
-                .ok_or(Refusing::from(Refusal::PathInvalid))?
-        };
+        let search_path = sanitize_path(value.search_path.as_deref())
+            .ok_or(Refusing::from(Refusal::PathInvalid))?;
         // The outside switch at submit (switch check 1).
         if outside {
             match self.persons.switch() {
@@ -921,12 +948,30 @@ impl Owner {
                 Some(true) => {}
             }
         }
+        // The declared variables: the submit waits for the start-time read.
+        let Some(declared) = self.persons.declared.as_ref() else {
+            return Ok(());
+        };
+        let declared = declared
+            .get(&id(&value.project_id))
+            .cloned()
+            .unwrap_or_default();
         // The rule set: a reactor user waits for the warm wake (SD-S2).
         let rules = match self.rules.need(self.wake.as_ref()) {
             None => return Ok(()),
             Some(Err(_)) => return Err(Refusal::SecretDetectionUnavailable.into()),
             Some(Ok(rules)) => rules,
         };
+        // The scanner never lets a flagged terminal value through (PE-R6).
+        // Bounded: at most 39 values and 17,895 bytes on this step.
+        for (code, text) in &environment {
+            let name = env::by_code(*code).map_or("", |t| t.name);
+            if secrets::environment::scan_variable(rules, name.as_bytes(), text.as_bytes())
+                .is_some()
+            {
+                return Err(Refusal::EnvironmentInvalid.into());
+            }
+        }
         let command = value.command.as_deref().unwrap_or_default();
         let plan = match secrets::rewrite_exec_cmd_call_with(rules, command, cwd) {
             Ok(plan) => plan,
@@ -953,26 +998,10 @@ impl Owner {
         record.rule_set_revision = rules.revision();
         record.rule_set_digest = rules.digest();
         record.search_path = search_path;
-        record.environment = if outside {
-            Vec::new()
-        } else {
-            client_variables(value)
-        };
-        let mut values = planned.secrets;
-        if outside {
-            values.launch_environment = Some(
-                value
-                    .launch_environment
-                    .iter()
-                    .map(|e| EnvironmentEntry {
-                        name: Zeroizing::new(e.name.clone().unwrap_or_default()),
-                        value: Zeroizing::new(e.value.clone().unwrap_or_default()),
-                    })
-                    .collect(),
-            );
-        }
-        submit.needs_item =
-            outside || !values.variables.is_empty() || values.whole_command.is_some();
+        record.environment = environment;
+        record.declared = declared;
+        let values = planned.secrets;
+        submit.needs_item = !values.variables.is_empty() || values.whole_command.is_some();
         record.digest =
             journal::request_digest(journal::Request::QueuePersonCommand(record.request()))
                 .map_err(|_| Refusing::from(Refusal::InvalidRequest))?;
@@ -1137,6 +1166,7 @@ impl Owner {
                         } else {
                             None
                         },
+                        command_environment: None,
                     }),
                 )
             }
@@ -1410,6 +1440,11 @@ impl Owner {
         let waiting = self.waiting_reasons();
         let mut budget = guard::QUEUE_WARNING_BYTES;
         let mut entries = Vec::with_capacity(value.inputs.len());
+        // The accepted command's environment facts (reply facts).
+        let accepted = value
+            .accepted_input_id
+            .filter(|_| matches!(request.body, Some(Body::ConversationQueueCommandSubmit(_))));
+        let mut environment = None;
         for v in value.inputs {
             // A dispatch hold whose decision waits for the ticket keeps the
             // reason it noted.
@@ -1433,6 +1468,9 @@ impl Owner {
                 } else {
                     v.status
                 };
+                if accepted == Some(v.input.input) {
+                    environment = Some(command_environment(person));
+                }
                 let paths = guard::entry_fields(self.paths.shown(&v.input.input), &mut budget);
                 entries.push(queue_entry(
                     &v,
@@ -1485,6 +1523,7 @@ impl Owner {
                 order_revision: value.order_revision,
                 stale_order: Some(value.stale_order),
                 accepted_input_id: value.accepted_input_id.map(|id| id.to_vec()),
+                command_environment: environment,
             }),
         ));
     }
@@ -1639,9 +1678,7 @@ impl Owner {
         pacing: Option<Pacing>,
         now: Instant,
     ) -> Dispatch {
-        let needs_item =
-            record.outside_sandbox || !record.number_kinds.is_empty() || record.whole_command;
-        if !needs_item {
+        if !record.has_secret_item() {
             return self.person_start(record, None, now);
         }
         self.persons.items.insert(record.input);
@@ -1772,29 +1809,19 @@ impl Owner {
                 }
             }
         };
+        // The recorded allow-list environment, the same for both modes
+        // (ENV2): no Keychain value is part of it.
+        let search = record.search_path.as_bytes().to_vec();
+        let client = client_entries(&record);
         let launch = if record.outside_sandbox {
-            let Some(environment) = values.launch_environment.as_ref() else {
-                self.person_delete(record.input);
-                return self.command_hold(record.input, SECRETS_LOST);
-            };
             PersonLaunch::Outside {
-                launch: environment
-                    .iter()
-                    .map(|e| (e.name.to_vec(), e.value.to_vec()))
-                    .collect(),
+                path: search,
+                client,
             }
         } else {
             PersonLaunch::Sandboxed {
-                path: record.search_path.as_bytes().to_vec(),
-                client: record
-                    .environment
-                    .iter()
-                    .map(|(variable, value)| {
-                        let name = asura_control::person::CLIENT_VARIABLES
-                            [usize::from(*variable as u8) - 1];
-                        (name.as_bytes().to_vec(), value.as_bytes().to_vec())
-                    })
-                    .collect(),
+                path: search,
+                client,
             }
         };
         let redaction = if literals.is_empty() {
@@ -1982,7 +2009,7 @@ impl Owner {
             .iter()
             .find(|v| v.input.input == input)
             .and_then(|v| v.person.as_deref())
-            .is_some_and(|p| p.outside_sandbox || !p.number_kinds.is_empty() || p.whole_command);
+            .is_some_and(PersonCommandQueued::has_secret_item);
         if has_item {
             self.person_delete(input);
         }
@@ -2032,9 +2059,7 @@ impl Owner {
         }
         if state.input_status(input) == Some(InputStatus::Dropped) {
             self.persons.dispatches.remove(&input);
-            if self.persons.items.contains(&input)
-                || entry.person.as_ref().is_some_and(|p| p.outside_sandbox)
-            {
+            if self.persons.items.contains(&input) {
                 self.person_delete(input);
             } else if self.persons.checks.len() < CHECKS && !self.persons.checks.contains(&input) {
                 self.persons.checks.push_back(input);
@@ -2162,10 +2187,13 @@ impl Owner {
     /// switch and the target, the replay the installation; the sweep runs
     /// once start-time recovery committed every `interrupted` settlement.
     fn poll_store(&mut self) {
-        if let Some((outside, target)) = self.jobs.take_person() {
+        if let Some((outside, declared, target)) = self.jobs.take_person() {
             // A persisted change that arrived first is newer.
             if self.persons.switch().is_none() {
                 self.persons.set_switch(outside);
+            }
+            if self.persons.declared.is_none() {
+                self.persons.declared = Some(declared);
             }
             self.persons.target = Some(target);
             let switch = self.persons.switch.clone();
@@ -2343,6 +2371,14 @@ impl Owner {
     /// next `!!` submit and slot grant read it.
     pub(crate) fn set_allow_outside(&mut self, on: bool) {
         self.persons.set_switch(on);
+    }
+    /// A persisted `personCommands.environment` change (ENV1): the next
+    /// command submit records it; queued commands keep their kind 31.
+    pub(crate) fn set_person_environment(
+        &mut self,
+        declared: asura_storage::config::DeclaredVariables,
+    ) {
+        self.persons.declared = Some(declared);
     }
     /// `ServiceObservation` field 8.
     pub(crate) fn secret_store_status(&self) -> Option<pb::SecretStoreStatus> {

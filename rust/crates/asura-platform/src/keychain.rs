@@ -48,7 +48,9 @@ pub const ACCOUNT_PREFIX: &str = "input.";
 /// Label of every secret item.
 pub const LABEL: &str = "Asura queued command secrets";
 /// Largest item data the store writes: the largest payload of the design.
-pub const MAX_ITEM_BYTES: usize = 55_413;
+/// 1 + 32 + 1 + 8,241 + 32 = 8,307 (secret-store.md, payload; ENV1 removed
+/// the launch environment).
+pub const MAX_ITEM_BYTES: usize = 8_307;
 
 /// Most results one list asks for: the 256-item limit plus one. A listing of
 /// this many results is truncated and means "more than 256 items".
@@ -719,6 +721,43 @@ pub mod scratch {
         }
         let keychain = Keychain::open(target)?;
         add_raw_with(keychain.calls(), &service_name(installation), account, data)
+    }
+
+    /// The target of an existing scratch keychain file (no call is made).
+    pub fn target(path: &Path, password: &str) -> Target {
+        Target::Scratch {
+            path: path.to_path_buf(),
+            password: Zeroizing::new(password.to_owned()),
+        }
+    }
+
+    /// The service attributes of the generic items in a scratch keychain,
+    /// at most [`LIST_BOUND`], attributes only, never item data. A PTY
+    /// journey counts the Asura items with it, so no `security` command
+    /// runs. An empty keychain is an empty list.
+    pub fn services(target: &Target) -> Result<Vec<String>, Failure> {
+        let (keychain, _) = open_checked(target)?;
+        let limit = i64::try_from(LIST_BOUND).map_err(|_| Failure::Invalid)?;
+        let results = ItemSearchOptions::new()
+            .keychains(std::slice::from_ref(&keychain))
+            .class(ItemClass::generic_password())
+            .load_attributes(true)
+            .limit(Limit::Max(limit))
+            .search();
+        let results = match results {
+            Ok(results) => results,
+            Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(Failure::Unavailable {
+                    status: error.code(),
+                    item_call: true,
+                });
+            }
+        };
+        Ok(results
+            .iter()
+            .filter_map(|result| result.simplify_dict()?.remove("svce"))
+            .collect())
     }
 
     /// The data every fixture item holds.

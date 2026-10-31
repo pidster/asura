@@ -591,84 +591,19 @@ pub const MAX_PERSON_CWD: usize = 1024;
 pub const MAX_SEARCH_PATH: usize = 4096;
 /// Entries of the sanitized PATH.
 pub const MAX_SEARCH_PATH_ENTRIES: usize = 64;
-/// Kind 31 field 12: PC3 locale values (codes 1 to 8).
-pub const MAX_LOCALE_VALUE: usize = 64;
-/// Kind 31 field 12: the `SSH_AUTH_SOCK` value (code 9), an absolute path.
-pub const MAX_AGENT_SOCKET: usize = 103;
 /// Kind 31 field 14 without the whole-command variable: the rewrite's
 /// secret variables, as for an exec_cmd call.
 pub const MAX_PERSON_REWRITE_NUMBERS: usize = 16;
-/// The kind 31 decode bound: 105 bytes of IDs, digest, generation and
-/// flags, 8,196 each for the command and display text, 1,028 for the cwd,
-/// 4,100 for the search path, 634 for the client environment, 8 for the
-/// order revision and 303 for fields 14 to 22. Fields 8 and 9 cannot both
-/// be full in one valid record, so this is an upper bound.
-pub const MAX_PERSON_COMMAND_PAYLOAD: usize = 22_570;
+/// The kind 31 decode bound (person-command-environment.md, kind 31
+/// fields): 105 bytes of IDs, digest, generation and flags, 8,196 each for
+/// the command and display text, 1,028 for the cwd, 4,100 for the search
+/// path, 18,013 for the terminal variables, 4,193 for the declared
+/// variables, 8 for the order revision and 303 for fields 14 to 22. Fields 8
+/// and 9 cannot both be full in one valid record, so this is an upper bound.
+pub const MAX_PERSON_COMMAND_PAYLOAD: usize = 44_142;
 
-/// Kind 31 field 12 name codes (PC3), stored in increasing order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(u8)]
-pub enum ClientVariable {
-    Lang = 1,
-    LcAll = 2,
-    LcCollate = 3,
-    LcCtype = 4,
-    LcMessages = 5,
-    LcMonetary = 6,
-    LcNumeric = 7,
-    LcTime = 8,
-    SshAuthSock = 9,
-}
-impl ClientVariable {
-    pub const ALL: [Self; 9] = [
-        Self::Lang,
-        Self::LcAll,
-        Self::LcCollate,
-        Self::LcCtype,
-        Self::LcMessages,
-        Self::LcMonetary,
-        Self::LcNumeric,
-        Self::LcTime,
-        Self::SshAuthSock,
-    ];
-    pub fn from_code(code: u8) -> Option<Self> {
-        Self::ALL.get(usize::from(code).checked_sub(1)?).copied()
-    }
-    /// The environment variable name.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Lang => "LANG",
-            Self::LcAll => "LC_ALL",
-            Self::LcCollate => "LC_COLLATE",
-            Self::LcCtype => "LC_CTYPE",
-            Self::LcMessages => "LC_MESSAGES",
-            Self::LcMonetary => "LC_MONETARY",
-            Self::LcNumeric => "LC_NUMERIC",
-            Self::LcTime => "LC_TIME",
-            Self::SshAuthSock => "SSH_AUTH_SOCK",
-        }
-    }
-    /// The PC3 value rule: codes 1 to 8 take 1 to 64 bytes of ASCII
-    /// letters, digits, `_`, `-`, `.` and `@`; code 9 an absolute path of 1
-    /// to 103 bytes with no NUL.
-    pub fn valid_value(self, value: &str) -> bool {
-        match self {
-            Self::SshAuthSock => {
-                (1..=MAX_AGENT_SOCKET).contains(&value.len())
-                    && value.starts_with('/')
-                    && !value.contains('\0')
-            }
-            _ => {
-                (1..=MAX_LOCALE_VALUE).contains(&value.len())
-                    && value.bytes().all(|b| {
-                        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'@')
-                    })
-            }
-        }
-    }
-}
 /// The fields of a person command that the client supplies and the request
-/// digest covers (kind 31 fields 4 to 12). `conversation` is `None` for a
+/// digest covers (kind 31 fields 4 to 12 and 23). `conversation` is `None` for a
 /// new conversation; the digest then holds the zero ID, so an exact retry
 /// matches before the service allocates the conversation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -682,12 +617,13 @@ pub struct PersonCommandRequest<'a> {
     pub display_command: &'a str,
     pub cwd: &'a str,
     pub search_path: &'a str,
-    pub environment: &'a [(ClientVariable, String)],
+    pub environment: &'a [(u8, String)],
+    pub declared: &'a [(String, String)],
 }
 /// Kind 31, PersonCommandQueued (P2): a queued `!` or `!!` command, the
 /// lane entry that replaces kind 18 for that input. It holds the rewritten
-/// command or the whole-command placeholder, never a secret value and never
-/// the `!!` launch environment (those wait in the secret store item).
+/// command or the whole-command placeholder and the non-secret allow-list
+/// environment, never a secret value (those wait in the secret store item).
 /// Fields 14 to 22 mirror kind 14 fields 15 to 23 (SL5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersonCommandQueued {
@@ -715,11 +651,13 @@ pub struct PersonCommandQueued {
     pub display_command: String,
     /// Field 10: project relative, `.` for the root.
     pub cwd: String,
-    /// Field 11: the sanitized PATH of a `!` command; empty for `!!`.
+    /// Field 11: the sanitized PATH (both modes, ENV1).
     pub search_path: String,
-    /// Field 12: the PC3 variables of a `!` command in increasing name
-    /// code; empty for `!!`.
-    pub environment: Vec<(ClientVariable, String)>,
+    /// Field 12: the terminal variables in increasing name code
+    /// (`asura_platform::exec_cmd::environment::TERMINAL`).
+    pub environment: Vec<(u8, String)>,
+    /// Field 23: the project's declared variables in increasing name order.
+    pub declared: Vec<(String, String)>,
     /// Field 13.
     pub order_revision: u64,
     /// Fields 14 and 15: entry i is the secret kind of
@@ -753,6 +691,7 @@ impl PersonCommandQueued {
             cwd: &self.cwd,
             search_path: &self.search_path,
             environment: &self.environment,
+            declared: &self.declared,
         }
     }
     /// The stored command text a person or model sees: the display text of
@@ -764,16 +703,15 @@ impl PersonCommandQueued {
             &self.command
         }
     }
-    /// Whether the command has a secret store item: secret variables, the
-    /// whole-command variable or the `!!` launch environment. Replay does
-    /// not check the Keychain; dispatch does.
+    /// Whether the command has a secret store item: secret variables or
+    /// the whole-command variable (ENV1: a `!!` command alone has none).
+    /// Replay does not check the Keychain; dispatch does.
     pub fn has_secret_item(&self) -> bool {
-        !self.number_kinds.is_empty() || self.whole_command || self.outside_sandbox
+        !self.number_kinds.is_empty() || self.whole_command
     }
     /// The taint rule (context-composer.md, taint exclusion hook; owner
     /// decision T1, 2026-10-31): the job received a raw secret value from
-    /// stored secret variables or the whole-command variable. The `!!`
-    /// launch environment alone does not count. The one deterministic
+    /// stored secret variables or the whole-command variable. The one deterministic
     /// check; every reader derives the flag from this record.
     pub fn received_secret_values(&self) -> bool {
         !self.number_kinds.is_empty() || self.whole_command
@@ -1180,6 +1118,17 @@ pub struct ToolCall {
     /// Fields 21-23: an exec_cmd secret refusal, or with `whole_command` the
     /// fallback reason. Never holds a value.
     pub refusal: Option<ExecCmdRefusal>,
+}
+impl ToolCall {
+    /// The taint rule for a model job (context-composer.md, taint exclusion
+    /// hook, source 2; owner decision ENV4, 2026-10-31): an `exec_cmd` call
+    /// whose job received SL3 secret variables or the SL7 whole-command
+    /// variable. Interim until the broker work forbids raw delivery to
+    /// model jobs (AD-4).
+    pub fn received_secret_values(&self) -> bool {
+        self.tool_operation == Some(ToolOperation::ExecCmd)
+            && (!self.number_kinds.is_empty() || self.whole_command)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolResult {
@@ -1934,7 +1883,9 @@ impl JobResultOutcome {
             Self::Busy => code == T::JobRead,
             Self::Cancelled => job && code != T::JobCancel,
             Self::Limit => code == T::JobNote,
-            Self::Private => matches!(code, T::JobStatus | T::JobRead | T::JobWait),
+            // Code 10 since ENV4 (2026-10-31): a tainted model call's
+            // handle delivery.
+            Self::Private => matches!(code, T::ExecCmd | T::JobStatus | T::JobRead | T::JobWait),
         }
     }
 }
@@ -2512,12 +2463,14 @@ impl JobCommand {
     pub fn outside_sandbox(&self) -> bool {
         self.person().is_some_and(|c| c.outside_sandbox)
     }
-    /// The taint rule over this command source
-    /// ([`PersonCommandQueued::received_secret_values`]); false for a model
-    /// job (context-composer.md, open question O2).
+    /// The taint rule over this command source: the person input's
+    /// [`PersonCommandQueued::received_secret_values`] or the model call's
+    /// [`ToolCall::received_secret_values`] (ENV4).
     pub fn received_secret_values(&self) -> bool {
-        self.person()
-            .is_some_and(PersonCommandQueued::received_secret_values)
+        match self {
+            Self::Model(call) => call.received_secret_values(),
+            Self::Person(command) => command.received_secret_values(),
+        }
     }
 }
 /// The notice inputs of one turn (J5 binding point): the cursor range

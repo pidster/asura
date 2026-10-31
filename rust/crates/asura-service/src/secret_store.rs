@@ -29,8 +29,7 @@ mod port;
 mod worker;
 
 pub use codec::{
-    CodecError, DIGEST_BYTES, EnvironmentEntry, MAX_ENVIRONMENT_BYTES, MAX_ENVIRONMENT_ENTRIES,
-    MAX_ENVIRONMENT_NAME_BYTES, MAX_VARIABLE_BYTES, MAX_VARIABLES, MAX_WHOLE_COMMAND_BYTES,
+    CodecError, DIGEST_BYTES, MAX_VARIABLE_BYTES, MAX_VARIABLES, MAX_WHOLE_COMMAND_BYTES,
     SecretValue, Secrets, VERSION, binding,
 };
 #[cfg(feature = "test-support")]

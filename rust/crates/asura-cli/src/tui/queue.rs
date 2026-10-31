@@ -66,9 +66,9 @@ fn command_reply(
 ) -> pb::ConversationQueueReply {
     match outcome {
         asura_client::CommandSubmit::Accepted(reply) => reply,
-        asura_client::CommandSubmit::Refused {
-            refusal, status, ..
-        } => refusal_reply(request, refusal, status),
+        asura_client::CommandSubmit::Refused { refusal, status } => {
+            refusal_reply(request, refusal, status)
+        }
     }
 }
 /// A definite service rejection keeps the text; a journal hold reason shows
@@ -268,7 +268,6 @@ mod tests {
             asura_client::CommandSubmit::Refused {
                 refusal: pb::QueueRefusal::SecretStoreUnavailable,
                 status: Some(25_307),
-                sent: true,
             },
         );
         assert_eq!(refused.request_id, request.request_id);
@@ -279,20 +278,6 @@ mod tests {
         assert_eq!(refused.refusal_status, Some(25_307));
         assert!(refused.entries.is_empty() && refused.accepted_input_id.is_none());
         assert_eq!(refused.full_text, Some(false));
-        // A local refusal (never sent) has the same form, without a status.
-        let local = command_reply(
-            &request,
-            asura_client::CommandSubmit::Refused {
-                refusal: pb::QueueRefusal::EnvironmentTooLarge,
-                status: None,
-                sent: false,
-            },
-        );
-        assert_eq!(
-            local.refusal,
-            Some(pb::QueueRefusal::EnvironmentTooLarge as i32)
-        );
-        assert_eq!(local.refusal_status, None);
         let accepted = pb::ConversationQueueReply {
             request_id: request.request_id.clone(),
             accepted_input_id: Some(vec![9; 16]),

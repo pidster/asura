@@ -1,0 +1,250 @@
+//! The environment scanner (`docs/designs/person-command-environment.md`,
+//! environment scanner; owner decision ENV1).
+//!
+//! Deterministic: the rule stage is the ported rule set, unchanged, over
+//! `NAME=value` in whole-buffer mode; the entropy stage applies only to
+//! environment values. No model or classifier. A finding holds a kind,
+//! never a value, and nothing here logs or displays a value.
+use super::stream::scan_spans;
+use super::{RuleSet, SecretKind};
+
+/// Most variables one launch scan checks.
+pub const MAX_SCAN_VARIABLES: usize = 1_024;
+/// Most bytes of names and values one launch scan checks.
+pub const MAX_SCAN_BYTES: usize = 1 << 20;
+/// Entropy candidates: 32 to 4,096 bytes.
+pub const ENTROPY_MIN_BYTES: usize = 32;
+pub const ENTROPY_MAX_BYTES: usize = 4_096;
+/// Shannon entropy threshold, bits per byte (proposed; PE-M1).
+pub const ENTROPY_BITS: f64 = 4.0;
+/// Class change rate threshold (proposed; PE-M1).
+pub const CLASS_CHANGE_RATE: f64 = 0.4;
+
+/// Why a variable was flagged. Never holds a value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Finding {
+    /// A rule span covered a value byte.
+    Rule(SecretKind),
+    /// The entropy stage.
+    HighEntropy,
+    /// The variable could not be checked (bytes withheld, a bound, or
+    /// detection unavailable).
+    Unchecked,
+}
+impl Finding {
+    /// The person-facing kind label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rule(kind) => kind.as_str(),
+            Self::HighEntropy => "high-entropy",
+            Self::Unchecked => "unchecked",
+        }
+    }
+}
+
+/// Scans one variable (PE-F2): the rule stage, then the entropy stage.
+pub fn scan_variable(rules: &'static RuleSet, name: &[u8], value: &[u8]) -> Option<Finding> {
+    let mut line = Vec::with_capacity(name.len() + 1 + value.len());
+    line.extend_from_slice(name);
+    line.push(b'=');
+    line.extend_from_slice(value);
+    let start = (name.len() + 1) as u64;
+    let (spans, withheld) = scan_spans(rules, &line);
+    // The line held the value; clear it before returning.
+    zeroize::Zeroize::zeroize(&mut line);
+    if withheld {
+        return Some(Finding::Unchecked);
+    }
+    if let Some(span) = spans.iter().find(|s| s.end > start) {
+        return Some(Finding::Rule(span.kind));
+    }
+    high_entropy(value).then_some(Finding::HighEntropy)
+}
+
+fn class(byte: u8) -> u8 {
+    if byte.is_ascii_uppercase() {
+        0
+    } else if byte.is_ascii_lowercase() {
+        1
+    } else if byte.is_ascii_digit() {
+        2
+    } else {
+        3
+    }
+}
+
+/// The entropy stage alone: a candidate (32 to 4,096 bytes of
+/// `[A-Za-z0-9+/=_-]` with an uppercase letter, a lowercase letter and a
+/// digit, not starting with `/`) whose entropy is at least 4.0 bits per byte
+/// and whose class change rate is at least 0.4.
+pub fn high_entropy(value: &[u8]) -> bool {
+    if !(ENTROPY_MIN_BYTES..=ENTROPY_MAX_BYTES).contains(&value.len())
+        || value[0] == b'/'
+        || !value
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"+/=_-".contains(b))
+        || !value.iter().any(u8::is_ascii_uppercase)
+        || !value.iter().any(u8::is_ascii_lowercase)
+        || !value.iter().any(u8::is_ascii_digit)
+    {
+        return false;
+    }
+    let mut counts = [0u32; 256];
+    for byte in value {
+        counts[usize::from(*byte)] += 1;
+    }
+    let n = value.len() as f64;
+    let entropy: f64 = counts
+        .iter()
+        .filter(|c| **c > 0)
+        .map(|c| {
+            let p = f64::from(*c) / n;
+            -p * p.log2()
+        })
+        .sum();
+    let changes = value
+        .windows(2)
+        .filter(|w| class(w[0]) != class(w[1]))
+        .count();
+    let rate = changes as f64 / (n - 1.0);
+    entropy >= ENTROPY_BITS && rate >= CLASS_CHANGE_RATE
+}
+
+/// Scans a captured environment within the launch bounds. Returns the
+/// flagged names, in input order, with their findings. Variables beyond
+/// 1,024 or 1 MiB are `unchecked`. `rules` is `None` when detection is
+/// unavailable: every variable is then `unchecked`.
+pub fn scan_environment(
+    rules: Option<&'static RuleSet>,
+    captured: &[(Vec<u8>, Vec<u8>)],
+) -> Vec<(Vec<u8>, Finding)> {
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    for (index, (name, value)) in captured.iter().enumerate() {
+        bytes = bytes.saturating_add(name.len() + value.len());
+        let finding = match rules {
+            _ if index >= MAX_SCAN_VARIABLES || bytes > MAX_SCAN_BYTES => Some(Finding::Unchecked),
+            None => Some(Finding::Unchecked),
+            Some(rules) => scan_variable(rules, name, value),
+        };
+        if let Some(finding) = finding {
+            out.push((name.clone(), finding));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    //! Synthetic tokens only: each is built at run time from a fixed prefix
+    //! and generated bytes, never a real credential.
+    use super::*;
+
+    fn rules() -> &'static RuleSet {
+        crate::secrets::detection().expect("rule set")
+    }
+    /// Deterministic pseudo-random bytes over `alphabet` (xorshift).
+    fn synthetic(seed: u64, len: usize, alphabet: &[u8]) -> String {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                alphabet[(x % alphabet.len() as u64) as usize] as char
+            })
+            .collect()
+    }
+    const BASE62: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+    /// PE-U4: the rule stage with synthetic tokens.
+    #[test]
+    fn pe_u4_rule_stage() {
+        let github = format!("ghp_{}", synthetic(1, 36, BASE62));
+        let aws = format!(
+            "AKIA{}",
+            synthetic(2, 16, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
+        );
+        let anthropic = format!("sk-ant-api03-{}", synthetic(3, 80, BASE62));
+        let cases = [
+            ("GH_PAT", github.as_str(), SecretKind::GithubToken),
+            ("AWS_ID", aws.as_str(), SecretKind::AwsAccessKey),
+            ("CLAUDE", anthropic.as_str(), SecretKind::AnthropicKey),
+            ("MY_SERVICE_TOKEN", "q7Wz2x9Lp0", SecretKind::EnvSecret),
+        ];
+        for (name, value, kind) in cases {
+            let found = scan_variable(rules(), name.as_bytes(), value.as_bytes());
+            assert_eq!(found, Some(Finding::Rule(kind)), "{name}");
+            // The finding's text never holds the value.
+            let text = format!("{found:?} {}", found.unwrap().label());
+            assert!(!text.contains(value));
+        }
+        // A placeholder value is not a secret.
+        assert_eq!(scan_variable(rules(), b"API_TOKEN", b"changeme"), None);
+        // A name alone is never flagged: the span must cover the value.
+        assert_eq!(
+            scan_variable(rules(), b"TOKEN_FILE", b"/Users/me/t.txt"),
+            None
+        );
+    }
+
+    /// PE-U5: the entropy stage.
+    #[test]
+    fn pe_u5_entropy_stage() {
+        let mut flagged = 0;
+        for seed in 1..=200 {
+            let token = synthetic(seed, 32, BASE62);
+            if high_entropy(token.as_bytes()) {
+                flagged += 1;
+            }
+        }
+        // The simulation in the design found 99.9 % above both thresholds.
+        assert!(flagged >= 195, "{flagged} of 200");
+        let token = synthetic(7, 40, BASE62);
+        assert!(
+            high_entropy(token.as_bytes()) || high_entropy(synthetic(8, 40, BASE62).as_bytes())
+        );
+        assert!(!high_entropy(synthetic(9, 31, BASE62).as_bytes()));
+        for benign in [
+            "/Users/me/Library/Developer/Toolchains/swift-6.3.xctoolchain",
+            "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "com.apple.dt.toolchain.Metal.32023.921.5",
+            "7A2B6B5C-1D2E-4F30-8A9B-0C1D2E3F4A5B",
+            "w0t0p0:7A2B6B5C-1D2E-4F30-8A9B-0C1D2E3F4A5B",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "AsuraDevelopmentBuildConfiguration2026",
+            "ThisIsAVeryLongVariableName2024Release",
+            "MyApplicationName123456ProductionServer01",
+            "di=1;34:ln=1;36:so=1;35:pi=1;33:ex=1;32:bd=1;33",
+            "application.com.googlecode.iterm2.4214342.4214348",
+        ] {
+            assert!(!high_entropy(benign.as_bytes()), "{benign}");
+            assert_eq!(
+                scan_variable(rules(), b"SOME_SETTING", benign.as_bytes()),
+                None,
+                "{benign}"
+            );
+        }
+        let token = synthetic(11, 48, BASE62);
+        assert_eq!(
+            scan_variable(rules(), b"BUILD_SIGNING", token.as_bytes()),
+            Some(Finding::HighEntropy)
+        );
+    }
+
+    /// PE-U6: the launch scan bounds and detection unavailable.
+    #[test]
+    fn pe_u6_launch_scan_bounds() {
+        let mut captured: Vec<(Vec<u8>, Vec<u8>)> = (0..1_025)
+            .map(|i| (format!("V{i}").into_bytes(), b"plain".to_vec()))
+            .collect();
+        let flagged = scan_environment(Some(rules()), &captured);
+        assert_eq!(flagged, [(b"V1024".to_vec(), Finding::Unchecked)]);
+        captured.truncate(2);
+        captured[1].1 = vec![b'a'; MAX_SCAN_BYTES];
+        let flagged = scan_environment(Some(rules()), &captured);
+        assert_eq!(flagged, [(b"V1".to_vec(), Finding::Unchecked)]);
+        let flagged = scan_environment(None, &captured[..1]);
+        assert_eq!(flagged, [(b"V0".to_vec(), Finding::Unchecked)]);
+    }
+}

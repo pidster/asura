@@ -1611,7 +1611,8 @@ impl Replay {
             | (JobResultBody::List { .. }, T::JobList, O::Ok)
             | (JobResultBody::Page(_), T::JobRead, O::Ok)
             | (JobResultBody::Wait(..), T::JobWait, O::Ok) => true,
-            (JobResultBody::None, T::ExecCmd, _) => false,
+            // A tainted model call's delivery has no body (ENV4).
+            (JobResultBody::None, T::ExecCmd, outcome) => outcome == O::Private,
             (JobResultBody::None, T::JobNote, _) => true,
             (JobResultBody::None, _, outcome) => outcome != O::Ok,
             _ => false,
@@ -3150,9 +3151,18 @@ impl Replay {
         };
         settled.numbers = Vec::new();
         // A person job's kind 31, read for its outside flag and its taint
-        // flag only and dropped at once (owner decision, option A; T1).
+        // flag only and dropped at once (owner decision, option A; T1); a
+        // model job's kind 14 for its taint flag (ENV4).
         let (outside_sandbox, received_secret) = match intent.origin {
-            JobOrigin::Model { .. } => (false, false),
+            JobOrigin::Model {
+                operation, ordinal, ..
+            } => {
+                let frame = self.call_frame(operation, ordinal, index)?;
+                match index.frame(&frame)? {
+                    Record::ToolCall(call) => (false, call.received_secret_values()),
+                    _ => return Err(ReplayError::Corrupt),
+                }
+            }
             JobOrigin::Person { input } => {
                 let frame = self.input_frame(input, index)?;
                 match index.frame(&frame)? {

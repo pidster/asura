@@ -3437,8 +3437,8 @@ fn j3t_03_jr12_outcome_table_and_body_per_operation_code() {
         }
     }
     // ok 7, not_found 5, not_permitted 1, busy 1, cancelled 6,
-    // unavailable 6, limit 1, private 3.
-    assert_eq!(accepted, 7 + 5 + 1 + 1 + 6 + 6 + 1 + 3);
+    // unavailable 6, limit 1, private 4 (code 10 since ENV4).
+    assert_eq!(accepted, 7 + 5 + 1 + 1 + 6 + 6 + 1 + 4);
     // An allowed outcome with another code's body is Corrupt.
     for (op, body) in [
         (
@@ -4484,16 +4484,9 @@ fn pcq(
         command: format!("echo person {request}\nsecond line"),
         display_command: String::new(),
         cwd: ".".into(),
-        search_path: if outside {
-            String::new()
-        } else {
-            "/usr/bin:/bin".into()
-        },
-        environment: if outside {
-            vec![]
-        } else {
-            vec![(ClientVariable::LcAll, "C".into())]
-        },
+        search_path: "/usr/bin:/bin".into(),
+        environment: vec![(2, "C".into())],
+        declared: Vec::new(),
         order_revision: revision,
         number_kinds: vec![],
         unnumbered: 0,

@@ -154,14 +154,10 @@ fn tables(
                 (".asura.control.v1.JobDetail", "notes") => 16,
                 (".asura.control.v1.JobPage", "pages") => 2,
                 (".asura.control.v1.ConversationEvent", "outlived_job_ids") => 8,
-                // Person command mode: PC3 names.
-                (".asura.control.v1.ConversationQueueCommandSubmit", "environment") => 9,
-                // The `!!` launch environment is bounded by its typed refusal
-                // (1,024 entries, `environment_too_large`), so the wire bound
-                // is only the frame's: each entry takes at least 2 bytes.
-                (".asura.control.v1.ConversationQueueCommandSubmit", "launch_environment") => {
-                    32_768
-                }
+                // Person command environment: the 39 terminal table names,
+                // and at most 32 declared names in a reply.
+                (".asura.control.v1.ConversationQueueCommandSubmit", "environment") => 39,
+                (".asura.control.v1.CommandEnvironment", "project_names") => 32,
                 // Execution path guard: 16 listed warnings, 256 approvals.
                 (".asura.control.v1.PathGuardReply", "pending") => 16,
                 (".asura.control.v1.PathGuardReply", "approved") => 256,

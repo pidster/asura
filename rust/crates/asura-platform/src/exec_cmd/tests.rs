@@ -1394,62 +1394,64 @@ fn pc_u50_frame_codec_bounds_and_faults() {
     assert_eq!(got[0], b"PATH=/usr/bin:/bin");
     assert_eq!(got[9], b"SSH_AUTH_SOCK=/tmp/agent.sock");
     assert_eq!(got.len(), 10);
-    // Outside bounds: 1,024 entries and 40,960 bytes exactly; the largest
-    // frame is within MAX_FRAME_BYTES.
-    let names: Vec<Vec<u8>> = (0..1024).map(|i| format!("V{i:04}").into_bytes()).collect();
-    let name_bytes: usize = names.iter().map(Vec::len).sum();
-    let value = vec![b'v'; (40_960 - name_bytes) / 1024];
-    let mut values: Vec<Vec<u8>> = vec![value; 1024];
+    // Bounds (ENV1): 128 entries and 40,960 bytes exactly, for both
+    // profiles; the largest frame is within MAX_FRAME_BYTES.
+    let names: Vec<Vec<u8>> = (0..125).map(|i| format!("V{i:03}").into_bytes()).collect();
+    let base_bytes: usize = PERSON_BASE.iter().map(|(n, v)| n.len() + v.len()).sum();
+    let name_bytes: usize = names.iter().map(Vec::len).sum::<usize>() + base_bytes;
+    let value = vec![b'v'; (40_960 - name_bytes) / 125];
+    let mut values: Vec<Vec<u8>> = vec![value; 125];
     let used: usize = name_bytes + values.iter().map(Vec::len).sum::<usize>();
     values[0].extend(std::iter::repeat_n(b'v', 40_960 - used));
-    let full: Vec<(&[u8], &[u8])> = names
-        .iter()
-        .zip(&values)
-        .map(|(n, v)| (n.as_slice(), v.as_slice()))
-        .collect();
+    let mut full: Vec<(&[u8], &[u8])> = PERSON_BASE.to_vec();
+    full.extend(
+        names
+            .iter()
+            .zip(&values)
+            .map(|(n, v)| (n.as_slice(), v.as_slice())),
+    );
     let frame = raw_frame(&[], &full);
     assert!(frame.len() <= MAX_FRAME_BYTES);
-    assert_eq!(MAX_FRAME_BYTES, 47_119);
+    assert_eq!(MAX_FRAME_BYTES, 41_743);
     assert_eq!(
         parse_frame(&frame, Profile::PersonOutside1)
             .unwrap()
             .entries
             .len(),
-        1024
+        128
     );
     let mut over_bytes = values.clone();
     over_bytes[1].push(b'v');
-    let over: Vec<(&[u8], &[u8])> = names
-        .iter()
-        .zip(&over_bytes)
-        .map(|(n, v)| (n.as_slice(), v.as_slice()))
-        .collect();
+    let mut over: Vec<(&[u8], &[u8])> = PERSON_BASE.to_vec();
+    over.extend(
+        names
+            .iter()
+            .zip(&over_bytes)
+            .map(|(n, v)| (n.as_slice(), v.as_slice())),
+    );
     invalid(
         "40,961 bytes",
         &raw_frame(&[], &over),
         Profile::PersonOutside1,
     );
-    let mut too_many = full.clone();
-    too_many.push((b"EXTRA", b""));
-    let mut small: Vec<(&[u8], &[u8])> = names.iter().map(|n| (n.as_slice(), &b""[..])).collect();
+    let mut small: Vec<(&[u8], &[u8])> = PERSON_BASE.to_vec();
+    small.extend(names.iter().map(|n| (n.as_slice(), &b""[..])));
     small.push((b"EXTRA", b""));
     invalid(
-        "1,025 entries",
+        "129 entries",
         &raw_frame(&[], &small),
         Profile::PersonOutside1,
     );
-    let long_name = vec![b'N'; 1024];
-    assert!(
-        parse_frame(
-            &raw_frame(&[], &[(&long_name, b"x")]),
-            Profile::PersonOutside1
-        )
-        .is_ok()
-    );
-    let longer = vec![b'N'; 1025];
+    let long_name = vec![b'N'; 64];
+    let mut long: Vec<(&[u8], &[u8])> = PERSON_BASE.to_vec();
+    long.push((&long_name, b"x"));
+    assert!(parse_frame(&raw_frame(&[], &long), Profile::PersonOutside1).is_ok());
+    let longer = vec![b'N'; 65];
+    long.pop();
+    long.push((&longer, b"x"));
     invalid(
-        "name 1,025 bytes",
-        &raw_frame(&[], &[(&longer, b"x")]),
+        "name 65 bytes",
+        &raw_frame(&[], &long),
         Profile::PersonOutside1,
     );
     // Short frames, trailing bytes, a length that disagrees.
@@ -1460,15 +1462,36 @@ fn pc_u50_frame_codec_bounds_and_faults() {
     let mut trailing = good.clone();
     trailing.push(0);
     invalid("trailing byte", &trailing, Profile::Person1);
-    // person-1 name and role rules.
+    // Name rules, the same for both profiles (ENV1): a declared name is
+    // accepted; a terminal name with an invalid value is not.
     let mut other = PERSON_BASE.to_vec();
     other.push((b"EDITOR", b"vi"));
+    assert!(parse_frame(&raw_frame(&[1, 2], &other), Profile::Person1).is_ok());
+    assert!(parse_frame(&raw_frame(&[], &other), Profile::PersonOutside1).is_ok());
+    let mut bad_class = PERSON_BASE.to_vec();
+    bad_class.push((b"LANG", b"en GB"));
     invalid(
-        "non-PC3 name",
-        &raw_frame(&[1, 2], &other),
+        "LANG class",
+        &raw_frame(&[1, 2], &bad_class),
         Profile::Person1,
     );
-    assert!(parse_frame(&raw_frame(&[], &other), Profile::PersonOutside1).is_ok());
+    invalid(
+        "LANG class",
+        &raw_frame(&[], &bad_class),
+        Profile::PersonOutside1,
+    );
+    invalid(
+        "outside without HOME",
+        &raw_frame(
+            &[],
+            &PERSON_BASE[..1]
+                .iter()
+                .chain(&PERSON_BASE[2..])
+                .copied()
+                .collect::<Vec<_>>(),
+        ),
+        Profile::PersonOutside1,
+    );
     invalid(
         "no HOME",
         &raw_frame(
@@ -1537,53 +1560,63 @@ fn pc_u50_frame_codec_bounds_and_faults() {
         ("secret command", b"ASURA_SECRET_COMMAND", b"x"),
         ("job marker", b"ASURA_JOB_00", b"1"),
     ] {
-        invalid(
-            label,
-            &raw_frame(&[], &[(name, value)]),
-            Profile::PersonOutside1,
-        );
+        let mut entries = PERSON_BASE.to_vec();
+        entries.push((name, value));
+        invalid(label, &raw_frame(&[], &entries), Profile::PersonOutside1);
     }
+    let mut duplicate = PERSON_BASE.to_vec();
+    duplicate.extend([(&b"A"[..], &b"1"[..]), (b"A", b"2")]);
     invalid(
         "duplicate",
-        &raw_frame(&[], &[(b"A", b"1"), (b"A", b"2")]),
+        &raw_frame(&[], &duplicate),
         Profile::PersonOutside1,
     );
-    // The service-side encoder round-trips through the guardian parser.
-    let launch = vec![
-        (b"PATH".to_vec(), b"/bin".to_vec()),
+    // The service-side encoder round-trips through the guardian parser,
+    // with the account values set by the setup and a declared variable.
+    let dir = std::env::temp_dir();
+    let client = vec![
+        (b"LANG".to_vec(), b"C".to_vec()),
         (b"DYLD_INSERT_LIBRARIES".to_vec(), b"/x.dylib".to_vec()),
-        (b"EMPTY".to_vec(), Vec::new()),
     ];
-    let setup = PersonSetup::outside(&launch).unwrap();
-    assert_eq!(setup.names(), ["PATH", "DYLD_INSERT_LIBRARIES", "EMPTY"]);
+    let setup = PersonSetup::outside_for_test("p", &dir, &dir, b"/bin", &client).unwrap();
+    assert_eq!(
+        setup.names(),
+        [
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "TMPDIR",
+            "TERM",
+            "GIT_TERMINAL_PROMPT",
+            "LANG",
+            "DYLD_INSERT_LIBRARIES"
+        ]
+    );
     let parsed = parse_frame(&setup.frame(), Profile::PersonOutside1).unwrap();
     assert!(parsed.roles.is_empty());
     assert_eq!(
-        parsed.entries[1].as_slice(),
+        parsed.entries[9].as_slice(),
         b"DYLD_INSERT_LIBRARIES=/x.dylib"
     );
-    assert_eq!(parsed.entries[2].as_slice(), b"EMPTY=");
-    // The encoder refuses what the parser refuses.
+    // The encoder refuses what the parser refuses, and Asura-set names
+    // from a client.
     for bad in [
         vec![(b"ASURA_JOB_1".to_vec(), b"1".to_vec())],
         vec![(b"A=".to_vec(), b"1".to_vec())],
+        vec![(b"HOME".to_vec(), b"/elsewhere".to_vec())],
+        vec![(b"LANG".to_vec(), b"bad value".to_vec())],
         vec![
             (b"A".to_vec(), b"1".to_vec()),
             (b"A".to_vec(), b"2".to_vec()),
         ],
     ] {
         assert_eq!(
-            PersonSetup::outside(&bad).err(),
+            PersonSetup::outside_for_test("p", &dir, &dir, b"/bin", &bad).err(),
             Some(ExecCmdError::Invalid)
         );
     }
-    let many: Vec<(Vec<u8>, Vec<u8>)> = (0..1025)
-        .map(|i| (format!("V{i}").into_bytes(), Vec::new()))
-        .collect();
-    assert_eq!(
-        PersonSetup::outside(&many).err(),
-        Some(ExecCmdError::Invalid)
-    );
 }
 /// PC-U50 through a real pipe: the guardian's reader takes exactly one
 /// frame and its EOF; a short frame, trailing bytes, an oversized length
@@ -1868,9 +1901,10 @@ fn pc_u51_setup_roots_from_a_fixture_home() {
         [
             "PATH",
             "HOME",
-            "TMPDIR",
             "USER",
             "LOGNAME",
+            "SHELL",
+            "TMPDIR",
             "TERM",
             "GIT_TERMINAL_PROMPT",
             "LANG"
@@ -1933,8 +1967,11 @@ fn p1_setup_checks_path_and_client_variables() {
         (b"SSH_AUTH_SOCK".to_vec(), b"/tmp/s".to_vec()),
     ];
     assert!(check_client(&ok).is_ok());
+    // A declared variable is a valid client entry (ENV1).
+    assert!(check_client(&[(b"EDITOR".to_vec(), b"vi".to_vec())]).is_ok());
     for bad in [
-        vec![(b"EDITOR".to_vec(), b"vi".to_vec())],
+        vec![(b"EDITOR".to_vec(), b"a\nb".to_vec())],
+        vec![(b"ASURA_X".to_vec(), b"1".to_vec())],
         vec![(b"PATH".to_vec(), b"/bin".to_vec())],
         vec![(b"HOME".to_vec(), b"/x".to_vec())],
         vec![(b"LANG".to_vec(), b"en GB".to_vec())],
@@ -1974,7 +2011,8 @@ fn p1_prepare_requires_the_matching_person_setup() {
         let refused = PreparedExecCmd::prepare(runtime(), &project, with(profile), &cancel);
         assert_eq!(refused.err().map(|e| e.reason), Some(ExecCmdError::Invalid));
     }
-    let outside = || PersonSetup::outside(&[(b"PATH".to_vec(), b"/bin".to_vec())]).unwrap();
+    let dir = std::env::temp_dir();
+    let outside = || PersonSetup::outside_for_test("p", &dir, &dir, b"/bin", &[]).unwrap();
     for profile in [Profile::Model1, Profile::Person1] {
         let refused =
             PreparedExecCmd::prepare_person(runtime(), &project, with(profile), outside(), &cancel);

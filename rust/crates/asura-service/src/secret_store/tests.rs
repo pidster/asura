@@ -43,32 +43,12 @@ fn variables(sizes: &[usize]) -> Vec<SecretValue> {
         .collect()
 }
 
-/// `entries` launch entries whose names and values total `total` bytes.
-fn environment(entries: usize, total: usize) -> Vec<EnvironmentEntry> {
-    let per = total / entries;
-    (0..entries)
-        .map(|i| {
-            let name_len = per.clamp(1, 8);
-            let extra = if i == entries - 1 {
-                total - per * entries
-            } else {
-                0
-            };
-            EnvironmentEntry {
-                name: bytes(name_len, 0x41),
-                value: bytes(per - name_len + extra, i as u8),
-            }
-        })
-        .collect()
-}
-
-/// The largest payload: 16 variables of 8,192 bytes in total and a launch
-/// environment of 1,024 entries and 40,960 bytes.
+/// The largest payload: 16 variables of 8,192 bytes in total (ENV1
+/// removed the launch environment).
 pub(super) fn largest() -> Secrets {
     Secrets {
         variables: variables(&[512; 16]),
         whole_command: None,
-        launch_environment: Some(environment(MAX_ENVIRONMENT_ENTRIES, MAX_ENVIRONMENT_BYTES)),
     }
 }
 
@@ -253,7 +233,7 @@ fn ss_u1_codec_bounds() {
     assert_eq!(
         payload.len(),
         MAX_ITEM_BYTES,
-        "largest payload is 55,413 bytes"
+        "largest payload is 8,307 bytes"
     );
     let decoded = decode(&payload, &BINDING).unwrap();
     assert_eq!(decoded.secrets, max);
@@ -261,7 +241,6 @@ fn ss_u1_codec_bounds() {
 
     let whole = Secrets {
         whole_command: Some(bytes(MAX_WHOLE_COMMAND_BYTES, 9)),
-        launch_environment: Some(Vec::new()),
         ..Secrets::default()
     };
     let payload = encode(&BINDING, &whole, &KEY).unwrap();
@@ -310,29 +289,7 @@ fn ss_u1_codec_bounds() {
     invalid.push(Secrets {
         variables: variables(&[1]),
         whole_command: Some(bytes(1, 0)),
-        ..Secrets::default()
     });
-    // 1,025 entries; 40,961 bytes; an empty name; a 1,025-byte name.
-    invalid.push(Secrets {
-        launch_environment: Some(environment(MAX_ENVIRONMENT_ENTRIES + 1, 2_050)),
-        ..Secrets::default()
-    });
-    invalid.push(Secrets {
-        launch_environment: Some(environment(
-            MAX_ENVIRONMENT_ENTRIES,
-            MAX_ENVIRONMENT_BYTES + 1,
-        )),
-        ..Secrets::default()
-    });
-    for name in [0, MAX_ENVIRONMENT_NAME_BYTES + 1] {
-        invalid.push(Secrets {
-            launch_environment: Some(vec![EnvironmentEntry {
-                name: bytes(name, 0),
-                value: bytes(1, 0),
-            }]),
-            ..Secrets::default()
-        });
-    }
     for secrets in &invalid {
         assert_eq!(
             encode(&BINDING, secrets, &KEY).map(drop),
@@ -359,6 +316,9 @@ fn ss_u1_codec_bounds() {
     let mut flags = good.to_vec();
     flags[33] = 0x4;
     assert_eq!(decode(&flags, &BINDING).err(), Some(CodecError::Bound));
+    // Flag bit 1, the launch environment that ENV1 removed, is refused.
+    flags[33] = 0x2;
+    assert_eq!(decode(&flags, &BINDING).err(), Some(CodecError::Bound));
     let mut count = good.to_vec();
     count[34] = 17;
     assert_eq!(decode(&count, &BINDING).err(), Some(CodecError::Bound));
@@ -377,10 +337,7 @@ fn ss_u1_codec_bounds() {
 #[test]
 fn secrets_debug_shows_no_value() {
     let text = format!("{:?}", small(0x5a));
-    assert_eq!(
-        text,
-        "Secrets { variables: 1, whole_command: false, launch_environment: None }"
-    );
+    assert_eq!(text, "Secrets { variables: 1, whole_command: false }");
 }
 
 // ---- SS-U2: binding --------------------------------------------------------

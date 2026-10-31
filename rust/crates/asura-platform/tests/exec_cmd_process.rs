@@ -1412,26 +1412,23 @@ impl PersonHome {
         )
         .unwrap()
     }
-    /// A `!!` launch environment with a scratch HOME and TMPDIR.
+    /// A `!!` setup with the fixture account (ENV2: the same allow-list
+    /// environment as `!`); `extra` are declared variables.
     fn outside(&self, extra: &[(&str, &str)]) -> PersonSetup {
-        let mut launch = vec![
-            (b"PATH".to_vec(), b"/usr/bin:/bin:/usr/sbin:/sbin".to_vec()),
-            (
-                b"HOME".to_vec(),
-                self.home.as_os_str().as_encoded_bytes().to_vec(),
-            ),
-            (
-                b"TMPDIR".to_vec(),
-                self.tmpdir.as_os_str().as_encoded_bytes().to_vec(),
-            ),
-            (b"LANG".to_vec(), b"C".to_vec()),
-        ];
-        launch.extend(
+        let mut client = vec![(b"LANG".to_vec(), b"C".to_vec())];
+        client.extend(
             extra
                 .iter()
                 .map(|(n, v)| (n.as_bytes().to_vec(), v.as_bytes().to_vec())),
         );
-        PersonSetup::outside(&launch).unwrap()
+        PersonSetup::outside_for_test(
+            "fixture",
+            &self.home,
+            &self.tmpdir,
+            b"/usr/bin:/bin:/usr/sbin:/sbin",
+            &client,
+        )
+        .unwrap()
     }
 }
 /// Prepare and spawn a person job with optional guardian fault and frame.
@@ -1638,6 +1635,7 @@ fn pc_i2_to_i4_person_profile_files(home: &Path, person: &PersonHome) {
             "LOGNAME",
             "PATH",
             "PWD",
+            "SHELL",
             "SHLVL",
             "TERM",
             "TMPDIR",
@@ -1835,15 +1833,12 @@ fn pc_u50_guardian_refuses_bad_frames(home: &Path, person: &PersonHome) {
     let mut trailing = good.clone();
     trailing.push(b'x');
     let mut other = base.to_vec();
-    other.push(("EDITOR", "vi"));
+    // ENV1: a declared name is valid; a bad name form is not.
+    other.push(("BAD-NAME", "vi"));
     for (label, profile, bytes) in [
         ("short", Profile::Person1, good[..good.len() - 3].to_vec()),
         ("trailing", Profile::Person1, trailing),
-        (
-            "non-PC3 name",
-            Profile::Person1,
-            frame(&[1, 2, 4, 4], &other),
-        ),
+        ("bad name", Profile::Person1, frame(&[1, 2, 4, 4], &other)),
         (
             "no HOME",
             Profile::Person1,

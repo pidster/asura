@@ -138,6 +138,16 @@ pub(crate) fn render(input: &Render<'_>) -> Result<String, RenderError> {
             state_block(&mut lines, &view, snapshot, Extra::Delivery)?;
             lines.join("\n")
         }
+        // A tainted model call's handle delivery (ENV4): the private line
+        // and the handle, nothing the job produced.
+        (JobResultOutcome::Private, JobResultBody::None) if code == ToolOperation::ExecCmd => {
+            let view = view_for(input, true)?;
+            format!(
+                "{}\njob: {}",
+                crate::context::taint::PRIVATE_DELIVERY,
+                handle(&view.job)
+            )
+        }
         (_, JobResultBody::None) if code != ToolOperation::ExecCmd => {
             other_text(result.outcome).to_owned()
         }
@@ -2019,13 +2029,25 @@ mod tests {
             assert_eq!(text, crate::context::taint::PRIVATE_TEXT);
             assert_eq!(r.status, 2);
         }
-        for code in [T::ExecCmd, T::JobList, T::JobCancel, T::JobNote] {
+        for code in [T::JobList, T::JobCancel, T::JobNote] {
             let r = result(code, JobResultOutcome::Private, JobResultBody::None);
             assert_eq!(
                 render_one(code, &r, None),
                 Err(RenderError::Form),
                 "{code:?}"
             );
+        }
+        // CC-U28 (ENV4): a tainted model call's handle delivery is the
+        // private line and the handle, nothing the job produced.
+        let r = result(T::ExecCmd, JobResultOutcome::Private, JobResultBody::None);
+        assert_eq!(r.status, 2);
+        let text = render_one(T::ExecCmd, &r, Some(view(Origin::Model, None))).unwrap();
+        assert_eq!(
+            text,
+            format!("{}\njob: {H}", crate::context::taint::PRIVATE_DELIVERY)
+        );
+        for leak in ["exit", "elapsed", "stdout", "stderr", "cargo build"] {
+            assert!(!text.contains(leak), "{text}");
         }
         let mut facts = settled(JobOutcome::Exited, JobReason::None, 1, 7);
         facts.job = id(H2);

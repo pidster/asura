@@ -5,9 +5,10 @@
 //! secret store worker over a scratch keychain file, in private scratch
 //! homes. No case reads or writes `~/.asura` or the login keychain: each
 //! home names its own scratch keychain in `secret-store-keychain`, and a
-//! `!` command's account home and `$TMPDIR` are fixture directories
-//! (`exec-cmd-person-account`). A `!!` command gets a fixture launch
-//! environment whose HOME is the scratch home.
+//! `!` or `!!` command's account home and `$TMPDIR` are fixture
+//! directories (`exec-cmd-person-account`). Both modes get the allow-list
+//! environment (person-command-environment.md): a submit carries only the
+//! terminal table names of its fixture environment.
 //!
 //! With `ASURA_TEST_SECRET_STORE=test-group` (SG5, only in a qualification
 //! harness bundle signed with the test App ID, never under `cargo test`)
@@ -219,17 +220,20 @@ fn request(
         new_conversation: Some(conversation.is_none()),
         command: Some(command.into()),
         cwd: Some(".".into()),
-        search_path: launch.is_none().then(|| PATH.into()),
-        environment: Vec::new(),
-        outside_sandbox: launch.is_some().then_some(true),
-        launch_environment: launch
+        search_path: Some(PATH.into()),
+        // As the TUI builds it: only terminal table names (ENV1).
+        environment: launch
             .unwrap_or_default()
             .iter()
-            .map(|(name, value)| pb::LaunchVariable {
-                name: Some(name.as_bytes().to_vec()),
-                value: Some(value.as_bytes().to_vec()),
+            .filter(|(name, _)| {
+                asura_platform::exec_cmd::environment::terminal(name.as_bytes()).is_some()
+            })
+            .map(|(name, value)| pb::PersonEnvironment {
+                name: Some((*name).into()),
+                value: Some((*value).into()),
             })
             .collect(),
+        outside_sandbox: launch.is_some().then_some(true),
     }
 }
 /// A fixture launch environment: PATH, the scratch HOME and `extra`.
@@ -314,9 +318,22 @@ fn settled(env: &Env, input: [u8; 16]) -> Result<Option<JobSettled>> {
 }
 fn wait_settled(env: &Env, input: [u8; 16], limit: Duration) -> Result<JobSettled> {
     let mut found = None;
-    wait_for(limit, "kind 28", || {
+    let label = format!("kind 28 of input {}", job_fixture::hex(&input));
+    wait_for(limit, &label, || {
         found = settled(env, input).ok().flatten();
         found.is_some()
+    })
+    .map_err(|e| {
+        let state = kind_31(env, input)
+            .and_then(|q| entry(env, q.project, input))
+            .map(|e| {
+                format!(
+                    "state {:?} hold {:?} waiting {:?}",
+                    e.state, e.hold_reason, e.waiting_text
+                )
+            })
+            .unwrap_or_default();
+        format!("{e}; {state}")
     })?;
     Ok(found.expect("settled"))
 }
@@ -394,6 +411,11 @@ fn walk(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 /// Fixture secrets assembled at run time, so no token is committed.
+/// A command with a synthetic token argument, so it has a Keychain item:
+/// since ENV1 a `!!` command needs the Keychain only for a secret.
+fn with_secret(command: &str) -> String {
+    format!("{command} \"{}\"", token("sS1"))
+}
 fn token(seed: &str) -> String {
     ["ghp_", &seed.repeat(12)].concat()
 }
@@ -526,6 +548,120 @@ fn refusals() -> Result<()> {
     Ok(())
 }
 
+/// PE-I1 and PE-I2 (person-command-environment.md): the allow-list
+/// environment through the real service. A declared value holding a
+/// synthetic token is refused with `config_secret_value`; a plain one is
+/// set. `!` and `!!` commands submitted with a fixture environment as the
+/// TUI builds it (a listed toolchain variable; an unlisted marker and a
+/// token variable are not sent) receive exactly the Asura-set names, the
+/// listed variables and the declared variable, plus the job marker for
+/// `!!`; neither needs a Keychain item; kind 31 records the non-secret
+/// environment; no journal, audit or payload byte holds the token. A
+/// command queued behind a blocker keeps the declared value its kind 31
+/// recorded after the configuration changes.
+fn environment() -> Result<()> {
+    let mut env = Env::new("pc-environment")?;
+    env.start()?;
+    let (project, directory) = env.project("project")?;
+    let secret = token("pQ8");
+    let id: String = project.iter().map(|b| format!("{b:02x}")).collect();
+    let key = format!("personCommands.environment.{id}");
+    // PE-I2: a flagged value is refused, its value in no reply.
+    let reply = env.fixture.config(&key, &format!("{{GH: {secret}}}"))?;
+    assert_eq!(
+        reply.error.as_deref(),
+        Some("config_secret_value"),
+        "{reply:?}"
+    );
+    let reply = env.fixture.config(&key, "{PE_DECLARED: declared}")?;
+    assert!(reply.error.is_none(), "{reply:?}");
+    // PE-I1: the TUI sends only terminal table names.
+    let captured = [
+        ("LANG", "C".to_owned()),
+        ("CARGO_HOME", "/Users/fixture/.cargo".to_owned()),
+        ("UNLISTED_MARKER", "marker".to_owned()),
+        ("GH_TOKEN_VARIABLE", secret.clone()),
+    ];
+    let names = "env | sed 's/=.*//' | sort | tr '\\n' ' '";
+    for outside_mode in [false, true] {
+        let pairs: Vec<(&str, &str)> = captured.iter().map(|(n, v)| (*n, v.as_str())).collect();
+        let mut submit = request(project, None, names, Some(&pairs));
+        if !outside_mode {
+            submit.outside_sandbox = None;
+        }
+        let sent: Vec<_> = submit
+            .environment
+            .iter()
+            .map(|e| e.name.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(sent, ["LANG", "CARGO_HOME"]);
+        let (input, _) = queued(&env, &submit)?;
+        let settled = wait_settled(&env, input, Duration::from_secs(60))?;
+        assert_eq!(settled.outcome, JobOutcome::Exited, "{settled:?}");
+        let output = String::from_utf8(stdout(&env, input)?)?;
+        let mut got: Vec<&str> = output.split_whitespace().collect();
+        got.retain(|n| !n.starts_with("ASURA_JOB_") && *n != "PWD" && *n != "SHLVL" && *n != "_");
+        assert_eq!(
+            got,
+            [
+                "CARGO_HOME",
+                "GIT_TERMINAL_PROMPT",
+                "HOME",
+                "LANG",
+                "LOGNAME",
+                "PATH",
+                "PE_DECLARED",
+                "SHELL",
+                "TERM",
+                "TMPDIR",
+                "USER"
+            ],
+            "{output}"
+        );
+        assert_eq!(
+            output.contains("ASURA_JOB_"),
+            outside_mode,
+            "only !! gets the job marker: {output}"
+        );
+        let q = kind_31(&env, input)?;
+        assert_eq!(q.search_path, PATH);
+        assert_eq!(
+            q.environment.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+            [1, 15]
+        );
+        assert_eq!(
+            q.declared,
+            [("PE_DECLARED".to_owned(), "declared".to_owned())]
+        );
+        assert!(!q.has_secret_item() && !q.received_secret_values());
+        assert!(env.items()?.is_empty(), "no Keychain item without a secret");
+    }
+    // The recorded declared value outlives a configuration change.
+    let (blocker, conversation) = queued(&env, &request(project, None, BLOCKER, None))?;
+    wait_for(Duration::from_secs(30), "blocker running", || {
+        intent_committed(&env, blocker).unwrap_or(false)
+    })?;
+    let (late, _) = queued(
+        &env,
+        &request(
+            project,
+            Some(conversation),
+            "printf '%s\\n' \"$PE_DECLARED\"",
+            None,
+        ),
+    )?;
+    let reply = env.fixture.config(&key, "{PE_DECLARED: changed}")?;
+    assert!(reply.error.is_none(), "{reply:?}");
+    std::fs::write(directory.join("release"), b"")?;
+    wait_settled(&env, late, Duration::from_secs(60))?;
+    assert_eq!(stdout(&env, late)?, b"declared\n");
+    job_fixture::sweep(env.home(), &[secret.as_bytes()])?;
+    println!(
+        "PASS PE-I1 PE-I2: a flagged declared value is refused; ! and !! receive only the allow-list environment, !! adds the job marker; no item; kind 31 records the environment; a queued command keeps its recorded value"
+    );
+    Ok(())
+}
+
 /// SS-I1, PC-I28 and SS-I11: a `!` command with a rewritten secret, one
 /// with a whole-command secret and a `!!` command whose launch environment
 /// holds a token, queued behind a blocker: one item each, and no journal,
@@ -559,11 +695,15 @@ fn secrets() -> Result<()> {
         &format!("printf %s '{whole}' | /usr/bin/shasum -a 256; echo '{whole}'"),
         None,
     );
+    // ENV1: a terminal token is never passed; the `!!` command gets its
+    // secret only by naming it in the command (PE-I3).
     let environment = launch(&env, &[("FIXTURE_TOKEN", &launched)]);
     let third = outside(
         project,
         Some(conversation),
-        "printf %s \"$FIXTURE_TOKEN\" | /usr/bin/shasum -a 256; printf '%s\\n' \"$FIXTURE_TOKEN\"",
+        &format!(
+            "printf %s \"{launched}\" | /usr/bin/shasum -a 256; printf '%s\\n' \"{launched}\"; printf '[%s]\\n' \"$FIXTURE_TOKEN\""
+        ),
         &environment,
     );
     let (one, _) = queued(&env, &first)?;
@@ -587,7 +727,12 @@ fn secrets() -> Result<()> {
     );
     assert!(q.display_command.contains("$ASURA_SECRET_1"), "{q:?}");
     let q = kind_31(&env, three)?;
-    assert!(q.outside_sandbox && q.search_path.is_empty() && q.environment.is_empty());
+    assert!(q.outside_sandbox && q.search_path == PATH && q.environment.is_empty());
+    assert_eq!(
+        q.number_kinds.len(),
+        1,
+        "the `!!` secret is a secret variable"
+    );
     let needles = [rewritten.as_bytes(), whole.as_bytes(), launched.as_bytes()];
     job_fixture::sweep(env.home(), &needles)?;
     std::fs::write(directory.join("release"), b"")?;
@@ -602,6 +747,8 @@ fn secrets() -> Result<()> {
         assert!(output.contains("$ASURA_SECRET_"), "placeholder: {output}");
         assert!(!output.contains(value.as_str()), "no value retained");
     }
+    // The terminal variable was not passed (PE-R1).
+    assert!(String::from_utf8(stdout(&env, three)?)?.contains("[]"));
     wait_for(Duration::from_secs(20), "items deleted", || {
         env.items().is_ok_and(|i| i.is_empty())
     })?;
@@ -705,13 +852,14 @@ fn restart() -> Result<()> {
     })?;
     let secret = token("gH9");
     let launched = token("jK2");
-    let environment = launch(&env, &[("FIXTURE_TOKEN", &launched)]);
+    let lost = token("mN4");
+    let environment = launch(&env, &[]);
     let (a, _) = queued(
         &env,
         &outside(
             project,
             Some(conversation),
-            "printf %s \"$FIXTURE_TOKEN\" | /usr/bin/shasum -a 256",
+            &format!("printf %s \"{launched}\" | /usr/bin/shasum -a 256"),
             &environment,
         ),
     )?;
@@ -730,7 +878,22 @@ fn restart() -> Result<()> {
     )?;
     let (d, _) = queued(
         &env,
-        &outside(project, Some(conversation), "echo lost", &environment),
+        &outside(
+            project,
+            Some(conversation),
+            &format!("printf %s \"{lost}\""),
+            &environment,
+        ),
+    )?;
+    // PE-I4: a `!!` command without a secret has no item (ENV1).
+    let (e, _) = queued(
+        &env,
+        &outside(
+            project,
+            Some(conversation),
+            "echo plain-outside",
+            &environment,
+        ),
     )?;
     let mut items = env.items()?;
     items.sort_unstable();
@@ -743,7 +906,7 @@ fn restart() -> Result<()> {
     // The blocker's job is interrupted; the queued inputs are held.
     let settled = wait_settled(&env, blocker, Duration::from_secs(30))?;
     assert_eq!(settled.outcome, JobOutcome::Interrupted);
-    for input in [a, b, c, d] {
+    for input in [a, b, c, d, e] {
         let entry = entry(&env, project, input)?;
         assert_eq!(entry.state, Some(2), "held after restart: {entry:?}");
     }
@@ -779,12 +942,21 @@ fn restart() -> Result<()> {
     })?;
     assert!(!intent_committed(&env, d)?, "nothing ran");
     decide(&env, d, DROP)?;
+    // PE-I4: the `!!` command without an item, behind the dropped one,
+    // resumes with no Keychain call.
+    decide(&env, e, RESUME)?;
+    let settled = wait_settled(&env, e, Duration::from_secs(60))?;
+    assert_eq!(settled.outcome, JobOutcome::Exited, "{settled:?}");
+    assert_eq!(stdout(&env, e)?, b"plain-outside\n");
     wait_for(Duration::from_secs(20), "items deleted", || {
         env.items().is_ok_and(|i| i.is_empty())
     })?;
-    job_fixture::sweep(env.home(), &[secret.as_bytes(), launched.as_bytes()])?;
+    job_fixture::sweep(
+        env.home(),
+        &[secret.as_bytes(), launched.as_bytes(), lost.as_bytes()],
+    )?;
     println!(
-        "PASS SS-I2 PC-I11 PC-I32 SDI-10: held after restart, each resumed ran once with its stored values; a deleted item held secrets_lost and dropped"
+        "PASS SS-I2 PC-I11 PC-I32 SDI-10 PE-I4: held after restart, each resumed ran once with its stored values; a !! command without a secret had no item and resumed; a deleted item held secrets_lost and dropped"
     );
     Ok(())
 }
@@ -799,7 +971,14 @@ fn orphan() -> Result<()> {
     env.start()?;
     let (project, _) = env.project("project")?;
     let environment = launch(&env, &[]);
-    let submit = outside(project, None, "echo orphan", &environment);
+    // ENV1: only a command with a secret has an item.
+    let held = token("oR3");
+    let submit = outside(
+        project,
+        None,
+        &format!("echo orphan \"{held}\""),
+        &environment,
+    );
     let runtime = env.fixture.runtime()?;
     // The reply never comes while the append is held: send it on a thread.
     let sender = std::thread::spawn(move || {
@@ -848,7 +1027,7 @@ fn locked() -> Result<()> {
     let (project, directory) = env.project("project")?;
     let environment = launch(&env, &[]);
     keychain::scratch::lock(env.target()).map_err(|e| format!("lock: {e:?}"))?;
-    let submit = outside(project, None, "echo unlocked", &environment);
+    let submit = outside(project, None, &with_secret("echo unlocked"), &environment);
     assert_eq!(refused(&env, &submit)?, pb::QueueRefusal::SecretStoreLocked);
     assert!(
         !records(&env)?
@@ -869,7 +1048,12 @@ fn locked() -> Result<()> {
     })?;
     let (waiting, _) = queued(
         &env,
-        &outside(project, Some(conversation), "echo after", &environment),
+        &outside(
+            project,
+            Some(conversation),
+            &with_secret("echo after"),
+            &environment,
+        ),
     )?;
     keychain::scratch::lock(env.target()).map_err(|e| format!("lock: {e:?}"))?;
     std::fs::write(directory.join("release"), b"")?;
@@ -904,11 +1088,21 @@ fn lost() -> Result<()> {
     })?;
     let (missing, _) = queued(
         &env,
-        &outside(project, Some(conversation), "echo missing", &environment),
+        &outside(
+            project,
+            Some(conversation),
+            &with_secret("echo missing"),
+            &environment,
+        ),
     )?;
     let (denied, _) = queued(
         &env,
-        &outside(project, Some(conversation), "echo denied", &environment),
+        &outside(
+            project,
+            Some(conversation),
+            &with_secret("echo denied"),
+            &environment,
+        ),
     )?;
     env.fixture.crash()?;
     std::fs::write(directory.join("release"), b"")?;
@@ -1013,12 +1207,11 @@ fn outside_profile() -> Result<()> {
         "the !! write succeeded"
     );
     let output = String::from_utf8(stdout(&env, input)?)?;
+    // PC-I23 (ENV1): the unlisted marker is not passed; HOME is the
+    // fixture account home, PATH the sanitized one.
     assert_eq!(
         output,
-        format!(
-            "marker-value|{}|{PATH}\nnotty\nstdin-eof\n",
-            env.home().display()
-        )
+        format!("|{}|{PATH}\nnotty\nstdin-eof\n", env.account.display())
     );
     let denied = format!("touch '{}/made-inside'", target.display());
     let (sandboxed, _) = queued(&env, &request(project, None, &denied, None))?;
@@ -1042,7 +1235,7 @@ fn outside_profile() -> Result<()> {
     );
     assert!(std::fs::read_to_string(&config)?.contains("# touched by !!"));
     println!(
-        "PASS PC-I23 PC-I30: !! wrote outside the roots with the launch environment, no TTY, stdin EOF; ! was denied; !! reached the scratch config and socket"
+        "PASS PC-I23 PC-I30: !! wrote outside the roots with the allow-list environment, no TTY, stdin EOF; ! was denied; !! reached the scratch config and socket"
     );
     Ok(())
 }
@@ -1971,7 +2164,7 @@ fn full() -> Result<()> {
     assert_eq!(status.unrecognized_count, Some(256));
     assert_eq!(status.sweep_pending, Some(false));
     let environment = launch(&env, &[]);
-    let submit = outside(project, None, "echo full", &environment);
+    let submit = outside(project, None, &with_secret("echo full"), &environment);
     assert_eq!(refused(&env, &submit)?, pb::QueueRefusal::SecretStoreFull);
     // A command without values never touches the Keychain and runs.
     let (input, _) = queued(&env, &request(project, None, "echo free", None))?;
@@ -2170,7 +2363,12 @@ fn gate() -> Result<()> {
     )?;
     let (dropped, _) = queued(
         &env,
-        &outside(project, Some(conversation), "echo dropped", &environment),
+        &outside(
+            project,
+            Some(conversation),
+            &with_secret("echo dropped"),
+            &environment,
+        ),
     )?;
     // A restart holds the queued inputs.
     service.stop(&env)?;
@@ -2207,7 +2405,12 @@ fn gate() -> Result<()> {
         .map(|n| {
             // In the blocker's lane: a project holds one pending new
             // conversation at a time (kind 18 rule, PR1).
-            let submit = outside(other, Some(lane), &format!("echo held {n}"), &environment);
+            let submit = outside(
+                other,
+                Some(lane),
+                &with_secret(&format!("echo held {n}")),
+                &environment,
+            );
             let runtime = runtime.clone();
             std::thread::spawn(move || -> std::result::Result<bool, String> {
                 let cancel: asura_client::Cancel = std::sync::Arc::new(|| false);
@@ -2253,7 +2456,7 @@ fn gate() -> Result<()> {
         JobOutcome::Cancelled
     );
     // 16 requests are outstanding: the next submit with values is busy.
-    let probe = outside(other, Some(lane), "echo busy", &environment);
+    let probe = outside(other, Some(lane), &with_secret("echo busy"), &environment);
     assert_eq!(refused(&env, &probe)?, pb::QueueRefusal::SecretStoreBusy);
     gate.release();
     for thread in held {
@@ -2931,7 +3134,7 @@ fn views_taint() -> Result<()> {
     assert_eq!(tools.len(), 4, "{tools:?}");
     for text in &tools[..3] {
         assert!(
-            text.contains("private: the person ran this job with a secret value"),
+            text.contains("private: this job received a secret value"),
             "{text}"
         );
     }
@@ -3013,6 +3216,221 @@ fn views_taint() -> Result<()> {
     }
     println!(
         "PASS CC-I16 CC-I17: an untainted person job's view reached the next turn; the tainted job's entry, status, read, wait and list row were private; no model request held its output, outcome or counts; after a restart its rebuilt entry was private"
+    );
+    Ok(())
+}
+
+/// CC-I18 and CC-I19 (context-composer.md; owner decision ENV4): a model
+/// `exec_cmd` whose command holds a synthetic token runs with a secret
+/// variable, so its job is tainted. The handle delivery is `private` at
+/// once; the next turn's notice entry, `status`, `read`, `wait` and the
+/// `list` row are private. A raw-byte sweep of every chat request the
+/// model received finds no token, no SHA-256 digest of it, no canary, no
+/// exit status and no line or byte count of the job. After a restart the
+/// later turn's rebuilt notice is private again: the taint is recomputed
+/// from kind 14.
+fn model_taint() -> Result<()> {
+    let model = Model::start()?;
+    model.set_context(1_048_576);
+    let mut env = Env::new("pc-model-taint")?;
+    env.start()?;
+    let (project, _) = env.project("project")?;
+    env.fixture.model(&model.endpoint)?;
+    let secret = token("wX5");
+    let command =
+        format!("printf %s \"{secret}\" | /usr/bin/shasum -a 256; printf 'CAN%sARY\\n' Y; exit 7");
+    model.script(&[
+        call("exec_cmd", serde_json::json!({"command": command})),
+        Step::Final,
+    ]);
+    let before = model.chats().len();
+    let first = env
+        .fixture
+        .submit(project, "Run it.")
+        .map_err(|e| format!("first turn: {e}"))?;
+    env.fixture.finish(first, Duration::from_secs(60))?;
+    let first_chats: Vec<String> = model.chats()[before..].to_vec();
+    assert_eq!(first_chats.len(), 2, "the call and the answer");
+    let delivery: Vec<String> = chat_messages(&first_chats[1])?
+        .into_iter()
+        .filter(|(role, _)| role == "tool")
+        .map(|(_, text)| text)
+        .collect();
+    assert_eq!(delivery.len(), 1, "{delivery:?}");
+    assert!(
+        delivery[0].contains(
+            "private: this command received a secret value; its output, result and counts are not shown to you"
+        ),
+        "{}",
+        delivery[0]
+    );
+    // The job: its kind 26 in the first turn, tainted by its kind 14.
+    let all = records(&env)?;
+    let job = all
+        .iter()
+        .find_map(|r| match r {
+            Record::JobIntent(i)
+                if matches!(i.origin, journal::JobOrigin::Model { operation, .. } if operation == first) =>
+            {
+                Some(journal::job_id(&i.origin))
+            }
+            _ => None,
+        })
+        .ok_or("model job intent")?;
+    let handle = job_fixture::hex(&job);
+    assert!(
+        delivery[0].contains(&format!("job: {handle}")),
+        "{}",
+        delivery[0]
+    );
+    assert!(
+        all.iter().any(|r| matches!(r, Record::ToolCall(c)
+            if c.operation == first && c.received_secret_values())),
+        "the call's kind 14 records secret variables"
+    );
+    let mut settled = None;
+    wait_for(Duration::from_secs(60), "model job settled", || {
+        settled = records(&env).ok().and_then(|rs| {
+            rs.into_iter().find_map(|r| match r {
+                Record::JobSettled(s) if s.job == job => Some(s),
+                _ => None,
+            })
+        });
+        settled.is_some()
+    })?;
+    let facts = settled.ok_or("settled")?;
+    assert_eq!((facts.outcome, facts.exit_value), (JobOutcome::Exited, 7));
+    let derived = sha256_hex(secret.as_bytes());
+    let counts = [
+        format!("{} bytes", facts.stdout.capture.stored_bytes),
+        format!("stdout {} B", facts.stdout.capture.stored_bytes),
+    ];
+    // The next turn: the notice and the job calls.
+    model.script(&[
+        call(
+            "job",
+            serde_json::json!({"command": "status", "job": handle}),
+        ),
+        call(
+            "job",
+            serde_json::json!({"command": "read", "job": handle, "stream": "stdout"}),
+        ),
+        call("job", serde_json::json!({"command": "wait", "job": handle})),
+        call("job", serde_json::json!({"command": "list"})),
+        Step::Final,
+    ]);
+    let before = model.chats().len();
+    let next = env
+        .fixture
+        .follow(project, first, "What happened?")
+        .map_err(|e| format!("second turn: {e}"))?;
+    env.fixture.finish(next, Duration::from_secs(90))?;
+    let chats: Vec<String> = model.chats()[before..].to_vec();
+    assert_eq!(chats.len(), 5, "four calls and the answer");
+    for chat in &chats {
+        assert!(
+            !chat.contains(secret.as_str()),
+            "a later request holds the token"
+        );
+    }
+    let notice = user_entry(&chats[0], "What happened?")?;
+    assert!(
+        notice.contains("result: private (the command received a secret value"),
+        "{notice}"
+    );
+    assert!(notice.contains(&format!("job: {handle}")), "{notice}");
+    let tools: Vec<String> = chat_messages(&chats[4])?
+        .into_iter()
+        .filter(|(role, _)| role == "tool")
+        .map(|(_, text)| text)
+        .collect();
+    assert_eq!(tools.len(), 4, "{tools:?}");
+    for text in &tools[..3] {
+        assert!(
+            text.contains("private: this job received a secret value"),
+            "{text}"
+        );
+    }
+    let row = tools[3]
+        .lines()
+        .find(|line| line.contains(&handle))
+        .ok_or("list row")?;
+    assert!(row.contains(" · private · "), "{row}");
+    // The sweep: every chat request of both turns.
+    let reference_leak = format!("[job {handle}: you, exit");
+    let leaks = [
+        secret.as_str(),
+        derived.as_str(),
+        "CANYARY",
+        "result: exit 7",
+        "· exit 7 ·",
+        "exit status 7",
+        reference_leak.as_str(),
+    ];
+    // Within the first turn the transcript holds the model's own call,
+    // whose arguments the model wrote (it already has that token): every
+    // message Asura added (user and tool) is swept for every leak, and the
+    // whole request for the rest. Later requests are swept whole.
+    for chat in &first_chats {
+        for (role, text) in chat_messages(chat)? {
+            if role == "assistant" {
+                continue;
+            }
+            for leak in leaks {
+                assert!(!text.contains(leak), "a {role} message holds {leak}");
+            }
+        }
+        for leak in &leaks[1..] {
+            assert!(!chat.contains(leak), "a model request holds {leak}");
+        }
+    }
+    for chat in first_chats.iter().chain(&chats) {
+        for leak in &leaks[1..] {
+            assert!(!chat.contains(leak), "a model request holds {leak}");
+        }
+        for count in &counts {
+            assert!(
+                !chat.contains(count.as_str()),
+                "a model request holds {count}"
+            );
+        }
+    }
+    // Kind 29: the delivery and the three calls record `private`.
+    let all = records(&env)?;
+    let privates = all
+        .iter()
+        .filter(|r| {
+            matches!(r, Record::JobResult(p)
+                if (p.operation == first || p.operation == next)
+                    && p.outcome == journal::JobResultOutcome::Private)
+        })
+        .count();
+    assert_eq!(privates, 4);
+    // CC-I19: after a restart the rebuilt notice is private again.
+    env.fixture.stop()?;
+    env.start()?;
+    model.script(&[Step::Final]);
+    let before = model.chats().len();
+    let later = env
+        .fixture
+        .follow(project, next, "And later?")
+        .map_err(|e| format!("later turn: {e}"))?;
+    env.fixture.finish(later, Duration::from_secs(60))?;
+    let chat = model.chats()[before..]
+        .last()
+        .cloned()
+        .ok_or("later chat")?;
+    let rebuilt = user_entry(&chat, "What happened?")?;
+    assert!(
+        rebuilt.contains(&format!("[job {handle}: you, private]")),
+        "{rebuilt}"
+    );
+    for leak in leaks {
+        assert!(!chat.contains(leak), "the later request holds {leak}");
+    }
+    job_fixture::sweep(env.home(), &[secret.as_bytes()])?;
+    println!(
+        "PASS CC-I18 CC-I19: a model exec_cmd with a secret variable was private at delivery, in the next notice, status, read, wait and list; no model request held the token, its digest, the canary, the exit status or the counts; after a restart its rebuilt entry was private"
     );
     Ok(())
 }
@@ -3119,6 +3537,8 @@ fn main() {
         ("history", history),
         ("notice_later", notice_later),
         ("views_taint", views_taint),
+        ("environment", environment),
+        ("model_taint", model_taint),
     ];
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {

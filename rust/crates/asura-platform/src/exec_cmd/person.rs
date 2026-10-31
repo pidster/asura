@@ -7,6 +7,7 @@
 //! own pinned descriptor paths. Command text and client paths never enter a
 //! profile. Every call here that touches the filesystem or account database
 //! runs on the slot setup thread or in the guardian, never on the reactor.
+use super::environment::{self as env, ASURA_SET};
 use super::{ExecCmdError, Profile, guardian, spawn};
 use crate::runtime::{open_at, stat_fd};
 use std::ffi::{CStr, CString, OsStr};
@@ -22,13 +23,13 @@ pub type Variables = [(Vec<u8>, Vec<u8>)];
 pub const MAX_ROOTS: usize = 8;
 /// Most cache-list roots (PCR10).
 pub const MAX_CACHES: usize = 5;
-/// Most environment entries (OD4).
-pub const MAX_ENTRIES: usize = 1024;
-/// Longest name (OD4).
-pub const MAX_NAME_BYTES: usize = 1024;
-/// Names and values together (OD4).
+/// Most environment entries (FD 11 frame, ENV1).
+pub const MAX_ENTRIES: usize = 128;
+/// Longest name (FD 11 frame, ENV1).
+pub const MAX_NAME_BYTES: usize = env::MAX_NAME_BYTES;
+/// Names and values together.
 pub const MAX_ENVIRONMENT_BYTES: usize = 40_960;
-/// The largest frame: 4 + 1 + 8 + 2 + 1,024 × 6 + 40,960.
+/// The largest frame: 4 + 1 + 8 + 2 + 128 × 6 + 40,960.
 pub const MAX_FRAME_BYTES: usize = 4 + 1 + MAX_ROOTS + 2 + MAX_ENTRIES * 6 + MAX_ENVIRONMENT_BYTES;
 /// The first root descriptor; roots take FDs 12 to 12 + count − 1.
 pub(super) const FIRST_ROOT_FD: RawFd = 12;
@@ -42,38 +43,9 @@ const CACHE_LIST: [&[&str]; MAX_CACHES] = [
     &["Library", "Caches"],
     &[".npm"],
 ];
-/// Longest PATH the setup accepts (PC2).
-const MAX_PATH_BYTES: usize = 4096;
-/// Most PATH entries (PC2).
-const MAX_PATH_ENTRIES: usize = 64;
-/// Longest locale value (PC3).
-const MAX_LOCALE_BYTES: usize = 64;
-/// Longest `SSH_AUTH_SOCK` (PC3; `sun_path` holds 104 bytes with its NUL).
-const MAX_SOCKET_BYTES: usize = 103;
-/// Locale names a client may send (PC3).
-const LOCALE_NAMES: [&str; 8] = [
-    "LANG",
-    "LC_ALL",
-    "LC_COLLATE",
-    "LC_CTYPE",
-    "LC_MESSAGES",
-    "LC_MONETARY",
-    "LC_NUMERIC",
-    "LC_TIME",
-];
-/// Names the setup worker sets for `person-1`.
-const SERVICE_NAMES: [&str; 7] = [
-    "PATH",
-    "HOME",
-    "TMPDIR",
-    "USER",
-    "LOGNAME",
-    "TERM",
-    "GIT_TERMINAL_PROMPT",
-];
 const SSH_AUTH_SOCK: &str = "SSH_AUTH_SOCK";
-/// Prefixes only the service sets.
-const RESERVED_PREFIXES: [&[u8]; 2] = [b"ASURA_SECRET_", b"ASURA_JOB_"];
+/// Longest login shell path the setup passes as `SHELL`.
+const MAX_SHELL_BYTES: usize = 1_024;
 /// The model roots, also read and exec roots of the person profile.
 pub(super) const MODEL_ROOTS: [&str; 7] = [
     "/bin",
@@ -147,19 +119,19 @@ impl Entry {
 /// The data of one person job: root descriptors and environment entries.
 /// It travels to the guardian as FDs 12–19 and the FD 11 frame; nothing
 /// here enters the guardian's own environment or argv. No `Debug`: values
-/// may hold tokens from a terminal environment.
+/// may hold paths of the person's account.
 pub struct PersonSetup {
     profile: Profile,
     roots: Vec<(RootRole, OwnedFd)>,
     entries: Vec<Entry>,
 }
 impl PersonSetup {
-    /// `person-1` setup for a `!` command (PC2, PC3). `path` is the
-    /// service-sanitized PATH; `client` holds the PC3 client variables
-    /// (locale names and `SSH_AUTH_SOCK`). Resolves HOME, USER and LOGNAME
-    /// from the account database, `$TMPDIR` with `confstr`, the developer
-    /// directory and the existing cache-list directories. Blocking: slot
-    /// setup thread only; it checks `cancel` between steps.
+    /// `person-1` setup for a `!` command (person-command-environment.md).
+    /// `path` is the service-sanitized PATH; `client` holds the terminal and
+    /// declared variables. Resolves HOME, USER, LOGNAME and SHELL from the
+    /// account database, `$TMPDIR` with `confstr`, the developer directory
+    /// and the existing cache-list directories. Blocking: slot setup thread
+    /// only; it checks `cancel` between steps.
     ///
     /// A missing home or `$TMPDIR` fails with `Unavailable`
     /// (`sandbox_unavailable`); an invalid PATH or client variable with
@@ -169,25 +141,38 @@ impl PersonSetup {
         client: &Variables,
         cancel: &AtomicBool,
     ) -> Result<Self, ExecCmdError> {
-        let (user, home) = account()?;
+        let account = Self::account(cancel, true)?;
+        Self::resolve(Profile::Person1, account, path, client, cancel)
+    }
+    /// `person-outside-1` setup for a `!!` command: the same allow-list
+    /// environment as `!` (ENV2), with no root descriptors.
+    pub fn outside(
+        path: &[u8],
+        client: &Variables,
+        cancel: &AtomicBool,
+    ) -> Result<Self, ExecCmdError> {
+        let account = Self::account(cancel, false)?;
+        Self::resolve(Profile::PersonOutside1, account, path, client, cancel)
+    }
+    fn account(cancel: &AtomicBool, developer: bool) -> Result<Account, ExecCmdError> {
+        let (user, home, shell) = account()?;
         check(cancel)?;
         let tmpdir = user_temp_dir()?;
         check(cancel)?;
-        let developer = developer_target(Path::new(DEVELOPER_LINK), Path::new(COMMAND_LINE_TOOLS));
-        Self::resolve(
-            Account {
-                user,
-                home,
-                tmpdir,
-                developer,
+        Ok(Account {
+            user,
+            home,
+            shell,
+            tmpdir,
+            developer: if developer {
+                developer_target(Path::new(DEVELOPER_LINK), Path::new(COMMAND_LINE_TOOLS))
+            } else {
+                Developer::Omitted
             },
-            path,
-            client,
-            cancel,
-        )
+        })
     }
     /// `person-1` setup with fixture account values, so tests never use
-    /// the account's real home or temporary directory.
+    /// the account's real home or temporary directory. `SHELL` is `/bin/sh`.
     #[cfg(feature = "test-support")]
     pub fn sandboxed_for_test(
         user: &str,
@@ -198,21 +183,45 @@ impl PersonSetup {
         client: &Variables,
     ) -> Result<Self, ExecCmdError> {
         Self::resolve(
-            Account {
-                user: user.into(),
-                home: home.to_path_buf(),
-                tmpdir: tmpdir.as_os_str().as_bytes().to_vec(),
-                developer: match developer {
-                    Some(path) => Developer::Root(path.to_path_buf()),
-                    None => Developer::Omitted,
-                },
-            },
+            Profile::Person1,
+            Self::fixture(user, home, tmpdir, developer),
             path,
             client,
             &AtomicBool::new(false),
         )
     }
+    /// `person-outside-1` setup with fixture account values (test-support).
+    #[cfg(feature = "test-support")]
+    pub fn outside_for_test(
+        user: &str,
+        home: &Path,
+        tmpdir: &Path,
+        path: &[u8],
+        client: &Variables,
+    ) -> Result<Self, ExecCmdError> {
+        Self::resolve(
+            Profile::PersonOutside1,
+            Self::fixture(user, home, tmpdir, None),
+            path,
+            client,
+            &AtomicBool::new(false),
+        )
+    }
+    #[cfg(feature = "test-support")]
+    fn fixture(user: &str, home: &Path, tmpdir: &Path, developer: Option<&Path>) -> Account {
+        Account {
+            user: user.into(),
+            home: home.to_path_buf(),
+            shell: Some(b"/bin/sh".to_vec()),
+            tmpdir: tmpdir.as_os_str().as_bytes().to_vec(),
+            developer: match developer {
+                Some(path) => Developer::Root(path.to_path_buf()),
+                None => Developer::Omitted,
+            },
+        }
+    }
     fn resolve(
+        profile: Profile,
         account: Account,
         path: &[u8],
         client: &Variables,
@@ -221,70 +230,58 @@ impl PersonSetup {
         check_path(path)?;
         let client = check_client(client)?;
         let home_text = account.home.as_os_str().as_bytes().to_vec();
-        let home = open_directory(&account.home).ok_or(ExecCmdError::Unavailable)?;
-        check(cancel)?;
-        let tmpdir = open_directory(Path::new(OsStr::from_bytes(&account.tmpdir)))
-            .ok_or(ExecCmdError::Unavailable)?;
-        check(cancel)?;
-        let mut roots = vec![(RootRole::Home, home), (RootRole::TempDir, tmpdir)];
-        if let Developer::Root(target) = &account.developer
-            && let Some(fd) = open_directory(target)
-            && let Ok(resolved) = spawn::path(fd.as_raw_fd())
-            && !covered(&resolved)
-        {
-            roots.push((RootRole::Developer, fd));
-        }
-        check(cancel)?;
-        for components in CACHE_LIST {
-            if let Some(fd) = cache_directory(roots[0].1.as_raw_fd(), components) {
-                roots.push((RootRole::Cache, fd));
+        let mut roots = Vec::new();
+        if profile == Profile::Person1 {
+            let home = open_directory(&account.home).ok_or(ExecCmdError::Unavailable)?;
+            check(cancel)?;
+            let tmpdir = open_directory(Path::new(OsStr::from_bytes(&account.tmpdir)))
+                .ok_or(ExecCmdError::Unavailable)?;
+            check(cancel)?;
+            roots = vec![(RootRole::Home, home), (RootRole::TempDir, tmpdir)];
+            if let Developer::Root(target) = &account.developer
+                && let Some(fd) = open_directory(target)
+                && let Ok(resolved) = spawn::path(fd.as_raw_fd())
+                && !covered(&resolved)
+            {
+                roots.push((RootRole::Developer, fd));
             }
+            check(cancel)?;
+            for components in CACHE_LIST {
+                if let Some(fd) = cache_directory(roots[0].1.as_raw_fd(), components) {
+                    roots.push((RootRole::Cache, fd));
+                }
+            }
+            check(cancel)?;
         }
-        check(cancel)?;
         let mut entries = vec![
             Entry::new(b"PATH", path),
             Entry::new(b"HOME", &home_text),
-            Entry::new(b"TMPDIR", &account.tmpdir),
             Entry::new(b"USER", account.user.as_bytes()),
             Entry::new(b"LOGNAME", account.user.as_bytes()),
+        ];
+        if let Some(shell) = &account.shell {
+            entries.push(Entry::new(b"SHELL", shell));
+        }
+        entries.extend([
+            Entry::new(b"TMPDIR", &account.tmpdir),
             Entry::new(b"TERM", b"dumb"),
             Entry::new(b"GIT_TERMINAL_PROMPT", b"0"),
-        ];
+        ]);
         for (name, value) in client {
             // A socket path that does not name a socket is dropped; the
-            // command still runs (PC3).
+            // command still runs.
             if name == SSH_AUTH_SOCK.as_bytes() && !is_socket(value) {
                 continue;
             }
             entries.push(Entry::new(name, value));
         }
         let setup = Self {
-            profile: Profile::Person1,
+            profile,
             roots,
             entries,
         };
         setup.check_bounds()?;
         Ok(setup)
-    }
-    /// `person-outside-1` setup for a `!!` command: the TUI launch
-    /// environment, form checked only (PCR21, OD4). Each name 1–1,024 bytes
-    /// with no `=` and no NUL, each value without NUL, at most 1,024
-    /// entries and 40,960 bytes, no duplicate and no `ASURA_SECRET_` or
-    /// `ASURA_JOB_` name. Anything else is `Invalid`.
-    pub fn outside(launch: &Variables) -> Result<Self, ExecCmdError> {
-        let entries: Vec<Entry> = launch
-            .iter()
-            .map(|(name, value)| Entry::new(name, value))
-            .collect();
-        check_entries(
-            entries.iter().map(|e| (e.name(), e.value())),
-            Profile::PersonOutside1,
-        )?;
-        Ok(Self {
-            profile: Profile::PersonOutside1,
-            roots: Vec::new(),
-            entries,
-        })
     }
     /// The profile this setup belongs to.
     pub fn profile(&self) -> Profile {
@@ -351,12 +348,16 @@ fn check(cancel: &AtomicBool) -> Result<(), ExecCmdError> {
 struct Account {
     user: String,
     home: PathBuf,
+    /// The login shell, when the account database names an absolute one.
+    shell: Option<Vec<u8>>,
     tmpdir: Vec<u8>,
     developer: Developer,
 }
 
-/// The account name and home of the effective UID (`getpwuid_r`).
-fn account() -> Result<(String, PathBuf), ExecCmdError> {
+/// The account name, home and login shell of the effective UID
+/// (`getpwuid_r`). A shell that is missing, relative or longer than 1,024
+/// bytes is `None`; the command then runs without `SHELL`.
+fn account() -> Result<(String, PathBuf, Option<Vec<u8>>), ExecCmdError> {
     let mut buffer = vec![0u8; 64 * 1024];
     // SAFETY: passwd is plain output data; zero is a valid bit pattern.
     let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
@@ -382,9 +383,18 @@ fn account() -> Result<(String, PathBuf), ExecCmdError> {
     if name.is_empty() || home.to_bytes().first() != Some(&b'/') {
         return Err(ExecCmdError::Unavailable);
     }
+    let shell = (!entry.pw_shell.is_null())
+        .then(|| {
+            // SAFETY: as above; `pw_shell` points inside `buffer`.
+            unsafe { CStr::from_ptr(entry.pw_shell) }
+                .to_bytes()
+                .to_vec()
+        })
+        .filter(|s| s.first() == Some(&b'/') && s.len() <= MAX_SHELL_BYTES);
     Ok((
         name.into(),
         PathBuf::from(OsStr::from_bytes(home.to_bytes())),
+        shell,
     ))
 }
 
@@ -492,39 +502,28 @@ fn is_socket(path: &[u8]) -> bool {
 pub(super) fn check_path(path: &[u8]) -> Result<(), ExecCmdError> {
     let entries: Vec<&[u8]> = path.split(|b| *b == b':').collect();
     if path.is_empty()
-        || path.len() > MAX_PATH_BYTES
+        || path.len() > env::MAX_PATH_BYTES
         || path.contains(&0)
-        || entries.len() > MAX_PATH_ENTRIES
+        || entries.len() > env::MAX_PATH_ENTRIES
         || entries.iter().any(|e| e.first() != Some(&b'/'))
     {
         return Err(ExecCmdError::Invalid);
     }
     Ok(())
 }
-/// The PC3 client variables: locale names with short plain values and
-/// `SSH_AUTH_SOCK` with an absolute path; no name twice.
+/// The client variables (terminal and declared): each a terminal table name
+/// with a class-valid value or a valid declared name and value; never an
+/// Asura-set name; no name twice.
 pub(super) fn check_client(client: &Variables) -> Result<&Variables, ExecCmdError> {
     let mut seen: Vec<&[u8]> = Vec::new();
     for (name, value) in client {
-        if seen.contains(&name.as_slice()) {
+        if seen.contains(&name.as_slice())
+            || ASURA_SET.iter().any(|n| n.as_bytes() == name.as_slice())
+            || !env::client_entry_valid(name, value)
+        {
             return Err(ExecCmdError::Invalid);
         }
         seen.push(name);
-        let locale = LOCALE_NAMES.iter().any(|n| n.as_bytes() == name.as_slice());
-        let valid = if locale {
-            !value.is_empty()
-                && value.len() <= MAX_LOCALE_BYTES
-                && value
-                    .iter()
-                    .all(|b| b.is_ascii_alphanumeric() || b"_-.@".contains(b))
-        } else if name == SSH_AUTH_SOCK.as_bytes() {
-            value.first() == Some(&b'/') && value.len() <= MAX_SOCKET_BYTES && !value.contains(&0)
-        } else {
-            false
-        };
-        if !valid {
-            return Err(ExecCmdError::Invalid);
-        }
     }
     Ok(client)
 }
@@ -552,47 +551,16 @@ pub(super) fn check_roles(roles: &[RootRole], profile: Profile) -> Result<(), Ex
         Err(ExecCmdError::Invalid)
     }
 }
-/// The entry checks shared by the setup and the guardian (OD4 and the FD 11
-/// guardian entry checks).
+/// The entry checks shared by the setup and the guardian (FD 11 frame,
+/// ENV1): the same allow-list form for both person profiles; `model-1` has
+/// no frame.
 pub(super) fn check_entries<'a>(
     entries: impl Iterator<Item = (&'a [u8], &'a [u8])>,
     profile: Profile,
 ) -> Result<(), ExecCmdError> {
-    let mut names: Vec<&[u8]> = Vec::new();
-    let mut total = 0usize;
-    for (name, value) in entries {
-        total += name.len() + value.len();
-        if names.len() == MAX_ENTRIES
-            || name.is_empty()
-            || name.len() > MAX_NAME_BYTES
-            || total > MAX_ENVIRONMENT_BYTES
-            || name.contains(&b'=')
-            || name.contains(&0)
-            || value.contains(&0)
-            || names.contains(&name)
-            || RESERVED_PREFIXES.iter().any(|p| name.starts_with(p))
-        {
-            return Err(ExecCmdError::Invalid);
-        }
-        if profile == Profile::Person1
-            && !SERVICE_NAMES
-                .iter()
-                .chain(LOCALE_NAMES.iter())
-                .chain(std::iter::once(&SSH_AUTH_SOCK))
-                .any(|n| n.as_bytes() == name)
-        {
-            return Err(ExecCmdError::Invalid);
-        }
-        names.push(name);
-    }
-    if profile == Profile::Person1
-        && !["PATH", "HOME", "TMPDIR"]
-            .iter()
-            .all(|n| names.contains(&n.as_bytes()))
+    if profile == Profile::Model1
+        || !env::frame_entries_valid(entries, MAX_ENTRIES, MAX_ENVIRONMENT_BYTES)
     {
-        return Err(ExecCmdError::Invalid);
-    }
-    if profile == Profile::Model1 {
         return Err(ExecCmdError::Invalid);
     }
     Ok(())

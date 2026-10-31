@@ -411,14 +411,22 @@ message ConversationQueueCommandSubmit {
   optional bool new_conversation = 5;
   optional string command = 6;      // 1-8192 UTF-8 bytes, no NUL
   optional string cwd = 7;          // project-relative, "." for root, 1-1024 bytes
-  optional string search_path = 8;  // `!` only: client PATH, at most 4096 bytes
-  repeated PersonEnvironment environment = 9;  // `!` only: PC3 client names, at most 9
+  optional string search_path = 8;  // both modes: client PATH, at most 4096 bytes
+  // Both modes: terminal variables of the allow-list (person-command-
+  // environment.md), at most 39, names at most 64 and values at most 4096 bytes.
+  repeated PersonEnvironment environment = 9;
   optional bool outside_sandbox = 10;          // true for a `!!` command
-  repeated LaunchVariable launch_environment = 11;  // `!!` only: at most 1,024 entries, 40,960 bytes
+  reserved 11;                                 // the removed `!!` launch environment (ENV1)
 }
 message PersonEnvironment { optional string name = 1; optional string value = 2; }
-// Bytes: a terminal environment need not be UTF-8.
-message LaunchVariable { optional bytes name = 1; optional bytes value = 2; }
+// The environment names of an accepted command submit, never values
+// (person-command-environment.md, reply facts).
+message CommandEnvironment {
+  optional uint64 terminal_names = 1;   // bit (code - 1) per terminal table name passed
+  repeated string project_names = 2;    // declared names, at most 32
+  optional uint32 secret_variables = 3; // count of ASURA_SECRET_<n>, 1-16
+  optional bool secret_command = 4;     // ASURA_SECRET_COMMAND
+}
 message ConversationQueueReorder {
   optional bytes request_id = 1;
   optional bytes input_id = 2;
@@ -494,6 +502,7 @@ message ConversationQueueReply {
   optional bytes accepted_input_id = 8; // new Submit receipt within the bounded projection
   optional QueueRefusal refusal = 9;     // a definite refusal; nothing was queued or stored
   optional uint32 refusal_status = 10;   // with SECRET_STORE_UNAVAILABLE: |OSStatus|
+  optional CommandEnvironment command_environment = 11; // accepted command submit only
 }
 // Execution path guard (execution-path-guard.md, control messages), part of
 // capability 8. Paths are project-relative and display-redacted.
@@ -525,7 +534,7 @@ enum QueueRefusal {
   QUEUE_REFUSAL_UNSPECIFIED = 0;
   QUEUE_REFUSAL_OUTSIDE_SANDBOX_OFF = 1;
   QUEUE_REFUSAL_ENVIRONMENT_INVALID = 2;
-  QUEUE_REFUSAL_ENVIRONMENT_TOO_LARGE = 3;
+  reserved 3; // ENVIRONMENT_TOO_LARGE, removed with the launch environment (ENV1)
   QUEUE_REFUSAL_PATH_INVALID = 4;
   QUEUE_REFUSAL_CWD_INVALID = 5;
   QUEUE_REFUSAL_SECRET_STORE_LOCKED = 6;

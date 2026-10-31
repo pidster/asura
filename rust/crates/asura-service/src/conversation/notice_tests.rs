@@ -550,6 +550,7 @@ fn person_settlement(n: u8, sequence: u64, outside: bool, whole: bool) -> Notice
             "/usr/bin:/bin".into()
         },
         environment: Vec::new(),
+        declared: Vec::new(),
         order_revision: 1,
         number_kinds: Vec::new(),
         unnumbered: 0,

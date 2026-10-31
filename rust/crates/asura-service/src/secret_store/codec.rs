@@ -17,17 +17,10 @@ pub const MAX_VARIABLES: usize = 16;
 pub const MAX_VARIABLE_BYTES: usize = 8_192;
 /// The whole-command value.
 pub const MAX_WHOLE_COMMAND_BYTES: usize = 8_192;
-/// Launch environment entries (OD4).
-pub const MAX_ENVIRONMENT_ENTRIES: usize = 1_024;
-/// One launch environment name.
-pub const MAX_ENVIRONMENT_NAME_BYTES: usize = 1_024;
-/// Launch environment names and values in total (OD4).
-pub const MAX_ENVIRONMENT_BYTES: usize = 40_960;
 /// Bytes of the binding digest and of the value digest key.
 pub const DIGEST_BYTES: usize = 32;
 
 const FLAG_WHOLE_COMMAND: u8 = 0x1;
-const FLAG_LAUNCH_ENVIRONMENT: u8 = 0x2;
 const BINDING_DOMAIN: &[u8] = b"asura.secret-item";
 const VALUE_DOMAIN: &[u8] = b"asura.secret-values";
 
@@ -40,15 +33,6 @@ pub struct SecretValue {
     pub value: Zeroizing<Vec<u8>>,
 }
 
-/// One `!!` launch environment entry.
-#[derive(Clone, PartialEq, Eq)]
-pub struct EnvironmentEntry {
-    /// The name, 1 to 1,024 bytes.
-    pub name: Zeroizing<Vec<u8>>,
-    /// The value; it may be empty.
-    pub value: Zeroizing<Vec<u8>>,
-}
-
 /// All values of one person command input. Every buffer zeroizes on drop.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Secrets {
@@ -57,20 +41,14 @@ pub struct Secrets {
     pub variables: Vec<SecretValue>,
     /// The raw command for the whole-command variable, 1 to 8,192 bytes.
     pub whole_command: Option<Zeroizing<Vec<u8>>>,
-    /// The `!!` launch environment, at most 1,024 entries.
-    pub launch_environment: Option<Vec<EnvironmentEntry>>,
 }
 
 impl std::fmt::Debug for Secrets {
-    /// Counts only: a value, name or length never reaches a log.
+    /// Counts only: a value or length never reaches a log.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Secrets")
             .field("variables", &self.variables.len())
             .field("whole_command", &self.whole_command.is_some())
-            .field(
-                "launch_environment",
-                &self.launch_environment.as_ref().map(Vec::len),
-            )
             .finish()
     }
 }
@@ -140,33 +118,16 @@ pub(crate) fn validate(secrets: &Secrets) -> Result<(), CodecError> {
     {
         return Err(CodecError::Bound);
     }
-    if let Some(environment) = &secrets.launch_environment {
-        if environment.len() > MAX_ENVIRONMENT_ENTRIES {
-            return Err(CodecError::Bound);
-        }
-        let mut total = 0usize;
-        for entry in environment {
-            if entry.name.is_empty() || entry.name.len() > MAX_ENVIRONMENT_NAME_BYTES {
-                return Err(CodecError::Bound);
-            }
-            total += entry.name.len() + entry.value.len();
-            if total > MAX_ENVIRONMENT_BYTES {
-                return Err(CodecError::Bound);
-            }
-        }
-    }
     Ok(())
 }
 
-/// The canonical value section: flags, variables, whole-command value and
-/// launch environment. Equal secrets give equal bytes.
+/// The canonical value section: flags, variables and whole-command value.
+/// Equal secrets give equal bytes. Flag bit 1, the launch environment that
+/// ENV1 removed, is never set.
 fn body(secrets: &Secrets, out: &mut Vec<u8>) {
     let mut flags = 0u8;
     if secrets.whole_command.is_some() {
         flags |= FLAG_WHOLE_COMMAND;
-    }
-    if secrets.launch_environment.is_some() {
-        flags |= FLAG_LAUNCH_ENVIRONMENT;
     }
     out.push(flags);
     // Bounds were validated, so every cast below is lossless.
@@ -179,15 +140,6 @@ fn body(secrets: &Secrets, out: &mut Vec<u8>) {
     if let Some(command) = &secrets.whole_command {
         out.extend_from_slice(&(command.len() as u16).to_be_bytes());
         out.extend_from_slice(command);
-    }
-    if let Some(environment) = &secrets.launch_environment {
-        out.extend_from_slice(&(environment.len() as u16).to_be_bytes());
-        for entry in environment {
-            out.extend_from_slice(&(entry.name.len() as u16).to_be_bytes());
-            out.extend_from_slice(&entry.name);
-            out.extend_from_slice(&(entry.value.len() as u32).to_be_bytes());
-            out.extend_from_slice(&entry.value);
-        }
     }
 }
 
@@ -232,11 +184,6 @@ impl<'a> Reader<'a> {
         let bytes = self.take(2)?;
         Ok(usize::from(u16::from_be_bytes([bytes[0], bytes[1]])))
     }
-    fn u32(&mut self) -> Result<usize, CodecError> {
-        let bytes = self.take(4)?;
-        usize::try_from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-            .map_err(|_| CodecError::Bound)
-    }
     /// A length-prefixed field no longer than `max`, checked before the copy.
     fn bytes(&mut self, len: usize, max: usize) -> Result<Zeroizing<Vec<u8>>, CodecError> {
         if len > max {
@@ -259,7 +206,7 @@ pub(crate) fn decode(data: &[u8], expected: &[u8; DIGEST_BYTES]) -> Result<Decod
         return Err(CodecError::Binding);
     }
     let flags = reader.u8()?;
-    if flags & !(FLAG_WHOLE_COMMAND | FLAG_LAUNCH_ENVIRONMENT) != 0 {
+    if flags & !FLAG_WHOLE_COMMAND != 0 {
         return Err(CodecError::Bound);
     }
     let count = usize::from(reader.u8()?);
@@ -276,21 +223,6 @@ pub(crate) fn decode(data: &[u8], expected: &[u8; DIGEST_BYTES]) -> Result<Decod
     if flags & FLAG_WHOLE_COMMAND != 0 {
         let len = reader.u16()?;
         secrets.whole_command = Some(reader.bytes(len, MAX_WHOLE_COMMAND_BYTES)?);
-    }
-    if flags & FLAG_LAUNCH_ENVIRONMENT != 0 {
-        let entries = reader.u16()?;
-        if entries > MAX_ENVIRONMENT_ENTRIES {
-            return Err(CodecError::Bound);
-        }
-        let mut environment = Vec::with_capacity(entries);
-        for _ in 0..entries {
-            let len = reader.u16()?;
-            let name = reader.bytes(len, MAX_ENVIRONMENT_NAME_BYTES)?;
-            let len = reader.u32()?;
-            let value = reader.bytes(len, MAX_ENVIRONMENT_BYTES)?;
-            environment.push(EnvironmentEntry { name, value });
-        }
-        secrets.launch_environment = Some(environment);
     }
     let mut key = Zeroizing::new([0u8; DIGEST_BYTES]);
     key.copy_from_slice(reader.take(DIGEST_BYTES)?);

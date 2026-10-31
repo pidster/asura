@@ -2927,8 +2927,9 @@ fn p2_command(
         command: format!("ls {request}"),
         display_command: String::new(),
         cwd: ".".into(),
-        search_path: if outside { "" } else { "/bin" }.into(),
+        search_path: "/bin".into(),
         environment: vec![],
+        declared: Vec::new(),
         order_revision: 0,
         number_kinds: vec![],
         unnumbered: 0,
@@ -2994,10 +2995,11 @@ fn p2_real_writer_queues_kind_31_and_reads_person_jobs() {
         p2_queue(&mut writer, changed),
         Err(Error::Conflict)
     ));
-    // Invalid fields are refused before the writer: `!!` with a PATH.
+    // Invalid fields are refused before the writer: no PATH (ENV1: both
+    // modes record one).
     let invalid = PersonCommandQueued {
         request: [64; 16],
-        search_path: "/bin".into(),
+        search_path: String::new(),
         ..first.clone()
     };
     assert!(matches!(

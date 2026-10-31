@@ -47,25 +47,25 @@ use std::{
 /// L3: cleanup until unconfirmed, from the cancel trigger.
 const CLEANUP_BOUND: Duration = Duration::from_millis(2500);
 
-/// The person setup inputs of one person job (person-command-mode.md,
-/// environment sections), which the conversation owner moves into the job
-/// admission at dispatch: from kind 31 (the sanitized PATH) and the input's
-/// secret store item (client variables, launch environment). The slot
-/// resolves them on its setup thread with [`PersonSetup`]; the values reach
-/// the guardian only in the FD 11 frame. No `Debug`, and every byte is
-/// zeroed on drop: a launch environment commonly holds tokens.
+/// The person setup inputs of one person job (person-command-environment.md),
+/// which the conversation owner moves into the job admission at dispatch,
+/// from kind 31: the sanitized PATH and the terminal and declared
+/// variables. HOME, USER, LOGNAME, SHELL, `$TMPDIR` and, for `!`, the root
+/// descriptors are resolved by the setup thread, never taken from the
+/// client. The slot resolves them on its setup thread with [`PersonSetup`];
+/// the values reach the guardian only in the FD 11 frame. No `Debug`, and
+/// every byte is zeroed on drop.
 pub(crate) enum PersonLaunch {
-    /// `person-1` (`!`): the service-sanitized PATH (PC2) and the PC3
-    /// client variables (locale names and `SSH_AUTH_SOCK`). HOME, USER,
-    /// LOGNAME, `$TMPDIR` and the root descriptors are resolved by the
-    /// setup thread, never taken from the client.
+    /// `person-1` (`!`).
     Sandboxed {
         path: Vec<u8>,
         client: Vec<(Vec<u8>, Vec<u8>)>,
     },
-    /// `person-outside-1` (`!!`): the TUI launch environment, form-checked
-    /// only (PCR21, OD4).
-    Outside { launch: Vec<(Vec<u8>, Vec<u8>)> },
+    /// `person-outside-1` (`!!`): the same environment as `!` (ENV2).
+    Outside {
+        path: Vec<u8>,
+        client: Vec<(Vec<u8>, Vec<u8>)>,
+    },
 }
 impl PersonLaunch {
     /// The guardian profile these inputs belong to.
@@ -79,14 +79,9 @@ impl PersonLaunch {
 impl Drop for PersonLaunch {
     fn drop(&mut self) {
         use zeroize::Zeroize;
-        let (path, entries) = match self {
-            Self::Sandboxed { path, client } => (Some(path), client),
-            Self::Outside { launch } => (None, launch),
-        };
-        if let Some(path) = path {
-            path.zeroize();
-        }
-        for (name, value) in entries.iter_mut() {
+        let (Self::Sandboxed { path, client } | Self::Outside { path, client }) = self;
+        path.zeroize();
+        for (name, value) in client.iter_mut() {
             name.zeroize();
             value.zeroize();
         }
@@ -1106,19 +1101,20 @@ fn person_setup(
             }
             PersonSetup::sandboxed(path, client, cancel)
         }
-        PersonLaunch::Outside { launch } => {
-            if cancel.load(Ordering::Acquire) {
-                return Err(ExecCmdError::Cancelled);
+        PersonLaunch::Outside { path, client } => {
+            #[cfg(feature = "test-support")]
+            if let Some((home, tmpdir)) = person_account(runtime) {
+                return PersonSetup::outside_for_test("fixture", &home, &tmpdir, path, client);
             }
-            PersonSetup::outside(launch)
+            PersonSetup::outside(path, client, cancel)
         }
     }
 }
 
 /// Test-support person account: when `HOME/exec-cmd-person-account`
 /// exists, its first line names the fixture home and its second line the
-/// fixture `$TMPDIR`, so a `person-1` test never resolves the account's
-/// real home or temporary directory. Read on the setup worker only.
+/// fixture `$TMPDIR`, so a `person-1` or `person-outside-1` test never
+/// resolves the account's real home or temporary directory. Read on the setup worker only.
 #[cfg(feature = "test-support")]
 fn person_account(runtime: &RuntimeDirectory) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let home = runtime.scratch_home_for_test()?;

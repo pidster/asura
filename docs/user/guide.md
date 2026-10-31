@@ -496,6 +496,7 @@ Settings are in `~/.asura/config.yaml`. Use these commands:
 | `jobs.modelReservedPageReads` | 0 or 1 | `1` |
 | `execution.enabled` | `true` or `false` | `true` |
 | `execution.projects.ID` | `on`, `off` or `inherit` for the project with this ID | `inherit` |
+| `personCommands.environment.ID` | Variables that `!` and `!!` commands get in the project with this ID, such as `{RUST_LOG: debug}`; `{}` removes them. Values that look like secrets are refused | `{}` |
 
 Values use YAML. Quote text that contains spaces or punctuation. A model change
 applies to the next message. Audit changes apply after the service restarts.

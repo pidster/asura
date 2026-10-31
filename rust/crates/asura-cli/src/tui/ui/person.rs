@@ -7,6 +7,9 @@
 use super::*;
 use crate::tui::jobs::{self as worker, Command as JobCommand, FoldTarget, FoldUpdate};
 use asura_control::{pb, person as rules};
+use asura_platform::exec_cmd::environment::{self as env, NotPassed};
+use asura_platform::secrets::environment::Finding;
+use std::sync::{Arc, OnceLock};
 
 // Composer roles (person-command-mode.md PCR5, PCR22, PCR26; composer
 // interactions, hidden characters). Defined once here.
@@ -31,6 +34,10 @@ pub(super) const STRIPE_TEXT: Color = Color::Rgb(0xE6, 0xED, 0xF0);
 pub(super) const OUTSIDE_WARNING: &str =
     "running OUTSIDE the sandbox, as you typed it: it may write anywhere you can";
 pub(super) const TYPE_A_COMMAND: &str = "Type a command";
+/// Enter before the launch scan ended (person-command-environment.md,
+/// failure handling).
+pub(super) const CHECKING_ENVIRONMENT: &str =
+    "Checking this terminal's environment; press Enter again";
 pub(super) const SELECT_PROJECT: &str = "Select a project to run commands";
 /// Lines of retained output the log fold shows (PCR15).
 pub(super) const FOLD_LINES: usize = 8;
@@ -326,73 +333,310 @@ pub(super) fn cursor_cell(rows: &[Row], cursor: usize) -> (usize, usize) {
     last
 }
 
-/// The TUI's environment, read once at launch, in memory only (PC2, PCR21).
-#[derive(Clone, Debug, Default)]
+/// The launch scan of the captured environment (person-command-environment.md,
+/// environment scanner): flagged names and kinds, never a value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Scan {
+    pub flagged: Vec<(String, Finding)>,
+    /// The rule set failed its self-check: every variable is unchecked.
+    pub unavailable: bool,
+}
+impl Scan {
+    fn finding(&self, name: &[u8]) -> Option<Finding> {
+        self.flagged
+            .iter()
+            .find(|(n, _)| n.as_bytes() == name)
+            .map(|(_, f)| *f)
+    }
+}
+
+/// The TUI's environment, read once at launch, in memory only (PC2), and
+/// its launch scan, which a launch thread fills (bounded in-memory work; the
+/// TUI exit does not wait for it).
+#[derive(Clone, Default)]
 pub(super) struct Launch {
     pub path: Option<Vec<u8>>,
     pub environment: Vec<(Vec<u8>, Vec<u8>)>,
+    pub scan: Arc<OnceLock<Scan>>,
+}
+impl std::fmt::Debug for Launch {
+    /// Names only: a value never reaches a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Launch")
+            .field("variables", &self.environment.len())
+            .field("scanned", &self.scan.get().is_some())
+            .finish()
+    }
 }
 impl Launch {
     pub(super) fn from_process() -> Self {
         use std::os::unix::ffi::OsStrExt;
-        Self {
+        let launch = Self {
             path: std::env::var_os("PATH").map(|p| p.as_bytes().to_vec()),
             environment: std::env::vars_os()
                 .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
                 .collect(),
+            scan: Arc::new(OnceLock::new()),
+        };
+        let captured = launch.environment.clone();
+        let cell = launch.scan.clone();
+        // The rule set compile and the scan block: never on the render loop.
+        let started = std::thread::Builder::new()
+            .name("asura-env-scan".into())
+            .spawn(move || {
+                let _ = cell.set(scan(&captured));
+            });
+        if started.is_err() {
+            let _ = launch.scan.set(Scan {
+                flagged: Vec::new(),
+                unavailable: true,
+            });
+        }
+        launch
+    }
+    /// A launch whose scan is already done (tests).
+    #[cfg(test)]
+    pub(super) fn scanned(
+        path: Option<Vec<u8>>,
+        environment: Vec<(Vec<u8>, Vec<u8>)>,
+        flagged: Vec<(String, Finding)>,
+    ) -> Self {
+        let cell = OnceLock::new();
+        let _ = cell.set(Scan {
+            flagged,
+            unavailable: false,
+        });
+        Self {
+            path,
+            environment,
+            scan: Arc::new(cell),
         }
     }
-    /// The PC3 client variables of a `!` command: only listed names, as set.
-    /// The codec rule refuses a bad value; a value that is not UTF-8 cannot
-    /// be sent and refuses here with the same reason.
-    pub(super) fn client_variables(&self) -> Result<Vec<pb::PersonEnvironment>, pb::QueueRefusal> {
-        let mut out = Vec::new();
-        for name in rules::CLIENT_VARIABLES {
-            if let Some((_, value)) = self
-                .environment
-                .iter()
-                .find(|(key, _)| key.as_slice() == name.as_bytes())
-            {
-                let value = String::from_utf8(value.clone())
-                    .map_err(|_| pb::QueueRefusal::EnvironmentInvalid)?;
-                out.push(pb::PersonEnvironment {
-                    name: Some(name.into()),
-                    value: Some(value),
-                });
+    /// The terminal variables of a submit (PE-F1): `None` while the launch
+    /// scan runs; `path_invalid` without a usable PATH. A flagged or
+    /// invalid variable is not sent.
+    pub(super) fn terminal(
+        &self,
+    ) -> Option<Result<(String, Vec<pb::PersonEnvironment>), pb::QueueRefusal>> {
+        let scan = self.scan.get()?;
+        let mut captured = self.environment.clone();
+        if let Some(path) = &self.path {
+            captured.retain(|(n, _)| n.as_slice() != b"PATH");
+            captured.push((b"PATH".to_vec(), path.clone()));
+        } else {
+            captured.retain(|(n, _)| n.as_slice() != b"PATH");
+        }
+        let built = env::build(&captured, &|name| {
+            if scan.unavailable {
+                Some(Finding::Unchecked)
+            } else {
+                scan.finding(name)
             }
-        }
-        Ok(out)
+        });
+        let Some(path) = built.path.clone() else {
+            return Some(Err(pb::QueueRefusal::PathInvalid));
+        };
+        let variables = built
+            .passed
+            .iter()
+            .filter_map(|(code, value)| {
+                Some(pb::PersonEnvironment {
+                    name: Some(env::by_code(*code)?.name.into()),
+                    value: Some(value.clone()),
+                })
+            })
+            .collect();
+        Some(Ok((path, variables)))
     }
-    /// The whole launch environment of a `!!` command, unchanged (PCR21).
-    pub(super) fn launch_variables(&self) -> Vec<pb::LaunchVariable> {
+    /// Whether the captured environment sets `name`.
+    fn sets(&self, name: &str) -> bool {
         self.environment
             .iter()
-            .map(|(name, value)| pb::LaunchVariable {
-                name: Some(name.clone()),
-                value: Some(value.clone()),
+            .any(|(n, _)| n.as_slice() == name.as_bytes())
+    }
+    /// Why a terminal variable the terminal sets was not passed, if it was
+    /// flagged or invalid.
+    fn not_passed(&self, name: &str) -> Option<NotPassed> {
+        let scan = self.scan.get()?;
+        if let Some(finding) = scan.finding(name.as_bytes()) {
+            return Some(NotPassed::Flagged(finding));
+        }
+        env::terminal(name.as_bytes())
+            .filter(|t| {
+                !self
+                    .environment
+                    .iter()
+                    .any(|(n, v)| n.as_slice() == name.as_bytes() && env::class_valid(t.class, v))
             })
-            .collect()
+            .map(|_| NotPassed::Invalid)
     }
 }
 
-/// PC2: the client PATH a `!` submit carries. Empty and relative entries are
-/// dropped, keeping order; NUL, more than 4,096 bytes, more than 64 entries,
-/// text that is not UTF-8, or no remaining entry is `path_invalid`.
-pub(super) fn search_path(raw: Option<&[u8]>) -> Result<String, pb::QueueRefusal> {
-    let invalid = pb::QueueRefusal::PathInvalid;
-    let raw = raw.ok_or(invalid)?;
-    if raw.len() > rules::MAX_SEARCH_PATH_BYTES || raw.contains(&0) {
-        return Err(invalid);
+/// The launch scan of a captured environment: the rule set (compiled on
+/// this thread) and the entropy stage. Detection unavailable marks every
+/// variable unchecked.
+fn scan(captured: &[(Vec<u8>, Vec<u8>)]) -> Scan {
+    let rules = asura_platform::secrets::detection().ok();
+    let flagged = asura_platform::secrets::environment::scan_environment(rules, captured)
+        .into_iter()
+        .map(|(name, finding)| (String::from_utf8_lossy(&name).into_owned(), finding))
+        .collect();
+    Scan {
+        flagged,
+        unavailable: rules.is_none(),
     }
-    let text = std::str::from_utf8(raw).map_err(|_| invalid)?;
-    if text.split(':').count() > 64 {
-        return Err(invalid);
+}
+
+/// The launch report (PE-R7): the flagged names and kinds, never a value;
+/// at most 8 names, then a count. `None` with nothing flagged.
+pub(super) fn launch_report(scan: &Scan) -> Option<String> {
+    if scan.unavailable {
+        return Some(
+            "Secret detection is unavailable in this TUI: only PATH is passed to ! and !! commands."
+                .into(),
+        );
     }
-    let kept: Vec<&str> = text.split(':').filter(|e| e.starts_with('/')).collect();
-    if kept.is_empty() {
-        return Err(invalid);
+    if scan.flagged.is_empty() {
+        return None;
     }
-    Ok(kept.join(":"))
+    let mut names: Vec<String> = scan
+        .flagged
+        .iter()
+        .take(8)
+        .map(|(name, finding)| format!("{} ({})", literal(name, 64), finding.label()))
+        .collect();
+    if scan.flagged.len() > 8 {
+        names.push(format!("and {} more", scan.flagged.len() - 8));
+    }
+    Some(format!(
+        "Not passed to ! and !! commands because they may be secrets: {}. Asura never shows their values.",
+        names.join(", ")
+    ))
+}
+
+/// The names the setup thread sets itself, as the environment line shows
+/// them (PATH is a terminal variable there).
+const ASURA_NAMES: [&str; 7] = [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TERM",
+    "GIT_TERMINAL_PROMPT",
+];
+/// Names the shell sets itself: a reference to one gets no hint.
+const SHELL_NAMES: [&str; 10] = [
+    "PWD", "OLDPWD", "SHLVL", "_", "IFS", "PPID", "OPTIND", "LINENO", "RANDOM", "SECONDS",
+];
+/// Most not-passed hints on one entry.
+const MAX_HINTS: usize = 4;
+
+/// The environment line of an accepted command (PE-R8): names by source,
+/// never values.
+pub(super) fn environment_line(
+    facts: &pb::CommandEnvironment,
+    outside: bool,
+    job: Option<[u8; 16]>,
+) -> String {
+    let bits = facts.terminal_names.unwrap_or(0);
+    let named = |source: env::Source| -> Vec<&'static str> {
+        env::TERMINAL
+            .iter()
+            .filter(|t| t.source == source && bits & 1 << (t.code - 1) != 0)
+            .map(|t| t.name)
+            .collect()
+    };
+    let mut terminal = vec!["PATH"];
+    terminal.extend(named(env::Source::Base));
+    let mut parts = vec![
+        format!("Asura {}", ASURA_NAMES.join(" ")),
+        format!("terminal {}", terminal.join(" ")),
+    ];
+    let toolchain = named(env::Source::Toolchain);
+    if !toolchain.is_empty() {
+        parts.push(format!("toolchain {}", toolchain.join(" ")));
+    }
+    if !facts.project_names.is_empty() {
+        parts.push(format!("project {}", facts.project_names.join(" ")));
+    }
+    if facts.secret_command == Some(true) {
+        parts.push("secret ASURA_SECRET_COMMAND".into());
+    } else if let Some(n) = facts.secret_variables.filter(|n| *n > 0) {
+        let names: Vec<String> = (1..=n).map(|i| format!("ASURA_SECRET_{i}")).collect();
+        parts.push(format!("secret {}", names.join(" ")));
+    }
+    if outside && let Some(job) = job {
+        parts.push(format!("job ASURA_JOB_{}", worker::handle(&job)));
+    }
+    format!("env  {}", parts.join(" · "))
+}
+
+/// The `$NAME` and `${NAME}` references of a command, in order, once each.
+fn references(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut out: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let braced = bytes.get(i + 1) == Some(&b'{');
+            let start = i + 1 + usize::from(braced);
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if end > start && !bytes[start].is_ascii_digit() {
+                let name = &command[start..end];
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+            i = end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The not-passed hints of an accepted command (PE-R9): for each `$NAME`
+/// the command names that the terminal sets and the command did not
+/// receive, with the reason; at most 4, never a value.
+pub(super) fn not_passed_hints(
+    command: &str,
+    facts: &pb::CommandEnvironment,
+    launch: &Launch,
+    project: Option<[u8; 16]>,
+) -> Vec<String> {
+    let bits = facts.terminal_names.unwrap_or(0);
+    let received = |name: &str| {
+        name == "PATH"
+            || ASURA_NAMES.contains(&name)
+            || name.starts_with("ASURA_")
+            || facts.project_names.iter().any(|n| n == name)
+            || env::terminal(name.as_bytes()).is_some_and(|t| bits & 1 << (t.code - 1) != 0)
+    };
+    let mut hints = Vec::new();
+    for name in references(command) {
+        if hints.len() == MAX_HINTS {
+            break;
+        }
+        if SHELL_NAMES.contains(&name) || received(name) || !launch.sets(name) {
+            continue;
+        }
+        let reason = match launch.not_passed(name) {
+            Some(NotPassed::Flagged(finding)) => {
+                format!("it may be a secret ({})", finding.label())
+            }
+            Some(NotPassed::Invalid) => "its value is not valid for this variable".into(),
+            None => format!(
+                "it is not on the list; declare it in personCommands.environment.{}",
+                project.map_or_else(|| "<project ID>".into(), |p| worker::handle(&p))
+            ),
+        };
+        hints.push(format!("${name} was not passed: {reason}"));
+    }
+    hints
 }
 
 /// The |OSStatus| of `errSecMissingEntitlement`: the service's build is not
@@ -407,8 +651,7 @@ pub(super) fn refusal_text(refusal: pb::QueueRefusal, status: Option<u32>) -> St
     use pb::QueueRefusal as R;
     match refusal {
         R::OutsideSandboxOff => "Running outside the sandbox is turned off (personCommands.allowOutsideSandbox is false). Type it after a single ! to run it in the sandbox.".into(),
-        R::EnvironmentInvalid => "This terminal's environment cannot be passed to a command (invalid or reserved variable name).".into(),
-        R::EnvironmentTooLarge => "This terminal's environment is too large to pass to a command (at most 1,024 variables and 40 KiB).".into(),
+        R::EnvironmentInvalid => "This command's environment could not be built (a variable has an invalid value).".into(),
         R::PathInvalid => "PATH has no usable absolute entry.".into(),
         R::CwdInvalid => "The working directory cannot be used for commands.".into(),
         R::SecretStoreLocked => "The Keychain is locked until this Mac is unlocked after start-up. Unlock it, then press Enter again.".into(),
@@ -501,6 +744,10 @@ pub(super) struct LogEntry {
     pub path_check: bool,
     /// The queue dropped the entry before it ran.
     pub dropped: bool,
+    /// The environment line of the accepted command (PE-R8).
+    pub environment: Option<String>,
+    /// The not-passed hints (PE-R9).
+    pub hints: Vec<String>,
 }
 impl LogEntry {
     pub(super) fn state(&self) -> Option<pb::JobState> {
@@ -719,6 +966,13 @@ pub(super) fn entry_rows(entry: &LogEntry, text: Style) -> Vec<(String, Style)> 
             text.fg(ALERT).add_modifier(Modifier::BOLD),
         ));
     }
+    // The environment names and the not-passed hints (ENV1).
+    if let Some(line) = &entry.environment {
+        rows.push((line.clone(), muted));
+    }
+    for hint in &entry.hints {
+        rows.push((hint.clone(), text.fg(ALERT)));
+    }
     // Path warnings, between the header and the output (EPG-R5).
     for line in super::path_guard::warning_lines(&entry.path_warnings, entry.path_overflow) {
         rows.push((line, text.fg(ALERT)));
@@ -870,6 +1124,17 @@ impl App {
     fn person_mode_change(&mut self, mode: Mode) {
         self.mode = mode;
         self.history.reset_navigation();
+        // The launch report, once per session, at the first entry into a
+        // command mode after the scan ended (PE-R7).
+        if mode.command()
+            && !self.person.reported
+            && let Some(scan) = self.person.launch.scan.get()
+        {
+            self.person.reported = true;
+            if let Some(report) = launch_report(scan) {
+                self.notice = report;
+            }
+        }
     }
     /// The mode keys: `!` and Backspace at position 0 with no selection
     /// (PCR1, PCR3, PCR4, PCR20). True when the key changed the mode.
@@ -964,19 +1229,18 @@ impl App {
             return;
         };
         let mode = self.mode;
-        let environment = if mode == Mode::Command {
-            match (
-                search_path(self.person.launch.path.as_deref()),
-                self.person.launch.client_variables(),
-            ) {
-                (Ok(path), Ok(variables)) => Some((path, variables)),
-                (Err(refusal), _) | (_, Err(refusal)) => {
-                    self.notice = refusal_text(refusal, None);
-                    return;
-                }
+        // The allow-list's terminal variables, the same for both modes
+        // (ENV1, ENV2).
+        let environment = match self.person.launch.terminal() {
+            None => {
+                self.notice = CHECKING_ENVIRONMENT.into();
+                return;
             }
-        } else {
-            None
+            Some(Err(refusal)) => {
+                self.notice = refusal_text(refusal, None);
+                return;
+            }
+            Some(Ok(built)) => built,
         };
         let recall = recall_entry(mode, &text);
         // The existing outbox stages the row: its limits, restoration rule
@@ -1031,10 +1295,8 @@ impl App {
         row: &CommandRow,
     ) -> pb::ConversationQueueCommandSubmit {
         let outside = row.mode == Mode::Outside;
-        let (search_path, environment) = match &row.environment {
-            Some((path, variables)) => (Some(path.clone()), variables.clone()),
-            None => (None, Vec::new()),
-        };
+        let (search_path, environment) =
+            (Some(row.environment.0.clone()), row.environment.1.clone());
         pb::ConversationQueueCommandSubmit {
             request_id: Some(item.request_id.to_vec()),
             project_id: Some(item.project.to_vec()),
@@ -1046,11 +1308,6 @@ impl App {
             search_path,
             environment,
             outside_sandbox: outside.then_some(true),
-            launch_environment: if outside {
-                self.person.launch.launch_variables()
-            } else {
-                Vec::new()
-            },
         }
     }
     /// A typed refusal: the row's text returns to the editor in its mode
@@ -1091,15 +1348,19 @@ impl App {
     /// job, derived from the input ID, and shows the command as the service
     /// stored it (`stored`, the accepted entry's text): a secret in the typed
     /// text is then shown only as its placeholder (PCR19).
+    /// `facts` are the reply's environment facts: the entry shows the
+    /// environment line and the not-passed hints (ENV1).
     pub(super) fn command_accepted(
         &mut self,
         request: [u8; 16],
         input: &[u8],
         stored: Option<&str>,
+        facts: Option<&pb::CommandEnvironment>,
     ) {
         let Ok(input) = <[u8; 16]>::try_from(input) else {
             return;
         };
+        let launch = self.person.launch.clone();
         if let Some(entry) = self
             .person
             .log
@@ -1109,6 +1370,12 @@ impl App {
             entry.request_id = None;
             entry.input = Some(input);
             entry.job = Some(job_of(input));
+            // Hints use the command as typed: a secret in it is rewritten,
+            // but `$NAME` references stay.
+            if let (Some(facts), Some(typed)) = (facts, entry.command.as_deref()) {
+                entry.environment = Some(environment_line(facts, entry.outside, entry.job));
+                entry.hints = not_passed_hints(typed, facts, &launch, entry.project);
+            }
             if let Some(text) = stored.filter(|t| !t.is_empty()) {
                 entry.command = Some(text.to_owned());
             }
@@ -1650,8 +1917,8 @@ pub(super) struct CommandRow {
     pub request_id: [u8; 16],
     pub mode: Mode,
     pub cwd: String,
-    /// `!` only: the sanitized PATH and the PC3 client variables.
-    pub environment: Option<(String, Vec<pb::PersonEnvironment>)>,
+    /// The sanitized PATH and the terminal variables (both modes, ENV1).
+    pub environment: (String, Vec<pb::PersonEnvironment>),
 }
 
 /// Person command state beside the App's other views.
@@ -1675,6 +1942,8 @@ pub(super) struct Person {
     pub deferred: Option<JobCommand>,
     /// `/paths` and the held entries' decisions (execution-path-guard.md).
     pub paths: super::path_guard::Paths,
+    /// The launch report was shown (PE-R7).
+    pub reported: bool,
 }
 
 #[cfg(test)]
@@ -1686,17 +1955,23 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
     const PROJECT: [u8; 16] = [1; 16];
+    /// A scanned fixture environment: one flagged variable, never a real
+    /// token (the scan result is given, not computed).
     fn launch() -> Launch {
-        Launch {
-            path: Some(b"/usr/bin::relative:/bin".to_vec()),
-            environment: vec![
+        Launch::scanned(
+            Some(b"/usr/bin::relative:/bin".to_vec()),
+            vec![
                 (b"PATH".to_vec(), b"/usr/bin::relative:/bin".to_vec()),
                 (b"LANG".to_vec(), b"en_US.UTF-8".to_vec()),
                 (b"HOME".to_vec(), b"/Users/fixture".to_vec()),
                 (b"TMPDIR".to_vec(), b"/tmp/fixture".to_vec()),
                 (b"GITHUB_TOKEN".to_vec(), b"fixture".to_vec()),
             ],
-        }
+            vec![(
+                "GITHUB_TOKEN".into(),
+                Finding::Rule(asura_platform::secrets::SecretKind::GithubToken),
+            )],
+        )
     }
     fn app() -> App {
         let mut app = App::new();
@@ -1965,9 +2240,7 @@ mod tests {
             ["LANG"]
         );
         assert_eq!(request.outside_sandbox, None);
-        assert!(request.launch_environment.is_empty());
         assert_eq!(request.conversation_id, Some(vec![2; 16]));
-        assert_eq!(asura_control::person::environment_refusal(&request), None);
         assert!(asura_control::person::submit_shape(&request));
     }
     #[test]
@@ -2200,33 +2473,8 @@ mod tests {
     }
     #[test]
     fn pc_u19_path_drops_empty_and_relative_entries_and_rejects_bad_forms() {
-        assert_eq!(search_path(Some(b"/a::b:./c:/d")), Ok("/a:/d".into()));
-        assert_eq!(
-            search_path(Some(b"/a\0:/b")),
-            Err(pb::QueueRefusal::PathInvalid)
-        );
-        let long = format!("/{}", "a".repeat(4096));
-        assert_eq!(
-            search_path(Some(long.as_bytes())),
-            Err(pb::QueueRefusal::PathInvalid)
-        );
-        let many = vec!["/x"; 65].join(":");
-        assert_eq!(
-            search_path(Some(many.as_bytes())),
-            Err(pb::QueueRefusal::PathInvalid)
-        );
-        let enough = vec!["/x"; 64].join(":");
-        assert_eq!(search_path(Some(enough.as_bytes())), Ok(enough.clone()));
-        assert_eq!(
-            search_path(Some(b"::rel")),
-            Err(pb::QueueRefusal::PathInvalid)
-        );
-        assert_eq!(search_path(None), Err(pb::QueueRefusal::PathInvalid));
-        assert_eq!(
-            search_path(Some(b"/a:\xff")),
-            Err(pb::QueueRefusal::PathInvalid)
-        );
-        // A PATH without a usable entry refuses locally; draft and mode stay.
+        // The sanitizer is the allow-list owner's (PE-U2); a PATH without a
+        // usable entry refuses locally; draft and mode stay.
         let mut app = app();
         app.person.launch.path = Some(b"bin:".to_vec());
         press(&mut app, KeyCode::Char('!'));
@@ -2239,12 +2487,15 @@ mod tests {
             (Mode::Command, "ls")
         );
     }
+    /// PE-U3 (TUI part): both modes send the same terminal variables: listed
+    /// names with class-valid values; never unlisted, Asura-set, invalid or
+    /// flagged ones.
     #[test]
-    fn pc_u29_client_environment_sends_only_listed_names() {
-        let request = |launch: Launch| {
+    fn pe_u3_terminal_variables_for_both_modes() {
+        let request = |launch: Launch, mode: &str| {
             let mut app = app();
             app.person.launch = launch;
-            press(&mut app, KeyCode::Char('!'));
+            typed(&mut app, mode);
             typed(&mut app, "ls");
             press(&mut app, KeyCode::Enter);
             staged_command(&mut app)
@@ -2254,40 +2505,112 @@ mod tests {
             (b"USER".to_vec(), b"fixture".to_vec()),
             (b"ASURA_SECRET_1".to_vec(), b"x".to_vec()),
             (b"SSH_AUTH_SOCK".to_vec(), b"/tmp/agent.sock".to_vec()),
+            (b"CARGO_HOME".to_vec(), b"/Users/fixture/.cargo".to_vec()),
+            (b"TZ".to_vec(), b"bad value".to_vec()),
+            (b"UNLISTED".to_vec(), b"x".to_vec()),
         ]);
-        let sent = request(fixture.clone());
-        let names: Vec<_> = sent
-            .environment
-            .iter()
-            .map(|e| e.name.clone().unwrap())
-            .collect();
-        // Service-sourced names (HOME, TMPDIR, USER, ASURA_SECRET_n) and
-        // unlisted names never come from the client.
-        assert_eq!(names, ["LANG", "SSH_AUTH_SOCK"]);
-        assert_eq!(asura_control::person::environment_refusal(&sent), None);
-        for (name, value) in [
-            ("LANG", "en US".to_owned()),
-            ("SSH_AUTH_SOCK", "tmp/agent.sock".into()),
-            ("SSH_AUTH_SOCK", format!("/{}", "s".repeat(103))),
-        ] {
-            let mut bad = fixture.clone();
-            bad.environment
-                .retain(|(n, _)| n.as_slice() != name.as_bytes());
-            bad.environment
-                .push((name.as_bytes().to_vec(), value.into_bytes()));
-            assert_eq!(
-                asura_control::person::environment_refusal(&request(bad)),
-                Some(pb::QueueRefusal::EnvironmentInvalid),
-                "{name}"
-            );
+        for mode in ["!", "!!"] {
+            let sent = request(fixture.clone(), mode);
+            let names: Vec<_> = sent
+                .environment
+                .iter()
+                .map(|e| e.name.clone().unwrap())
+                .collect();
+            assert_eq!(names, ["LANG", "SSH_AUTH_SOCK", "CARGO_HOME"], "{mode}");
+            assert_eq!(sent.search_path.as_deref(), Some("/usr/bin:/bin"));
+            assert!(asura_control::person::submit_shape(&sent));
         }
+        // A non-UTF-8 LANG is not sent.
         let mut binary = fixture;
         binary.environment.retain(|(n, _)| n.as_slice() != b"LANG");
         binary.environment.push((b"LANG".to_vec(), vec![0xff]));
-        assert_eq!(
-            binary.client_variables(),
-            Err(pb::QueueRefusal::EnvironmentInvalid)
+        let sent = request(binary, "!");
+        assert!(
+            !sent
+                .environment
+                .iter()
+                .any(|e| e.name.as_deref() == Some("LANG"))
         );
+    }
+    /// Enter before the launch scan ended keeps the draft (failure handling).
+    #[test]
+    fn enter_waits_for_the_launch_scan() {
+        let mut app = app();
+        app.person.launch.scan = Arc::new(OnceLock::new());
+        press(&mut app, KeyCode::Char('!'));
+        typed(&mut app, "ls");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.local_outbox.is_empty());
+        assert_eq!(app.notice, CHECKING_ENVIRONMENT);
+        assert_eq!(app.editor.text(), "ls");
+    }
+    /// PE-U13: the launch report once, the environment line by source and
+    /// the not-passed hints, never a value.
+    #[test]
+    fn pe_u13_report_environment_line_and_hints() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('!'));
+        assert_eq!(
+            app.notice,
+            "Not passed to ! and !! commands because they may be secrets: GITHUB_TOKEN (github-token). Asura never shows their values."
+        );
+        assert!(!app.notice.contains("fixture"));
+        // Once per session.
+        press(&mut app, KeyCode::Backspace);
+        app.notice.clear();
+        press(&mut app, KeyCode::Char('!'));
+        assert!(app.notice.is_empty());
+        // The accepted reply's facts.
+        let mut launch = launch();
+        launch.environment.extend([
+            (b"JAVA_OPTS".to_vec(), b"-Xmx1g".to_vec()),
+            (b"TZ".to_vec(), b"bad value".to_vec()),
+            (b"A1".to_vec(), b"1".to_vec()),
+            (b"A2".to_vec(), b"1".to_vec()),
+            (b"A3".to_vec(), b"1".to_vec()),
+        ]);
+        let facts = pb::CommandEnvironment {
+            terminal_names: Some(1 | 1 << 14),
+            project_names: vec!["RUST_LOG".into()],
+            secret_variables: Some(1),
+            secret_command: None,
+        };
+        let line = environment_line(&facts, true, Some([0xab; 16]));
+        assert_eq!(
+            line,
+            format!(
+                "env  Asura HOME USER LOGNAME SHELL TMPDIR TERM GIT_TERMINAL_PROMPT · terminal PATH LANG · toolchain CARGO_HOME · project RUST_LOG · secret ASURA_SECRET_1 · job ASURA_JOB_{}",
+                "ab".repeat(16)
+            )
+        );
+        let command =
+            "echo $PWD $GITHUB_TOKEN ${JAVA_OPTS} $TZ $LANG $RUST_LOG $NOT_SET $A1 $A2 $A3";
+        let hints = not_passed_hints(command, &facts, &launch, Some([1; 16]));
+        assert_eq!(
+            hints,
+            [
+                "$GITHUB_TOKEN was not passed: it may be a secret (github-token)".to_owned(),
+                format!(
+                    "$JAVA_OPTS was not passed: it is not on the list; declare it in personCommands.environment.{}",
+                    "01".repeat(16)
+                ),
+                "$TZ was not passed: its value is not valid for this variable".to_owned(),
+                format!(
+                    "$A1 was not passed: it is not on the list; declare it in personCommands.environment.{}",
+                    "01".repeat(16)
+                ),
+            ]
+        );
+        for hint in &hints {
+            assert!(!hint.contains("fixture") && !hint.contains("Xmx1g"));
+        }
+        // An entry shows the line and the hints under its header.
+        let mut entry = running(3, false);
+        entry.environment = Some(line);
+        entry.hints = hints;
+        let rows = entry_rows(&entry, Style::default());
+        assert!(rows[1].0.starts_with("env  Asura"));
+        assert!(rows[2].0.starts_with("$GITHUB_TOKEN was not passed"));
     }
     fn starts(text: &str) -> Vec<&str> {
         let split = split(text);
@@ -2532,9 +2855,10 @@ mod tests {
         assert!(all.contains(">> Pending local · !! brew upgrade"));
         let request = staged_command(&mut app);
         assert_eq!(request.outside_sandbox, Some(true));
-        assert!(request.search_path.is_none() && request.environment.is_empty());
-        assert_eq!(request.launch_environment.len(), launch().environment.len());
-        assert_eq!(asura_control::person::environment_refusal(&request), None);
+        // ENV2: the same allow-list environment as `!`.
+        assert_eq!(request.search_path.as_deref(), Some("/usr/bin:/bin"));
+        assert_eq!(request.environment.len(), 1);
+        assert!(asura_control::person::submit_shape(&request));
         // Settled: the stripe and the warning stay.
         let mut settled = running(5, true);
         let job = settled.entry.as_mut().unwrap();
@@ -2770,11 +3094,7 @@ mod tests {
         use pb::QueueRefusal as R;
         assert_eq!(
             refusal_text(R::EnvironmentInvalid, None),
-            "This terminal's environment cannot be passed to a command (invalid or reserved variable name)."
-        );
-        assert_eq!(
-            refusal_text(R::EnvironmentTooLarge, None),
-            "This terminal's environment is too large to pass to a command (at most 1,024 variables and 40 KiB)."
+            "This command's environment could not be built (a variable has an invalid value)."
         );
         assert_eq!(
             refusal_text(R::CwdInvalid, None),
@@ -2802,7 +3122,8 @@ mod tests {
             refusal_text(R::SecretStoreFull, None),
             "The Keychain holds the most Asura items (256); wait for queued commands to finish."
         );
-        for code in 1..=rules::MAX_REFUSAL {
+        // Value 3 is reserved since ENV1.
+        for code in (1..=rules::MAX_REFUSAL).filter(|c| *c != 3) {
             let refusal = R::try_from(code).unwrap();
             assert!(!refusal_text(refusal, Some(1)).is_empty());
         }

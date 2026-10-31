@@ -53,19 +53,23 @@ impl Job {
 /// A person job's setup for the harness: the service-side
 /// [`PersonLaunch`] in a public test form.
 pub enum Person {
-    /// `person-1`: the sanitized PATH and the PC3 client variables.
+    /// `person-1`: the sanitized PATH and the terminal and declared
+    /// variables.
     Sandboxed {
         path: Vec<u8>,
         client: Vec<(Vec<u8>, Vec<u8>)>,
     },
-    /// `person-outside-1`: the launch environment.
-    Outside { launch: Vec<(Vec<u8>, Vec<u8>)> },
+    /// `person-outside-1`: the same environment (ENV2).
+    Outside {
+        path: Vec<u8>,
+        client: Vec<(Vec<u8>, Vec<u8>)>,
+    },
 }
 impl Person {
     fn launch(self) -> PersonLaunch {
         match self {
             Self::Sandboxed { path, client } => PersonLaunch::Sandboxed { path, client },
-            Self::Outside { launch } => PersonLaunch::Outside { launch },
+            Self::Outside { path, client } => PersonLaunch::Outside { path, client },
         }
     }
 }

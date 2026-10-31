@@ -838,13 +838,23 @@ fn person_home() -> (Home, std::path::PathBuf) {
     .unwrap();
     let marks = home.path.join("marks");
     std::fs::create_dir(&marks).unwrap();
+    // The fixture account (ENV2: `!!` resolves it as `!` does), so no test
+    // resolves the account's real home or temporary directory.
+    std::fs::write(
+        home.path.join("exec-cmd-person-account"),
+        format!("{0}\n{0}\n", home.path.display()),
+    )
+    .unwrap();
     (home, marks)
 }
+/// A `!!` launch: the allow-list environment with one terminal and one
+/// declared variable (ENV1, ENV2).
 fn launch_outside() -> PersonLaunch {
     PersonLaunch::Outside {
-        launch: vec![
-            (b"PATH".to_vec(), b"/usr/bin:/bin".to_vec()),
-            (b"FIXTURE_TOKEN".to_vec(), b"launch-value".to_vec()),
+        path: b"/usr/bin:/bin".to_vec(),
+        client: vec![
+            (b"LANG".to_vec(), b"C".to_vec()),
+            (b"FIXTURE_DECLARED".to_vec(), b"declared-value".to_vec()),
         ],
     }
 }
@@ -978,7 +988,8 @@ fn person_setup_failures_map_to_not_started_reasons() {
         SlotEvent::SetupFailed(JobReason::SandboxUnavailable)
     ));
     let bad = PersonLaunch::Outside {
-        launch: vec![(b"BAD=NAME".to_vec(), b"x".to_vec())],
+        path: b"/usr/bin:/bin".to_vec(),
+        client: vec![(b"BAD=NAME".to_vec(), b"x".to_vec())],
     };
     worker
         .start_job_with(
@@ -1039,7 +1050,7 @@ fn person_start_sends_the_frame_and_root_descriptors() {
     let frame = wait_file(&marks.join("frame"));
     assert_eq!(
         frame,
-        "length ok\nprofile person-1\nroles 1 2\nroots dir dir\nPATH\nHOME\nTMPDIR\nUSER\nLOGNAME\nTERM\nGIT_TERMINAL_PROMPT\nLANG\n"
+        "length ok\nprofile person-1\nroles 1 2\nroots dir dir\nPATH\nHOME\nUSER\nLOGNAME\nSHELL\nTMPDIR\nTERM\nGIT_TERMINAL_PROMPT\nLANG\n"
     );
     let outcome = capture_outcome(events.get_mut(3));
     assert_eq!(outcome.state, CaptureState::Complete);
@@ -1056,7 +1067,7 @@ fn person_start_sends_the_frame_and_root_descriptors() {
     assert_port_order(&events);
     assert_eq!(
         wait_file(&marks.join("frame")),
-        "length ok\nprofile person-outside-1\nroles \nroots \nPATH\nFIXTURE_TOKEN\n"
+        "length ok\nprofile person-outside-1\nroles \nroots \nPATH\nHOME\nUSER\nLOGNAME\nSHELL\nTMPDIR\nTERM\nGIT_TERMINAL_PROMPT\nLANG\nFIXTURE_DECLARED\n"
     );
     capture_outcome(events.get_mut(3))
         .capture

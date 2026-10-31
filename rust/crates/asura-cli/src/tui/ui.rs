@@ -892,7 +892,12 @@ impl App {
                 let row = self.local_outbox.remove(index);
                 self.notice = queue_input_notice(entry);
                 if let Some(input) = entry.input_id.as_deref().filter(|_| command) {
-                    self.command_accepted(row.request_id, input, entry.text.as_deref());
+                    self.command_accepted(
+                        row.request_id,
+                        input,
+                        entry.text.as_deref(),
+                        reply.command_environment.as_ref(),
+                    );
                     self.person.rows.retain(|r| r.request_id != row.request_id);
                 }
                 // Ctrl+S: promote the accepted row only while its exact
@@ -4270,7 +4275,7 @@ mod tests {
         use asura_control::pb::QueueRefusal;
         for refusal in [
             QueueRefusal::OutsideSandboxOff,
-            QueueRefusal::EnvironmentTooLarge,
+            QueueRefusal::EnvironmentInvalid,
             QueueRefusal::SecretStoreLocked,
         ] {
             let text = person::refusal_text(refusal, None);
@@ -6024,6 +6029,7 @@ mod tests {
             outcome: Ok(asura_control::pb::ConversationQueueReply {
                 refusal: None,
                 refusal_status: None,
+                command_environment: None,
                 entries: vec![asura_control::pb::ConversationQueueEntry {
                     input_id: Some(input_id.clone()),
                     project_id: sent.project_id.clone(),

@@ -14,9 +14,8 @@ use asura_platform::keychain::{
     Added, ItemKey, Keychain, LIST_BOUND, MAX_ITEM_BYTES, Target, scratch, service_name,
 };
 use asura_service::secret_store::{
-    Call, DeleteReply, EnvironmentEntry, Gate, GetReply, MAX_ENVIRONMENT_BYTES,
-    MAX_ENVIRONMENT_ENTRIES, Polled, PutReply, QUEUE_BOUND, Refused, SecretValue, Secrets, Store,
-    StoreFailure, SweepReport,
+    Call, DeleteReply, Gate, GetReply, Polled, PutReply, QUEUE_BOUND, Refused, SecretValue,
+    Secrets, Store, StoreFailure, SweepReport,
 };
 use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
@@ -174,7 +173,7 @@ fn bytes(len: usize, seed: u8) -> Zeroizing<Vec<u8>> {
     )
 }
 
-/// Values whose payload is exactly 55,413 bytes.
+/// Values whose payload is exactly 8,307 bytes.
 fn largest() -> Secrets {
     Secrets {
         variables: (1..=16)
@@ -184,14 +183,6 @@ fn largest() -> Secrets {
             })
             .collect(),
         whole_command: None,
-        launch_environment: Some(
-            (0..MAX_ENVIRONMENT_ENTRIES)
-                .map(|i| EnvironmentEntry {
-                    name: bytes(8, 0x41),
-                    value: bytes(MAX_ENVIRONMENT_BYTES / MAX_ENVIRONMENT_ENTRIES - 8, i as u8),
-                })
-                .collect(),
-        ),
     }
 }
 
@@ -259,11 +250,10 @@ fn ss_w1_largest_payload_round_trip() {
 /// SS-W1 payload size check: the values above encode to the item bound.
 #[test]
 fn largest_values_fill_the_item_bound() {
-    // 1 version + 32 binding + 1 flags + 8,241 variables + 47,106 launch
-    // environment + 32 key.
+    // 1 version + 32 binding + 1 flags + 8,241 variables + 32 key (ENV1
+    // removed the launch environment).
     let variables = 1 + 16 * 3 + 16 * 512;
-    let environment = 2 + MAX_ENVIRONMENT_ENTRIES * 6 + MAX_ENVIRONMENT_BYTES;
-    assert_eq!(1 + 32 + 1 + variables + environment + 32, MAX_ITEM_BYTES);
+    assert_eq!(1 + 32 + 1 + variables + 32, MAX_ITEM_BYTES);
 }
 
 /// SS-W2: a locked keychain gives `locked` for get and put; list and delete

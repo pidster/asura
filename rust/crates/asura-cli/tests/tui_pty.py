@@ -1984,9 +1984,12 @@ def exec_cmd_capture(fixture, source):
         offset = len(trial.output)
         trial.send(b"Digest the fixture token.\r")
         trial.until(b"DIGEST-DONE", offset, plain=True, limit=60, reject="Incomplete response")
-        assert any(digest in m for m in tool_messages), [m[:400] for m in tool_messages[-2:]]
-        assert any("command filtered: run from a secret variable" in m for m in tool_messages)
-        assert all(third not in m for m in tool_messages)
+        # ENV4: the job received the whole-command variable, so the model's
+        # delivery and `job read` are private; the digest is not shown to it.
+        assert "private: this command received a secret value" in tool_messages[-2], tool_messages[-2:]
+        assert "private: this job received a secret value" in tool_messages[-1], tool_messages[-2:]
+        assert all(digest not in m and third not in m for m in tool_messages)
+        handle = re.search(r"^job: ([0-9a-f]{32})$", tool_messages[-2], re.M).group(1)
         trial.send(b"\x1b[17~\r")  # F6 response history; Enter expands the latest activity.
         trial.until("▾ Activity".encode(), offset, plain=True)
         trial.until(b"printf %s '$ASURA_SECRET_1' | shasum -a 256", offset, plain=True)
@@ -1994,6 +1997,13 @@ def exec_cmd_capture(fixture, source):
         assert third not in trial.screen.text(), "raw secret on screen"
         trial.send(b"\x1b")
         trial.idle(0.1)
+        # The person sees the printed digest in the job viewer: the real
+        # value ran.
+        offset = len(trial.output)
+        trial.send(f"/job {handle}\r".encode())
+        trial.until(digest.encode(), offset, plain=True, limit=30)
+        trial.send(b"\x1b")
+        trial.idle(0.2)
         # J1T-21: a stalled capture only backpressures; typing stays responsive.
         gate = home / "capture-hold-scan"
         gate.write_bytes(b"")
@@ -2243,7 +2253,15 @@ def tool_call_records(fixture, source):
         trial.idle(0.2)
         screen = trial.screen.text()
         assert secret not in screen, "raw secret on screen"
-        assert any("GITHUB_TOKEN=$ASURA_SECRET_1" in m for m in tool_messages), tool_messages
+        # ENV4: the job received a secret variable, so the model's delivery
+        # and its `job read` are private.
+        assert "private: this command received a secret value" in tool_messages[-2], tool_messages[-2:]
+        assert "private: this job received a secret value" in tool_messages[-1], tool_messages[-2:]
+        # The delivery does not wait for the job: wait for its file.
+        end = time.monotonic() + 30
+        while not (project / "out.txt").exists() or not (project / "out.txt").read_text():
+            assert time.monotonic() < end, "E02 command did not write out.txt"
+            trial.read(0.05)
         assert (project / "out.txt").read_text() == secret, "the rewritten command used the value"
         (project / "out.txt").unlink()
         assert all(secret not in m for m in tool_messages)
@@ -3953,18 +3971,19 @@ class PersonHarness(JobsHarness):
     loopback model, in a scratch home whose test-support seams name
 
     - `secret-store-keychain`: a scratch keychain created under the fixture
-      root with `security create-keychain` (never the login keychain; the
-      search list and the default keychain are never changed, and the
-      harness checks the search list is unchanged at close);
-    - `exec-cmd-person-account`: the `!` command's account home and
-      `$TMPDIR` are fixture directories.
+      root through the Security framework by the fixture binary's
+      `--create-scratch-keychain` (never the login keychain; the search
+      list and the default keychain are never changed, and the harness
+      checks the search list is unchanged at close). No journey runs a
+      `security` command except the read-only `list-keychains -d user`;
+    - `exec-cmd-person-account`: a `!` or `!!` command's account home and
+      `$TMPDIR` are fixture directories (ENV2: both modes resolve them).
 
     The CLI, the TUI and every service it launches get a scratch
-    environment: HOME and TMPDIR are the fixture account directories, so a
-    `!!` command's launch environment names no real directory of the person.
+    environment: HOME and TMPDIR are the fixture account directories.
     """
 
-    def __init__(self, fixture, source, api_keychain=False):
+    def __init__(self, fixture, source):
         super().__init__(fixture, source)
         try:
             root = fixture.root
@@ -3978,16 +3997,11 @@ class PersonHarness(JobsHarness):
                 directory.mkdir(mode=0o700)
             self.keychain = root / "scratch.keychain"
             password = os.urandom(16).hex()
-            if api_keychain:
-                # The fixture binary creates it through the Security
-                # framework, with no `security` command (--context-views).
-                code, out, err = fixture.command("--create-scratch-keychain", str(self.keychain), password)
-                assert code == 0 and out == b"created\n", (code, out, err)
-            else:
-                created = subprocess.run(
-                    ["/usr/bin/security", "create-keychain", "-p", password, str(self.keychain)],
-                    stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
-                assert created.returncode == 0, created
+            self.password = password
+            # The fixture binary creates it through the Security framework,
+            # with no `security` command.
+            code, out, err = fixture.command("--create-scratch-keychain", str(self.keychain), password)
+            assert code == 0 and out == b"created\n", (code, out, err)
             assert self.keychain.is_file(), sorted(p.name for p in root.iterdir())
             assert keychain_search_list() == self.search_list, "create-keychain changed the search list"
             write_private(home / "secret-store-keychain", f"{self.keychain}\n{password}\n")
@@ -4005,6 +4019,13 @@ class PersonHarness(JobsHarness):
         except BaseException:
             JobsHarness.close(self)
             raise
+
+    def keychain_action(self, action):
+        """Locks, unlocks or lists the scratch keychain through the fixture
+        binary (Security framework; no `security` command). Returns stdout."""
+        code, out, err = self.fixture.command(action, str(self.keychain), self.password)
+        assert code == 0, (action, code, out, err)
+        return out
 
     def close(self):
         try:
@@ -4035,6 +4056,20 @@ class PersonHarness(JobsHarness):
         command-mode Enter without it keeps the draft with a notice."""
         trial.until(b"Connected (", plain=True, limit=10)
 
+    def enter(self, trial, limit=30):
+        """Presses Enter on a command draft. Before the TUI's launch scan of
+        its own environment ends, Enter keeps the draft with "Checking this
+        terminal's environment; press Enter again" (person-command-
+        environment.md, failure handling): press it again until the draft
+        leaves the box."""
+        end = time.monotonic() + remaining(limit)
+        while True:
+            trial.send(b"\r")
+            trial.idle(0.2)
+            if "Checking this terminal" not in trial.screen.text():
+                return
+            assert time.monotonic() < end, "the launch scan did not end"
+
     def run(self, trial, text, mode="!", expect=None, limit=30):
         """Types a command in `!` or `!!` mode and presses Enter; waits for
         the accepted notice, or `expect`."""
@@ -4042,10 +4077,25 @@ class PersonHarness(JobsHarness):
         trial.send(mode.encode())
         trial.send(text.encode())
         trial.idle(0.1)
-        trial.send(b"\r")
-        trial.until((expect or "Command ").encode(), offset, plain=True, limit=limit,
-                    reject="Commands are not enabled")
-        return offset
+        # The renderer redraws changed cells only, so a hint or notice equal
+        # in part to what the screen held is not contiguous in the output:
+        # also check the screen, typed and after Enter.
+        typed = trial.screen.text()
+        self.enter(trial)
+        if expect is not None and expect in typed:
+            return offset
+        header = f"{mode} {text}"[:30]
+        end = time.monotonic() + remaining(limit)
+        while True:
+            assert "Commands are not enabled" not in bytes(trial.output[offset:]).decode("utf-8", "replace")
+            screen = trial.screen.text()
+            if expect is not None:
+                if expect.encode() in bytes(trial.output[offset:]) or expect in screen:
+                    return offset
+            elif "Command " in screen or any(row.strip().startswith(header) for row in screen.splitlines()):
+                return offset
+            assert time.monotonic() < end, ("command not accepted", expect, screen)
+            trial.read(0.025)
 
     def footer(self, trial, header, prefix="↳ exit 0", limit=30):
         """Waits until the newest log entry whose stripe starts with `header`
@@ -4115,7 +4165,8 @@ def person_commands_journey(fixture, source):
         trial.send(b"!")
         trial.until("↵ run in src/ui".encode(), offset, plain=True, limit=10)
         assert AMBER_BOX in trial.output[offset:], "amber command box"
-        trial.send(b"pwd\r")
+        trial.send(b"pwd")
+        harness.enter(trial)
         trial.until(b"! pwd", offset, plain=True, limit=10, reject="Commands are not enabled")
         line = harness.footer(trial, "! pwd")
         assert "src/ui" in line, line
@@ -4212,11 +4263,19 @@ def person_outside_journey(fixture, source):
     Backspace at position 0 returns to `!`; the same command is refused by
     the sandbox), PC-E15 (allowOutsideSandbox false: the refusal names the
     key; draft and outside mode kept), PC-E3 and PC-E16 (Ctrl-C stops, a
-    second Ctrl-C kills, the TUI keeps running, for `!` and `!!`) and PC-E11
+    second Ctrl-C kills, the TUI keeps running, for `!` and `!!`), PC-E11
     (a 50 MB flood: the fold shows the newest lines while running; typing
-    stays responsive). Runnable after P3-E and P4."""
+    stays responsive), PE-E1 (person-command-environment.md: the launch
+    report names a synthetic token variable and its kind, never its value;
+    the env line lists names by source; an unlisted variable gets the
+    not-listed hint) and PE-E2 (a declared project variable reaches `!` and
+    `!!`; `!!` adds only the job marker). Runnable after P3-E and P4."""
     harness = PersonHarness(fixture, source)
     project = harness.project("outsider")
+    # PE-E1: a synthetic GitHub-form token in the TUI's own environment.
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    env_token = "ghp_" + "".join(alphabet[b % 62] for b in os.urandom(36))
+    fixture.env["PE_FIXTURE_TOKEN"] = env_token
     trial = None
     try:
         fixture.start()
@@ -4225,7 +4284,16 @@ def person_outside_journey(fixture, source):
         trial = fixture.launch()
         trial.resize(120, 40)
         harness.select(trial, project)
-        harness.run(trial, "pwd", expect="↵ run in Outsider")
+        # PE-E1: the launch report at the first command mode entry.
+        offset = len(trial.output)
+        trial.send(b"!")
+        notice_until(trial, "Not passed to ! and !! commands because they may be secrets: "
+                     "PE_FIXTURE_TOKEN (github-token). Asura never shows their values.", offset, limit=20)
+        trial.send(b"\x7f")
+        trial.idle(0.2)
+        # The footer hint was drawn at the report: only its changed cells
+        # are redrawn.
+        harness.run(trial, "pwd", expect="run in Outsider")
         line = harness.footer(trial, "! pwd")
         assert "Outsider" in line, line
         rows = [row.strip() for row in trial.screen.text().splitlines()]
@@ -4357,9 +4425,49 @@ def person_outside_journey(fixture, source):
         assert "Broken pipe" not in trial.screen.text(), trial.screen.text()
         trial.send(b"\x7f" * len("responsive"))
         trial.idle(0.2)
+
+        # PE-E1: the env line and the not-listed hint, never a value.
+        harness.run(trial, 'echo "[$OUTSIDE_FIXTURE]"')
+        header = '! echo "[$OUTSIDE_FIXTURE]"'
+        harness.footer(trial, header)
+        rows = entry_rows(trial, header, "$OUTSIDE_FIXTURE was not passed")
+        joined = " ".join(rows)
+        assert "env  Asura HOME USER LOGNAME SHELL TMPDIR TERM GIT_TERMINAL_PROMPT" in joined, rows
+        assert "terminal PATH LANG" in joined, rows
+        assert "[]" in rows, rows
+        hint = re.search(r"personCommands\.environment\.([0-9a-f]{32})", joined)
+        assert hint, rows
+        project_id = hint.group(1)
+        assert env_token.encode() not in bytes(trial.output), "the token reached the TUI"
+
+        # PE-E2: a declared variable reaches both modes; `!!` adds the job
+        # marker only.
+        key = f"personCommands.environment.{project_id}"
+        harness.command(trial, f"/config set {key} {{PE_DECLARED: declared}}", f"Saved {key}")
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        names = ("env | sed 's/=.*//' | grep -E "
+                 "'^(PE_DECLARED|ASURA_JOB_[0-9a-f]+|OUTSIDE_FIXTURE|PE_FIXTURE_TOKEN|HOME|SHELL)$' | sort"
+                 " | sed 's/^/out:/'")
+        for mode in ("!", "!!"):
+            harness.run(trial, names, mode=mode)
+            header = f"{mode} env | sed"
+            harness.footer(trial, header)
+            rows = entry_rows(trial, header, "out:PE_DECLARED")
+            joined = " ".join(rows)
+            assert "project PE_DECLARED" in joined, rows
+            # The env line wraps: the output rows carry the `out:` prefix.
+            output = [r[len("out:"):] for r in rows if r.startswith("out:")]
+            assert "OUTSIDE_FIXTURE" not in output and "PE_FIXTURE_TOKEN" not in output, rows
+            assert "HOME" in output and "SHELL" in output, rows
+            markers = [r for r in output if r.startswith("ASURA_JOB_")]
+            assert len(markers) == (1 if mode == "!!" else 0), rows
         quit_tui(trial)
         trial = None
         fixture.stop()
+        print("PASS PE-E1/E2 TUI: the launch report names the flagged variable and kind only; the env "
+              "line lists names by source; an unlisted variable gets its hint; a declared variable "
+              "reaches ! and !!, and !! adds only the job marker")
         print("PASS PC-E2/E3/E11/E13/E14/E15/E16 TUI: !pwd outside the project runs at its root; "
               "!! box, stripe and warning, file made; Backspace to ! and the sandbox refuses; the "
               "allowOutsideSandbox refusal keeps the draft; Ctrl-C stops and a second kills for ! "
@@ -4675,13 +4783,12 @@ def person_restart_journey(fixture, source):
         harness.close()
 
 
-def keychain_items(path):
-    """The service names of the generic items in the scratch keychain at
-    `path` (read-only; attributes only, never secret data)."""
-    result = subprocess.run(["/usr/bin/security", "dump-keychain", str(path)],
-                            stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
-    assert result.returncode == 0, result
-    return re.findall(rb'"svce"<blob>="([^"]*)"', result.stdout)
+def keychain_items(harness):
+    """The service names of the generic items in the harness's scratch
+    keychain (attributes only, never secret data), read by the fixture
+    binary through the Security framework."""
+    out = harness.keychain_action("--scratch-keychain-services")
+    return [line for line in out.splitlines() if line]
 
 
 def context_views_journey(fixture, source):
@@ -4694,10 +4801,13 @@ def context_views_journey(fixture, source):
     output; the next turn's notice entry, labelled as the person's command,
     carries a view. CC-E7: a `!` command with a stored secret variable; the
     person sees its output in the log fold; the model's notice entry and
-    its `job read` are private; no model request holds the output. The
-    scratch keychain is created through the fixture binary, so no
-    `security` command runs."""
-    harness = PersonHarness(fixture, source, api_keychain=True)
+    its `job read` are private; no model request holds the output. CC-E8
+    (ENV4): a model `exec_cmd` with a synthetic token in its command; its
+    handle delivery and a later `job read` are private; the person sees the
+    output in the job viewer; no model request holds the token, its digest,
+    the canary or the exit status. The scratch keychain is created through
+    the fixture binary, so no `security` command runs."""
+    harness = PersonHarness(fixture, source)
     harness.context = 1048576
     project = harness.project("views")
     trial = None
@@ -4766,7 +4876,7 @@ def context_views_journey(fixture, source):
             return ("job", {"command": "read", "job": found.group(1), "stream": "stdout"})
 
         def cite_e7(tools):
-            return f"E7-PRIVATE {tools[-1].startswith('private:') or 'private: the person ran this job' in tools[-1]}"
+            return f"E7-PRIVATE {tools[-1].startswith('private:') or 'private: this job received' in tools[-1]}"
 
         before = len(harness.chats)
         harness.script[:] = [read_private, cite_e7]
@@ -4776,6 +4886,46 @@ def context_views_journey(fixture, source):
         for leak in ("CANXARY", digest, token):
             assert leak not in sent, f"a model request holds {leak[:8]}"
         print("PASS CC-E7: the person saw the output; the model's notice entry and job read were private; no model request held the output")
+
+        # CC-E8: a model command with a secret variable is private too.
+        model_token = "ghp_" + "wX5" * 12
+        model_digest = hashlib.sha256(model_token.encode()).hexdigest()
+        model_command = f'printf %s "{model_token}" | shasum -a 256; printf \'CAN%sARY\\n\' Z; exit 7'
+        delivered = {}
+
+        def cite_e8(tools):
+            found = re.search(r"^job: ([0-9a-f]{32})$", tools[-1], re.M)
+            delivered["handle"] = found.group(1) if found else None
+            return f"E8-PRIVATE {'private: this command received a secret value' in tools[-1]}"
+
+        before = len(harness.chats)
+        harness.script[:] = [("exec_cmd", {"command": model_command}), cite_e8]
+        trial.send(b"Run the secret command.\r")
+        trial.until(b"E8-PRIVATE True", plain=True, limit=60, reject="Incomplete response")
+        handle = delivered["handle"]
+        assert handle, "the delivery named the job"
+        # The person sees the output in the job viewer.
+        harness.command(trial, f"/job {handle}", "Job " + handle[:8])
+        trial.until(b"CANZARY", plain=True, limit=30)
+        trial.send(b"\x1b")
+        trial.idle(0.3)
+
+        def cite_e8_read(tools):
+            return f"E8-READ {'private: this job received a secret value' in tools[-1]}"
+
+        harness.script[:] = [("job", {"command": "read", "job": handle, "stream": "stdout"}), cite_e8_read]
+        trial.send(b"What did it print?\r")
+        trial.until(b"E8-READ True", plain=True, limit=40, reject="Incomplete response")
+        sent = json.dumps(harness.chats[before:])
+        for leak in ("CANZARY", model_digest, "result: exit 7", "exit status 7"):
+            assert leak not in sent, f"a model request holds {leak[:8]}"
+        # The model's own call holds the token it wrote; no message Asura
+        # added (user or tool) does.
+        for chat in harness.chats[before:]:
+            for message in chat["messages"]:
+                if message.get("role") in ("user", "tool", "system"):
+                    assert model_token not in json.dumps(message), "an Asura message holds the token"
+        print("PASS CC-E8: a model command with a secret variable was private at delivery and in job read; the person saw the output; no model request held it")
         trial.send(b"\x01/quit\r")
         trial.finish()
         fixture.active_trials.remove(trial)
@@ -4786,19 +4936,26 @@ def context_views_journey(fixture, source):
 
 def person_secrets_journey(fixture, source):
     """--person-secrets: SS-E1 (secret-store.md, end to end: with a model
-    turn running, a `!!` command reading a launch environment token and a `!`
+    turn running, a `!!` command carrying a synthetic token and a `!`
     command carrying a bearer token queue behind it; the service restarts;
     after Resume both run with the real values: the loopback fixture gets
     the token, the digest matches, the relaunched log shows no token, and no
     Keychain item remains after settlement) and SS-E2 (with the scratch
-    keychain locked, a `!!` submit shows the locked message and keeps the
-    draft; after unlocking, Enter runs it). Runnable after P3-E and P4."""
+    keychain locked, a `!!` submit with a secret shows the locked message
+    and keeps the draft; after unlocking, Enter runs it). ENV1: a token in
+    the TUI's own environment is never passed; the command sees it empty.
+    The scratch keychain is locked, unlocked and listed through the fixture
+    binary, so no `security` command runs. Runnable after P3-E and P4."""
     import hashlib
     import threading
     harness = PersonHarness(fixture, source)
     project = harness.project("secretive")
     env_token = "fixture-env-" + os.urandom(12).hex()
     bearer = "fx" + os.urandom(16).hex()
+    # A synthetic GitHub-form token (never a real one) typed in a `!!` command.
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    outside_token = "ghp_" + "".join(alphabet[b % 62] for b in os.urandom(36))
+    locked_token = "ghp_" + "".join(alphabet[b % 62] for b in os.urandom(36))
     fixture.env["FIXTURE_TOKEN"] = env_token
     received = []
     listener = socket.socket()
@@ -4833,21 +4990,18 @@ def person_secrets_journey(fixture, source):
         trial = fixture.launch()
         harness.configure(trial, project)
         # SS-E2 first: a locked scratch keychain refuses the `!!` submit.
-        locked = subprocess.run(["/usr/bin/security", "lock-keychain", str(harness.keychain)],
-                                stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
-        assert locked.returncode == 0, locked
+        assert harness.keychain_action("--lock-scratch-keychain") == b"locked\n"
         offset = len(trial.output)
-        trial.send(b"!!echo unlocked-run\r")
+        # ENV1: only a command with a secret needs the Keychain.
+        locked_command = f'echo unlocked-run "{locked_token}"'
+        trial.send(f"!!{locked_command}".encode())
+        harness.enter(trial)
         notice_until(trial, "The Keychain is locked until this Mac is unlocked after start-up. Unlock it, then press Enter again.", offset,
                      limit=20)
         trial.until("↵ run OUTSIDE the sandbox".encode(), offset, plain=True, limit=10)
-        rows = [row.strip() for row in trial.screen.text().splitlines()]
-        assert "!!echo unlocked-run" in rows, trial.screen.text()
-        unlocked = subprocess.run(["/usr/bin/security", "unlock-keychain", "-p",
-                                   (fixture.root / "home/secret-store-keychain").read_text().splitlines()[1],
-                                   str(harness.keychain)],
-                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
-        assert unlocked.returncode == 0, unlocked
+        joined = "".join(row.strip() for row in trial.screen.text().splitlines())
+        assert "!!echo unlocked-run" in joined, trial.screen.text()
+        assert harness.keychain_action("--unlock-scratch-keychain") == b"unlocked\n"
         trial.send(b"\r")
         harness.footer(trial, "!! echo unlocked-run")
         trial.resize(160, 48)
@@ -4856,14 +5010,14 @@ def person_secrets_journey(fixture, source):
         harness.script[:] = [JobsHarness.HOLD]
         trial.send(b"Hold for the secrets.\r")
         harness.wait_chats(trial, 1)
-        digest_command = 'printf %s "$FIXTURE_TOKEN" | shasum -a 256'
+        digest_command = f'printf %s "{outside_token}" | shasum -a 256; printf "[%s]\\n" "$FIXTURE_TOKEN"'
         curl_command = f"curl -s -H 'Authorization: Bearer {bearer}' http://127.0.0.1:{port}/ss-e1"
         harness.run(trial, digest_command, mode="!!")
         harness.run(trial, curl_command)
         trial.idle(0.5)
         assert not received, "a queued command ran during the turn"
         # Each queued command holds one Keychain item before it runs.
-        items = [i for i in keychain_items(harness.keychain) if i.startswith(b"asura.secret-store")]
+        items = [i for i in keychain_items(harness) if i.startswith(b"asura.secret-store")]
         assert len(items) == 2, items
         # The service restarts with both queued.
         trial.send(b"\x01/quit\r")
@@ -4889,7 +5043,10 @@ def person_secrets_journey(fixture, source):
             if "· Held" in held:
                 rows = held.splitlines()
                 for above, row in zip(rows, rows[1:]):
-                    if re.search(r"[0-9a-f]{32} · Held", above) and row.strip().startswith(text[:24]):
+                    # The queue shows a stored secret as its placeholder:
+                    # match the text before the first quote.
+                    prefix = re.split("[\"']", text)[0][:24]
+                    if re.search(r"[0-9a-f]{32} · Held", above) and row.strip().startswith(prefix):
                         resume_held(trial, row.strip())
                         break
         harness.footer(trial, "!! printf %s", limit=40)
@@ -4898,13 +5055,16 @@ def person_secrets_journey(fixture, source):
             assert time.monotonic() < end, ("the loopback fixture got no request", trial.screen.text())
             trial.read(0.05)
         assert f"Authorization: Bearer {bearer}".encode() in received[0], received[0]
-        trial.until(hashlib.sha256(env_token.encode()).hexdigest().encode(), plain=True, limit=20)
+        trial.until(hashlib.sha256(outside_token.encode()).hexdigest().encode(), plain=True, limit=20)
+        # The terminal token was never passed (ENV1).
+        trial.until(b"[]", plain=True, limit=20)
         trial.until(b"SS-OK", plain=True, limit=20)
         # The relaunched log shows placeholders, never the token.
         assert bearer.encode() not in bytes(trial.output[restarted:]), "the token reached the relaunched log"
-        assert env_token.encode() not in bytes(trial.output[restarted:]), "the env token reached the log"
+        assert outside_token.encode() not in bytes(trial.output[restarted:]), "the !! token reached the log"
+        assert env_token.encode() not in bytes(trial.output), "the env token reached the TUI"
         trial.idle(1.0)
-        items = keychain_items(harness.keychain)
+        items = keychain_items(harness)
         assert not [i for i in items if i.startswith(b"asura.secret-store")], items
         quit_tui(trial)
         trial = None
@@ -5067,7 +5227,10 @@ def path_guard_journey(fixture, source):
         harness.run(trial, "cat build.rs")
         rows = entry_rows(trial, "! cat build.rs", "↳ exit 0")
         warning = "⚠ changed by the model since your last command: build.rs"
-        assert rows[1] == warning and "fn main() {}" in rows, rows
+        # The environment line follows the stripe; the warning comes next,
+        # above the output.
+        assert rows[1].startswith("env  Asura ") and rows[2] == warning, rows
+        assert "fn main() {}" in rows, rows
         assert rows.index(warning) < rows.index("fn main() {}"), rows
         # Kind 1 appears once: the next command shows none.
         harness.run(trial, "echo clean")

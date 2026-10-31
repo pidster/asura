@@ -492,6 +492,7 @@ fn submit_exec(
                 exec.yield_seconds,
                 stored_command,
                 tool.record.whole_command,
+                tool.record.received_secret_values(),
             ));
         }
         Admission::Busy(reason) => refuse(
@@ -3881,6 +3882,7 @@ impl Owner {
                             Body::ConversationQueueReply(pb::ConversationQueueReply {
                                 refusal: None,
                                 refusal_status: None,
+                                command_environment: None,
                                 entries: Vec::new(),
                                 request_id: None,
                                 full_text: Some(false),

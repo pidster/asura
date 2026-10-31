@@ -103,18 +103,14 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
 
 // ------------------------------------------------------------ submits
 
-/// A `!` submit (PATH, no client variables), or a `!!` submit with the
-/// fixture launch environment (PATH and the scratch HOME).
+/// A `!` or `!!` submit with PATH and no terminal variables (ENV1: the
+/// same allow-list environment for both modes).
 fn request(
-    env: &Env,
+    _env: &Env,
     project: [u8; 16],
     command: &str,
     outside: bool,
 ) -> pb::ConversationQueueCommandSubmit {
-    let launch = [
-        ("PATH", PATH.to_string()),
-        ("HOME", env.home().display().to_string()),
-    ];
     pb::ConversationQueueCommandSubmit {
         request_id: Some(asura_platform::random_id().to_vec()),
         project_id: Some(project.to_vec()),
@@ -123,20 +119,9 @@ fn request(
         new_conversation: Some(true),
         command: Some(command.into()),
         cwd: Some(".".into()),
-        search_path: (!outside).then(|| PATH.into()),
+        search_path: Some(PATH.into()),
         environment: Vec::new(),
         outside_sandbox: outside.then_some(true),
-        launch_environment: if outside {
-            launch
-                .iter()
-                .map(|(name, value)| pb::LaunchVariable {
-                    name: Some(name.as_bytes().to_vec()),
-                    value: Some(value.as_bytes().to_vec()),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        },
     }
 }
 /// Queues a command; retries `conversation_busy` only. Returns its input.

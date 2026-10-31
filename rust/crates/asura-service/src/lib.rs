@@ -660,6 +660,9 @@ where
                 if let Some(on) = job.take_allow_outside() {
                     conversations.set_allow_outside(on);
                 }
+                if let Some(declared) = job.take_person_environment() {
+                    conversations.set_person_environment(declared);
+                }
                 if job.settled() {
                     config_job = None;
                 }
@@ -1174,6 +1177,9 @@ where
             }
             if let Some(on) = job.take_allow_outside() {
                 conversations.set_allow_outside(on);
+            }
+            if let Some(declared) = job.take_person_environment() {
+                conversations.set_person_environment(declared);
             }
             if job.settled() {
                 config_job = None;

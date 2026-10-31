@@ -198,6 +198,11 @@ pub enum Setting {
     PersonCommands,
     #[serde(rename = "personCommands.allowOutsideSandbox")]
     PersonCommandsAllowOutsideSandbox,
+    /// `personCommands.environment` and every leaf
+    /// `personCommands.environment.<id>` (person-command-environment.md,
+    /// declared variables). The values are never in the event.
+    #[serde(rename = "personCommands.environment")]
+    PersonCommandsEnvironment,
 }
 impl Setting {
     /// The setting that a successful `ConfigSet` of `key` reports in
@@ -225,8 +230,13 @@ impl Setting {
             "personCommands" => Self::PersonCommands,
             "personCommands.allowOutsideSandbox" => Self::PersonCommandsAllowOutsideSandbox,
             // The leaf form: only a valid project ID names a key.
-            leaf => match leaf.strip_prefix("execution.projects.") {
-                Some(project) if id::parse(project).is_ok() => Self::ExecutionProjects,
+            "personCommands.environment" => Self::PersonCommandsEnvironment,
+            leaf => match (
+                leaf.strip_prefix("execution.projects."),
+                leaf.strip_prefix("personCommands.environment."),
+            ) {
+                (Some(project), _) if id::parse(project).is_ok() => Self::ExecutionProjects,
+                (_, Some(project)) if id::parse(project).is_ok() => Self::PersonCommandsEnvironment,
                 _ => return None,
             },
         })
@@ -274,7 +284,6 @@ pub enum PersonCommandRefusal {
     // `QueueRefusal` values 1-13.
     OutsideSandboxOff,
     EnvironmentInvalid,
-    EnvironmentTooLarge,
     PathInvalid,
     CwdInvalid,
     SecretStoreLocked,

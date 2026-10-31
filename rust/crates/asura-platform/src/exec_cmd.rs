@@ -1,6 +1,7 @@
 //! Bounded noninteractive command process owner. Filesystem work is worker-only.
 mod capture;
 mod cleanup;
+pub mod environment;
 mod escapee;
 mod guardian;
 mod person;

@@ -324,19 +324,24 @@ impl ExecutionSetting {
         self.project_override(project).unwrap_or(self.enabled)
     }
 }
-/// Person command settings (person-command-mode.md, PCR23). Written only
-/// away from its default.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Person command settings (person-command-mode.md, PCR23; person command
+/// environment, declared variables). Written only away from its defaults.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersonCommands {
     /// `personCommands.allowOutsideSandbox`: `false` refuses `!!` commands.
     #[serde(default = "enabled", rename = "allowOutsideSandbox")]
     allow_outside_sandbox: bool,
+    /// `personCommands.environment`: project ID text to declared variables
+    /// (ENV1). Non-secret by rule: a flagged value is refused.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    environment: BTreeMap<String, BTreeMap<String, String>>,
 }
 impl Default for PersonCommands {
     fn default() -> Self {
         Self {
             allow_outside_sandbox: enabled(),
+            environment: BTreeMap::new(),
         }
     }
 }
@@ -344,6 +349,74 @@ impl PersonCommands {
     fn is_default(&self) -> bool {
         *self == Self::default()
     }
+    /// The declared variables' form rules (person-command-environment.md,
+    /// declared variables): at most 256 projects, each a valid project ID
+    /// with a non-empty mapping that passes the allow-list rules.
+    fn environment_valid(&self) -> bool {
+        use asura_platform::exec_cmd::environment as env;
+        self.environment.len() <= env::MAX_DECLARED_PROJECTS
+            && self.environment.iter().all(|(id, variables)| {
+                project_id(id).is_some()
+                    && !variables.is_empty()
+                    && env::declared_valid(
+                        variables.iter().map(|(n, v)| (n.as_bytes(), v.as_bytes())),
+                    )
+            })
+    }
+    /// The scanner check of every declared value (ENV1): a flagged value is
+    /// `config_secret_value`. Blocking on the first rule set compile, so
+    /// only configuration workers and start-time reads call it.
+    fn environment_secret_free(&self) -> Result<()> {
+        if self.environment.is_empty() {
+            return Ok(());
+        }
+        let rules = asura_platform::secrets::detection()
+            .map_err(|_| "config_secret_detection_unavailable")?;
+        for variables in self.environment.values() {
+            for (name, value) in variables {
+                if asura_platform::secrets::environment::scan_variable(
+                    rules,
+                    name.as_bytes(),
+                    value.as_bytes(),
+                )
+                .is_some()
+                {
+                    return Err("config_secret_value");
+                }
+            }
+        }
+        Ok(())
+    }
+    /// The effective declared variables by project.
+    fn declared(&self) -> DeclaredVariables {
+        self.environment
+            .iter()
+            .filter_map(|(id, variables)| {
+                Some((
+                    project_id(id)?,
+                    variables
+                        .iter()
+                        .map(|(n, v)| (n.clone(), v.clone()))
+                        .collect(),
+                ))
+            })
+            .collect()
+    }
+}
+/// The leaf key prefix of one project's declared variables.
+const PERSON_ENVIRONMENT_PREFIX: &str = "personCommands.environment.";
+/// Declared variables by project, names in increasing order
+/// (person-command-environment.md, declared variables).
+pub type DeclaredVariables = BTreeMap<[u8; 16], Vec<(String, String)>>;
+/// The leaf key `personCommands.environment.<id>` of a project.
+pub fn person_environment_key(project: &[u8; 16]) -> String {
+    use std::fmt::Write;
+    let mut key = String::with_capacity(PERSON_ENVIRONMENT_PREFIX.len() + 32);
+    key.push_str(PERSON_ENVIRONMENT_PREFIX);
+    for byte in project {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -455,6 +528,9 @@ enum Scope {
     Root,
     Execution,
     Projects,
+    PersonCommands,
+    /// `personCommands.environment`: at most 256 projects.
+    Declarations,
     Other,
 }
 const MAPPING_ENTRIES: usize = 64;
@@ -463,16 +539,18 @@ const MAPPING_ENTRIES: usize = 64;
 struct Strict<'a>(u8, Scope, &'a Cell<bool>);
 impl Strict<'_> {
     fn entries(&self) -> usize {
-        if self.1 == Scope::Projects {
-            EXECUTION_MAX_PROJECTS
-        } else {
-            MAPPING_ENTRIES
+        match self.1 {
+            Scope::Projects => EXECUTION_MAX_PROJECTS,
+            Scope::Declarations => asura_platform::exec_cmd::environment::MAX_DECLARED_PROJECTS,
+            _ => MAPPING_ENTRIES,
         }
     }
     fn child(&self, key: &Value) -> Scope {
         match (self.1, key.as_str()) {
             (Scope::Root, Some("execution")) => Scope::Execution,
             (Scope::Execution, Some("projects")) => Scope::Projects,
+            (Scope::Root, Some("personCommands")) => Scope::PersonCommands,
+            (Scope::PersonCommands, Some("environment")) => Scope::Declarations,
             _ => Scope::Other,
         }
     }
@@ -529,7 +607,8 @@ impl<'de> Visitor<'de> for Strict<'_> {
                 return Err(de::Error::custom("invalid or duplicate key"));
             }
             if values.len() >= self.entries() {
-                self.2.set(self.1 == Scope::Projects);
+                self.2
+                    .set(matches!(self.1, Scope::Projects | Scope::Declarations));
                 return Err(de::Error::custom("entry limit"));
             }
             let value = map.next_value_seed(Strict(self.0 + 1, self.child(&key), self.2))?;
@@ -577,6 +656,7 @@ impl Config {
             || !(JOURNAL_MIN_QUOTA..=JOURNAL_MAX_QUOTA).contains(&self.journal.quota_bytes)
             || !self.jobs.valid()
             || !self.execution.valid()
+            || !self.person_commands.environment_valid()
             || self
                 .thinking
                 .as_deref()
@@ -596,6 +676,7 @@ impl Config {
         if self.providers.mlx.models.len() > 64 {
             return Err("config_invalid_value");
         }
+        self.person_commands.environment_secret_free()?;
         for (asset, capabilities) in &self.providers.mlx.models {
             if !valid_asset_name(asset) {
                 return Err("config_invalid_value");
@@ -616,6 +697,17 @@ impl Config {
         self.providers.mlx.models.get(asset)?.mask().ok()
     }
     fn get(&self, key: &str) -> Result<String> {
+        if let Some(project) = key.strip_prefix(PERSON_ENVIRONMENT_PREFIX) {
+            project_id(project).ok_or("config_invalid_value")?;
+            return yaml(
+                &self
+                    .person_commands
+                    .environment
+                    .get(project)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
         if let Some(project) = key.strip_prefix(EXECUTION_PROJECTS_PREFIX) {
             project_id(project).ok_or("config_invalid_value")?;
             return yaml(&match self.execution.projects.get(project) {
@@ -670,6 +762,7 @@ impl Config {
             "personCommands.allowOutsideSandbox" => {
                 yaml(&self.person_commands.allow_outside_sandbox)
             }
+            "personCommands.environment" => yaml(&self.person_commands.environment),
             "thinking" => yaml(&THINKING_LEVELS[usize::from(self.thinking())]),
             _ => Err("config_unknown_key"),
         }
@@ -681,9 +774,28 @@ impl Config {
         let scope = match key {
             "execution" => Scope::Execution,
             "execution.projects" => Scope::Projects,
+            "personCommands" => Scope::PersonCommands,
+            "personCommands.environment" => Scope::Declarations,
             _ => Scope::Other,
         };
         let value = parse(text.as_bytes(), scope)?;
+        if let Some(project) = key.strip_prefix(PERSON_ENVIRONMENT_PREFIX) {
+            project_id(project).ok_or("config_invalid_value")?;
+            if !value.is_mapping() {
+                return Err("config_invalid_value");
+            }
+            let variables: BTreeMap<String, String> =
+                serde_yaml_ng::from_value(value).map_err(|_| "config_invalid_value")?;
+            // `{}` removes the project's declarations.
+            if variables.is_empty() {
+                self.person_commands.environment.remove(project);
+            } else {
+                self.person_commands
+                    .environment
+                    .insert(project.to_owned(), variables);
+            }
+            return self.validate();
+        }
         if let Some(project) = key.strip_prefix(EXECUTION_PROJECTS_PREFIX) {
             project_id(project).ok_or("config_invalid_value")?;
             let Value::String(switch) = value else {
@@ -823,12 +935,15 @@ impl Config {
                     serde_yaml_ng::from_value(value).map_err(|_| "config_invalid_value")?;
             }
             "personCommands" => {
-                // The whole mapping: its one field present, no other field.
+                // The whole mapping: `allowOutsideSandbox` present, and at
+                // most `environment` beside it.
                 let Value::Mapping(ref fields) = value else {
                     return Err("config_invalid_value");
                 };
-                if fields.len() != 1
-                    || !fields.contains_key(Value::String("allowOutsideSandbox".into()))
+                if !fields.contains_key(Value::String("allowOutsideSandbox".into()))
+                    || fields.len() > 2
+                    || (fields.len() == 2
+                        && !fields.contains_key(Value::String("environment".into())))
                 {
                     return Err("config_invalid_value");
                 }
@@ -840,6 +955,13 @@ impl Config {
                     return Err("config_invalid_value");
                 };
                 self.person_commands.allow_outside_sandbox = allow;
+            }
+            "personCommands.environment" => {
+                if !value.is_mapping() {
+                    return Err("config_invalid_value");
+                }
+                self.person_commands.environment =
+                    serde_yaml_ng::from_value(value).map_err(|_| "config_invalid_value")?;
             }
             "thinking" => {
                 let Value::String(level) = value else {
@@ -974,6 +1096,10 @@ pub struct Reply {
     /// set of `personCommands` or its leaf, which applies to the next `!!`
     /// submit and slot grant (PCR23); else `None`.
     pub allow_outside_sandbox: Option<bool>,
+    /// The effective declared variables after a persisted set of
+    /// `personCommands` or any `personCommands.environment` key (ENV1);
+    /// they apply to the next command submit. Else `None`.
+    pub person_environment: Option<DeclaredVariables>,
 }
 
 /// A persisted execution change: the file's effective setting before the
@@ -1019,9 +1145,11 @@ pub fn execute(
                 | "execution.projects"
                 | "personCommands"
                 | "personCommands.allowOutsideSandbox"
+                | "personCommands.environment"
                 | "thinking"
         )
         && !key.starts_with(EXECUTION_PROJECTS_PREFIX)
+        && !key.starts_with(PERSON_ENVIRONMENT_PREFIX)
     {
         return Err("config_unknown_key");
     }
@@ -1032,6 +1160,7 @@ pub fn execute(
     let mut journal_quota = None;
     let mut execution = None;
     let mut allow_outside_sandbox = None;
+    let mut person_environment = None;
     if let Some(value) = value {
         let previous = config.execution.setting();
         config.set(key, value)?;
@@ -1051,6 +1180,9 @@ pub fn execute(
         if matches!(key, "personCommands" | "personCommands.allowOutsideSandbox") {
             allow_outside_sandbox = Some(config.person_commands.allow_outside_sandbox);
         }
+        if key == "personCommands" || key.starts_with("personCommands.environment") {
+            person_environment = Some(config.person_commands.declared());
+        }
     } else if cancel.load(Ordering::Acquire) {
         return Err("config_cancelled");
     }
@@ -1059,6 +1191,7 @@ pub fn execute(
         journal_quota,
         execution,
         allow_outside_sandbox,
+        person_environment,
     })
 }
 
@@ -1110,6 +1243,19 @@ pub fn allow_outside_sandbox(runtime: RuntimeDirectory, cancel: &AtomicBool) -> 
     Ok(Config::read(&snapshot.bytes)?
         .person_commands
         .allow_outside_sandbox)
+}
+
+/// The effective declared variables of every project (ENV1), read once at
+/// service start; later changes arrive in `Reply::person_environment`. The
+/// read runs on the caller's worker with the bounded read pipeline and has
+/// no time bound; it ends on completion, an error or cancel. An invalid file
+/// is an error: the service never runs with a guessed value.
+pub fn person_environment(
+    runtime: RuntimeDirectory,
+    cancel: &AtomicBool,
+) -> Result<DeclaredVariables> {
+    let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
+    Ok(Config::read(&snapshot.bytes)?.person_commands.declared())
 }
 
 /// Startup-only typed audit settings from the canonical validated YAML snapshot.
@@ -1751,7 +1897,8 @@ mod tests {
                 value_yaml: "4294967296\n".into(),
                 journal_quota: None,
                 execution: None,
-                allow_outside_sandbox: None
+                allow_outside_sandbox: None,
+                person_environment: None,
             })
         );
         let file = root.0.join(".asura/config.yaml");
@@ -1768,7 +1915,8 @@ mod tests {
                 value_yaml: "67108864\n".into(),
                 journal_quota: Some(JOURNAL_MIN_QUOTA),
                 execution: None,
-                allow_outside_sandbox: None
+                allow_outside_sandbox: None,
+                person_environment: None,
             })
         );
         assert!(
@@ -1786,7 +1934,8 @@ mod tests {
                 value_yaml: "quotaBytes: 1099511627776\n".into(),
                 journal_quota: Some(JOURNAL_MAX_QUOTA),
                 execution: None,
-                allow_outside_sandbox: None
+                allow_outside_sandbox: None,
+                person_environment: None,
             })
         );
         assert_eq!(
@@ -2073,7 +2222,8 @@ mod tests {
                 value_yaml: "2\n".into(),
                 journal_quota: None,
                 execution: None,
-                allow_outside_sandbox: None
+                allow_outside_sandbox: None,
+                person_environment: None,
             })
         );
         assert!(
@@ -2422,7 +2572,8 @@ mod tests {
                 value_yaml: "inherit\n".into(),
                 journal_quota: None,
                 execution: None,
-                allow_outside_sandbox: None
+                allow_outside_sandbox: None,
+                person_environment: None,
             })
         );
         let off = ExecutionSetting {
@@ -2438,7 +2589,8 @@ mod tests {
                     previous: ExecutionSetting::default(),
                     current: off.clone(),
                 }),
-                allow_outside_sandbox: None
+                allow_outside_sandbox: None,
+                person_environment: None,
             })
         );
         let file = root.0.join(".asura/config.yaml");
@@ -2619,6 +2771,114 @@ mod tests {
             EXECUTION_MAX_PROJECTS
         );
     }
+    /// PE-U7 (person-command-environment.md, declared variables): get, set,
+    /// file read and validation of `personCommands.environment`, with a
+    /// synthetic token that the scanner flags.
+    #[test]
+    fn pe_u7_declared_variables_key() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let key = format!("personCommands.environment.{id}");
+        let mut config = Config::default();
+        assert_eq!(config.get(&key).unwrap(), "{}\n");
+        assert_eq!(config.get("personCommands.environment").unwrap(), "{}\n");
+        config
+            .set(&key, "{RUST_LOG: debug, DATA_DIR: /Users/me/data}")
+            .unwrap();
+        assert_eq!(
+            config.get(&key).unwrap(),
+            "DATA_DIR: /Users/me/data\nRUST_LOG: debug\n"
+        );
+        let written = yaml(&config).unwrap();
+        let again = Config::read(written.as_bytes()).unwrap();
+        let declared = again.person_commands.declared();
+        let project = project_id(id).unwrap();
+        assert_eq!(
+            declared[&project],
+            [
+                ("DATA_DIR".to_owned(), "/Users/me/data".to_owned()),
+                ("RUST_LOG".to_owned(), "debug".to_owned())
+            ]
+        );
+        assert_eq!(
+            person_environment_key(&project),
+            key,
+            "the leaf key of a project"
+        );
+        // `{}` removes the project; the default mapping is not written.
+        config.set(&key, "{}").unwrap();
+        assert!(!yaml(&config).unwrap().contains("environment"));
+        // The whole mapping, beside the switch.
+        config
+            .set(
+                "personCommands",
+                &format!("{{allowOutsideSandbox: true, environment: {{{id}: {{A: '1'}}}}}}"),
+            )
+            .unwrap();
+        assert_eq!(config.get(&key).unwrap(), "A: '1'\n");
+        // Form faults.
+        let names: String = (0..33).map(|i| format!("V{i:02}: x, ")).collect();
+        for (key, value) in [
+            (key.as_str(), "[a]"),
+            (key.as_str(), "{1X: a}"),
+            (key.as_str(), "{A-B: a}"),
+            (key.as_str(), "{LANG: C}"),
+            (key.as_str(), "{HOME: /x}"),
+            (key.as_str(), "{ASURA_X: a}"),
+            (key.as_str(), "{A: ''}"),
+            (key.as_str(), "{A: 1}"),
+            (key.as_str(), "{A: \"a\\nb\"}"),
+            (key.as_str(), &format!("{{{names}}}")),
+            ("personCommands.environment.0123", "{A: a}"),
+            ("personCommands.environment", "{zz: {A: a}}"),
+            ("personCommands.environment", &format!("{{{id}: {{}}}}")),
+        ] {
+            assert_eq!(
+                config.set(key, value),
+                Err("config_invalid_value"),
+                "{key}: {value}"
+            );
+        }
+        // Over 4,096 bytes of names and values: only a file can say it,
+        // since a supplied value is at most 4 KiB.
+        let big = "v".repeat(1_024);
+        let file = format!(
+            "personCommands:\n  environment:\n    {id}:\n      A: {big}\n      B: {big}\n      C: {big}\n      D: {big}\n"
+        );
+        assert_eq!(
+            Config::read(file.as_bytes()).err(),
+            Some("config_invalid_value")
+        );
+        let fits = "v".repeat(1_023);
+        let file = format!(
+            "personCommands:\n  environment:\n    {id}:\n      A: {fits}\n      B: {fits}\n      C: {fits}\n      D: {fits}\n"
+        );
+        assert!(Config::read(file.as_bytes()).is_ok());
+        // A synthetic token is refused and named by no error text.
+        let token: String = std::iter::once("ghp_".to_owned())
+            .chain((0..36).map(|i| ((b'a' + (i * 7 % 26) as u8) as char).to_string()))
+            .collect();
+        let refused = config.set(&key, &format!("{{GH: {token}}}"));
+        assert_eq!(refused, Err("config_secret_value"));
+        assert!(!refused.unwrap_err().contains(&token));
+        // The same value in a hand-edited file makes the file invalid.
+        let file = format!("personCommands:\n  environment:\n    {id}:\n      GH: {token}\n");
+        assert_eq!(
+            Config::read(file.as_bytes()).err(),
+            Some("config_secret_value")
+        );
+        // 256 projects at most.
+        let file = |count: u32| {
+            let projects: String = (1..=count)
+                .map(|i| format!("    a{i:031x}:\n      A: a\n"))
+                .collect();
+            format!("personCommands:\n  environment:\n{projects}")
+        };
+        assert_eq!(Config::read(file(256).as_bytes()).err(), None);
+        assert_eq!(
+            Config::read(file(257).as_bytes()).err(),
+            Some("config_invalid_value")
+        );
+    }
     /// PCR23 (P2-G): `personCommands.allowOutsideSandbox` defaults to `true`,
     /// takes only a boolean, is written only away from its default, and
     /// `set personCommands` takes the whole mapping.
@@ -2725,7 +2985,8 @@ mod tests {
                 value_yaml: "true\n".into(),
                 journal_quota: None,
                 execution: None,
-                allow_outside_sandbox: None
+                allow_outside_sandbox: None,
+                person_environment: None,
             })
         );
         assert_eq!(
@@ -2734,7 +2995,8 @@ mod tests {
                 value_yaml: "false\n".into(),
                 journal_quota: None,
                 execution: None,
-                allow_outside_sandbox: Some(false)
+                allow_outside_sandbox: Some(false),
+                person_environment: None,
             })
         );
         let file = root.0.join(".asura/config.yaml");

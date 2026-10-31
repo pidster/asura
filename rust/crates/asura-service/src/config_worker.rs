@@ -27,6 +27,8 @@ pub(crate) struct Worker {
     execution: Option<asura_storage::config::ExecutionChange>,
     /// `personCommands.allowOutsideSandbox` after a persisted set (PCR23).
     allow_outside_sandbox: Option<bool>,
+    /// The declared variables after a persisted set (ENV1).
+    person_environment: Option<asura_storage::config::DeclaredVariables>,
     completion: crate::completion::Completion,
 }
 impl Worker {
@@ -59,6 +61,7 @@ impl Worker {
             journal_quota: None,
             execution: None,
             allow_outside_sandbox: None,
+            person_environment: None,
             completion,
         })
     }
@@ -100,6 +103,14 @@ impl Worker {
     /// next `!!` submit and slot grant (PCR23, switch check). Taken once.
     pub(crate) fn take_allow_outside(&mut self) -> Option<bool> {
         self.allow_outside_sandbox.take()
+    }
+    /// The declared variables after a persisted set of `personCommands` or
+    /// a `personCommands.environment` key: the owner records them in the
+    /// next command submit (ENV1). Taken once.
+    pub(crate) fn take_person_environment(
+        &mut self,
+    ) -> Option<asura_storage::config::DeclaredVariables> {
+        self.person_environment.take()
     }
     pub(crate) fn poll(&mut self) -> Option<pb::Envelope> {
         let done = self.task.as_ref().is_some_and(JoinHandle::is_finished);
@@ -143,6 +154,8 @@ impl Worker {
                 self.journal_quota = reply.journal_quota;
                 self.execution.clone_from(&reply.execution);
                 self.allow_outside_sandbox = reply.allow_outside_sandbox;
+                self.person_environment
+                    .clone_from(&reply.person_environment);
             }
         }
         if self.replied {
@@ -178,6 +191,7 @@ mod tests {
                 journal_quota: None,
                 execution: None,
                 allow_outside_sandbox: None,
+                person_environment: None,
             }),
         )
     }
@@ -217,6 +231,7 @@ mod tests {
                 journal_quota: None,
                 execution: None,
                 allow_outside_sandbox: None,
+                person_environment: None,
                 completion: Default::default(),
             },
             send,
@@ -252,6 +267,7 @@ mod tests {
                     journal_quota: Some(67_108_864),
                     execution: None,
                     allow_outside_sandbox: None,
+                    person_environment: None,
                 }),
             );
             assert_eq!(worker.take_journal_quota(), None);
@@ -281,6 +297,7 @@ mod tests {
                 journal_quota: None,
                 execution: None,
                 allow_outside_sandbox: None,
+                person_environment: None,
             }),
         );
         settle(&mut worker, release);
@@ -314,6 +331,7 @@ mod tests {
                     journal_quota: None,
                     execution: None,
                     allow_outside_sandbox: None,
+                    person_environment: None,
                 }),
             );
             settle(&mut worker, release);
@@ -418,6 +436,7 @@ mod reactor_tests {
                             journal_quota: None,
                             execution: None,
                             allow_outside_sandbox: None,
+                            person_environment: None,
                         })
                     });
                     admitted_tx.send(()).unwrap();
@@ -431,6 +450,7 @@ mod reactor_tests {
                         journal_quota: None,
                         execution: None,
                         allow_outside_sandbox: None,
+                        person_environment: None,
                         completion,
                     })
                 },

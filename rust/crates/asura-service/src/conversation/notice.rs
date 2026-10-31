@@ -83,7 +83,13 @@ pub(super) fn build(conversation: Id, inputs: &JobNotice) -> Result<Notice, Noti
                 outside_sandbox: source.outside_sandbox,
                 command: &source.command,
                 directory: &source.directory,
-                taint: Taint::from_flag(source.received_secret),
+                taint: Taint::from_flag(
+                    source.received_secret,
+                    matches!(
+                        settlement.listing.intent.origin,
+                        journal::JobOrigin::Person { .. }
+                    ),
+                ),
             })
         })
         .collect();
@@ -149,7 +155,10 @@ fn prior_notice(conversation: Id, inputs: &PriorNotice) -> Result<Notice, Notice
             outside_sandbox: settlement.outside_sandbox,
             command: "",
             directory: "",
-            taint: Taint::from_flag(settlement.received_secret),
+            taint: Taint::from_flag(
+                settlement.received_secret,
+                matches!(settlement.intent.origin, journal::JobOrigin::Person { .. }),
+            ),
         });
     }
     Notice::reference_only(&NoticeInputs {

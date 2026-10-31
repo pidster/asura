@@ -132,14 +132,10 @@ pub enum CommandSubmit {
     /// from it.
     Accepted(pb::ConversationQueueReply),
     /// A definite refusal: nothing was queued or stored. `status` is the
-    /// |OSStatus| of `secret_store_unavailable`. `sent` is false when this
-    /// client refused before sending, by the codec's own environment rule
-    /// ([`asura_control::person::environment_refusal`]), so an environment
-    /// that cannot fit one control frame still gets its refusal.
+    /// |OSStatus| of `secret_store_unavailable`.
     Refused {
         refusal: pb::QueueRefusal,
         status: Option<u32>,
-        sent: bool,
     },
 }
 
@@ -155,7 +151,6 @@ fn command_submit_reply(
         return Some(CommandSubmit::Refused {
             refusal: pb::QueueRefusal::try_from(refusal).ok()?,
             status: reply.refusal_status,
-            sent: true,
         });
     }
     let outside = request.outside_sandbox == Some(true);
@@ -733,22 +728,15 @@ impl Client {
             _ => Err(Error::Protocol),
         }
     }
-    /// Queues a person `!` or `!!` command (field 68). A submit whose
-    /// environment the codec refuses is answered locally and never sent.
-    /// Only `cancelled` or a lost connection ends the wait, as
+    /// Queues a person `!` or `!!` command (field 68). The caller builds
+    /// its environment from the allow-list (person-command-environment.md);
+    /// the service checks it. Only `cancelled` or a lost connection ends the wait, as
     /// `OutcomeUnconfirmed`; the caller retains its request ID for a retry.
     pub fn queue_person_command(
         &mut self,
         request: pb::ConversationQueueCommandSubmit,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<CommandSubmit> {
-        if let Some(refusal) = asura_control::person::environment_refusal(&request) {
-            return Ok(CommandSubmit::Refused {
-                refusal,
-                status: None,
-                sent: false,
-            });
-        }
         let expected = request.clone();
         match self.mutation(
             pb::envelope::Body::ConversationQueueCommandSubmit(request),
@@ -1782,17 +1770,9 @@ mod tests {
             new_conversation: Some(false),
             command: Some("make test".into()),
             cwd: Some(".".into()),
-            search_path: (!outside).then(|| "/usr/bin:/bin".into()),
+            search_path: Some("/usr/bin:/bin".into()),
             environment: Vec::new(),
             outside_sandbox: outside.then_some(true),
-            launch_environment: if outside {
-                vec![pb::LaunchVariable {
-                    name: Some(b"HOME".to_vec()),
-                    value: Some(b"/Users/p".to_vec()),
-                }]
-            } else {
-                Vec::new()
-            },
         }
     }
     fn command_accept_answer(request: &pb::envelope::Body) -> pb::envelope::Body {
@@ -1880,7 +1860,6 @@ mod tests {
             CommandSubmit::Refused {
                 refusal: pb::QueueRefusal::SecretStoreUnavailable,
                 status: Some(25_308),
-                sent: true,
             }
         );
         let fake = fake_service_with(Fake::Answer(command_foreign_answer), person_capabilities());
@@ -1889,25 +1868,6 @@ mod tests {
             client.queue_person_command(person_submit(true), &|| false),
             Err(Error::Protocol)
         ));
-        // An environment too large for one frame is refused before sending:
-        // the fake closes on any request, so a sent submit would fail.
-        let fake = fake_service_with(Fake::Close, person_capabilities());
-        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
-        let mut huge = person_submit(true);
-        huge.launch_environment = (0..2_000)
-            .map(|i| pb::LaunchVariable {
-                name: Some(format!("V{i}").into_bytes()),
-                value: Some(vec![b'x'; 40]),
-            })
-            .collect();
-        assert_eq!(
-            client.queue_person_command(huge, &|| false).unwrap(),
-            CommandSubmit::Refused {
-                refusal: pb::QueueRefusal::EnvironmentTooLarge,
-                status: None,
-                sent: false,
-            }
-        );
     }
     #[test]
     fn person_command_reply_must_match_mode_and_kind() {

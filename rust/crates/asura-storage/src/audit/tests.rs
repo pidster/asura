@@ -1656,7 +1656,7 @@ fn pc_u58_person_command_queued_and_refused_events() {
             true,
         ),
         (
-            refused_event(true, PersonCommandRefusal::EnvironmentTooLarge),
+            refused_event(true, PersonCommandRefusal::EnvironmentInvalid),
             "person_command.refused",
             refused_fields,
             true,
@@ -1800,10 +1800,6 @@ fn pc_u58_person_command_queued_and_refused_events() {
         (
             "environment_invalid",
             PersonCommandRefusal::EnvironmentInvalid,
-        ),
-        (
-            "environment_too_large",
-            PersonCommandRefusal::EnvironmentTooLarge,
         ),
         ("path_invalid", PersonCommandRefusal::PathInvalid),
         ("cwd_invalid", PersonCommandRefusal::CwdInvalid),

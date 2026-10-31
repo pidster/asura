@@ -5,6 +5,7 @@
 //! numbering, loss markers and the command rewrite planner. The only system
 //! call is the per-job random key. Detection is best effort (SR8).
 mod arguments;
+pub mod environment;
 pub mod json;
 pub mod rewrite;
 mod rules;

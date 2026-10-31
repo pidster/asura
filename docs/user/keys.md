@@ -62,6 +62,17 @@ the conversation log. Command mode works only with a service that supports
 commands; otherwise Enter shows "Commands are not enabled in this service"
 and keeps the draft.
 
+Both modes pass the same short list of variables, not your whole terminal
+environment: PATH, your account's HOME, USER, LOGNAME, SHELL and TMPDIR,
+locale settings, TZ, SSH_AUTH_SOCK, the XDG directories and common toolchain
+variables such as CARGO_HOME, RUSTUP_HOME, DEVELOPER_DIR and JAVA_HOME. Add
+other variables for a project with `personCommands.environment.ID` (see the
+[guide](guide.md#configuration)). Asura checks your terminal's variables for
+secrets when it starts and never passes one it flags; the first time you
+enter command mode it names them, never their values. Under each command,
+the log shows the names the command received and a hint for each `$NAME`
+it used that was not passed.
+
 | Key | Action |
 | --- | --- |
 | ! | At the start of the draft, switch to command mode; in command mode, switch to outside mode |

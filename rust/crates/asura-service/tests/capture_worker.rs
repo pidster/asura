@@ -959,14 +959,15 @@ fn survivor_job(home: &Home, mode: &str) -> Result<(Job, PathBuf)> {
         Vec::new(),
     );
     job.profile = Profile::PersonOutside1;
+    // The fixture account seam: HOME and TMPDIR are the scratch home, never
+    // the account's (ENV2: the setup resolves them for `!!` too).
+    std::fs::write(
+        home.path.join("exec-cmd-person-account"),
+        format!("{0}\n{0}\n", home.path.display()),
+    )?;
     job.person = Some(Person::Outside {
-        launch: vec![
-            (b"PATH".to_vec(), b"/usr/bin:/bin".to_vec()),
-            (
-                b"HOME".to_vec(),
-                home.path.as_os_str().as_encoded_bytes().to_vec(),
-            ),
-        ],
+        path: b"/usr/bin:/bin".to_vec(),
+        client: Vec::new(),
     });
     Ok((job, marks))
 }

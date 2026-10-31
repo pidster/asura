@@ -1902,9 +1902,10 @@ impl Index for KindIndex<'_> {
 }
 
 /// J5T-11 (storage part, owner option A): a prior-notice read keeps
-/// fixed-size reference facts only. A model job's read touches its kind 26
-/// and kind 28 and no kind 14 (nor its kind 27); a person job's touches
-/// its kind 26, kind 28 and its kind 31 once, for the outside flag. The
+/// fixed-size reference facts only. A model job's read touches its kind 26,
+/// kind 28 and its kind 14 once, for the taint flag (ENV4), and no kind 27;
+/// a person job's touches its kind 26, kind 28 and its kind 31 once, for
+/// the outside and taint flags. The
 /// whole `history_notices` reply is bounded by `MAX_PRIOR_NOTICE_BYTES` =
 /// 1,024 turns × 9 settlements × `PRIOR_SETTLEMENT_BYTES`.
 #[test]
@@ -1941,7 +1942,8 @@ fn j5t_11_prior_notice_reads_no_command_source_and_is_bounded() {
             .prior_notice(conversation, 1, through, 0, &mut kinds)
             .unwrap();
         assert_eq!(prior.settlements.len(), MAX_NOTICE_SETTLEMENTS);
-        assert_eq!(kinds.kinds, [26, 28].repeat(MAX_NOTICE_SETTLEMENTS));
+        // A model job's kind 14 is read for its taint flag (ENV4).
+        assert_eq!(kinds.kinds, [26, 28, 14].repeat(MAX_NOTICE_SETTLEMENTS));
         assert!(prior.settlements.iter().all(|s| !s.outside_sandbox));
         // No heap beyond the settlement vector: `numbers` is empty.
         assert!(
@@ -2132,8 +2134,9 @@ fn person31(
         command: "cargo test".into(),
         display_command: String::new(),
         cwd: "crates".into(),
-        search_path: if outside { "" } else { "/usr/bin" }.into(),
+        search_path: "/usr/bin".into(),
         environment: vec![],
+        declared: Vec::new(),
         order_revision: h.state().order_revision + 1,
         number_kinds: vec![],
         unnumbered: 0,

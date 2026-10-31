@@ -39,6 +39,7 @@ fn queue_projection_requires_bounded_text_and_truthful_operation_state() {
             &envelope(Body::ConversationQueueReply(pb::ConversationQueueReply {
                 refusal: None,
                 refusal_status: None,
+                command_environment: None,
                 entries,
                 request_id: None,
                 full_text: Some(full),
@@ -221,6 +222,7 @@ fn queue_projection_and_stale_order_are_strict() {
     let reply = pb::ConversationQueueReply {
         refusal: None,
         refusal_status: None,
+        command_environment: None,
         entries: vec![entry.clone()],
         request_id: Some(vec![4; 16]),
         full_text: Some(false),

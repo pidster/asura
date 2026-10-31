@@ -140,6 +140,7 @@ pub(super) fn valid(body: &Body) -> bool {
                 && v.full_text.is_some()
                 && (v.request_id.is_none() || id(&v.request_id))
                 && person::refusal_shape(v)
+                && person::command_environment_shape(v)
                 && (v.accepted_input_id.is_none()
                     || (id(&v.accepted_input_id)
                         && v.request_id.is_some()
@@ -520,44 +521,27 @@ pub(super) fn valid(body: &Body) -> bool {
 pub mod person {
     use super::lane_target;
     use crate::{id, pb};
-    use std::collections::HashSet;
 
     /// UTF-8 bytes of a command (field 6).
     pub const MAX_COMMAND_BYTES: usize = 8_192;
     /// Bytes of a project-relative working directory (field 7).
     pub const MAX_CWD_BYTES: usize = 1_024;
-    /// Bytes of the client PATH (field 8, `!` only).
+    /// Bytes of the client PATH (field 8, both modes).
     pub const MAX_SEARCH_PATH_BYTES: usize = 4_096;
-    /// PC3 client variables (field 9, `!` only): one per listed name.
-    pub const MAX_CLIENT_VARIABLES: usize = 9;
-    /// `!!` launch environment entries (field 11, OD4).
-    pub const MAX_LAUNCH_VARIABLES: usize = 1_024;
-    /// Name and value bytes of the `!!` launch environment together (OD4).
-    pub const MAX_LAUNCH_ENVIRONMENT_BYTES: usize = 40_960;
-    /// Bytes of one launch variable name.
-    pub const MAX_LAUNCH_NAME_BYTES: usize = 1_024;
+    /// Terminal variables on the wire (field 9): the terminal table's 39
+    /// names. The allow-list owner (`asura_platform::exec_cmd::environment`)
+    /// checks the names and values; this is wire shape only.
+    pub const MAX_ENVIRONMENT_ENTRIES: usize = 39;
+    /// Bytes of one field 9 name, and of one declared name in a reply.
+    pub const MAX_ENVIRONMENT_NAME_BYTES: usize = 64;
+    /// Bytes of one field 9 value.
+    pub const MAX_ENVIRONMENT_VALUE_BYTES: usize = 4_096;
+    /// Declared names in a reply's environment facts.
+    pub const MAX_PROJECT_NAMES: usize = 32;
+    /// Terminal table codes in a reply's bit set (bits 0-38).
+    pub const TERMINAL_NAME_BITS: u32 = 39;
     /// Bytes of a queue entry's brief waiting text.
     pub const MAX_WAITING_TEXT_BYTES: usize = 128;
-    /// Bytes of a PC3 locale value.
-    pub const MAX_LOCALE_VALUE_BYTES: usize = 64;
-    /// Bytes of an `SSH_AUTH_SOCK` value: a `sun_path` holds 104 with its NUL.
-    pub const MAX_AUTH_SOCKET_BYTES: usize = 103;
-    /// The PC3 names a client may send for a `!` command, in kind 31 name
-    /// code order (code = index + 1).
-    pub const CLIENT_VARIABLES: [&str; 9] = [
-        "LANG",
-        "LC_ALL",
-        "LC_COLLATE",
-        "LC_CTYPE",
-        "LC_MESSAGES",
-        "LC_MONETARY",
-        "LC_NUMERIC",
-        "LC_TIME",
-        "SSH_AUTH_SOCK",
-    ];
-    /// Name prefixes the service sets itself; a launch environment that
-    /// names one is `environment_invalid`.
-    pub const RESERVED_PREFIXES: [&[u8]; 2] = [b"ASURA_SECRET_", b"ASURA_JOB_"];
     /// The highest `QueueWaitReason` value in this protocol revision.
     pub const MAX_WAIT_REASON: i32 = 15;
     /// The highest `QueueRefusal` value.
@@ -567,8 +551,8 @@ pub mod person {
 
     /// Protocol shape of a `ConversationQueueCommandSubmit`: presence, lane
     /// target and sizes. A shape failure is a protocol fault. Environment
-    /// content is not shape: [`environment_refusal`] reports it as a typed
-    /// refusal the service returns.
+    /// content is not shape: the service checks it against the allow-list
+    /// and refuses it with `environment_invalid`.
     pub fn submit_shape(v: &pb::ConversationQueueCommandSubmit) -> bool {
         id(&v.request_id)
             && id(&v.project_id)
@@ -586,80 +570,39 @@ pub mod person {
             && v.search_path
                 .as_ref()
                 .is_none_or(|p| p.len() <= MAX_SEARCH_PATH_BYTES)
-            && v.environment.len() <= MAX_CLIENT_VARIABLES
+            && v.environment.len() <= MAX_ENVIRONMENT_ENTRIES
+            && v.environment.iter().all(|e| {
+                e.name
+                    .as_ref()
+                    .is_some_and(|n| !n.is_empty() && n.len() <= MAX_ENVIRONMENT_NAME_BYTES)
+                    && e.value
+                        .as_ref()
+                        .is_some_and(|v| v.len() <= MAX_ENVIRONMENT_VALUE_BYTES)
+            })
     }
 
-    /// The environment refusal of a well-shaped submit, or `None`. With
-    /// `outside_sandbox` absent or false, `launch_environment` must be empty
-    /// and fields 8 and 9 follow the `!` (PC3) rules; with it true, fields 8
-    /// and 9 must be absent and the launch environment follows the outside
-    /// bounds. Size is checked before form, so an oversized environment is
-    /// `environment_too_large` whatever its names. Values are bytes and need
-    /// not be UTF-8.
-    pub fn environment_refusal(v: &pb::ConversationQueueCommandSubmit) -> Option<pb::QueueRefusal> {
-        use pb::QueueRefusal::{EnvironmentInvalid, EnvironmentTooLarge};
-        if v.outside_sandbox != Some(true) {
-            if !v.launch_environment.is_empty() || !client_environment(&v.environment) {
-                return Some(EnvironmentInvalid);
-            }
-            return None;
-        }
-        if v.search_path.is_some() || !v.environment.is_empty() {
-            return Some(EnvironmentInvalid);
-        }
-        let bytes = v.launch_environment.iter().fold(0usize, |total, entry| {
-            total
-                .saturating_add(entry.name.as_ref().map_or(0, Vec::len))
-                .saturating_add(entry.value.as_ref().map_or(0, Vec::len))
-        });
-        if v.launch_environment.len() > MAX_LAUNCH_VARIABLES || bytes > MAX_LAUNCH_ENVIRONMENT_BYTES
-        {
-            return Some(EnvironmentTooLarge);
-        }
-        let mut names = HashSet::with_capacity(v.launch_environment.len());
-        for entry in &v.launch_environment {
-            let (Some(name), Some(value)) = (&entry.name, &entry.value) else {
-                return Some(EnvironmentInvalid);
-            };
-            if name.is_empty()
-                || name.len() > MAX_LAUNCH_NAME_BYTES
-                || name.contains(&b'=')
-                || name.contains(&0)
-                || value.contains(&0)
-                || RESERVED_PREFIXES.iter().any(|p| name.starts_with(p))
-                || !names.insert(name.as_slice())
-            {
-                return Some(EnvironmentInvalid);
-            }
-        }
-        None
-    }
-
-    /// PC3: only listed names, each at most once, with checked values.
-    fn client_environment(entries: &[pb::PersonEnvironment]) -> bool {
-        let mut seen = [false; CLIENT_VARIABLES.len()];
-        entries.iter().all(|entry| {
-            let (Some(name), Some(value)) = (&entry.name, &entry.value) else {
-                return false;
-            };
-            let Some(code) = CLIENT_VARIABLES.iter().position(|n| n == name) else {
-                return false;
-            };
-            if std::mem::replace(&mut seen[code], true) {
-                return false;
-            }
-            if name == "SSH_AUTH_SOCK" {
-                value.starts_with('/')
-                    && value.len() <= MAX_AUTH_SOCKET_BYTES
-                    && !value.contains('\0')
-            } else {
-                !value.is_empty()
-                    && value.len() <= MAX_LOCALE_VALUE_BYTES
-                    && value.bytes().all(|b| {
-                        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'@')
-                    })
-            }
-        })
+    /// The environment facts of an accepted command reply (person command
+    /// environment, reply facts): only with `accepted_input_id`; terminal
+    /// bits 0-38; at most 32 declared names in the declared-name form;
+    /// secret variables 1-16 or the whole-command flag, not both.
+    pub(crate) fn command_environment_shape(v: &pb::ConversationQueueReply) -> bool {
+        let Some(e) = &v.command_environment else {
+            return true;
+        };
+        let name = |n: &String| {
+            let b = n.as_bytes();
+            (1..=MAX_ENVIRONMENT_NAME_BYTES).contains(&b.len())
+                && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+                && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        };
+        v.accepted_input_id.is_some()
+            && e.terminal_names
+                .is_none_or(|bits| bits >> TERMINAL_NAME_BITS == 0)
+            && e.project_names.len() <= MAX_PROJECT_NAMES
+            && e.project_names.iter().all(name)
+            && e.secret_variables.is_none_or(|n| (1..=16).contains(&n))
+            && e.secret_command.is_none_or(|w| w)
+            && !(e.secret_variables.is_some() && e.secret_command.is_some())
     }
 
     /// The PCR9 working directory form: relative, no NUL, no `..`
@@ -715,7 +658,9 @@ pub mod person {
         match v.refusal {
             None => v.refusal_status.is_none(),
             Some(refusal) => {
-                (1..=MAX_REFUSAL).contains(&refusal)
+                pb::QueueRefusal::try_from(refusal)
+                    .is_ok_and(|r| r != pb::QueueRefusal::Unspecified)
+                    && v.command_environment.is_none()
                     && id(&v.request_id)
                     && v.entries.is_empty()
                     && v.accepted_input_id.is_none()
@@ -1509,12 +1454,6 @@ mod tests {
         ))));
     }
 
-    fn launch(name: &[u8], value: &[u8]) -> pb::LaunchVariable {
-        pb::LaunchVariable {
-            name: Some(name.to_vec()),
-            value: Some(value.to_vec()),
-        }
-    }
     fn command_submit() -> pb::ConversationQueueCommandSubmit {
         pb::ConversationQueueCommandSubmit {
             request_id: Some(vec![3; 16]),
@@ -1530,31 +1469,13 @@ mod tests {
                 value: Some("en_GB.UTF-8".into()),
             }],
             outside_sandbox: None,
-            launch_environment: Vec::new(),
         }
     }
-    fn outside_submit(
-        launch_environment: Vec<pb::LaunchVariable>,
-    ) -> pb::ConversationQueueCommandSubmit {
-        pb::ConversationQueueCommandSubmit {
-            search_path: None,
-            environment: Vec::new(),
-            outside_sandbox: Some(true),
-            launch_environment,
-            ..command_submit()
+    fn variable(name: &str, value: &str) -> pb::PersonEnvironment {
+        pb::PersonEnvironment {
+            name: Some(name.into()),
+            value: Some(value.into()),
         }
-    }
-    /// Names `V0000`..; values fill `bytes` names and values together.
-    fn sized_launch(entries: usize, bytes: usize) -> Vec<pb::LaunchVariable> {
-        let names = entries * 5;
-        let mut values = vec![0usize; entries];
-        let rest = bytes - names;
-        // Two large values carry 3-byte lengths; the rest are empty.
-        values[entries - 1] = rest / 2;
-        values[entries - 2] = rest - rest / 2;
-        (0..entries)
-            .map(|i| launch(format!("V{i:04}").as_bytes(), &vec![b'x'; values[i]]))
-            .collect()
     }
     fn round_trips(body: Body) -> bool {
         let value = envelope(body);
@@ -1564,175 +1485,57 @@ mod tests {
         decode_body(&frame[HEADER_BYTES..]).is_ok_and(|decoded| decoded == value)
     }
 
-    /// PC-U41: the submit codec's environment rules. Each invalid form is a
-    /// typed refusal, not a protocol fault: the submit stays well-shaped.
+    /// PC-U41 (revised for ENV1): the submit's environment is wire shape
+    /// only, the same for `!` and `!!`: at most 39 entries, names 1-64
+    /// bytes, values at most 4,096 bytes. Names and values against the
+    /// allow-list are the service's check.
     #[test]
-    fn pc_u41_submit_environment_refusals() {
-        use pb::QueueRefusal::{EnvironmentInvalid as Invalid, EnvironmentTooLarge as TooLarge};
-        use person::environment_refusal as refusal;
+    fn pc_u41_submit_environment_shape() {
         let sandboxed = command_submit();
         assert!(person::submit_shape(&sandboxed));
-        assert_eq!(refusal(&sandboxed), None);
-        let outside = outside_submit(vec![launch(b"HOME", b"/Users/p"), launch(b"EMPTY", b"")]);
-        assert_eq!(refusal(&outside), None);
-        let mut cases: Vec<(&str, pb::ConversationQueueCommandSubmit, pb::QueueRefusal)> = vec![
-            (
-                "outside with field 8",
-                pb::ConversationQueueCommandSubmit {
-                    search_path: Some("/bin".into()),
-                    ..outside.clone()
-                },
-                Invalid,
-            ),
-            (
-                "outside with field 9",
-                pb::ConversationQueueCommandSubmit {
-                    environment: sandboxed.environment.clone(),
-                    ..outside.clone()
-                },
-                Invalid,
-            ),
-            (
-                "sandboxed with a launch environment",
-                pb::ConversationQueueCommandSubmit {
-                    launch_environment: vec![launch(b"A", b"1")],
-                    ..sandboxed.clone()
-                },
-                Invalid,
-            ),
-            (
-                "false flag with a launch environment",
-                pb::ConversationQueueCommandSubmit {
-                    outside_sandbox: Some(false),
-                    launch_environment: vec![launch(b"A", b"1")],
-                    ..sandboxed.clone()
-                },
-                Invalid,
-            ),
-            (
-                "duplicate names",
-                outside_submit(vec![launch(b"A", b"1"), launch(b"A", b"2")]),
-                Invalid,
-            ),
-            (
-                "name with =",
-                outside_submit(vec![launch(b"A=B", b"1")]),
-                Invalid,
-            ),
-            (
-                "empty name",
-                outside_submit(vec![launch(b"", b"1")]),
-                Invalid,
-            ),
-            (
-                "NUL name",
-                outside_submit(vec![launch(b"A\0", b"1")]),
-                Invalid,
-            ),
-            (
-                "NUL value",
-                outside_submit(vec![launch(b"A", b"x\0y")]),
-                Invalid,
-            ),
-            (
-                "ASURA_SECRET_1",
-                outside_submit(vec![launch(b"ASURA_SECRET_1", b"v")]),
-                Invalid,
-            ),
-            (
-                "ASURA_SECRET_COMMAND",
-                outside_submit(vec![launch(b"ASURA_SECRET_COMMAND", b"v")]),
-                Invalid,
-            ),
-            (
-                "ASURA_JOB_x",
-                outside_submit(vec![launch(b"ASURA_JOB_x", b"1")]),
-                Invalid,
-            ),
-            (
-                "absent value",
-                outside_submit(vec![pb::LaunchVariable {
-                    name: Some(b"A".to_vec()),
-                    value: None,
-                }]),
-                Invalid,
-            ),
-            (
-                "1,025-byte name",
-                outside_submit(vec![launch(&[b'N'; 1025], b"")]),
-                Invalid,
-            ),
-            (
-                "1,025 entries",
-                outside_submit(sized_launch(1025, 40_960)),
-                TooLarge,
-            ),
-            (
-                "40,961 bytes",
-                outside_submit(sized_launch(1024, 40_961)),
-                TooLarge,
-            ),
-        ];
-        // `!` (PC3) forms: only listed names, once each, with checked values.
-        for environment in [
-            vec![("HOME", "/Users/p")],
-            vec![("LANG", "C"), ("LANG", "C")],
-            vec![("LANG", "bad value")],
-            vec![("LANG", "")],
-            vec![("LC_ALL", &"a".repeat(65) as &str)],
-            vec![("SSH_AUTH_SOCK", "relative/agent")],
-            vec![("SSH_AUTH_SOCK", &format!("/{}", "s".repeat(103)) as &str)],
-            vec![("ASURA_SECRET_1", "v")],
-        ] {
-            cases.push((
-                "PC3",
-                pb::ConversationQueueCommandSubmit {
-                    environment: environment
-                        .into_iter()
-                        .map(|(name, value)| pb::PersonEnvironment {
-                            name: Some(name.into()),
-                            value: Some(value.into()),
-                        })
-                        .collect(),
-                    ..sandboxed.clone()
-                },
-                Invalid,
-            ));
-        }
-        for (name, case, expected) in cases {
-            assert!(person::submit_shape(&case), "{name}: shape");
-            assert_eq!(refusal(&case), Some(expected), "{name}");
-            // A refused form still crosses the wire, so the service can
-            // answer it with its typed refusal.
-            assert!(
-                round_trips(Body::ConversationQueueCommandSubmit(case)),
-                "{name}: wire"
-            );
-        }
-        // Accepted bounds: a non-UTF-8 value, a 1,024-byte name, the
-        // largest SSH_AUTH_SOCK, every PC3 name once.
-        let accepted = outside_submit(vec![
-            launch(b"BYTES", &[0xff, 0xfe, b'a']),
-            launch(&[b'N'; 1024], b""),
-        ]);
-        assert_eq!(refusal(&accepted), None);
-        assert!(round_trips(Body::ConversationQueueCommandSubmit(accepted)));
-        let every = pb::ConversationQueueCommandSubmit {
-            environment: person::CLIENT_VARIABLES
-                .iter()
-                .map(|name| pb::PersonEnvironment {
-                    name: Some((*name).into()),
-                    value: Some(if *name == "SSH_AUTH_SOCK" {
-                        format!("/{}", "s".repeat(102))
-                    } else {
-                        "en_GB.UTF-8@euro".into()
-                    }),
-                })
-                .collect(),
+        let outside = pb::ConversationQueueCommandSubmit {
+            outside_sandbox: Some(true),
             ..sandboxed.clone()
         };
-        assert_eq!(refusal(&every), None);
-        assert!(round_trips(Body::ConversationQueueCommandSubmit(every)));
+        assert!(person::submit_shape(&outside));
+        assert!(round_trips(Body::ConversationQueueCommandSubmit(outside)));
+        let many = |n: usize| pb::ConversationQueueCommandSubmit {
+            environment: (0..n).map(|i| variable(&format!("V{i:02}"), "x")).collect(),
+            ..sandboxed.clone()
+        };
+        assert!(person::submit_shape(&many(39)));
+        assert!(!person::submit_shape(&many(40)));
+        for (label, entry) in [
+            ("empty name", variable("", "x")),
+            ("long name", variable(&"N".repeat(65), "x")),
+            ("long value", variable("A", &"v".repeat(4_097))),
+            (
+                "no value",
+                pb::PersonEnvironment {
+                    name: Some("A".into()),
+                    value: None,
+                },
+            ),
+        ] {
+            let case = pb::ConversationQueueCommandSubmit {
+                environment: vec![entry],
+                ..sandboxed.clone()
+            };
+            assert!(!person::submit_shape(&case), "{label}");
+        }
+        let edge = pb::ConversationQueueCommandSubmit {
+            environment: vec![variable(&"N".repeat(64), &"v".repeat(4_096))],
+            ..sandboxed.clone()
+        };
+        assert!(person::submit_shape(&edge));
+        // A name outside the allow-list is still well-shaped: the service
+        // answers it with `environment_invalid`.
+        let unlisted = pb::ConversationQueueCommandSubmit {
+            environment: vec![variable("HOME", "/x")],
+            ..sandboxed
+        };
+        assert!(person::submit_shape(&unlisted));
+        assert!(round_trips(Body::ConversationQueueCommandSubmit(unlisted)));
     }
 
     /// The submit's protocol shape: presence, lane target, sizes, direction.
@@ -1843,9 +1646,9 @@ mod tests {
             search_path: Some("p".repeat(4096)),
             ..request.clone()
         }));
-        // Ten PC3 entries exceed the wire bound of nine.
+        // Forty entries exceed the wire bound of 39 (ENV1).
         let ten = pb::ConversationQueueCommandSubmit {
-            environment: vec![request.environment[0].clone(); 10],
+            environment: vec![request.environment[0].clone(); 40],
             ..request
         };
         assert!(encode_frame(&envelope(Body::ConversationQueueCommandSubmit(ten))).is_err());
@@ -1857,22 +1660,31 @@ mod tests {
         assert!(!person::cwd_form_valid(&"d".repeat(1025)));
     }
 
-    /// PC-U49: a submit at every maximum together fits one control frame,
-    /// and the over-bound environments still fit, to be refused.
+    /// PC-U49 (revised for ENV1): a submit at every maximum together fits
+    /// one control frame: 39 terminal variables with the longest names (19
+    /// bytes) and values totalling 17,895 bytes, a 4,096-byte PATH, an
+    /// 8,192-byte command and a 1,024-byte cwd stay within 32,053 bytes.
     #[test]
     fn pc_u49_submit_at_every_maximum_fits_one_frame() {
-        // The frame-bound table: fixed 9,343 bytes, then 1,024 entries of at
-        // most 11 header bytes and 40,960 name and value bytes.
-        let bound =
-            9_343 + person::MAX_LAUNCH_VARIABLES * 11 + person::MAX_LAUNCH_ENVIRONMENT_BYTES;
+        let bound = 9_343 + 4_099 + 18_611;
+        assert_eq!(bound, 32_053);
         assert!(bound <= crate::MAX_FRAME_BYTES);
-        let launch_environment = sized_launch(1024, 40_960);
-        // Largest value lengths take 3-byte varints.
-        assert!(
-            launch_environment
-                .iter()
-                .any(|e| e.value.as_ref().unwrap().len() >= 16_384)
-        );
+        // 8 locales of 64, a socket of 103, 3 words of 128, 25 paths of 512
+        // and 2 path lists of 2,048: 17,895 bytes.
+        let sizes: Vec<usize> = [64; 8]
+            .into_iter()
+            .chain([103])
+            .chain([128; 3])
+            .chain([512; 25])
+            .chain([2_048; 2])
+            .collect();
+        assert_eq!(sizes.iter().sum::<usize>(), 17_895);
+        // The 39 names total 404 bytes; 19-byte names are an upper bound.
+        let environment: Vec<_> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| variable(&format!("N{i:018}"), &"v".repeat(*n)))
+            .collect();
         let submit = pb::ConversationQueueCommandSubmit {
             request_id: Some(vec![0xff; 16]),
             project_id: Some(vec![0xff; 16]),
@@ -1881,40 +1693,94 @@ mod tests {
             new_conversation: Some(false),
             command: Some("c".repeat(8_192)),
             cwd: Some("d".repeat(1_024)),
-            ..outside_submit(launch_environment)
+            search_path: Some("/".repeat(4_096)),
+            environment,
+            outside_sandbox: Some(true),
         };
-        assert_eq!(person::environment_refusal(&submit), None);
+        assert!(person::submit_shape(&submit));
         let value = pb::Envelope {
             service_epoch: Some(vec![0xff; 16]),
             attachment_id: Some(vec![0xff; 16]),
             request_counter: Some(u64::MAX),
-            body: Some(Body::ConversationQueueCommandSubmit(submit.clone())),
+            body: Some(Body::ConversationQueueCommandSubmit(submit)),
         };
         use prost::Message;
         let length = value.encoded_len();
-        assert!(
-            length <= bound && length <= crate::MAX_FRAME_BYTES,
-            "{length}"
-        );
+        // Names here are 39 x 19 = 741 bytes, 337 more than the table's 404.
+        assert!(length <= bound + 337, "{length}");
         assert!(validate_semantics(&value, Direction::ClientToServer).is_ok());
         let frame = encode_frame(&value).unwrap();
         assert_eq!(decode_body(&frame[HEADER_BYTES..]).unwrap(), value);
-        for over in [sized_launch(1025, 40_960), sized_launch(1024, 40_961)] {
-            let over = pb::ConversationQueueCommandSubmit {
-                launch_environment: over,
-                ..submit.clone()
-            };
-            assert_eq!(
-                person::environment_refusal(&over),
-                Some(pb::QueueRefusal::EnvironmentTooLarge)
-            );
-            let value = pb::Envelope {
-                body: Some(Body::ConversationQueueCommandSubmit(over)),
-                ..value.clone()
-            };
-            assert!(value.encoded_len() <= crate::MAX_FRAME_BYTES);
-            assert!(encode_frame(&value).is_ok());
+    }
+
+    /// The reply's environment facts (person command environment, reply
+    /// facts): only with an accepted input; bits 0-38; at most 32 declared
+    /// names; secret variables or the whole-command flag, not both.
+    #[test]
+    fn pe_u9_reply_environment_facts() {
+        let accepted = |facts: pb::CommandEnvironment| {
+            envelope(Body::ConversationQueueReply(pb::ConversationQueueReply {
+                request_id: Some(vec![6; 16]),
+                accepted_input_id: Some(vec![3; 16]),
+                command_environment: Some(facts),
+                ..entry_reply(command_entry())
+            }))
+        };
+        let valid =
+            |value: &pb::Envelope| validate_semantics(value, Direction::ServerToClient).is_ok();
+        let good = pb::CommandEnvironment {
+            terminal_names: Some((1 << 39) - 1),
+            project_names: (0..32).map(|i| format!("V{i:02}")).collect(),
+            secret_variables: Some(16),
+            secret_command: None,
+        };
+        assert!(valid(&accepted(good.clone())));
+        assert!(round_trips(accepted(good.clone()).body.unwrap()));
+        for (label, bad) in [
+            (
+                "bit 39",
+                pb::CommandEnvironment {
+                    terminal_names: Some(1 << 39),
+                    ..good.clone()
+                },
+            ),
+            (
+                "33 names",
+                pb::CommandEnvironment {
+                    project_names: (0..33).map(|i| format!("V{i:02}")).collect(),
+                    ..good.clone()
+                },
+            ),
+            (
+                "bad name",
+                pb::CommandEnvironment {
+                    project_names: vec!["1X".into()],
+                    ..good.clone()
+                },
+            ),
+            (
+                "both secrets",
+                pb::CommandEnvironment {
+                    secret_command: Some(true),
+                    ..good.clone()
+                },
+            ),
+            (
+                "17 variables",
+                pb::CommandEnvironment {
+                    secret_variables: Some(17),
+                    ..good.clone()
+                },
+            ),
+        ] {
+            assert!(!valid(&accepted(bad)), "{label}");
         }
+        // Without an accepted input the facts are invalid.
+        let mut value = accepted(good);
+        if let Some(Body::ConversationQueueReply(reply)) = &mut value.body {
+            reply.accepted_input_id = None;
+        }
+        assert!(!valid(&value));
     }
 
     fn command_entry() -> pb::ConversationQueueEntry {
@@ -2167,7 +2033,9 @@ mod tests {
             }
         ))));
         // Every refusal round-trips; the status only with unavailable.
-        for code in 1..=person::MAX_REFUSAL {
+        // Value 3 (ENVIRONMENT_TOO_LARGE) is reserved since ENV1.
+        assert!(pb::QueueRefusal::try_from(3).is_err());
+        for code in (1..=person::MAX_REFUSAL).filter(|c| *c != 3) {
             let refusal = pb::QueueRefusal::try_from(code).unwrap();
             let reply = refusal_reply(refusal);
             assert!(

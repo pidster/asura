@@ -996,17 +996,16 @@ fn valid_person_request(p: &PersonCommandRequest<'_>) -> Result<()> {
         p.conversation.is_some_and(|c| c != [0; 16])
     };
     let command = (1..=MAX_PERSON_COMMAND).contains(&p.command.len()) && !p.command.contains('\0');
-    let launch = if p.outside_sandbox {
-        // `!!`: the launch environment waits in the secret store item.
-        p.search_path.is_empty() && p.environment.is_empty()
-    } else {
-        valid_search_path(p.search_path)
-            && p.environment.len() <= ClientVariable::ALL.len()
-            && p.environment.windows(2).all(|pair| pair[0].0 < pair[1].0)
-            && p.environment
-                .iter()
-                .all(|(name, value)| name.valid_value(value))
-    };
+    // Both modes (ENV1): the sanitized PATH, terminal variables by name
+    // code with class-valid values, and the project's declared variables.
+    use asura_platform::exec_cmd::environment as env;
+    let launch = valid_search_path(p.search_path)
+        && p.environment.len() <= env::TERMINAL_COUNT
+        && p.environment.windows(2).all(|pair| pair[0].0 < pair[1].0)
+        && p.environment.iter().all(|(code, value)| {
+            env::by_code(*code).is_some_and(|t| env::class_valid(t.class, value.as_bytes()))
+        })
+        && env::declared_valid(p.declared.iter().map(|(n, v)| (n.as_bytes(), v.as_bytes())));
     require(
         p.project != [0; 16]
             && conversation
@@ -1016,8 +1015,8 @@ fn valid_person_request(p: &PersonCommandRequest<'_>) -> Result<()> {
             && launch,
     )
 }
-/// Kind 31 fields 7 to 12 in their field encoding, shared by the record
-/// and the request digest.
+/// Kind 31 fields 7 to 12, then field 23, in their field encoding, shared
+/// by the record and the request digest.
 fn person_request_fields(w: &mut Writer, p: &PersonCommandRequest<'_>) {
     w.byte(u8::from(p.new_conversation) | (u8::from(p.outside_sandbox) << 1));
     for text in [p.command, p.display_command, p.cwd, p.search_path] {
@@ -1025,9 +1024,16 @@ fn person_request_fields(w: &mut Writer, p: &PersonCommandRequest<'_>) {
         w.bytes(text.as_bytes());
     }
     w.byte(p.environment.len() as u8);
-    for (name, value) in p.environment {
-        w.byte(*name as u8);
-        w.byte(value.len() as u8);
+    for (code, value) in p.environment {
+        w.byte(*code);
+        w.u16(value.len() as u16);
+        w.bytes(value.as_bytes());
+    }
+    w.byte(p.declared.len() as u8);
+    for (name, value) in p.declared {
+        w.byte(name.len() as u8);
+        w.bytes(name.as_bytes());
+        w.u16(value.len() as u16);
         w.bytes(value.as_bytes());
     }
 }
@@ -1117,16 +1123,27 @@ fn read_person_command(r: &mut Reader<'_>) -> Result<PersonCommandQueued> {
     let display_command = r.bounded_string(MAX_PERSON_COMMAND)?;
     let cwd = r.bounded_string(MAX_PERSON_CWD)?;
     let search_path = r.bounded_string(MAX_SEARCH_PATH)?;
+    let text = |bytes: &[u8]| {
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| ReplayError::Corrupt)
+    };
     let count = usize::from(r.byte()?);
-    require(count <= ClientVariable::ALL.len())?;
+    require(count <= asura_platform::exec_cmd::environment::TERMINAL_COUNT)?;
     let mut environment = Vec::with_capacity(count);
     for _ in 0..count {
-        let name = ClientVariable::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
+        let code = r.byte()?;
+        let len = usize::from(r.u16()?);
+        environment.push((code, text(r.take(len)?)?));
+    }
+    let count = usize::from(r.byte()?);
+    require(count <= asura_platform::exec_cmd::environment::MAX_DECLARED)?;
+    let mut declared = Vec::with_capacity(count);
+    for _ in 0..count {
         let len = usize::from(r.byte()?);
-        let value = std::str::from_utf8(r.take(len)?)
-            .map_err(|_| ReplayError::Corrupt)?
-            .to_owned();
-        environment.push((name, value));
+        let name = text(r.take(len)?)?;
+        let len = usize::from(r.u16()?);
+        declared.push((name, text(r.take(len)?)?));
     }
     let order_revision = r.u64()?;
     let count = r.u16()? as usize;
@@ -1173,6 +1190,7 @@ fn read_person_command(r: &mut Reader<'_>) -> Result<PersonCommandQueued> {
         cwd,
         search_path,
         environment,
+        declared,
         order_revision,
         number_kinds,
         unnumbered,
@@ -5311,7 +5329,7 @@ mod tests {
         assert_eq!(allowed(O::Cancelled), vec![10, 11, 12, 13, 14, 16]);
         assert_eq!(allowed(O::Unavailable), vec![11, 12, 13, 14, 15, 16]);
         assert_eq!(allowed(O::Limit), vec![16]);
-        assert_eq!(allowed(O::Private), vec![12, 13, 14]);
+        assert_eq!(allowed(O::Private), vec![10, 12, 13, 14]);
         for outcome in O::ALL {
             assert!(!outcome.allows(T::ReadFile) && !outcome.allows(T::CreateNote));
         }
@@ -5697,6 +5715,7 @@ mod tests {
         assert_eq!(private.status, 2);
         round_job(r29(private));
         for code in [
+            ToolOperation::ExecCmd,
             ToolOperation::JobStatus,
             ToolOperation::JobRead,
             ToolOperation::JobWait,
@@ -5704,7 +5723,6 @@ mod tests {
             assert!(O::Private.allows(code));
         }
         for code in [
-            ToolOperation::ExecCmd,
             ToolOperation::JobList,
             ToolOperation::JobCancel,
             ToolOperation::JobNote,
@@ -5917,8 +5935,29 @@ mod tests {
     // PC-U20 and PC-U42 (unit): kind 31 PersonCommandQueued
     // (person-command-mode.md, kind 31) and capture reason 7.
     const RULES: Hash = [21; 32];
-    fn locale(n: usize) -> String {
-        "a".repeat(n)
+    use asura_platform::exec_cmd::environment::{self as env, Class};
+    /// The largest valid value of a terminal class.
+    fn largest(class: Class) -> String {
+        match class {
+            Class::Locale => "a".repeat(64),
+            Class::Word => "w".repeat(128),
+            Class::Path => format!("/{}", "p".repeat(511)),
+            Class::PathList => format!("/{}", "l".repeat(2_047)),
+            Class::Socket => format!("/{}", "s".repeat(102)),
+        }
+    }
+    /// Every terminal variable at its largest value.
+    fn largest_terminal() -> Vec<(u8, String)> {
+        env::TERMINAL
+            .iter()
+            .map(|t| (t.code, largest(t.class)))
+            .collect()
+    }
+    /// 32 declared variables of exactly 4,096 bytes together.
+    fn largest_declared() -> Vec<(String, String)> {
+        (0..32)
+            .map(|i| (format!("V{i:02}"), "d".repeat(125)))
+            .collect()
     }
     /// Recomputes the request digest of a record whose request fields are
     /// valid.
@@ -5941,7 +5980,8 @@ mod tests {
             display_command: String::new(),
             cwd: ".".into(),
             search_path: "/usr/bin:/bin".into(),
-            environment: vec![(ClientVariable::Lang, "en_GB.UTF-8".into())],
+            environment: vec![(1, "en_GB.UTF-8".into())],
+            declared: vec![],
             order_revision: 7,
             number_kinds: vec![],
             unnumbered: 0,
@@ -5952,15 +5992,15 @@ mod tests {
             fallback: None,
         })
     }
-    /// A `!!` command in a new conversation: no PATH, no client variables.
+    /// A `!!` command in a new conversation, with the same allow-list
+    /// environment as `!` (ENV2) and one declared variable.
     fn outside31() -> PersonCommandQueued {
         sealed(PersonCommandQueued {
             conversation: [5; 16],
             expected_generation: 0,
             new_conversation: true,
             outside_sandbox: true,
-            search_path: String::new(),
-            environment: vec![],
+            declared: vec![("RUST_LOG".into(), "debug".into())],
             ..pc31()
         })
     }
@@ -6020,26 +6060,20 @@ mod tests {
         round31(outside31());
         // Every `!` bound at once: an 8,192-byte rewrite with 16 numbers and
         // one unnumbered placeholder, a 1,024-byte cwd, a 4,096-byte PATH of
-        // 64 entries, all nine client variables at their maximum.
+        // 64 entries, all 39 terminal variables and 32 declared variables
+        // at their maximum.
         let mut command = placeholders(16) + "$ASURA_SECRET_0 ";
         command.push_str(&"x".repeat(MAX_PERSON_COMMAND - command.len()));
         let mut search_path = (0..63).map(|_| "/b").collect::<Vec<_>>().join(":");
         search_path.push_str(":/");
         search_path.push_str(&"p".repeat(MAX_SEARCH_PATH - search_path.len()));
         assert_eq!(search_path.split(':').count(), MAX_SEARCH_PATH_ENTRIES);
-        let mut environment: Vec<_> = ClientVariable::ALL[..8]
-            .iter()
-            .map(|v| (*v, locale(MAX_LOCALE_VALUE)))
-            .collect();
-        environment.push((
-            ClientVariable::SshAuthSock,
-            format!("/{}", "s".repeat(MAX_AGENT_SOCKET - 1)),
-        ));
         let full = sealed(PersonCommandQueued {
             command,
             cwd: "d".repeat(MAX_PERSON_CWD),
             search_path,
-            environment,
+            environment: largest_terminal(),
+            declared: largest_declared(),
             number_kinds: (1..=16).map(|code| kind_from(code * 2).unwrap()).collect(),
             unnumbered: 1,
             expected_generation: u64::MAX,
@@ -6049,7 +6083,7 @@ mod tests {
         });
         let bytes = round31(full);
         let rewrite_max =
-            105 + 4 + 8192 + 4 + 1028 + 4100 + 634 + 8 + (2 + 16 + 4 + 1 + 4 + 32 + 4);
+            105 + 4 + 8192 + 4 + 1028 + 4100 + 18_013 + 4_193 + 8 + (2 + 16 + 4 + 1 + 4 + 32 + 4);
         assert_eq!(bytes.len(), rewrite_max);
         // The whole-command bounds: 8,192 bytes of display text cut at the
         // limit, 256 numbers, the last secret kind and word 4,096.
@@ -6068,7 +6102,8 @@ mod tests {
             + (4 + 8192)
             + (4 + 1)
             + (4 + 13)
-            + (1 + 2 + 11)
+            + (1 + 1 + 2 + 11)
+            + 1
             + 8
             + (2 + 256 + 4 + 1 + 4 + 32 + 4);
         assert_eq!(bytes.len(), whole_max);
@@ -6083,8 +6118,6 @@ mod tests {
         }));
         round31(sealed(PersonCommandQueued {
             outside_sandbox: true,
-            search_path: String::new(),
-            environment: vec![],
             ..whole31("eval $ASURA_SECRET_1".into(), 1)
         }));
         round31(sealed(PersonCommandQueued {
@@ -6099,42 +6132,31 @@ mod tests {
             ..pc31()
         }));
         // The decode bound: both texts full is not a valid record, but the
-        // layout sums to the 22,570-byte payload and a 22,754-byte frame.
+        // layout sums to the 44,142-byte payload and a 44,326-byte frame.
         let mut both = whole31("z".repeat(MAX_PERSON_COMMAND), 0);
         both.command = "c".repeat(MAX_PERSON_COMMAND);
         both.cwd = "d".repeat(MAX_PERSON_CWD);
         both.search_path = "/".repeat(MAX_SEARCH_PATH);
-        both.environment = ClientVariable::ALL
-            .iter()
-            .map(|v| {
-                (
-                    *v,
-                    if *v == ClientVariable::SshAuthSock {
-                        "/".repeat(MAX_AGENT_SOCKET)
-                    } else {
-                        locale(MAX_LOCALE_VALUE)
-                    },
-                )
-            })
-            .collect();
+        both.environment = largest_terminal();
+        both.declared = largest_declared();
         both.number_kinds = vec![SecretKind::Jwt; 256];
         let raw = raw31(&both);
         assert_eq!(raw.len(), MAX_PERSON_COMMAND_PAYLOAD);
-        assert_eq!(HEADER + TRAILER + MAX_PERSON_COMMAND_PAYLOAD, 22_754);
+        assert_eq!(HEADER + TRAILER + MAX_PERSON_COMMAND_PAYLOAD, 44_326);
         const { assert!(HEADER + TRAILER + MAX_PERSON_COMMAND_PAYLOAD <= MAX_FRAME) };
         assert_eq!(decode_record(31, &raw), Err(ReplayError::Corrupt));
         let mut over = raw;
         over.push(0);
         assert_eq!(decode_record(31, &over), Err(ReplayError::Corrupt));
-        // PC-U42: a `!!` record holds the outside flag and no environment:
-        // an empty PATH and a zero variable count follow the cwd.
+        // PC-U42 (revised for ENV1): a `!!` record holds the outside flag
+        // and the same allow-list environment as `!`; it has no item.
         let p = outside31();
         let bytes = round31(p.clone());
         assert_eq!(bytes[FLAGS31], 0b11);
         let path_at = FLAGS31 + 1 + 4 + p.command.len() + 4 + 4 + p.cwd.len();
-        assert_eq!(&bytes[path_at..path_at + 5], &[0, 0, 0, 0, 0]);
+        assert_eq!(&bytes[path_at..path_at + 4], &13u32.to_be_bytes());
         assert_eq!(raw31(&pc31())[FLAGS31], 0);
-        assert!(p.has_secret_item() && !pc31().has_secret_item());
+        assert!(!p.has_secret_item() && !pc31().has_secret_item());
         assert!(whole31("a".into(), 0).has_secret_item());
     }
     /// PC-U20: the request digest covers kind 31 fields 4 to 12 in field
@@ -6153,8 +6175,9 @@ mod tests {
             hash.update((text.len() as u32).to_be_bytes());
             hash.update(text.as_bytes());
         }
-        hash.update([1, 1, 11]);
+        hash.update([1, 1, 0, 11]);
         hash.update(b"en_GB.UTF-8");
+        hash.update([0]);
         let expected: Hash = hash.finalize().into();
         assert_eq!(p.digest, expected);
         let outside = outside31();
@@ -6164,11 +6187,16 @@ mod tests {
         hash.update([0; 16]);
         hash.update(0u64.to_be_bytes());
         hash.update([0b11]);
-        for text in ["make test", "", ".", ""] {
+        for text in ["make test", "", ".", "/usr/bin:/bin"] {
             hash.update((text.len() as u32).to_be_bytes());
             hash.update(text.as_bytes());
         }
-        hash.update([0]);
+        hash.update([1, 1, 0, 11]);
+        hash.update(b"en_GB.UTF-8");
+        hash.update([1, 8]);
+        hash.update(b"RUST_LOG");
+        hash.update([0, 5]);
+        hash.update(b"debug");
         let expected: Hash = hash.finalize().into();
         assert_eq!(outside.digest, expected);
         // Each covered field changes it; the order revision and secret
@@ -6203,6 +6231,10 @@ mod tests {
                 environment: vec![],
                 ..p.clone()
             },
+            PersonCommandQueued {
+                declared: vec![("X".into(), "1".into())],
+                ..p.clone()
+            },
         ];
         for other in changed {
             assert_ne!(
@@ -6231,7 +6263,7 @@ mod tests {
     #[test]
     fn pc_u20_kind_31_rejects_each_invalid_field() {
         let p = pc31();
-        let socket = |value: &str| vec![(ClientVariable::SshAuthSock, value.to_owned())];
+        let socket = |value: &str| vec![(9u8, value.to_owned())];
         // Fields 1 to 3 and the digest.
         for bad in [
             PersonCommandQueued {
@@ -6333,33 +6365,43 @@ mod tests {
                 ..p.clone()
             },
             PersonCommandQueued {
-                environment: vec![
-                    (ClientVariable::LcAll, "C".into()),
-                    (ClientVariable::Lang, "C".into()),
-                ],
+                environment: vec![(2, "C".into()), (1, "C".into())],
                 ..p.clone()
             },
             PersonCommandQueued {
-                environment: vec![
-                    (ClientVariable::Lang, "C".into()),
-                    (ClientVariable::Lang, "C".into()),
-                ],
+                environment: vec![(1, "C".into()), (1, "C".into())],
                 ..p.clone()
             },
             PersonCommandQueued {
-                environment: vec![(ClientVariable::Lang, String::new())],
+                environment: vec![(0, "C".into())],
                 ..p.clone()
             },
             PersonCommandQueued {
-                environment: vec![(ClientVariable::Lang, "en GB".into())],
+                environment: vec![(40, "C".into())],
                 ..p.clone()
             },
             PersonCommandQueued {
-                environment: vec![(ClientVariable::LcTime, "C/x".into())],
+                environment: vec![(1, String::new())],
                 ..p.clone()
             },
             PersonCommandQueued {
-                environment: vec![(ClientVariable::Lang, locale(MAX_LOCALE_VALUE + 1))],
+                environment: vec![(1, "en GB".into())],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: vec![(8, "C/x".into())],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: vec![(1, "a".repeat(65))],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: vec![(15, "relative".into())],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                environment: vec![(25, "/a:b".into())],
                 ..p.clone()
             },
             PersonCommandQueued {
@@ -6375,21 +6417,37 @@ mod tests {
                 ..p.clone()
             },
             PersonCommandQueued {
-                environment: socket(&format!("/{}", "s".repeat(MAX_AGENT_SOCKET))),
+                environment: socket(&format!("/{}", "s".repeat(103))),
                 ..p.clone()
             },
-            // `!!`: no PATH and no client variables (PC-U42).
+            // Declared variables (field 23).
             PersonCommandQueued {
-                outside_sandbox: true,
-                environment: vec![],
+                declared: vec![("B".into(), "1".into()), ("A".into(), "1".into())],
                 ..p.clone()
             },
             PersonCommandQueued {
-                environment: socket("/s"),
-                ..outside31()
+                declared: vec![("LANG".into(), "C".into())],
+                ..p.clone()
             },
             PersonCommandQueued {
-                search_path: "/bin".into(),
+                declared: vec![("ASURA_X".into(), "1".into())],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                declared: vec![("X".into(), String::new())],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                declared: vec![("X".into(), "a\nb".into())],
+                ..p.clone()
+            },
+            PersonCommandQueued {
+                declared: (0..33).map(|i| (format!("V{i:02}"), "1".into())).collect(),
+                ..p.clone()
+            },
+            // Both modes need the PATH (ENV1).
+            PersonCommandQueued {
+                search_path: String::new(),
                 ..outside31()
             },
             PersonCommandQueued {

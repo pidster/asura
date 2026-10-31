@@ -4,8 +4,9 @@
 //! A job that received a raw secret value is tainted, and the composer
 //! never places its output, outcome, counts or durations in model input.
 //! The decision is a deterministic Asura check over the job's command
-//! source record: storage owns the predicate
-//! (`PersonCommandQueued::received_secret_values`), every read that hands
+//! source record: storage owns the predicates
+//! (`PersonCommandQueued::received_secret_values` and, since ENV4,
+//! `ToolCall::received_secret_values`), every read that hands
 //! job facts to the composer carries its flag, and this module maps the
 //! flag to a [`Taint`]. Nothing here reads a model output, a classifier or a
 //! summary. The value is derived at each read and never stored.
@@ -21,6 +22,10 @@ pub(crate) enum TaintSource {
     /// A person command with stored secret variables or the whole-command
     /// variable (kind 31 fields 14-15 or field 17 bit 1).
     PersonSecretValues = 1,
+    /// A model `exec_cmd` with SL3 secret variables or the SL7
+    /// whole-command variable (kind 14; owner decision ENV4, 2026-10-31).
+    /// Interim until the broker work forbids raw delivery to model jobs.
+    ModelSecretValues = 2,
 }
 
 /// The taint decision for one job.
@@ -31,17 +36,18 @@ pub(crate) enum Taint {
     Tainted(TaintSource),
 }
 impl Taint {
-    /// From the flag a storage read derived from the command source.
-    pub(crate) fn from_flag(received_secret: bool) -> Self {
-        if received_secret {
-            Self::Tainted(TaintSource::PersonSecretValues)
-        } else {
-            Self::Clean
+    /// From the flag a storage read derived from the command source, and
+    /// the job's origin, which names the source.
+    pub(crate) fn from_flag(received_secret: bool, person: bool) -> Self {
+        match (received_secret, person) {
+            (false, _) => Self::Clean,
+            (true, true) => Self::Tainted(TaintSource::PersonSecretValues),
+            (true, false) => Self::Tainted(TaintSource::ModelSecretValues),
         }
     }
     /// From the job's command source record (kind 14 or kind 31).
     pub(crate) fn of(command: &JobCommand) -> Self {
-        Self::from_flag(command.received_secret_values())
+        Self::from_flag(command.received_secret_values(), command.person().is_some())
     }
     pub(crate) fn is_tainted(self) -> bool {
         matches!(self, Self::Tainted(_))
@@ -57,8 +63,12 @@ impl Taint {
 
 /// The `result:` value of a tainted notice entry.
 pub(crate) const PRIVATE_RESULT: &str = "private (the command received a secret value; its output, result and counts are not shown to you)";
-/// The text of a kind 29 `private` result (codes 12 to 14).
-pub(crate) const PRIVATE_TEXT: &str = "private: the person ran this job with a secret value; its output, result and counts are not shown to you";
+/// The text of a kind 29 `private` result (codes 12 to 14), for either
+/// origin since ENV4.
+pub(crate) const PRIVATE_TEXT: &str =
+    "private: this job received a secret value; its output, result and counts are not shown to you";
+/// The text of a tainted model `exec_cmd` handle delivery (code 10, ENV4).
+pub(crate) const PRIVATE_DELIVERY: &str = "private: this command received a secret value; its output, result and counts are not shown to you";
 
 #[cfg(test)]
 mod tests {
@@ -86,8 +96,9 @@ mod tests {
             },
             display_command: String::new(),
             cwd: ".".into(),
-            search_path: String::new(),
+            search_path: "/bin".into(),
             environment: Vec::new(),
+            declared: Vec::new(),
             order_revision: 1,
             number_kinds: vec![SecretKind::GithubToken; kinds],
             unnumbered: 0,
@@ -106,33 +117,53 @@ mod tests {
         assert_eq!(Taint::of(&person(1, false, false)), tainted);
         assert_eq!(Taint::of(&person(2, false, true)), tainted);
         assert_eq!(Taint::of(&person(0, true, false)), tainted);
-        // The `!!` launch environment alone is not a taint source (O3).
+        // A `!!` command without secret variables is not tainted (ENV1).
         assert_eq!(Taint::of(&person(0, false, true)), Taint::Clean);
         assert_eq!(tainted.code(), 1);
         assert_eq!(Taint::Clean.code(), 0);
-        // A model call with SL3 secret variables is untainted today (O2).
-        let model = JobCommand::Model(Box::new(ToolCall {
-            operation: [7; 16],
-            generation: 1,
-            ordinal: 1,
-            source: ToolCallSource::GeneratedContent,
-            name: "exec_cmd".into(),
-            name_bytes: 8,
-            tool_operation: Some(ToolOperation::ExecCmd),
-            decision: ToolDecision::Run,
-            fault: None,
-            reason: None,
-            form: ArgumentForm::Verbatim,
-            arguments_bytes: 2,
-            arguments: "{}".into(),
-            number_kinds: vec![SecretKind::GithubToken],
-            unnumbered: 0,
-            rule_set_revision: 1,
-            rule_set_digest: [3; 32],
-            command_cut: false,
-            whole_command: true,
-            refusal: None,
-        }));
-        assert_eq!(Taint::of(&model), Taint::Clean);
+        // A model exec_cmd with the SL7 whole-command variable is tainted
+        // (ENV4, source 2).
+        let call = |kinds: usize, whole: bool, operation| {
+            JobCommand::Model(Box::new(ToolCall {
+                operation: [7; 16],
+                generation: 1,
+                ordinal: 1,
+                source: ToolCallSource::GeneratedContent,
+                name: "exec_cmd".into(),
+                name_bytes: 8,
+                tool_operation: Some(operation),
+                decision: ToolDecision::Run,
+                fault: None,
+                reason: None,
+                form: ArgumentForm::Verbatim,
+                arguments_bytes: 2,
+                arguments: "{}".into(),
+                number_kinds: vec![SecretKind::GithubToken; kinds],
+                unnumbered: 0,
+                rule_set_revision: 1,
+                rule_set_digest: [3; 32],
+                command_cut: false,
+                whole_command: whole,
+                refusal: None,
+            }))
+        };
+        let model = Taint::Tainted(TaintSource::ModelSecretValues);
+        assert_eq!(Taint::of(&call(1, true, ToolOperation::ExecCmd)), model);
+        // SL3 secret variables (ENV4).
+        assert_eq!(Taint::of(&call(2, false, ToolOperation::ExecCmd)), model);
+        assert_eq!(model.code(), 2);
+        // No secret variable, or another tool: untainted.
+        assert_eq!(
+            Taint::of(&call(0, false, ToolOperation::ExecCmd)),
+            Taint::Clean
+        );
+        assert_eq!(
+            Taint::of(&call(1, false, ToolOperation::ReadFile)),
+            Taint::Clean
+        );
+        // The flag maps by origin.
+        assert_eq!(Taint::from_flag(true, true), tainted);
+        assert_eq!(Taint::from_flag(true, false), model);
+        assert_eq!(Taint::from_flag(false, false), Taint::Clean);
     }
 }

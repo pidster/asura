@@ -408,6 +408,17 @@ fn records(bytes: &[u8]) -> Result<Vec<journal::Record>> {
     }
     Ok(out)
 }
+/// The calls of `operation` once each one's kind 28 committed: a tainted
+/// call's delivery does not wait for its job (ENV4), so the turn can end
+/// before the job settles.
+fn settled_calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Call>> {
+    let mut calls = Vec::new();
+    wait_for(Duration::from_secs(60), "every call settled", || {
+        calls = exec_cmd_calls(fixture, operation).unwrap_or_default();
+        !calls.is_empty() && calls.iter().all(|c| c.settled.is_some())
+    })?;
+    Ok(calls)
+}
 fn exec_cmd_calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Call>> {
     let (bytes, replay) = fixture.journal()?;
     let op = replay
@@ -597,7 +608,7 @@ fn secrets_turn() -> Result<()> {
             .unwrap_or("")
             .contains("ASURA_SECRET_1")
     );
-    let calls = exec_cmd_calls(&fixture, operation)?;
+    let calls = settled_calls(&fixture, operation)?;
     assert_eq!(calls.len(), 3);
     // 1. cat .env: placeholders in the stored output. Results carry no
     // output text (PC12); the J1 tails are retired.
@@ -647,23 +658,31 @@ fn secrets_turn() -> Result<()> {
     })?;
     let echoed = std::fs::read(object(&fixture, quoted.intent.stdout_payload))?;
     assert_eq!(echoed, b"$ASURA_SECRET_1\n");
-    // What the model saw: three handle deliveries, no output text.
+    // What the model saw: three handle deliveries, no output text. The
+    // two calls with secret variables are tainted (ENV4): their deliveries
+    // are private and name only the job.
     let messages = model.tool_messages();
     assert_eq!(messages.len(), 3, "{messages:?}");
     for message in &messages {
         assert!(!message.contains(&first) && !message.contains(&second));
-        assert!(message.starts_with("job: "), "{message}");
         assert!(
             !message.contains("GITHUB_TOKEN"),
             "no output text: {message}"
         );
     }
-    assert!(
-        messages[2]
-            .contains("command filtered: run from a secret variable: echo '$ASURA_SECRET_1'"),
-        "SL7 line: {}",
-        messages[2]
-    );
+    assert!(messages[0].starts_with("job: "), "{}", messages[0]);
+    for message in &messages[1..] {
+        assert!(
+            message.contains("private: this command received a secret value"),
+            "{message}"
+        );
+        assert!(
+            message.contains("job: ") && !message.contains("exit"),
+            "{message}"
+        );
+    }
+    // The private delivery shows no SL7 display line either.
+    assert!(!messages[2].contains("command filtered"), "{}", messages[2]);
     // The service stays available.
     model.script(&[Step::ExecCmd("printf after".into()), Step::Final]);
     let next = submit(&fixture, project, "Again.")?;
@@ -733,7 +752,7 @@ fn whole_command_turn() -> Result<()> {
         value.as_bytes()
     );
     std::fs::remove_file(directory.join("whole.txt"))?;
-    let calls = exec_cmd_calls(&fixture, operation)?;
+    let calls = settled_calls(&fixture, operation)?;
     assert_eq!(calls.len(), 1);
     let call = &calls[0];
     assert_eq!(call.intent.disposition, Disposition::Admitted);

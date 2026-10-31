@@ -706,15 +706,23 @@ fn exec_cmd_secret() -> Result<()> {
     // (PC12); the model's result is the handle delivery, no output text.
     assert!(recorded[0].result.is_none(), "no kind 15 for code 10");
     let result = recorded[0].job_result.as_ref().ok_or("kind 29")?;
+    // ENV4: the job received a secret variable, so it is tainted: the
+    // delivery is `private` with no body, no state, outcome or count.
     assert_eq!(
         (result.outcome, result.status),
-        (journal::JobResultOutcome::Ok, 1)
+        (journal::JobResultOutcome::Private, 2)
     );
+    assert_eq!(result.body, journal::JobResultBody::None);
     let delivered = model.tool_messages();
     assert_eq!(delivered.len(), 1, "{delivered:?}");
-    assert!(delivered[0].starts_with("job: "), "{}", delivered[0]);
-    assert!(delivered[0].contains("state: settled"), "{}", delivered[0]);
-    assert!(delivered[0].contains("result: exit 0"), "{}", delivered[0]);
+    assert!(
+        delivered[0].contains("private: this command received a secret value"),
+        "{}",
+        delivered[0]
+    );
+    assert!(delivered[0].contains("job: "), "{}", delivered[0]);
+    assert!(!delivered[0].contains("state: "), "{}", delivered[0]);
+    assert!(!delivered[0].contains("exit"), "{}", delivered[0]);
     assert!(!delivered[0].contains("GITHUB_TOKEN"), "no output text");
     assert!(
         !delivered[0].contains(&secret),

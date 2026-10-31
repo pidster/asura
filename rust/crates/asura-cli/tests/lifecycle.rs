@@ -1411,6 +1411,42 @@ fn main() {
         }
         return;
     }
+    // Lock, unlock or list a scratch keychain made by
+    // `--create-scratch-keychain` (SS-E2, SS-E1): the Security framework
+    // calls of the platform's `scratch` module, so the PTY journeys run no
+    // `security` command. The list prints service attributes only.
+    if let Some(
+        action @ ("--lock-scratch-keychain"
+        | "--unlock-scratch-keychain"
+        | "--scratch-keychain-services"),
+    ) = std::env::args().nth(1).as_deref()
+    {
+        let args: Vec<String> = std::env::args().collect();
+        let [_, _, path, password] = args.as_slice() else {
+            eprintln!("usage: {action} PATH PASSWORD");
+            std::process::exit(2);
+        };
+        use asura_platform::keychain::scratch;
+        let target = scratch::target(Path::new(path), password);
+        let outcome = match action {
+            "--lock-scratch-keychain" => scratch::lock(&target).map(|()| "locked".to_owned()),
+            "--unlock-scratch-keychain" => scratch::unlock(&target).map(|()| "unlocked".to_owned()),
+            _ => scratch::services(&target).map(|services| {
+                services.join(
+                    "
+",
+                )
+            }),
+        };
+        match outcome {
+            Ok(text) => println!("{text}"),
+            Err(error) => {
+                eprintln!("scratch keychain: {error:?}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if matches!(
         std::env::args().nth(1).as_deref(),
         Some("--seed-queue-reorder" | "--verify-queue-reorder")

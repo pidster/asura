@@ -11,7 +11,6 @@
 //! Q5 delete, absent and missing, Q6 observation, Q7 purge and an empty
 //! group. Every wait ends by the worker's reply; there is no time bound.
 //! The operator cancels with Ctrl-C; the next run purges first.
-use super::codec::{EnvironmentEntry, MAX_ENVIRONMENT_BYTES, MAX_ENVIRONMENT_ENTRIES};
 use super::{
     DeleteReply, GetReply, PutReply, SecretValue, Secrets, Store, SweepReport, Ticket, binding,
 };
@@ -31,9 +30,8 @@ fn bytes(len: usize, seed: u8) -> Zeroizing<Vec<u8>> {
     )
 }
 
-/// The largest payload of the item contract (55,413 bytes encoded).
+/// The largest payload of the item contract (8,307 bytes encoded).
 fn largest(seed: u8) -> Secrets {
-    let per = MAX_ENVIRONMENT_BYTES / MAX_ENVIRONMENT_ENTRIES;
     Secrets {
         variables: (0..16u8)
             .map(|i| SecretValue {
@@ -42,14 +40,6 @@ fn largest(seed: u8) -> Secrets {
             })
             .collect(),
         whole_command: None,
-        launch_environment: Some(
-            (0..MAX_ENVIRONMENT_ENTRIES)
-                .map(|i| EnvironmentEntry {
-                    name: bytes(8, 0x41),
-                    value: bytes(per - 8, seed ^ i as u8),
-                })
-                .collect(),
-        ),
     }
 }
 
