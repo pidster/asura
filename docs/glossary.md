@@ -108,6 +108,13 @@ or prove an operation completed.
 | Fencing | Enforcement that prevents a previous owner or obsolete generation from starting work after it loses authority |
 | Lease | Time-limited authority to own or perform specified work |
 | Egress | Data sent across a defined trust boundary, for example to a model provider or external database |
+| Trust class, proposed | One of classes A–F that states who may hold a raw secret or read tainted output: A Asura trusted code, B on-device models, C remote models, D1 model-originated jobs, D2 person-typed jobs, E the person, F OS services; see [trust classes](designs/assurance-and-differentiation.md#trust-classes) |
+| Brokered delivery, proposed | A job uses a credential through an Asura proxy or agent and never receives its value; the only delivery allowed to a model-originated job |
+| Raw delivery, proposed | Asura places a secret value in a job's environment, arguments, standard input or a file; allowed only for person-typed jobs, and it makes the job tainted |
+| Tainted job, proposed | A job that received raw delivery, with its descendants; its output and every value derived from it never reach a model |
+| Envelope approval, proposed | A person's one-time approval of a task's bounded grant (folders, hosts, secret bindings, budget, expiry), made as an authorized policy change; see [DF1](designs/assurance-and-differentiation.md#df1-approval-of-the-envelope-not-of-each-action) |
+| Evidence gate, proposed | The rule that a capability is enabled only while every evidence item it requires is current; see [evidence gate lifecycle](designs/assurance-and-differentiation.md#evidence-gate-lifecycle) |
+| Escape, proposed | In a red-team run: an effect outside the compiled enforcement set, a canary secret in model-bound bytes, a tainted datum on a model-bound path, or a denied context item at a remote endpoint |
 
 The [policy brief](designs/security-policy-brief.md) defines authorization duties.
 The [harness brief](designs/core-harness-brief.md) defines task and session checks.
