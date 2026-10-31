@@ -224,6 +224,11 @@ pub struct Composition {
     /// requires it to be at most [`MAX_UNSETTLED_JOBS`]; it stays in the
     /// kind 21 frame only.
     pub notice_live: u32,
+    /// The turn-start notice views (context-composer.md, CC3 notice views):
+    /// bit `i` is set when notice entry `i`, oldest first, has an output
+    /// view in the input. Reconstruction reads the views of the set bits
+    /// only; replay accepts any value.
+    pub notice_views: u8,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartAuthorized {

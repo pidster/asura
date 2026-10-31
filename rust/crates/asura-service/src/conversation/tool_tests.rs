@@ -49,6 +49,8 @@ impl Fixture {
             input: vec![],
             candidates: Vec::new(),
             notice: crate::context::Notice::none([5; 16], 0),
+            composing: None,
+            notice_jobs: Vec::new(),
             model: ModelOwner::tool_test_fixture(),
             accepted: true,
             ready: false,

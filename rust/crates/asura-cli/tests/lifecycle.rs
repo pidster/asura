@@ -1392,6 +1392,25 @@ fn main() {
         println!("ASURA_ISOLATED_LIFECYCLE_FIXTURE_V1");
         return;
     }
+    // A scratch keychain file for a PTY journey's secret store seam,
+    // created through the Security framework (SSR6, `scratch::create`):
+    // never the login keychain, never in the search list, and no
+    // `security` command.
+    if std::env::args().nth(1).as_deref() == Some("--create-scratch-keychain") {
+        let args: Vec<String> = std::env::args().collect();
+        let [_, _, path, password] = args.as_slice() else {
+            eprintln!("usage: --create-scratch-keychain PATH PASSWORD");
+            std::process::exit(2);
+        };
+        match asura_platform::keychain::scratch::create(Path::new(path), password) {
+            Ok(_) => println!("created"),
+            Err(error) => {
+                eprintln!("scratch keychain: {error:?}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if matches!(
         std::env::args().nth(1).as_deref(),
         Some("--seed-queue-reorder" | "--verify-queue-reorder")

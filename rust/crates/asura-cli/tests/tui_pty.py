@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production TUI journeys using only an isolated CLI fixture executable.
 
-Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer|--thinking|--jobs|--job-viewer|--job-retention|--execution-setting|--job-notices|--person-commands|--person-outside|--person-model|--person-restart|--person-secrets|--path-guard]
+Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--context-views|--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer|--thinking|--jobs|--job-viewer|--job-retention|--execution-setting|--job-notices|--person-commands|--person-outside|--person-model|--person-restart|--person-secrets|--path-guard]
 The job journeys (--jobs, --job-viewer, --job-retention, --execution-setting)
 need a service that lists CAPABILITY_JOBS; they run after packet J34-E.
 --job-notices needs the J5 job notice; it runs after packet J5-E.
@@ -3291,6 +3291,8 @@ class JobsHarness:
         self.script = []
         self.tool_messages = []
         self.chats = []
+        # The context length `/api/show` reports (tokens).
+        self.context = 16384
         self.errors = []
         self.release = threading.Event()
         self.stopped = threading.Event()
@@ -3332,7 +3334,7 @@ class JobsHarness:
                                 break
                     if request.startswith(b"POST /api/show "):
                         payload = json.dumps({"capabilities": ["completion", "tools"],
-                                              "model_info": {"fixture.context_length": 16384}}).encode()
+                                              "model_info": {"fixture.context_length": self.context}}).encode()
                         peer.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
                         continue
                     if not request.startswith(b"POST /api/chat "):
@@ -3864,7 +3866,9 @@ def job_notices_journey(fixture, source):
     def cite(_messages):
         text = notice_entry()
         found = re.search(r"^result: exit (\d+)$", text, re.M)
-        continuation = len(re.findall(r"^  \| ", text, re.M))
+        # The entry's own lines; the composer's view follows it (CC3).
+        entry = text.split("[Output excerpt follows.")[0]
+        continuation = len(re.findall(r"^  \| ", entry, re.M))
         status = found.group(1) if found else "none"
         return f"NOTICE-SEEN exit {status} with {continuation} continuation lines"
 
@@ -3960,7 +3964,7 @@ class PersonHarness(JobsHarness):
     `!!` command's launch environment names no real directory of the person.
     """
 
-    def __init__(self, fixture, source):
+    def __init__(self, fixture, source, api_keychain=False):
         super().__init__(fixture, source)
         try:
             root = fixture.root
@@ -3974,10 +3978,16 @@ class PersonHarness(JobsHarness):
                 directory.mkdir(mode=0o700)
             self.keychain = root / "scratch.keychain"
             password = os.urandom(16).hex()
-            created = subprocess.run(
-                ["/usr/bin/security", "create-keychain", "-p", password, str(self.keychain)],
-                stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
-            assert created.returncode == 0, created
+            if api_keychain:
+                # The fixture binary creates it through the Security
+                # framework, with no `security` command (--context-views).
+                code, out, err = fixture.command("--create-scratch-keychain", str(self.keychain), password)
+                assert code == 0 and out == b"created\n", (code, out, err)
+            else:
+                created = subprocess.run(
+                    ["/usr/bin/security", "create-keychain", "-p", password, str(self.keychain)],
+                    stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+                assert created.returncode == 0, created
             assert self.keychain.is_file(), sorted(p.name for p in root.iterdir())
             assert keychain_search_list() == self.search_list, "create-keychain changed the search list"
             write_private(home / "secret-store-keychain", f"{self.keychain}\n{password}\n")
@@ -4674,6 +4684,106 @@ def keychain_items(path):
     return re.findall(rb'"svce"<blob>="([^"]*)"', result.stdout)
 
 
+def context_views_journey(fixture, source):
+    """--context-views: CC-E3, CC-E4 and CC-E7 (context-composer.md, end to
+    end): the real TUI, service and Swift helper with the scripted loopback
+    model reporting a large window. CC-E3: a model command with a large
+    failing output; its handle delivery carries the composer's view, the
+    model pages on with `job read` from the named offset, and the answer
+    that cites both reaches the TUI. CC-E4: a `!` command with a large
+    output; the next turn's notice entry, labelled as the person's command,
+    carries a view. CC-E7: a `!` command with a stored secret variable; the
+    person sees its output in the log fold; the model's notice entry and
+    its `job read` are private; no model request holds the output. The
+    scratch keychain is created through the fixture binary, so no
+    `security` command runs."""
+    harness = PersonHarness(fixture, source, api_keychain=True)
+    harness.context = 1048576
+    project = harness.project("views")
+    trial = None
+
+    def user_text():
+        users = [m for m in harness.chats[-1]["messages"] if m.get("role") == "user"]
+        return users[-1]["content"] if users else ""
+
+    try:
+        fixture.start()
+        trial = fixture.launch()
+        harness.configure(trial, project)
+
+        # CC-E3: the delivery's view, then a page from its `more:` offset.
+        build = ("i=0; while [ $i -lt 3000 ]; do printf 'row %05d %s\\n' $i ABCDEFGHIJ; "
+                 "i=$((i+1)); done; printf 'ERR%sTAIL\\n' X >&2; exit 3")
+
+        def page_more(tools):
+            delivery = tools[-1]
+            more = re.search(r"^more: job read with stream (\w+) and offset (\d+)$", delivery, re.M)
+            handle = re.search(r"^job: ([0-9a-f]{32})$", delivery, re.M)
+            assert more and handle, delivery
+            return ("job", {"command": "read", "job": handle.group(1),
+                            "stream": more.group(1), "offset": int(more.group(2))})
+
+        def cite_e3(tools):
+            delivery, page = tools[-2], tools[-1]
+            first = re.search(r"^row (\d+) ", page, re.M)
+            return f"E3-VIEW {'  | ERRXTAIL' in delivery} PAGE {first.group(1) if first else 'none'}"
+
+        harness.script[:] = [("exec_cmd", {"command": build, "yield_seconds": 30}), page_more, cite_e3]
+        trial.send(b"Run the build.\r")
+        trial.until(b"E3-VIEW True PAGE 00000", plain=True, limit=90, reject="Incomplete response")
+        print("PASS CC-E3: the delivery carried the view, the model paged on from its offset, the answer reached the TUI")
+
+        # CC-E4: a person command's notice entry with a view.
+        listing = "i=0; while [ $i -lt 2000 ]; do printf 'line %05d\\n' $i; i=$((i+1)); done; printf 'BIG%sEND\\n' X"
+        harness.run(trial, listing)
+        harness.footer(trial, "! i=0", "↳ exit 0")
+
+        def cite_e4(_tools):
+            text = user_text()
+            entry = text[text.index(PERSON_LABEL):] if PERSON_LABEL in text else ""
+            seen = "stdout excerpt: bytes 0-" in entry and "  | BIGXEND" in entry
+            if not seen and os.environ.get("ASURA_VIEW_DEBUG"):
+                Path(os.environ["ASURA_VIEW_DEBUG"]).write_text(text)
+            return f"E4-NOTICE-VIEW {seen}"
+
+        harness.script[:] = [cite_e4]
+        trial.send(b"What did I list?\r")
+        trial.until(b"E4-NOTICE-VIEW True", plain=True, limit=40, reject="Incomplete response")
+        print("PASS CC-E4: the next turn's notice entry, labelled as the person's command, carried the composer's view")
+
+        # CC-E7: a command with a stored secret variable stays private.
+        token = "ghp_" + "tN9" * 12
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        secret_command = f"printf %s '{token}' | shasum -a 256; printf 'CAN%sARY\\n' X"
+        harness.run(trial, secret_command)
+        harness.footer(trial, "! printf %s", "↳ exit 0")
+        trial.until(b"CANXARY", plain=True, limit=20)
+
+        def read_private(_tools):
+            text = user_text()
+            found = re.search(r"result: private \(the command received a secret value[^\n]*\njob: ([0-9a-f]{32})", text)
+            assert found, text
+            return ("job", {"command": "read", "job": found.group(1), "stream": "stdout"})
+
+        def cite_e7(tools):
+            return f"E7-PRIVATE {tools[-1].startswith('private:') or 'private: the person ran this job' in tools[-1]}"
+
+        before = len(harness.chats)
+        harness.script[:] = [read_private, cite_e7]
+        trial.send(b"What did the secret command print?\r")
+        trial.until(b"E7-PRIVATE True", plain=True, limit=40, reject="Incomplete response")
+        sent = json.dumps(harness.chats[before:])
+        for leak in ("CANXARY", digest, token):
+            assert leak not in sent, f"a model request holds {leak[:8]}"
+        print("PASS CC-E7: the person saw the output; the model's notice entry and job read were private; no model request held the output")
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        fixture.active_trials.remove(trial)
+        trial = None
+    finally:
+        harness.close()
+
+
 def person_secrets_journey(fixture, source):
     """--person-secrets: SS-E1 (secret-store.md, end to end: with a model
     turn running, a `!!` command reading a launch environment token and a `!`
@@ -5058,6 +5168,7 @@ def main():
                  "--person-model": person_model_journey,
                  "--person-restart": person_restart_journey,
                  "--person-secrets": person_secrets_journey,
+                 "--context-views": context_views_journey,
                  "--path-guard": path_guard_journey}
     job_mode = job_modes.get(sys.argv[2]) if len(sys.argv) == 3 else None
     assert len(sys.argv) == 2 or job_mode or thinking or segmented or restore or records or steer or steps or waits_client or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__

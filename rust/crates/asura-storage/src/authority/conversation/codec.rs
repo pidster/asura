@@ -1979,6 +1979,7 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.u32(c.bytes_per_token_milli);
             w.u64(c.notice_through);
             w.u32(c.notice_live);
+            w.byte(c.notice_views);
             require(
                 p.thinking_level <= MAX_THINKING_LEVEL
                     && p.thinking_request <= MAX_THINKING_REQUEST,
@@ -2222,6 +2223,7 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
                 bytes_per_token_milli: r.u32()?,
                 notice_through: r.u64()?,
                 notice_live: r.u32()?,
+                notice_views: r.byte()?,
             };
             let thinking_level = r.byte()?;
             let thinking_request = r.byte()?;

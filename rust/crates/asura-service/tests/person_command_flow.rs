@@ -1355,6 +1355,8 @@ struct Model {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     chats: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     script: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Step>>>,
+    /// The context length `/api/show` reports; 32,768 by default.
+    context: std::sync::Arc<std::sync::atomic::AtomicU64>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl Model {
@@ -1366,7 +1368,9 @@ impl Model {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let chats = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let script = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-        let (token, log, steps) = (stop.clone(), chats.clone(), script.clone());
+        let context = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(32768));
+        let (token, log, steps, window) =
+            (stop.clone(), chats.clone(), script.clone(), context.clone());
         let thread = std::thread::spawn(move || {
             while !token.load(Ordering::Acquire) {
                 let (mut socket, _) = match listener.accept() {
@@ -1380,8 +1384,9 @@ impl Model {
                 let _ = socket.set_nonblocking(false);
                 let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
                 let (log, steps) = (log.clone(), steps.clone());
+                let window = window.load(Ordering::Acquire);
                 std::thread::spawn(move || {
-                    let _ = serve(&mut socket, &log, &steps);
+                    let _ = serve(&mut socket, &log, &steps, window);
                 });
             }
         });
@@ -1390,6 +1395,7 @@ impl Model {
             stop,
             chats,
             script,
+            context,
             thread: Some(thread),
         })
     }
@@ -1400,6 +1406,11 @@ impl Model {
     }
     fn chats(&self) -> Vec<String> {
         self.chats.lock().unwrap().clone()
+    }
+    /// Sets the context length the next `/api/show` reports.
+    fn set_context(&self, tokens: u64) {
+        self.context
+            .store(tokens, std::sync::atomic::Ordering::Release);
     }
 }
 impl Drop for Model {
@@ -1414,6 +1425,7 @@ fn serve(
     socket: &mut std::net::TcpStream,
     log: &std::sync::Mutex<Vec<String>>,
     steps: &std::sync::Mutex<std::collections::VecDeque<Step>>,
+    context: u64,
 ) -> std::io::Result<()> {
     use std::io::{Read, Write};
     let mut request = Vec::new();
@@ -1442,7 +1454,7 @@ fn serve(
     let body = &request[header_end + 4..header_end + 4 + length];
     if request.starts_with(b"POST /api/show ") {
         let payload = serde_json::json!({"capabilities": ["completion", "tools"],
-            "model_info": {"fixture.context_length": 32768}})
+            "model_info": {"fixture.context_length": context}})
         .to_string();
         return write!(
             socket,
@@ -2819,6 +2831,192 @@ fn notice_later() -> Result<()> {
     Ok(())
 }
 
+/// CC-I16 and CC-I17 (context-composer.md; taint exclusion hook, T1): with
+/// a large window, a `!` command with about 40 KiB of output and a `!`
+/// command with a stored secret variable settle before the next turn. The
+/// untainted entry carries a composer view; the tainted entry is the
+/// private form. The model's `status`, `read` and `wait` of the tainted
+/// job are `private` and its `list` row shows no state or counts. No chat
+/// request holds the tainted output, its exit status or its byte counts.
+/// After a restart, a later turn's rebuilt notice shows the tainted entry
+/// as private again: the taint is recomputed from kind 31.
+fn views_taint() -> Result<()> {
+    let model = Model::start()?;
+    model.set_context(1_048_576);
+    let mut env = Env::new("pc-views-taint")?;
+    env.start()?;
+    let (project, _) = env.project("project")?;
+    env.fixture.model(&model.endpoint)?;
+    model.script(&[Step::Final]);
+    let first = env
+        .fixture
+        .submit(project, "Hello.")
+        .map_err(|e| format!("first turn: {e}"))?;
+    env.fixture.finish(first, Duration::from_secs(60))?;
+    let (conversation, generation) = turn_of(&env, first)?;
+    // The markers are built at run time, so kind 31 does not hold them.
+    let big = "i=0; while [ $i -lt 2000 ]; do printf 'row %05d %s\\n' $i ABCDEFGHIJ; i=$((i+1)); done; printf 'BIG%sEND\\n' X";
+    let secret = token("tN9");
+    let tainted_command =
+        format!("printf %s '{secret}' | /usr/bin/shasum -a 256; printf 'CAN%sARY\\n' X; exit 7");
+    let (plain, _) = queued(
+        &env,
+        &at_generation(request(project, Some(conversation), big, None), generation),
+    )?;
+    let (private, _) = queued(
+        &env,
+        &at_generation(
+            request(project, Some(conversation), &tainted_command, None),
+            generation,
+        ),
+    )?;
+    let q = kind_31(&env, private)?;
+    assert!(
+        q.received_secret_values(),
+        "the secret became a variable: {q:?}"
+    );
+    assert!(!kind_31(&env, plain)?.received_secret_values());
+    let facts = wait_settled(&env, private, Duration::from_secs(60))?;
+    assert_eq!((facts.outcome, facts.exit_value), (JobOutcome::Exited, 7));
+    wait_settled(&env, plain, Duration::from_secs(60))?;
+    let output = String::from_utf8(stdout(&env, private)?)?;
+    let derived = sha256_hex(secret.as_bytes());
+    assert!(
+        output.contains(&derived) && output.contains("CANXARY"),
+        "{output}"
+    );
+    let handle = job_fixture::hex(&job_of(private));
+    let counts = [
+        format!("{} bytes", facts.stdout.capture.stored_bytes),
+        format!("stdout {} B", facts.stdout.capture.stored_bytes),
+    ];
+    model.script(&[
+        call(
+            "job",
+            serde_json::json!({"command": "status", "job": handle}),
+        ),
+        call(
+            "job",
+            serde_json::json!({"command": "read", "job": handle, "stream": "stdout"}),
+        ),
+        call("job", serde_json::json!({"command": "wait", "job": handle})),
+        call("job", serde_json::json!({"command": "list"})),
+        Step::Final,
+    ]);
+    let before = model.chats().len();
+    let next = env
+        .fixture
+        .follow(project, first, "What happened?")
+        .map_err(|e| format!("second turn: {e}"))?;
+    env.fixture.finish(next, Duration::from_secs(90))?;
+    let chats: Vec<String> = model.chats()[before..].to_vec();
+    assert_eq!(chats.len(), 5, "four calls and the answer");
+    // The untainted entry: a view inside the notice, on continuation lines.
+    let notice = user_entry(&chats[0], "What happened?")?;
+    assert!(notice.contains("stdout excerpt: bytes 0-"), "{notice}");
+    assert!(notice.contains("  | row 00000 ABCDEFGHIJ"), "{notice}");
+    assert!(notice.contains("  | BIGXEND"), "{notice}");
+    // The tainted entry: the private form only.
+    assert!(
+        notice.contains("result: private (the command received a secret value"),
+        "{notice}"
+    );
+    assert!(notice.contains(&format!("job: {handle}")), "{notice}");
+    // Its job calls: private, and a list row without state or counts.
+    let tools: Vec<String> = chat_messages(&chats[4])?
+        .into_iter()
+        .filter(|(role, _)| role == "tool")
+        .map(|(_, text)| text)
+        .collect();
+    assert_eq!(tools.len(), 4, "{tools:?}");
+    for text in &tools[..3] {
+        assert!(
+            text.contains("private: the person ran this job with a secret value"),
+            "{text}"
+        );
+    }
+    let row = tools[3]
+        .lines()
+        .find(|line| line.contains(&handle))
+        .ok_or("list row")?;
+    assert!(row.contains(" · private · "), "{row}");
+    // No chat request holds the tainted output, outcome or counts. The
+    // command text itself holds `exit 7`; the outcome text does not appear.
+    let reference_leak = format!("[job {handle}: the person, exit");
+    for chat in &chats {
+        for leak in [
+            derived.as_str(),
+            "CANXARY",
+            secret.as_str(),
+            "result: exit 7",
+            "· exit 7 ·",
+            reference_leak.as_str(),
+        ] {
+            assert!(!chat.contains(leak), "a model request holds {leak}");
+        }
+        for count in &counts {
+            assert!(
+                !chat.contains(count.as_str()),
+                "a model request holds {count}"
+            );
+        }
+    }
+    // Kind 29 records the exclusion: outcome `private`, no page read.
+    let all = records(&env)?;
+    let (_, replay) = env.fixture.journal()?;
+    let operation = replay.operations.get(&next).ok_or("operation")?;
+    let privates = all
+        .iter()
+        .filter(|r| {
+            matches!(r, Record::JobResult(p)
+            if p.operation == next && p.outcome == journal::JobResultOutcome::Private)
+        })
+        .count();
+    assert_eq!(privates, 3);
+    let accepted = all
+        .iter()
+        .find_map(|r| match r {
+            Record::TurnAccepted(t) if t.operation == next => Some(t.composition),
+            _ => None,
+        })
+        .ok_or("kind 21")?;
+    assert_eq!(accepted.composer_revision, 4);
+    assert_ne!(accepted.notice_views, 0, "the untainted view is recorded");
+    assert_eq!(operation.conversation, conversation);
+    // CC-I17: after a restart the later turn's history rebuilds the notice
+    // from kind 31; the tainted entry is private there too.
+    env.fixture.stop()?;
+    env.start()?;
+    model.script(&[Step::Final]);
+    let before = model.chats().len();
+    let later = env
+        .fixture
+        .follow(project, next, "And later?")
+        .map_err(|e| format!("later turn: {e}"))?;
+    env.fixture.finish(later, Duration::from_secs(60))?;
+    let chat = model.chats()[before..]
+        .last()
+        .cloned()
+        .ok_or("later chat")?;
+    let rebuilt = user_entry(&chat, "What happened?")?;
+    assert!(
+        rebuilt.contains(&format!("[job {handle}: the person, private]")),
+        "{rebuilt}"
+    );
+    for leak in [
+        derived.as_str(),
+        "CANXARY",
+        "result: exit 7",
+        reference_leak.as_str(),
+    ] {
+        assert!(!chat.contains(leak), "the later request holds {leak}");
+    }
+    println!(
+        "PASS CC-I16 CC-I17: an untainted person job's view reached the next turn; the tainted job's entry, status, read, wait and list row were private; no model request held its output, outcome or counts; after a restart its rebuilt entry was private"
+    );
+    Ok(())
+}
+
 type Case = (&'static str, fn() -> Result<()>);
 
 fn main() {
@@ -2920,6 +3118,7 @@ fn main() {
         ("printing", printing),
         ("history", history),
         ("notice_later", notice_later),
+        ("views_taint", views_taint),
     ];
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {

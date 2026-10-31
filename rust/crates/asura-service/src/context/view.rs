@@ -181,7 +181,7 @@ impl StageA {
 /// `None` when the share is below the floor and the view's fixed lines.
 pub(crate) fn view_budget(share: u64, fixed: u64) -> Option<u64> {
     let room = share.checked_sub(fixed)?;
-    (room >= VIEW_FLOOR + VIEW_OVERHEAD).then_some((room - VIEW_OVERHEAD) * 4 / 5)
+    (room >= VIEW_FLOOR + VIEW_OVERHEAD).then(|| (room - VIEW_OVERHEAD) * 4 / 5)
 }
 
 /// The replacement text of an unreadable page state (the J3 page texts).

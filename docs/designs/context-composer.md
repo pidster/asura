@@ -1,8 +1,9 @@
 # Context composer
 
 Status: selected design, 2026-10-14; slice **CC1 implemented 2026-10-15**;
-slices **CC2 and CC3 ready for implementation 2026-10-31** under
-[CC2 and CC3 implementation details](#cc2-and-cc3-implementation-details). The
+slices **CC2 and CC3 implemented 2026-10-31** under
+[CC2 and CC3 implementation details](#cc2-and-cc3-implementation-details),
+with the evidence and gaps in [design verification](#design-verification). The
 owner resolved decisions D1–D10 and N1; they are recorded in
 [owner decisions](#owner-decisions) with the mechanism each one selects. The
 tool job packets that CC2 and CC3 waited for (J1, J3 and J5) are delivered.
@@ -1126,7 +1127,7 @@ decisions, except item 8, which the owner selected.
 
 ### CC2 and CC3 implementation details
 
-Status: ready for implementation, 2026-10-31. Code inspection on 2026-10-31
+Status: implemented, 2026-10-31. Code inspection on 2026-10-31
 (`main` at `ed32394`) found the facts below; the subsections select the
 mechanisms under D4, D8, T1 and the iteration rules. Every value marked
 "proposed" is open to measured revision.
@@ -1318,8 +1319,9 @@ Composer revision 4 marks the CC3 composition. Its encoding adds:
 - **Kind 7 `job_output`**, one per placed range, directly after its entry's
   kind 5 segment: kind 7, role 1, fidelity 4 (excerpt), source identity the job
   ID, source digest the SHA-256 of the delivered range text, shown length and
-  shown digest of the rendered range lines, then the stream (u8), start (u64),
-  source length (u32) and stream total (u64).
+  shown digest of that same text (the rendered continuation lines are bound
+  by the input digest), then the stream (u8), start (u64), source length
+  (u32) and stream total (u64).
 - **Fidelity 5 (excluded)** for a tainted kind 5 segment, at the binding point
   and in a prior turn's rebuilt notice, followed by one byte, the taint source
   code.
@@ -1381,7 +1383,7 @@ One writer owns each packet's paths in order: CC2-S, CC2-C, CC3-S, CC3-C.
 - In-turn tool delivery is unchanged; L21 stays until CC2. L22 is removed
   (owner, 2026-10-18).
 
-**CC2, ready 2026-10-31 (J1 and J3 delivered): tool result views within a
+**CC2, implemented 2026-10-31 (J1 and J3 delivered): tool result views within a
 turn (stage A).** Size each job-mode result at the callback from the remaining
 budget, replacing L21 for those results ([stage A
 sizing](#cc2-stage-a-sizing)). Uses D8. Records each view in its kind 29.
@@ -1389,7 +1391,7 @@ Manifest bodies as payload objects (D5) are not built (O1). Lifts PC12 for
 model job results in the same turn. Includes the [taint exclusion
 hook](#taint-exclusion-hook) for job calls and `job list` rows (T1).
 
-**CC3, ready 2026-10-31 (CC2 and J5 delivered): tool output views across
+**CC3, implemented 2026-10-31 (CC2 and J5 delivered): tool output views across
 turns.** Output from retained streams in the turn's notice
 ([notice views](#cc3-notice-views)), with model reference holds. A prior turn's
 notice in history stays at reference fidelity. Lifts PC12 for person notices.
@@ -1556,6 +1558,27 @@ CC1 implementation evidence, 2026-10-15, macOS 27 development host:
 | Native journey | `tui_pty.py --conversation` with the rebuilt helper package | Pass |
 | CC-I2, CC-I5, CC-I6, CC-I9, CC-I11, CC-E5 | Not run as dedicated cases | Unverified |
 | CC-I10, CC-I12, CC-E2, CC-E6 | Need a window above 64 KiB or measured Ollama turns. The system model reports 4,096 tokens. Since 2026-10-20 an Ollama model has its full window (131,072 for `granite4.1:8b`), so these cases can now run; they have not been run as dedicated cases. | Unverified |
+
+CC2 and CC3 implementation evidence, 2026-10-31, macOS 27 development host,
+helper from an ad hoc `asura-bundle` package:
+
+| Case | Evidence | Result |
+| --- | --- | --- |
+| CC-U4, CC-U5, CC-U21 | `job_text` `cc_u4_cc_u5_state_result_with_view`, `cc_u21_private_results_and_list_row` | Pass |
+| CC-U6, CC-U9, CC-U12, CC-U17, CC-U23 | `context::view` tests | Pass |
+| CC-U11 (CC3), CC-U22, CC-U24 | `context::job_notice` tests `cc_u11_reconstruction_with_views`, `cc_u22_*`, `cc_u24_*` | Pass |
+| CC-U20 | `context::taint` `cc_u20_*` | Pass |
+| CC-U25 | `payload::store` `cc_u25_model_reference_holds` | Pass |
+| CC-U26 | `payload::pages` `cc_u26_*` | Pass |
+| CC-U27 | storage codec `cc_u27_*`; kind 29 and kind 21 size and outcome tables | Pass |
+| CC-I14, CC-I15 | `job_tool_flow views`, `view_cancel` (scripted loopback model, 1,048,576-token window; test-support file `page-hold` holds the pool) | Pass |
+| CC-I3, CC-I8 | `job_notice_flow views_hold`: held read, Inspect within 100 ms, acceptance after the hold, shutdown during a held read | Pass |
+| CC-I16, CC-I17 | `person_command_flow views_taint` (scratch keychain through the Security framework) | Pass |
+| CC-E3, CC-E4, CC-E7 | `tui_pty.py --context-views` (real TUI, service and helper; scripted loopback model; the scratch keychain is made by the fixture flag `--create-scratch-keychain`, so no `security` command runs) | Pass |
+| Regression | `tui_pty.py --job-notices` and `--jobs`; `conversation_flow --native-exec-cmd-tools` (system model, EQ-1 to EQ-4b) | Pass |
+| CC-I4 | The pool's `busy` at turn start; the drop path is unit-tested (CC-U24 partial view) | Unverified at integration: no harness saturates the page queue of 8 |
+| Model reference hold under real quota pressure | Unit only (CC-U25) | Unverified at integration |
+| Person PTY journeys (`--person-*`) | Not run: their harness creates its keychain with the `security` command, which this packet does not run | Unverified |
 
 The `--long-conversation` journey needs the native model and takes several
 minutes, so it is not in the lifecycle Cargo gate.

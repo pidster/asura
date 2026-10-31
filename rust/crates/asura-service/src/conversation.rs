@@ -610,6 +610,26 @@ impl TurnMeasurements {
         })
     }
 }
+/// The turn-start page phase (context-composer.md, CC3 notice views and
+/// CC-Q1): the planned views are read one range at a time on the page
+/// pool, then the turn is composed with what was read. The phase ends on
+/// the last reply, the turn's end (hold, shutdown, helper exit) or pool
+/// shutdown; it has no time bound (WB1).
+struct Composing {
+    instructions: &'static str,
+    budget: crate::context::Budget,
+    candidates: Vec<crate::context::Candidate>,
+    notice: crate::context::Notice,
+    plans: Vec<crate::context::ViewPlan>,
+    /// The plan and range being read.
+    plan: usize,
+    range: usize,
+    ticket: Option<asura_storage::payload::Ticket>,
+    /// The ranges of the current plan read so far.
+    current: Vec<(journal::JobPage, String)>,
+    /// One read view per notice entry; `None` when not planned or dropped.
+    views: Vec<Option<crate::context::NoticeView>>,
+}
 struct Active {
     /// Completed turns `Prepare` did not return (past 8 MiB of text).
     unlisted: u32,
@@ -628,6 +648,11 @@ struct Active {
     /// The turn's job notice, built from the `Prepare` notice inputs before
     /// the helper starts (J5); consumed by composition.
     notice: crate::context::Notice,
+    /// The turn-start page phase while notice views are read (CC3).
+    composing: Option<Box<Composing>>,
+    /// The jobs of the turn's notice entries, held for the model once
+    /// kind 21 commits (CC3 model reference hold).
+    notice_jobs: Vec<journal::Id>,
     model: ModelOwner,
     accepted: bool,
     ready: bool,
@@ -2257,6 +2282,8 @@ impl Owner {
             input: Vec::new(),
             candidates,
             notice,
+            composing: None,
+            notice_jobs: Vec::new(),
             model,
             accepted: false,
             ready: false,
@@ -2288,6 +2315,142 @@ impl Owner {
             cursors: Default::default(),
         });
         Ok(())
+    }
+    /// Composes the turn with the views read (or none) and binds its
+    /// digests before acceptance (context-composer.md, CC-Q1).
+    fn finish_composition(active: &mut Active, composing: Composing, now: Instant) {
+        let Composing {
+            instructions,
+            budget,
+            candidates,
+            notice,
+            views,
+            ..
+        } = composing;
+        match crate::context::compose_views(
+            instructions,
+            &active.turn.prompt,
+            &candidates,
+            active.unlisted,
+            &notice,
+            budget,
+            &views,
+        ) {
+            Ok(composed) => {
+                if !notice.is_empty() {
+                    tracing::debug!(
+                        entries = notice.entries.len(),
+                        reduced = composed.notice_reduced,
+                        overflow = notice.overflow,
+                        live = notice.live,
+                        views = composed.notice_views,
+                        "job_notice_composed"
+                    );
+                }
+                active.notice_jobs = notice.entries.iter().map(|e| e.job).collect();
+                active.turn.instructions_digest = Sha256::digest(instructions.as_bytes()).into();
+                active.turn.input_digest = Sha256::digest(&composed.input).into();
+                active.turn.composition = composed.composition(budget);
+                active.turn.prior_operations = composed.shown;
+                active.input = composed.input;
+                active.ready = true;
+            }
+            Err(crate::context::Error::ContextLimit {
+                mandatory_bytes,
+                budget_bytes,
+            }) => {
+                tracing::warn!(mandatory_bytes, budget_bytes, "context_limit");
+                Self::failed(active, "context_limit", now);
+            }
+            Err(crate::context::Error::Invalid) => {
+                Self::failed(active, "model_input_invalid", now);
+            }
+        }
+    }
+    /// The turn-start page phase (CC3): polls the read in flight, submits
+    /// the next range, and composes once every plan is read or dropped. A
+    /// view is all or nothing: a busy pool or an unreadable page drops the
+    /// entry's view. The turn's end drops the ticket, which withdraws the
+    /// read.
+    fn poll_composition(&mut self, now: Instant) {
+        let installation = self
+            .replay
+            .as_ref()
+            .map_or_else(|| self.payloads.installation(), |r| r.installation_id);
+        let closing = self.closing;
+        let pages = self.payloads.pages();
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        if active.composing.is_none() {
+            return;
+        }
+        if closing || active.terminal.is_some() {
+            active.composing = None;
+            return;
+        }
+        loop {
+            let composing = active.composing.as_mut().expect("composing");
+            if let Some(ticket) = &composing.ticket {
+                let Some(reply) = ticket.poll() else {
+                    return;
+                };
+                composing.ticket = None;
+                let plan = composing.plans[composing.plan].ranges[composing.range];
+                match job_tool::view_page(plan, reply) {
+                    Some((page, text, true)) => {
+                        composing.current.push((page, text));
+                        composing.range += 1;
+                    }
+                    // Unreadable, busy or shut down: no view for the entry.
+                    _ => {
+                        composing.current.clear();
+                        composing.plan += 1;
+                        composing.range = 0;
+                    }
+                }
+            }
+            if composing.plan >= composing.plans.len() {
+                let composing = active.composing.take().expect("composing");
+                Self::finish_composition(active, *composing, now);
+                return;
+            }
+            let plan = &composing.plans[composing.plan];
+            if composing.range >= plan.ranges.len() {
+                let entry = plan.entry;
+                let ranges = std::mem::take(&mut composing.current);
+                composing.views[entry] = Some(crate::context::NoticeView { ranges });
+                composing.plan += 1;
+                composing.range = 0;
+                continue;
+            }
+            let range = plan.ranges[composing.range];
+            let payload = asura_storage::payload::job_payloads(installation, plan.job)
+                [usize::from(range.stream == journal::OutputStream::Stderr)];
+            let submitted = pages.map(|pool| {
+                pool.submit(
+                    asura_storage::payload::PageRequest {
+                        payload,
+                        offset: range.offset,
+                        limit: range.limit as usize,
+                        scope: None,
+                        lines: range.lines,
+                    },
+                    asura_storage::payload::Origin::Model,
+                )
+            });
+            match submitted {
+                Some(Ok(ticket)) => {
+                    composing.ticket = Some(ticket);
+                }
+                // The pool is busy, closed or absent: no view for the entry.
+                _ => {
+                    composing.current.clear();
+                    composing.plan += 1;
+                    composing.range = 0;
+                }
+            }
+        }
     }
     fn job_done(&mut self, job: Job, result: writer::Result<writer::Reply>, now: Instant) {
         // The path guard's journal work keeps its own outcome handling.
@@ -2832,6 +2995,16 @@ impl Owner {
             Job::Accept => {
                 let active = self.active.as_mut().expect("active admission");
                 active.accepted = true;
+                // CC3 model reference hold: the jobs this turn's input shows.
+                if let Some(store) = self.payloads.store()
+                    && store.hold_model_refs(
+                        active.turn.conversation,
+                        active.turn.operation,
+                        &active.notice_jobs,
+                    )
+                {
+                    tracing::info!("model_hold_evicted");
+                }
                 if let Some(emitter) = &self.audit_emitter {
                     let _ = emitter.try_emit(asura_storage::audit::Event::ConversationAdmission {
                         project: active.turn.project,
@@ -3820,42 +3993,35 @@ impl Owner {
                         &mut active.notice,
                         crate::context::Notice::none(active.turn.conversation, 0),
                     );
-                    match crate::context::compose_turn(
+                    // CC3: notice views are read before composition when the
+                    // budget leaves room for one and the pool is ready.
+                    let plans = crate::context::plan_turn(
                         instructions,
                         &active.turn.prompt,
                         &candidates,
                         active.unlisted,
                         &notice,
                         budget,
-                    ) {
-                        Ok(composed) => {
-                            if !notice.is_empty() {
-                                tracing::debug!(
-                                    entries = notice.entries.len(),
-                                    reduced = composed.notice_reduced,
-                                    overflow = notice.overflow,
-                                    live = notice.live,
-                                    "job_notice_composed"
-                                );
-                            }
-                            active.turn.instructions_digest =
-                                Sha256::digest(instructions.as_bytes()).into();
-                            active.turn.input_digest = Sha256::digest(&composed.input).into();
-                            active.turn.composition = composed.composition(budget);
-                            active.turn.prior_operations = composed.shown;
-                            active.input = composed.input;
-                            active.ready = true;
-                        }
-                        Err(crate::context::Error::ContextLimit {
-                            mandatory_bytes,
-                            budget_bytes,
-                        }) => {
-                            tracing::warn!(mandatory_bytes, budget_bytes, "context_limit");
-                            Self::failed(active, "context_limit", now);
-                        }
-                        Err(crate::context::Error::Invalid) => {
-                            Self::failed(active, "model_input_invalid", now);
-                        }
+                    )
+                    .unwrap_or_default();
+                    let entries = notice.entries.len();
+                    let mut composing = Composing {
+                        instructions,
+                        budget,
+                        candidates,
+                        notice,
+                        plans,
+                        plan: 0,
+                        range: 0,
+                        ticket: None,
+                        current: Vec::new(),
+                        views: vec![None; entries],
+                    };
+                    if composing.plans.is_empty() || self.payloads.pages().is_none() {
+                        composing.plans.clear();
+                        Self::finish_composition(active, composing, now);
+                    } else {
+                        active.composing = Some(Box::new(composing));
                     }
                 }
                 ModelEvent::InferenceUsage(value) => {
@@ -3926,6 +4092,7 @@ impl Owner {
                 ModelEvent::Failed(message) => Self::failed(active, message, now),
             }
         }
+        self.poll_composition(now);
         if let Some(active) = &mut self.active
             && let Some(tool) = active.tool.as_mut().filter(|t| t.job.is_some())
             && let Some(outcome) = active.tool_executor.poll()
@@ -5005,6 +5172,21 @@ impl Owner {
             return;
         };
         active.cursors.apply(&result);
+        // CC3 model reference hold: the job this result names.
+        let named = if tool.record.tool_operation == Some(journal::ToolOperation::ExecCmd) {
+            Some(journal::exec_cmd_job_id(
+                result.operation,
+                result.generation,
+                result.ordinal,
+            ))
+        } else {
+            (result.job != [0; 16]).then_some(result.job)
+        };
+        if let (Some(job), Some(store)) = (named, self.payloads.store())
+            && store.hold_model_refs(active.turn.conversation, active.turn.operation, &[job])
+        {
+            tracing::info!("model_hold_evicted");
+        }
         let index = tool.ordinal as usize - 1;
         active.measurements.tool_ms[index] = active.measurements.tool_start[index].map(|start| {
             now.saturating_duration_since(start)

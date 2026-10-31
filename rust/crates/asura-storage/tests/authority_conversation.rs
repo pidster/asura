@@ -331,6 +331,7 @@ fn composed_turns_record_budget_and_account_for_omitted_history() {
             bytes_per_token_milli: 1000,
             notice_through: 0,
             notice_live: 0,
+            notice_views: 0,
         };
         p
     };
@@ -4335,16 +4336,18 @@ fn j5t_03_notice_through_is_encoded_and_replay_checks_its_range() {
     // Codec vector.
     let mut wide = first(0x0102_0304_0506_0708);
     wide.composition.notice_live = 0x0A0B_0C0D;
+    wide.composition.notice_views = 0x0E;
     wide.thinking_level = 2;
     wide.thinking_request = 3;
     let payload = turn_payload(&wide, 0x0102_0304_0506_0709);
     let narrow = turn_payload(&first(0), 4);
     assert_eq!(payload.len(), narrow.len());
+    // `notice_views` (u8, CC3) follows `notice_live`.
     assert_eq!(
-        payload[payload.len() - 14..],
-        [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 2, 3]
+        payload[payload.len() - 15..],
+        [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 2, 3]
     );
-    assert_eq!(narrow[narrow.len() - 14..], [0; 14]);
+    assert_eq!(narrow[narrow.len() - 15..], [0; 15]);
     assert_eq!(
         decode_record(21, &payload).unwrap(),
         Record::TurnAccepted(Box::new(wide))

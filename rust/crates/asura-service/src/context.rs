@@ -1,7 +1,7 @@
 //! Context composer: per-request model input from the model's window (context-composer.md).
 //! The core is pure: equal candidates and budget give equal bytes and manifest.
 use asura_control::model::{self, pb};
-use asura_storage::authority::conversation::{Composition, Hash, Id, MAX_COMPOSED_PRIOR};
+use asura_storage::authority::conversation::{Composition, Hash, Id, JobPage, MAX_COMPOSED_PRIOR};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -13,8 +13,9 @@ pub(crate) use job_notice::{Notice, NoticeError, NoticeInputs, Settlement};
 /// Versions the composition rules and the manifest encoding. Revision 2
 /// adds the J5 job notice and its segments; revision 3 adds each prior
 /// turn's notice, rebuilt at reference fidelity inside its history entry
-/// (tool-job-controller.md, notices in later turns).
-pub(crate) const COMPOSER_REVISION: u32 = 3;
+/// (tool-job-controller.md, notices in later turns); revision 4 adds the
+/// CC3 notice views (kind 7 segments) and the T1 excluded fidelity.
+pub(crate) const COMPOSER_REVISION: u32 = 4;
 /// Calibration before enough measurements: one token per byte (D2).
 const FALLBACK_MILLI: u32 = 1000;
 /// Upper bound on the learned bytes per token.
@@ -99,6 +100,8 @@ pub(crate) struct Composed {
     pub notice_live: u32,
     /// Notice entries at reference fidelity, oldest first (J5T-05).
     pub notice_reduced: u32,
+    /// `notice_views` for kind 21: bit `i` marks entry `i` with a view.
+    pub notice_views: u8,
 }
 impl Composed {
     pub(crate) fn composition(&self, budget: Budget) -> Composition {
@@ -112,6 +115,7 @@ impl Composed {
             bytes_per_token_milli: budget.bytes_per_token_milli,
             notice_through: self.notice_through,
             notice_live: self.notice_live,
+            notice_views: self.notice_views,
         }
     }
 }
@@ -121,6 +125,10 @@ enum Fidelity {
     Reference = 2,
     Full = 3,
 }
+/// The excerpt fidelity of a `job_output` segment (CC3).
+const EXCERPT: u8 = 4;
+/// The excluded fidelity of a tainted notice entry (T1).
+const EXCLUDED: u8 = 5;
 
 fn varint_len(value: u64) -> u64 {
     (64 - (value | 1).leading_zeros() as u64).div_ceil(7)
@@ -244,23 +252,52 @@ pub(crate) fn compose_turn(
     notice: &Notice,
     budget: Budget,
 ) -> Result<Composed, Error> {
+    compose_views(instructions, prompt, history, unlisted, notice, budget, &[])
+}
+
+/// The history and notice decisions of one turn: CC-F1 steps 2 to 5 for
+/// every candidate except notice views, which have the lowest priority.
+struct Decision<'a> {
+    limit: u64,
+    /// Every candidate, newest first.
+    ordered: Vec<&'a Candidate>,
+    /// At most [`MAX_COMPOSED_PRIOR`] newest candidates; the first
+    /// `fidelity.len()` are shown.
+    turns: Vec<&'a Candidate>,
+    fidelity: Vec<Fidelity>,
+    upgrades: Vec<usize>,
+    /// Notice entries at reference fidelity, oldest first.
+    reduced: usize,
+    /// Bytes the decisions use, with the context block's reserved room.
+    used: u64,
+    mandatory: u64,
+}
+
+fn decide<'a>(
+    instructions: &str,
+    prompt: &str,
+    history: &'a [Candidate],
+    unlisted: u32,
+    notice: &Notice,
+    budget: Budget,
+) -> Result<Decision<'a>, Error> {
     let limit = budget.bytes().ok_or(Error::ContextLimit {
         mandatory_bytes: 0,
         budget_bytes: 0,
     })?;
     let mut ordered: Vec<&Candidate> = history.iter().collect();
     ordered.sort_by_key(|t| (std::cmp::Reverse(t.generation), t.operation));
-    let turns = &ordered[..ordered.len().min(MAX_COMPOSED_PRIOR)];
+    let turns: Vec<&Candidate> = ordered[..ordered.len().min(MAX_COMPOSED_PRIOR)].to_vec();
     let mandatory = field_len(instructions.len() as u64) + field_len(prompt.len() as u64);
     // Reserve room for the largest possible context block, so the omitted line never
     // displaces a decision already made. The notice keeps as many entries at
     // full fidelity as fit; older entries are reduced first.
     let mut reduced = 0;
-    let (notice_text, block_room) = loop {
+    let block_room = loop {
         let text = notice.text(reduced);
         let room = context_block_room(history, unlisted, &text);
         if mandatory + room <= limit {
-            break (text, room);
+            break room;
         }
         if reduced == notice.entries.len() {
             return Err(Error::ContextLimit {
@@ -281,7 +318,7 @@ pub(crate) fn compose_turn(
         }
     };
     let mut fidelity = Vec::new();
-    for turn in turns {
+    for turn in &turns {
         let level = cheapest(turn);
         let size = turn_len(turn, level);
         if used + size > limit {
@@ -313,7 +350,148 @@ pub(crate) fn compose_turn(
         }
         index += 1;
     }
-    for _ in 0..ENCODE_ATTEMPTS {
+    Ok(Decision {
+        limit,
+        ordered,
+        turns,
+        fidelity,
+        upgrades,
+        reduced,
+        used,
+        mandatory,
+    })
+}
+
+/// A placed notice view: its rendered text and its kept ranges.
+type PlacedView = Option<(String, Vec<(JobPage, String)>)>;
+
+/// The ranges to read for one notice entry's view (CC3 notice views).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ViewPlan {
+    /// The entry's index, oldest first.
+    pub entry: usize,
+    pub job: Id,
+    pub ranges: Vec<view::RangePlan>,
+}
+
+/// One notice entry's view as read: each range with its delivered text,
+/// in plan order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NoticeView {
+    pub ranges: Vec<(JobPage, String)>,
+}
+
+/// The entries that may get a view, and the share of each: the bytes the
+/// decisions leave, divided equally among the untainted entries at full
+/// fidelity with stored bytes.
+fn view_shares(decision: &Decision<'_>, notice: &Notice) -> (Vec<usize>, u64) {
+    let eligible: Vec<usize> = notice
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(index, entry)| {
+            *index >= decision.reduced && !entry.taint.is_tainted() && entry.totals != [0, 0]
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if eligible.is_empty() {
+        return (eligible, 0);
+    }
+    let left = decision.limit.saturating_sub(decision.used);
+    let share = left / eligible.len() as u64;
+    (eligible, share)
+}
+
+/// Plans the notice views of one turn (CC3 step 1): the D8 ranges of each
+/// eligible entry whose share reaches the floor. Empty when no entry gets
+/// a view; then the turn composes as before.
+pub(crate) fn plan_turn(
+    instructions: &str,
+    prompt: &str,
+    history: &[Candidate],
+    unlisted: u32,
+    notice: &Notice,
+    budget: Budget,
+) -> Result<Vec<ViewPlan>, Error> {
+    let decision = decide(instructions, prompt, history, unlisted, notice, budget)?;
+    let (eligible, share) = view_shares(&decision, notice);
+    let Some(source) = view::view_budget(share, 0) else {
+        return Ok(Vec::new());
+    };
+    Ok(eligible
+        .into_iter()
+        .filter_map(|index| {
+            let entry = &notice.entries[index];
+            let ranges = view::plan(entry.shape, entry.totals, source);
+            (!ranges.is_empty()).then_some(ViewPlan {
+                entry: index,
+                job: entry.job,
+                ranges,
+            })
+        })
+        .collect())
+}
+
+/// The rendered view of an entry, fitted to its share: the last range is
+/// dropped while the text exceeds it. `None` when nothing is left.
+fn fitted_view(entry: &job_notice::Entry, read: &NoticeView, share: u64) -> PlacedView {
+    let mut ranges = read.ranges.clone();
+    let unverified = entry.shape == view::Shape::Unknown;
+    while !ranges.is_empty() {
+        let pairs: Vec<(JobPage, &str)> = ranges.iter().map(|(p, t)| (*p, t.as_str())).collect();
+        let text = view::render(&pairs, entry.totals, unverified);
+        if text.len() as u64 <= share {
+            return Some((text, ranges));
+        }
+        ranges.pop();
+    }
+    None
+}
+
+/// [`compose_turn`] with the notice views read for it: `views[i]` is entry
+/// `i`'s view, or `None` when it was not planned or could not be read
+/// completely (CC3 steps 3 and 4). History decisions never depend on views.
+pub(crate) fn compose_views(
+    instructions: &str,
+    prompt: &str,
+    history: &[Candidate],
+    unlisted: u32,
+    notice: &Notice,
+    budget: Budget,
+    views: &[Option<NoticeView>],
+) -> Result<Composed, Error> {
+    let decision = decide(instructions, prompt, history, unlisted, notice, budget)?;
+    let (eligible, share) = view_shares(&decision, notice);
+    let Decision {
+        limit,
+        ordered,
+        turns,
+        mut fidelity,
+        mut upgrades,
+        reduced,
+        mandatory,
+        ..
+    } = decision;
+    // Each placed view: its rendered text and its kept ranges.
+    let mut placed: Vec<PlacedView> = notice
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            if !eligible.contains(&index) || view::view_budget(share, 0).is_none() {
+                return None;
+            }
+            let read = views.get(index)?.as_ref()?;
+            fitted_view(entry, read, share)
+        })
+        .collect();
+    let mut attempts = 0;
+    loop {
+        let texts: Vec<Option<String>> = placed
+            .iter()
+            .map(|p| p.as_ref().map(|(text, _)| text.clone()))
+            .collect();
+        let notice_text = notice.text_with(reduced, &texts);
         let shown = &turns[..fidelity.len()];
         // Everything older than the shown turns, including any beyond the
         // shown-turn bound, joins one omitted range.
@@ -332,10 +510,16 @@ pub(crate) fn compose_turn(
                 omitted,
                 notice,
                 reduced,
+                views: &placed,
             });
             let mut shown_ids: Vec<(u64, Id)> =
                 shown.iter().map(|t| (t.generation, t.operation)).collect();
             shown_ids.sort();
+            let notice_views = placed
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.is_some())
+                .fold(0u8, |bits, (index, _)| bits | (1u8 << index.min(7)));
             return Ok(Composed {
                 input: bytes,
                 shown: shown_ids.into_iter().map(|(_, id)| id).collect(),
@@ -344,7 +528,17 @@ pub(crate) fn compose_turn(
                 notice_through: notice.through,
                 notice_live: notice.live,
                 notice_reduced: reduced as u32,
+                notice_views,
             });
+        }
+        // Views go first, the last entry's first; then CC-F1 step 7.
+        if let Some(last) = placed.iter().rposition(Option::is_some) {
+            placed[last] = None;
+            continue;
+        }
+        attempts += 1;
+        if attempts >= ENCODE_ATTEMPTS {
+            break;
         }
         match upgrades.pop() {
             Some(index) => fidelity[index] = Fidelity::Reference,
@@ -358,6 +552,67 @@ pub(crate) fn compose_turn(
         budget_bytes: limit,
     })
 }
+
+/// Reconstruction of a turn with notice views (CC3 step 4; D10): the
+/// views of the set `notice_views` bits must all be readable, otherwise
+/// the turn is `reconstruction_unavailable`. `read` returns the view of an
+/// entry's plan, or `None` when a range is missing, expired or unreadable.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn reconstruct(
+    instructions: &str,
+    prompt: &str,
+    history: &[Candidate],
+    unlisted: u32,
+    notice: &Notice,
+    budget: Budget,
+    recorded: Recorded<'_>,
+) -> Result<Composed, Reconstruction> {
+    let Recorded { notice_views, read } = recorded;
+    let plans = plan_turn(instructions, prompt, history, unlisted, notice, budget)
+        .map_err(Reconstruction::Compose)?;
+    let mut views: Vec<Option<NoticeView>> = vec![None; notice.entries.len()];
+    for plan in &plans {
+        if notice_views & (1u8 << plan.entry.min(7)) == 0 {
+            continue;
+        }
+        views[plan.entry] = Some(read(plan).ok_or(Reconstruction::Unavailable)?);
+    }
+    let composed = compose_views(
+        instructions,
+        prompt,
+        history,
+        unlisted,
+        notice,
+        budget,
+        &views,
+    )
+    .map_err(Reconstruction::Compose)?;
+    if composed.notice_views != notice_views {
+        return Err(Reconstruction::Unavailable);
+    }
+    Ok(composed)
+}
+
+/// What a kind 21 recorded about its notice views, and the reader of the
+/// retained streams for a reconstruction.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Recorded<'a> {
+    /// Kind 21 `notice_views`.
+    pub notice_views: u8,
+    /// The view of an entry's plan, or `None` when a range is missing,
+    /// expired or unreadable.
+    pub read: &'a mut dyn FnMut(&ViewPlan) -> Option<NoticeView>,
+}
+
+/// Why a past turn could not be recomposed.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Reconstruction {
+    /// `reconstruction_unavailable` (CCR12, D10).
+    Unavailable,
+    Compose(Error),
+}
+
 /// Room for the context block when every candidate is omitted.
 fn context_block_room(history: &[Candidate], unlisted: u32, notice: &str) -> u64 {
     if history.is_empty() && unlisted == 0 && notice.is_empty() {
@@ -409,6 +664,8 @@ struct Parts<'a> {
     notice: &'a Notice,
     /// The current notice's entries at reference fidelity, oldest first.
     reduced: usize,
+    /// Each entry's placed view: its rendered text and kept ranges.
+    views: &'a [PlacedView],
 }
 /// SHA-256 over the deterministic manifest encoding (context-composer.md, item 7).
 fn manifest(parts: &Parts<'_>) -> Hash {
@@ -470,7 +727,11 @@ fn manifest_encode(revision: u32, parts: &Parts<'_>, out: &mut dyn FnMut(&[u8]))
         // source identity and digest of its binding point; none for a
         // reference turn.
         if *fidelity == Fidelity::Full {
-            out(&notice_segments(&turn.notice, turn.notice.entries.len()));
+            out(&notice_segments(
+                &turn.notice,
+                turn.notice.entries.len(),
+                &[],
+            ));
         }
         segment(
             out,
@@ -491,7 +752,7 @@ fn manifest_encode(revision: u32, parts: &Parts<'_>, out: &mut dyn FnMut(&[u8]))
         parts.block,
         parts.block,
     );
-    out(&notice_segments(parts.notice, parts.reduced));
+    out(&notice_segments(parts.notice, parts.reduced, parts.views));
     segment(
         out,
         PROMPT,
@@ -524,6 +785,9 @@ const JOB_NOTICE: u8 = 5;
 /// The header, overflow and live lines; source identity the conversation
 /// ID, source digest [`Notice::summary_digest`].
 const JOB_NOTICE_SUMMARY: u8 = 6;
+/// One placed excerpt range after its entry (CC3); source identity the job
+/// ID, source digest the delivered range text's SHA-256.
+const JOB_OUTPUT: u8 = 7;
 
 /// One manifest segment: kind, role, fidelity, source identity, source
 /// digest, shown byte length (u64) and shown content digest.
@@ -546,25 +810,54 @@ fn segment_bytes(
 /// The notice segments, after the context block segment: each entry in
 /// settlement order at its fidelity, then the summary segment. None when
 /// the turn has no notice block.
-fn notice_segments(notice: &Notice, reduced: usize) -> Vec<u8> {
+fn notice_segments(notice: &Notice, reduced: usize, views: &[PlacedView]) -> Vec<u8> {
     let mut out = Vec::new();
     if notice.is_empty() {
         return out;
     }
     for (index, entry) in notice.entries.iter().enumerate() {
         let (fidelity, shown) = if index < reduced {
-            (Fidelity::Reference, &entry.reference)
+            (Fidelity::Reference as u8, &entry.reference)
         } else {
-            (Fidelity::Full, &entry.full)
+            (Fidelity::Full as u8, &entry.full)
         };
+        if entry.taint.is_tainted() {
+            // T1: the exclusion as a reference fact, with the taint code.
+            out.extend(segment_bytes(
+                JOB_NOTICE,
+                1,
+                EXCLUDED,
+                entry.job,
+                entry.digest,
+                shown,
+            ));
+            out.push(entry.taint.code());
+            continue;
+        }
         out.extend(segment_bytes(
             JOB_NOTICE,
             1,
-            fidelity as u8,
+            fidelity,
             entry.job,
             entry.digest,
             shown,
         ));
+        if let Some(Some((_, ranges))) = views.get(index).filter(|_| index >= reduced) {
+            for (page, text) in ranges {
+                out.extend(segment_bytes(
+                    JOB_OUTPUT,
+                    1,
+                    EXCERPT,
+                    entry.job,
+                    page.digest,
+                    text,
+                ));
+                out.push(page.stream as u8);
+                out.extend_from_slice(&page.start.to_be_bytes());
+                out.extend_from_slice(&page.source_len.to_be_bytes());
+                out.extend_from_slice(&page.total.to_be_bytes());
+            }
+        }
     }
     out.extend(segment_bytes(
         JOB_NOTICE_SUMMARY,

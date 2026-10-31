@@ -1289,7 +1289,7 @@ impl JobCall {
 /// text, and whether later ranges may still be read. `None` stops the view
 /// with no range for this reply (pool shutdown, `busy`, `denied`, a stale
 /// offset, an empty page).
-fn view_page(plan: RangePlan, reply: PageReply) -> Option<(JobPage, String, bool)> {
+pub(super) fn view_page(plan: RangePlan, reply: PageReply) -> Option<(JobPage, String, bool)> {
     let PageReply::Page(page) = reply else {
         return None;
     };

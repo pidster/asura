@@ -147,7 +147,70 @@ struct State {
     /// under quota pressure. Keyed by job ID, so a pin set before admission
     /// or after recovery holds as soon as the entry exists.
     pinned: BTreeSet<Id>,
+    /// The model reference holds (context-composer.md, CC3 model reference
+    /// hold): per conversation, the jobs of its current and previous turn.
+    model_refs: ModelRefs,
     listeners: Vec<Weak<dyn SpaceListener>>,
+}
+
+/// Jobs per held turn: 8 notice entries and 200 results fit (proposed).
+pub const MAX_MODEL_HOLD_JOBS: usize = 256;
+/// Conversations with model holds (proposed known-size bound).
+pub const MAX_MODEL_HOLD_CONVERSATIONS: usize = 64;
+
+/// One conversation's model holds.
+#[derive(Default)]
+struct TurnHolds {
+    operation: Id,
+    current: BTreeSet<Id>,
+    previous: BTreeSet<Id>,
+    /// The order in which the conversations moved to a new turn.
+    moved: u64,
+}
+/// The model reference holds of every conversation, memory only.
+#[derive(Default)]
+struct ModelRefs {
+    conversations: BTreeMap<Id, TurnHolds>,
+    clock: u64,
+}
+impl ModelRefs {
+    /// Adds `jobs` to the current turn of `conversation`; a new operation
+    /// first moves the current set to the previous one. Returns whether a
+    /// conversation's holds were released for the bound.
+    fn add(&mut self, conversation: Id, operation: Id, jobs: &[Id]) -> bool {
+        let mut evicted = false;
+        if !self.conversations.contains_key(&conversation)
+            && self.conversations.len() >= MAX_MODEL_HOLD_CONVERSATIONS
+            && let Some(oldest) = self
+                .conversations
+                .iter()
+                .min_by_key(|(id, holds)| (holds.moved, **id))
+                .map(|(id, _)| *id)
+        {
+            self.conversations.remove(&oldest);
+            evicted = true;
+        }
+        self.clock += 1;
+        let clock = self.clock;
+        let holds = self.conversations.entry(conversation).or_default();
+        if holds.operation != operation {
+            holds.previous = std::mem::take(&mut holds.current);
+            holds.operation = operation;
+            holds.moved = clock;
+        }
+        for job in jobs {
+            if holds.current.len() >= MAX_MODEL_HOLD_JOBS {
+                break;
+            }
+            holds.current.insert(*job);
+        }
+        evicted
+    }
+    fn held(&self, job: &Id) -> bool {
+        self.conversations
+            .values()
+            .any(|holds| holds.current.contains(job) || holds.previous.contains(job))
+    }
 }
 impl State {
     fn available(&self) -> u64 {
@@ -169,6 +232,7 @@ impl State {
                     && c.holds == 0
                     && !c.deleting
                     && !self.pinned.contains(*id)
+                    && !self.model_refs.held(id)
             })
             .collect();
         candidates.sort_by(|(_, a), (_, b)| {
@@ -541,6 +605,20 @@ impl Ledger {
         if changed && !pinned {
             self.space_event();
         }
+    }
+    /// Holds `jobs` for the current turn `operation` of `conversation`
+    /// and, after it, the conversation's next turn (CCR23; context-composer.md,
+    /// CC3 model reference hold). A new operation releases the turn before
+    /// the previous one, which may free space. Returns whether the
+    /// conversation bound released another conversation's holds.
+    pub fn hold_model_refs(&self, conversation: Id, operation: Id, jobs: &[Id]) -> bool {
+        let evicted = lock(self).model_refs.add(conversation, operation, jobs);
+        self.space_event();
+        evicted
+    }
+    /// Whether a model reference holds the job.
+    pub fn model_held(&self, job: Id) -> bool {
+        lock(self).model_refs.held(&job)
     }
     /// Whether the job is under the person pin hold.
     pub fn pinned(&self, job: Id) -> bool {
@@ -1405,6 +1483,67 @@ mod tests {
         delete_all(&ledger, &victims);
         assert_eq!(admit(&ledger, 12), Err(Short::Quota));
         assert!(ledger.used() <= ledger.quota());
+    }
+
+    /// CC-U25 (unit): the model reference hold keeps the jobs of a
+    /// conversation's current and previous turn out of expiry; the turn
+    /// before is released; the conversation bound releases the least
+    /// recently moved conversation.
+    #[test]
+    fn cc_u25_model_reference_holds() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        for n in 1..=3 {
+            admit(&ledger, n).unwrap();
+            settle(&ledger, n, MIB, u64::from(n));
+        }
+        let conversation = [0xc0; 16];
+        // Turn A shows job 1; turn B shows job 2: both held.
+        assert!(!ledger.hold_model_refs(conversation, [0xa; 16], &[call_id(1)]));
+        ledger.hold_model_refs(conversation, [0xb; 16], &[call_id(2)]);
+        ledger.hold_model_refs(conversation, [0xb; 16], &[call_id(2)]);
+        assert!(ledger.model_held(call_id(1)) && ledger.model_held(call_id(2)));
+        tighten(&ledger, 0);
+        let victims = admit(&ledger, 10).unwrap();
+        assert_eq!(
+            victim_calls(&victims),
+            [call_id(3)],
+            "held jobs are skipped"
+        );
+        delete_all(&ledger, &victims);
+        // Turn C: job 1 (two turns back) is released.
+        ledger.hold_model_refs(conversation, [0xc; 16], &[]);
+        assert!(!ledger.model_held(call_id(1)) && ledger.model_held(call_id(2)));
+        let victims = admit(&ledger, 11).unwrap();
+        assert_eq!(victim_calls(&victims), [call_id(1)]);
+        delete_all(&ledger, &victims);
+        // The conversation bound: the 65th conversation releases the least
+        // recently moved one (the first).
+        let others = Ledger::default();
+        for n in 0..MAX_MODEL_HOLD_CONVERSATIONS {
+            let id = [n as u8; 16];
+            assert!(!others.hold_model_refs(
+                id,
+                id,
+                &[[0xf0, n as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]]
+            ));
+        }
+        assert!(others.model_held([0xf0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]));
+        assert!(others.hold_model_refs([0xff; 16], [0xff; 16], &[[0xee; 16]]));
+        assert!(!others.model_held([0xf0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]));
+        assert!(others.model_held([0xee; 16]));
+        // The per-turn bound.
+        let many: Vec<Id> = (0..300u16)
+            .map(|n| {
+                let mut id = [0x77; 16];
+                id[..2].copy_from_slice(&n.to_be_bytes());
+                id
+            })
+            .collect();
+        let bounded = Ledger::default();
+        bounded.hold_model_refs([1; 16], [2; 16], &many);
+        let held = many.iter().filter(|id| bounded.model_held(**id)).count();
+        assert_eq!(held, MAX_MODEL_HOLD_JOBS);
     }
 
     /// J4T-06 (unit): the first step of a person delete. A live job is

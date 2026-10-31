@@ -6,6 +6,7 @@
 //! (AE-01); this runs on the reactor over at most
 //! [`journal::MAX_NOTICE_SETTLEMENTS`] settlements, each re-encoding one
 //! kind 28 of at most a few KiB and parsing one kind 14 argument object.
+use crate::context::taint::Taint;
 use crate::context::{Candidate, Notice, NoticeError, NoticeInputs, Settlement};
 use asura_storage::authority::conversation::{
     self as journal, Hash, Id, JobNotice, PriorNotice, TurnAccepted, TurnTerminal,
@@ -18,6 +19,8 @@ struct Source {
     directory: String,
     digest: Hash,
     outside_sandbox: bool,
+    /// The taint flag of the command source (T1).
+    received_secret: bool,
 }
 
 /// The notice of a turn of `conversation` from its `Prepare` notice
@@ -63,6 +66,8 @@ pub(super) fn build(conversation: Id, inputs: &JobNotice) -> Result<Notice, Noti
             digest,
             // Kind 31 field 7 bit 1 (PCR24); always false for kind 14.
             outside_sandbox: settlement.command.outside_sandbox(),
+            // The deterministic taint check of the command source (T1).
+            received_secret: settlement.command.received_secret_values(),
         });
     }
     let settlements: Vec<Settlement<'_>> = inputs
@@ -78,6 +83,7 @@ pub(super) fn build(conversation: Id, inputs: &JobNotice) -> Result<Notice, Noti
                 outside_sandbox: source.outside_sandbox,
                 command: &source.command,
                 directory: &source.directory,
+                taint: Taint::from_flag(source.received_secret),
             })
         })
         .collect();
@@ -143,6 +149,7 @@ fn prior_notice(conversation: Id, inputs: &PriorNotice) -> Result<Notice, Notice
             outside_sandbox: settlement.outside_sandbox,
             command: "",
             directory: "",
+            taint: Taint::from_flag(settlement.received_secret),
         });
     }
     Notice::reference_only(&NoticeInputs {

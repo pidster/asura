@@ -9,6 +9,8 @@
 //! does no I/O. The outcome and capture texts are the J3 result texts of
 //! [`job_text`]. The context composer places the rendered block inside the
 //! context block before the prompt and binds it in the manifest.
+use super::taint::{self, Taint};
+use super::view::Shape;
 use crate::job_text::{self, Origin};
 use crate::tools::MAX_COMMAND_BYTES;
 use asura_storage::authority::conversation::{
@@ -50,6 +52,8 @@ pub(crate) struct Settlement<'a> {
     pub command: &'a str,
     /// The stored cwd of kind 14 or kind 31.
     pub directory: &'a str,
+    /// The taint decision from the command source (T1).
+    pub taint: Taint,
 }
 
 /// The notice inputs of one turn (J5 binding point).
@@ -94,6 +98,13 @@ pub(crate) struct Entry {
     pub full: String,
     /// Reference fidelity: one line ending in a newline (CCR15).
     pub reference: String,
+    /// The taint decision (T1): a tainted entry is excluded at every
+    /// fidelity and never has a view.
+    pub taint: Taint,
+    /// The D8 class and the stored bytes of stdout and stderr, for a view
+    /// (CC3); never rendered for a tainted entry.
+    pub shape: Shape,
+    pub totals: [u64; 2],
 }
 
 /// The notice of one turn: entries in increasing kind 28 sequence, the
@@ -195,6 +206,28 @@ impl Notice {
         text
     }
 
+    /// [`Notice::text`] with each entry's view after its full text: one
+    /// optional view per entry, in entry order (CC3 notice views).
+    pub(crate) fn text_with(&self, reduced: usize, views: &[Option<String>]) -> String {
+        let mut text = String::new();
+        if !self.entries.is_empty() {
+            text.push_str(HEADER_LINE);
+            text.push('\n');
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            if index < reduced {
+                text.push_str(&entry.reference);
+                continue;
+            }
+            text.push_str(&entry.full);
+            if let Some(Some(view)) = views.get(index) {
+                text.push_str(view);
+            }
+        }
+        text.push_str(&self.tail());
+        text
+    }
+
     /// The overflow and live lines.
     fn tail(&self) -> String {
         let mut text = String::new();
@@ -250,9 +283,35 @@ fn entry(s: &Settlement<'_>) -> Result<Entry, NoticeError> {
         Origin::Person => PERSON_LABEL,
         Origin::PersonOutside => PERSON_OUTSIDE_LABEL,
     };
+    let handle = job_text::handle(&job);
+    let shape = Shape::settled(facts);
+    let totals = [
+        facts.stdout.capture.stored_bytes,
+        facts.stderr.capture.stored_bytes,
+    ];
+    if s.taint.is_tainted() {
+        // T1: only facts known before the job ran; no outcome, counts or
+        // durations (context-composer.md, taint exclusion hook).
+        let full = format!(
+            "{label}\n{}{}result: {}\njob: {handle}\n",
+            quoted("command", s.command),
+            quoted("directory", s.directory),
+            taint::PRIVATE_RESULT,
+        );
+        let reference = format!("[job {handle}: {}, private]\n", origin.as_str());
+        return Ok(Entry {
+            job,
+            sequence: s.sequence,
+            digest: s.digest,
+            full,
+            reference,
+            taint: s.taint,
+            shape,
+            totals,
+        });
+    }
     let outcome = job_text::outcome_text(facts, origin);
     let capture = capture_suffix(facts);
-    let handle = job_text::handle(&job);
     let full = format!(
         "{label}\n{}{}result: {outcome}\noutput: stdout {} lines, {} bytes; stderr {} lines, {} bytes{capture}\njob: {handle}\n",
         quoted("command", s.command),
@@ -274,6 +333,9 @@ fn entry(s: &Settlement<'_>) -> Result<Entry, NoticeError> {
         digest: s.digest,
         full,
         reference,
+        taint: s.taint,
+        shape,
+        totals,
     })
 }
 

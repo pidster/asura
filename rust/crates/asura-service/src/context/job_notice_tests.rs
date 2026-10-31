@@ -75,6 +75,8 @@ struct Fixture {
     commands: Vec<String>,
     directories: Vec<String>,
     sequences: Vec<u64>,
+    /// Indexes of settlements whose command source received secret values.
+    tainted: Vec<usize>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -85,6 +87,7 @@ impl Fixture {
             commands: Vec::new(),
             directories: Vec::new(),
             sequences: Vec::new(),
+            tainted: Vec::new(),
         }
     }
     fn push(
@@ -113,6 +116,7 @@ impl Fixture {
                 outside_sandbox: self.outside[i],
                 command: &self.commands[i],
                 directory: &self.directories[i],
+                taint: super::super::taint::Taint::from_flag(self.tainted.contains(&i)),
             })
             .collect()
     }
@@ -767,7 +771,7 @@ fn v9_command_of_8192_bytes() {
 #[test]
 fn v10_manifest_segment_encoding_of_v2() {
     let notice = v2();
-    let bytes = super::super::notice_segments(&notice, 0);
+    let bytes = super::super::notice_segments(&notice, 0, &[]);
     assert_eq!(bytes.len(), 2 * (3 + 16 + 32 + 8 + 32));
     assert_eq!(
         hex(&bytes),
@@ -799,7 +803,7 @@ fn v10_manifest_segment_encoding_of_v2() {
     );
     // A turn with no block has no notice segments.
     let none = models(0).notice(3, 9, 0).unwrap();
-    assert!(super::super::notice_segments(&none, 0).is_empty());
+    assert!(super::super::notice_segments(&none, 0, &[]).is_empty());
 }
 
 /// J5-E7: one live job has the singular form, `Use job list to see it.`;
@@ -1345,6 +1349,7 @@ fn encoded(revision: u32, shown: &[&Candidate], fidelity: &[Fidelity], budget: &
             omitted: &[],
             notice: &none,
             reduced: 0,
+            views: &[],
         },
         &mut |bytes| out.extend_from_slice(bytes),
     );
@@ -1560,7 +1565,7 @@ fn j5t_11_manifest_segments_and_revision_3() {
         )
         .as_slice()
     );
-    let segments = notice_segments(&notice, 3);
+    let segments = notice_segments(&notice, 3, &[]);
     assert_eq!(segments.len(), 4 * SEGMENT);
     let notice_at = user + SEGMENT;
     assert_eq!(
@@ -1591,11 +1596,11 @@ fn j5t_11_manifest_segments_and_revision_3() {
     // A reference turn has no notice segments.
     let reference = encoded(COMPOSER_REVISION, &shown, &[Fidelity::Reference], &budget);
     assert_eq!(reference.len(), bytes.len() - segments.len());
-    // Revision 3 changes the digest; the composition records it.
-    assert_eq!(COMPOSER_REVISION, 3);
+    // The revision changes the digest; the composition records it.
+    assert_eq!(COMPOSER_REVISION, 4);
     let two = encoded(2, &shown, &[Fidelity::Full], &budget);
     assert_ne!(Sha256::digest(&two), Sha256::digest(&bytes));
-    assert_eq!(composed.composition(budget).composer_revision, 3);
+    assert_eq!(composed.composition(budget).composer_revision, 4);
     // A different stored S or live count changes the bound digest.
     let mut moved = notice.clone();
     moved.through += 1;
@@ -1605,4 +1610,229 @@ fn j5t_11_manifest_segments_and_revision_3() {
         other.manifest_digest, composed.manifest_digest,
         "S is bound"
     );
+}
+
+// ----- CC3 (context-composer.md, CC3 notice views and the taint hook) -----
+
+use super::super::view::RangePlan;
+use super::super::{compose_views, plan_turn, reconstruct};
+use asura_storage::authority::conversation::{JobPage, JobPageState, OutputStream};
+
+/// Two settled model jobs: a success with a large stdout and a failure
+/// with stderr; no line breaks, so range snapping keeps every byte.
+fn views_fixture() -> Fixture {
+    let mut fixture = Fixture::new();
+    let first = model(1);
+    let mut facts = settled(&first, JobOutcome::Exited, JobReason::None, 0);
+    facts.stdout = stream(1, 50_000);
+    facts.stderr = stream(0, 0);
+    fixture.push(first, facts, false, "cargo build", ".", 10);
+    let second = model(2);
+    let mut facts = settled(&second, JobOutcome::Exited, JobReason::None, 2);
+    facts.stdout = stream(1, 300);
+    facts.stderr = stream(1, 4_000);
+    fixture.push(second, facts, false, "cargo test", ".", 11);
+    fixture
+}
+/// The bytes of each stream: `o` for stdout and `e` for stderr.
+fn read_view(plan: &super::super::ViewPlan) -> super::super::NoticeView {
+    let ranges = plan
+        .ranges
+        .iter()
+        .map(|range: &RangePlan| {
+            let fill = if range.stream == OutputStream::Stdout {
+                "o"
+            } else {
+                "e"
+            };
+            let text = fill.repeat(range.limit as usize);
+            let total = range.offset + u64::from(range.limit);
+            let page = JobPage {
+                stream: range.stream,
+                start: range.offset,
+                source_len: range.limit,
+                total,
+                state: JobPageState::Complete,
+                digest: Sha256::digest(text.as_bytes()).into(),
+            };
+            (page, text)
+        })
+        .collect();
+    super::super::NoticeView { ranges }
+}
+
+/// CC-U22: a tainted entry is the private form at full and reference
+/// fidelity, also as a prior turn's rebuilt notice; its manifest segment
+/// is excluded (fidelity 5) with the taint code, and it gets no view.
+#[test]
+fn cc_u22_tainted_entries_are_excluded() {
+    let mut fixture = v3_fixture();
+    fixture.facts[0].stdout = stream(9, 5_000);
+    fixture.tainted.push(0);
+    let notice = fixture.notice(10, 12, 0).unwrap();
+    let tainted = &notice.entries[0];
+    assert!(tainted.taint.is_tainted());
+    let private = super::super::taint::PRIVATE_RESULT;
+    assert_eq!(
+        tainted.full,
+        format!(
+            "{PERSON_LABEL}\ncommand: git status --short\ndirectory: src/ui\nresult: {private}\njob: {}\n",
+            job_text::handle(&tainted.job)
+        )
+    );
+    assert_eq!(
+        tainted.reference,
+        format!(
+            "[job {}: the person, private]\n",
+            job_text::handle(&tainted.job)
+        )
+    );
+    for text in [&tainted.full, &tainted.reference] {
+        for leak in ["exit", "output:", "5000", "bytes", "lines", "elapsed"] {
+            assert!(!text.contains(leak), "{leak}: {text}");
+        }
+    }
+    // The untainted entry keeps its outcome and counts.
+    assert!(notice.entries[1].full.contains("result: exit 1"));
+    // Manifest: fidelity 5 and the taint code after the segment.
+    let segments = notice_segments(&notice, 0, &[]);
+    assert_eq!(segments[..3], [5, 1, 5]);
+    let one = 3 + 16 + 32 + 8 + 32;
+    assert_eq!(segments[one], 1, "taint source code");
+    assert_eq!(
+        segments[one + 1..one + 4],
+        [5, 1, 3],
+        "the next entry is full"
+    );
+    // A prior turn's rebuilt notice: the private reference line.
+    let settlements = fixture.settlements();
+    let prior = Notice::reference_only(&NoticeInputs {
+        conversation: CONVERSATION,
+        previous: 10,
+        through: 12,
+        settlements: &settlements,
+        live: 0,
+    })
+    .unwrap();
+    assert!(prior.text(prior.entries.len()).contains(", private]"));
+    // No view is planned for it, however large the budget.
+    let plans = plan_turn("rules", "now?", &[], 0, &notice, budget(4_000_000)).unwrap();
+    assert!(plans.iter().all(|p| p.entry != 0), "{plans:?}");
+}
+
+/// CC-U24: notice views share the bytes the history leaves; history
+/// decisions are the same with and without views; the bits record the
+/// placed views; revision 4 binds the ranges.
+#[test]
+fn cc_u24_notice_views_share_the_leftover_budget() {
+    let notice = views_fixture().notice(0, 11, 0).unwrap();
+    let history: Vec<_> = (1..=6).map(|g| turn(g, 400)).collect();
+    let window = budget(2048 + 40_000);
+    let plans = plan_turn("rules", "now?", &history, 0, &notice, window).unwrap();
+    assert_eq!(plans.len(), 2, "{plans:?}");
+    // Success: stdout head and tail; failure: the stderr tail first.
+    assert_eq!(plans[0].ranges[0].stream, OutputStream::Stdout);
+    assert_eq!(plans[1].ranges[0].stream, OutputStream::Stderr);
+    let mut views = vec![None; notice.entries.len()];
+    for plan in &plans {
+        views[plan.entry] = Some(read_view(plan));
+    }
+    let plain = compose_turn("rules", "now?", &history, 0, &notice, window).unwrap();
+    let with = compose_views("rules", "now?", &history, 0, &notice, window, &views).unwrap();
+    assert_eq!(
+        with.shown, plain.shown,
+        "history decisions do not depend on views"
+    );
+    assert_eq!(with.omitted, plain.omitted);
+    assert_eq!(with.notice_views, 0b11);
+    assert_eq!(plain.notice_views, 0);
+    assert_ne!(with.manifest_digest, plain.manifest_digest);
+    assert!(with.input.len() as u64 <= window.bytes().unwrap());
+    let prompt = prompt_of(&with);
+    let first = prompt.find("job: ").unwrap();
+    let excerpt = prompt.find("stdout excerpt: bytes 0-").unwrap();
+    assert!(excerpt > first, "the view follows its entry");
+    for line in prompt.lines() {
+        assert!(
+            !(line.starts_with("oooo") || line.starts_with("eeee")),
+            "output text outside a continuation line: {line}"
+        );
+    }
+    assert!(prompt.contains("  | oooo") && prompt.contains("  | eeee"));
+    // A view that could not be read: its bit stays clear.
+    let one = vec![Some(read_view(&plans[0])), None];
+    let partial = compose_views("rules", "now?", &history, 0, &notice, window, &one).unwrap();
+    assert_eq!(partial.notice_views, 0b01);
+    // A small window plans no view.
+    let small = plan_turn("rules", "now?", &history, 0, &notice, budget(2048 + 4_000));
+    assert!(small.unwrap().is_empty());
+}
+
+/// CC-U11 (CC3): reconstruction recomposes a turn with views from the
+/// recorded bits and the streams; a missing stream for a set bit is
+/// `reconstruction_unavailable`.
+#[test]
+fn cc_u11_reconstruction_with_views() {
+    let notice = views_fixture().notice(0, 11, 0).unwrap();
+    let window = budget(2048 + 40_000);
+    let plans = plan_turn("rules", "now?", &[], 0, &notice, window).unwrap();
+    let mut views = vec![None; notice.entries.len()];
+    for plan in &plans {
+        views[plan.entry] = Some(read_view(plan));
+    }
+    let live = compose_views("rules", "now?", &[], 0, &notice, window, &views).unwrap();
+    let again = reconstruct(
+        "rules",
+        "now?",
+        &[],
+        0,
+        &notice,
+        window,
+        super::super::Recorded {
+            notice_views: live.notice_views,
+            read: &mut |plan| Some(read_view(plan)),
+        },
+    )
+    .unwrap();
+    assert_eq!(again.input, live.input);
+    assert_eq!(again.manifest_digest, live.manifest_digest);
+    // An expired stream for a set bit.
+    let missing = reconstruct(
+        "rules",
+        "now?",
+        &[],
+        0,
+        &notice,
+        window,
+        super::super::Recorded {
+            notice_views: live.notice_views,
+            read: &mut |_| None,
+        },
+    );
+    assert_eq!(
+        missing.unwrap_err(),
+        super::super::Reconstruction::Unavailable
+    );
+    // Clear bits read nothing and give the turn without views.
+    let mut reads = 0;
+    let mut count = |plan: &super::super::ViewPlan| {
+        reads += 1;
+        Some(read_view(plan))
+    };
+    let none = reconstruct(
+        "rules",
+        "now?",
+        &[],
+        0,
+        &notice,
+        window,
+        super::super::Recorded {
+            notice_views: 0,
+            read: &mut count,
+        },
+    )
+    .unwrap();
+    assert_eq!(reads, 0);
+    let plain = compose_turn("rules", "now?", &[], 0, &notice, window).unwrap();
+    assert_eq!(none.manifest_digest, plain.manifest_digest);
 }

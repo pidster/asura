@@ -47,7 +47,6 @@ impl Taint {
         matches!(self, Self::Tainted(_))
     }
     /// The manifest code: 0 clean, otherwise the source code.
-    #[allow(dead_code)] // The notice manifest uses it from CC3.
     pub(crate) fn code(self) -> u8 {
         match self {
             Self::Clean => 0,
@@ -57,7 +56,6 @@ impl Taint {
 }
 
 /// The `result:` value of a tainted notice entry.
-#[allow(dead_code)] // The notice entry uses it from CC3.
 pub(crate) const PRIVATE_RESULT: &str = "private (the command received a secret value; its output, result and counts are not shown to you)";
 /// The text of a kind 29 `private` result (codes 12 to 14).
 pub(crate) const PRIVATE_TEXT: &str = "private: the person ran this job with a secret value; its output, result and counts are not shown to you";
