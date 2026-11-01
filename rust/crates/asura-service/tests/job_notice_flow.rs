@@ -874,7 +874,7 @@ fn views_hold() -> Result<()> {
     // Queue the next input only: its acceptance waits for the held read.
     let (_, replay) = fixture.journal()?;
     let op = replay.operations.get(&first).ok_or("first")?;
-    queue_submit::queue_call(
+    let queued = queue_submit::queue_call(
         &|| fixture.attach(),
         queue_submit::queue_request(
             project,
@@ -884,6 +884,11 @@ fn views_hold() -> Result<()> {
         ),
     )
     .map_err(|e| format!("queue Held?: {e}"))?;
+    let input: [u8; 16] = queued
+        .accepted_input_id
+        .as_deref()
+        .ok_or("queue receipt lacks input")?
+        .try_into()?;
     thread::sleep(Duration::from_secs(1));
     assert_eq!(
         turn_count(&fixture)?,
@@ -895,17 +900,13 @@ fn views_hold() -> Result<()> {
         Ok(fixture.attach()?.inspect()?)
     })?;
     std::fs::remove_file(&hold)?;
-    wait_for(Duration::from_secs(30), "the held turn accepted", || {
-        turn_count(&fixture).is_ok_and(|n| n > turns)
-    })?;
-    let second = frames(&fixture)?
-        .into_iter()
-        .rev()
-        .find_map(|(_, r)| match r {
-            Record::TurnAccepted(t) => Some(t.operation),
-            _ => None,
-        })
-        .ok_or("second turn")?;
+    // The turn as the service reports it: its kind 21 can reach the
+    // journal file before the owner applies the append, and an observation
+    // in that gap is answered `conversation_busy`.
+    let second = queue_submit::dispatched(&|| fixture.attach(), project, input)
+        .map_err(|e| format!("the held turn accepted: {e}"))?;
+    let second = job_fixture::id(second.operation_id)?;
+    assert!(turn_count(&fixture)? > turns, "the held turn's kind 21");
     fixture.finish(second, Duration::from_secs(60))?;
     let (_, turn) = accepted(&fixture, second)?;
     assert_eq!(turn.composition.notice_views, 0b1);
