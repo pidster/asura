@@ -64,11 +64,13 @@ impl Taint {
 /// The `result:` value of a tainted notice entry.
 pub(crate) const PRIVATE_RESULT: &str = "private (the command received a secret value; its output, result and counts are not shown to you)";
 /// The text of a kind 29 `private` result (codes 12 to 14), for either
-/// origin since ENV4.
+/// origin since ENV4. A reference fact only, sent with status 8 `private`
+/// (tool-job-controller.md, private tool result status, PTS-R3).
 pub(crate) const PRIVATE_TEXT: &str =
-    "private: this job received a secret value; its output, result and counts are not shown to you";
+    "private: this job used secrets, so its output is private to the person";
 /// The text of a tainted model `exec_cmd` handle delivery (code 10, ENV4).
-pub(crate) const PRIVATE_DELIVERY: &str = "private: this command received a secret value; its output, result and counts are not shown to you";
+pub(crate) const PRIVATE_DELIVERY: &str =
+    "private: this command used secrets, so its output is private to the person";
 
 #[cfg(test)]
 mod tests {

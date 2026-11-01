@@ -157,6 +157,10 @@ impl Activity {
                         }
                     ));
                 }
+                // PTS-R6: a tainted job's result is private, not a failure.
+                if tool.state == Some(2) && tool.status == Some(8) {
+                    text.push_str(" · private");
+                }
                 if tool.state.is_some_and(|state| state >= 2) {
                     text.push_str(&format!("\n    ↳ {state}"));
                     if let Some(exit) = tool.exit_code {
@@ -1023,6 +1027,28 @@ mod tests {
         ] {
             assert!(text.contains(state), "{state}: {text}");
         }
+    }
+    /// PTS-R6: a complete call with status 8 shows `private`, not a failure.
+    #[test]
+    fn private_tool_result_is_complete_and_private() {
+        let mut app = App::new();
+        app.active_operation = Some(vec![1; 16]);
+        app.retained_request = Some(super::super::super::conversation::Request::Setup(
+            crate::conversation::Command::Observe([2; 16]),
+        ));
+        let mut complete = event(2, 3, 4, 3);
+        complete.tools = vec![pb::ToolProgress {
+            ordinal: Some(1),
+            name: Some("job".into()),
+            state: Some(2),
+            status: Some(8),
+            ..Default::default()
+        }];
+        apply(&mut app, complete);
+        app.activity[0].expanded = true;
+        let text = app.activity[0].display();
+        assert!(text.contains(" · private"), "{text}");
+        assert!(!text.contains("denied"), "{text}");
     }
     /// TCR-D31 (owner change, 2026-10-18): a long turn's event carries the most
     /// recent window; the header counts every call from the last ordinal.

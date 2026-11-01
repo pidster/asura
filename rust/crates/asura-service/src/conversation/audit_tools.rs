@@ -335,6 +335,7 @@ pub(super) fn tool_finished(
         5 => O::Timeout,
         6 => O::Cancelled,
         7 => O::Limit,
+        8 => O::Private,
         _ => O::Unavailable,
     };
     Some(Event::ToolFinished {
@@ -518,6 +519,7 @@ mod tests {
                 (4, ToolOutcome::Unavailable),
                 (6, ToolOutcome::Cancelled),
                 (7, ToolOutcome::Limit),
+                (8, ToolOutcome::Private),
             ] {
                 let event = tool_finished(&turn, 5, op, status).unwrap();
                 let Event::ToolFinished {

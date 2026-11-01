@@ -6169,7 +6169,7 @@ Required behavior:
 | PTS-R3 | The model-visible text is a reference fact only: the output is private to the person because the command used secrets. It holds no body, exit status, line or byte count, duration or advice. Code 10 adds the `job:` handle line |
 | PTS-R4 | The helper renders a status 8 result as its text alone: no `Tool failed:` prefix and no `[truncated: …]` line |
 | PTS-R5 | The service's model codec accepts status 8 only with `truncated` false and no `next_offset`. Kind 15 records keep statuses 1–7: no kind 15 result is private |
-| PTS-R6 | The `tool.finished` audit outcome gains `private` (8); the TUI activity line shows `private` for status 8 |
+| PTS-R6 | The `tool.finished` audit outcome gains `private` (8). `ToolProgress` reports a status 8 call as complete (state 2) with status 8, and the control codec allows status 1 or 8 with state 2. The TUI activity line shows `private` for it, never `denied` |
 
 #### PTS-F1: private result decision
 

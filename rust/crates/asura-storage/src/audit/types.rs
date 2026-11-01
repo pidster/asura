@@ -127,6 +127,9 @@ pub enum ToolOutcome {
     Timeout = 5,
     Cancelled = 6,
     Limit = 7,
+    /// Status 8: a tainted job's result (tool-job-controller.md, private
+    /// tool result status).
+    Private = 8,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

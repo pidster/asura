@@ -87,9 +87,11 @@ message Terminal { optional Outcome outcome = 1; optional uint64 last_revision =
 message ModelInput { optional string instructions = 1; repeated HistoryTurn history = 2; optional string prompt = 3; }
 message HistoryTurn { optional Role role = 1; optional string text = 2; }
 
+// TOOL_STATUS_PRIVATE (8): a tainted job's result, shown to the model as its
+// text alone (tool-job-controller.md, private tool result status).
 // Unparsed proposals. The service is the only argument parser and owns grants,
 // host execution and durable outcomes (tool-call-records.md).
-enum ToolStatus { TOOL_STATUS_UNSPECIFIED = 0; TOOL_STATUS_SUCCESS = 1; TOOL_STATUS_DENIED = 2; TOOL_STATUS_INVALID_ARGUMENTS = 3; TOOL_STATUS_UNAVAILABLE = 4; TOOL_STATUS_TIMEOUT = 5; TOOL_STATUS_CANCELLED = 6; TOOL_STATUS_LIMIT = 7; }
+enum ToolStatus { TOOL_STATUS_UNSPECIFIED = 0; TOOL_STATUS_SUCCESS = 1; TOOL_STATUS_DENIED = 2; TOOL_STATUS_INVALID_ARGUMENTS = 3; TOOL_STATUS_UNAVAILABLE = 4; TOOL_STATUS_TIMEOUT = 5; TOOL_STATUS_CANCELLED = 6; TOOL_STATUS_LIMIT = 7; TOOL_STATUS_PRIVATE = 8; }
 enum ToolCallSource { TOOL_CALL_SOURCE_UNSPECIFIED = 0; TOOL_CALL_SOURCE_GENERATED_CONTENT = 1; TOOL_CALL_SOURCE_PROVIDER_JSON = 2; }
 message ToolCall {
   // 1-201; 201 only for the over-limit proposal (owner, 2026-10-18).

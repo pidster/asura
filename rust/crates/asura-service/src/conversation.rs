@@ -4737,7 +4737,8 @@ impl Owner {
                     job_id: job.map(|id| id.to_vec()),
                     name: Some(prefix(&tool.name, 64)),
                     state: Some(match (&rendered, tool.result_status) {
-                        (Some(_), _) | (None, Some(2..)) => 3,
+                        // Status 8 `private` is a complete call (PTS-R6).
+                        (Some(_), _) | (None, Some(2..=7)) => 3,
                         (None, Some(_)) => 2,
                         (None, None) if op.terminal => 4,
                         (None, None) => 1,

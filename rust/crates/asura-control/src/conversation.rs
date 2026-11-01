@@ -338,7 +338,8 @@ pub(super) fn valid(body: &Body) -> bool {
                         && tool.name.as_ref().is_some_and(|name| name.len() <= 64)
                         && match tool.state {
                             Some(1 | 4) => tool.status.is_none(),
-                            Some(2) => tool.status == Some(1),
+                            // Complete: success, or 8 `private` (PTS-R6).
+                            Some(2) => matches!(tool.status, Some(1 | 8)),
                             Some(3) => tool.status.is_some_and(|n| (2..=7).contains(&n)),
                             _ => false,
                         }

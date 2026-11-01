@@ -69,7 +69,8 @@ fn entry(v: &pb::AuditEntry) -> bool {
                     // 1-10, and the `job` tool values 11-16 (one per
                     // operation code, audit of job tool calls).
                     && v.tool.is_some_and(|n| (1..=16).contains(&n))
-                    && v.outcome.is_some_and(|n| (1..=7).contains(&n))
+                    // 8 `private` since 2026-11-01 (private tool result status).
+                    && v.outcome.is_some_and(|n| (1..=8).contains(&n))
                     && v.reason == Some(0)
             }
             _ => false,

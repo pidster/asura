@@ -3313,6 +3313,7 @@ fn audit_table(reply: &asura_control::pb::AuditReply) -> String {
                 "timeout",
                 "cancelled",
                 "limit",
+                "private",
             ],
         };
         let outcome = outcomes

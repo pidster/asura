@@ -607,6 +607,18 @@ private actor CancellableGeneration: ModelBackend {
     #expect(await backend.cancelled)
 }
 
+/// PTS-R5: status 8 `private` is valid from the service only untruncated;
+/// status 9 is unknown.
+@Test func privateToolResultStatusRules() throws {
+    var result = Asura_Model_V1_ToolResult()
+    result.ordinal = 1; result.status = .private; result.text = "private: x"; result.truncated = false
+    try Wire.validate(scoped(.toolResult(result)), from: .service)
+    result.truncated = true
+    #expect(throws: HelperError.self) { try Wire.validate(scoped(.toolResult(result)), from: .service) }
+    result.truncated = false; result.status = .UNRECOGNIZED(9)
+    #expect(throws: HelperError.self) { try Wire.validate(scoped(.toolResult(result)), from: .service) }
+}
+
 /// Begin has no deadline field; the removed field 3 is an unknown field.
 @Test func beginCarriesNoDeadlineAndRemovedFieldIsRejected() throws {
     var begin = Asura_Model_V1_Begin(); begin.model = "system"

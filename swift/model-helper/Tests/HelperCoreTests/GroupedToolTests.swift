@@ -60,6 +60,17 @@ private func forward(_ tool: any Tool, _ content: GeneratedContent) async throws
         == "Tool failed: timeout\nstdout: partial\n[truncated: true]")
 }
 
+/// PTS-U4: a private result (status 8) is its text alone: no failure
+/// prefix and no truncation line.
+@Test func privateResultIsItsTextAlone() async throws {
+    let text = "private: this job used secrets, so its output is private to the person"
+    #expect(ToolResult(status: .private, text: text).rendered == text)
+    let tool = JobTool { _ in ToolResult(status: .private, text: text) }
+    let output = try await tool.call(arguments: GeneratedContent(json: #"{"command":"read","job":"00"}"#))
+    #expect(output == text)
+    #expect(!output.contains("Tool failed"))
+}
+
 @Test func groupedSchemasAdvertiseOnlyTypedCommands() throws {
     let tools = makeProjectTools { _ in throw HelperError.unavailable }
     #expect(tools.map(\.name) == ["project", "memory", "service", "exec_cmd", "job"])

@@ -220,8 +220,10 @@ public enum Wire {
         case .toolResult(let v):
             try check(service && v.hasOrdinal && (1...Limits.toolProposals).contains(v.ordinal)
                 && (v.ordinal < Limits.toolProposals || v.status == .limit)
-                && v.hasStatus && (1...7).contains(v.status.rawValue)
+                && v.hasStatus && (1...8).contains(v.status.rawValue)
                 && v.hasText && v.text.utf8.count <= 16_384 && v.hasTruncated)
+            // Status 8 `private` (PTS-R5): text only, never truncated.
+            if v.status == .private { try check(!v.truncated) }
             if v.status != .success { try check(!v.hasNextOffset) }
         case .terminal(let v):
             try check(!service && v.hasUsageKnown && (v.usageKnown ? v.hasUsageTokens && v.usageTokens <= Limits.countedTokens : !v.hasUsageTokens)

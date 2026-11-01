@@ -426,8 +426,10 @@ pub fn validate_semantics(
         Body::ToolResult(v) => {
             v.ordinal
                 .is_some_and(|n| (1..=MAX_TOOL_ORDINAL).contains(&n))
-                && v.status.is_some_and(|n| (1..=7).contains(&n))
+                && v.status.is_some_and(|n| (1..=8).contains(&n))
                 && (v.ordinal != Some(MAX_TOOL_ORDINAL) || v.status == Some(7))
+                // Status 8 `private` (PTS-R5): text only, never truncated.
+                && (v.status != Some(8) || v.truncated == Some(false))
                 && v.text.as_ref().is_some_and(|text| text.len() <= 16_384)
                 && v.truncated.is_some()
                 && (v.status == Some(1) || v.next_offset.is_none())

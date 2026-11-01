@@ -673,7 +673,8 @@ fn secrets_turn() -> Result<()> {
     assert!(messages[0].starts_with("job: "), "{}", messages[0]);
     for message in &messages[1..] {
         assert!(
-            message.contains("private: this command received a secret value"),
+            message.contains("private: this command used secrets, so its output is private to the person")
+                && !message.contains("Tool failed"),
             "{message}"
         );
         assert!(

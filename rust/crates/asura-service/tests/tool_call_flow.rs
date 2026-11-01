@@ -710,16 +710,18 @@ fn exec_cmd_secret() -> Result<()> {
     // delivery is `private` with no body, no state, outcome or count.
     assert_eq!(
         (result.outcome, result.status),
-        (journal::JobResultOutcome::Private, 2)
+        (journal::JobResultOutcome::Private, 8)
     );
     assert_eq!(result.body, journal::JobResultBody::None);
     let delivered = model.tool_messages();
     assert_eq!(delivered.len(), 1, "{delivered:?}");
     assert!(
-        delivered[0].contains("private: this command received a secret value"),
+        delivered[0].contains("private: this command used secrets, so its output is private to the person"),
         "{}",
         delivered[0]
     );
+    // PTS-R4: status 8 is shown as its text alone, never as a failure.
+    assert!(!delivered[0].contains("Tool failed"), "{}", delivered[0]);
     assert!(delivered[0].contains("job: "), "{}", delivered[0]);
     assert!(!delivered[0].contains("state: "), "{}", delivered[0]);
     assert!(!delivered[0].contains("exit"), "{}", delivered[0]);

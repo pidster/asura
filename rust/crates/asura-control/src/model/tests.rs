@@ -1210,6 +1210,33 @@ fn tool_results_enforce_direction_bounds_and_over_limit_ordinal() {
     assert!(encode_frame(&bad, Direction::ServiceToHelper).is_err());
 }
 
+/// PTS-U3: status 8 `private` is accepted only untruncated and without a
+/// next offset; status 9 is unknown.
+#[test]
+fn private_tool_result_status_rules() {
+    let private = |truncated, next_offset, status| {
+        envelope(Body::ToolResult(pb::ToolResult {
+            ordinal: Some(1),
+            status: Some(status),
+            text: Some("private: this job used secrets".into()),
+            next_offset,
+            truncated: Some(truncated),
+        }))
+    };
+    assert!(encode_frame(&private(false, None, 8), Direction::ServiceToHelper).is_ok());
+    for bad in [private(true, None, 8), private(false, Some(1), 8)] {
+        assert_eq!(
+            encode_frame(&bad, Direction::ServiceToHelper),
+            Err(ProtocolError::InvalidSemantics)
+        );
+    }
+    // An unknown enum value fails the wire scan first.
+    assert_eq!(
+        encode_frame(&private(false, None, 9), Direction::ServiceToHelper),
+        Err(ProtocolError::MalformedWire)
+    );
+}
+
 #[test]
 fn context_measurement_is_bounded_and_helper_only() {
     let message = envelope(Body::ContextMeasured(pb::ContextMeasured {

@@ -2027,7 +2027,12 @@ mod tests {
             let r = result(code, JobResultOutcome::Private, JobResultBody::None);
             let text = render_one(code, &r, None).unwrap();
             assert_eq!(text, crate::context::taint::PRIVATE_TEXT);
-            assert_eq!(r.status, 2);
+            // PTS-U2: status 8 `private`, never 2 `denied`.
+            assert_eq!(r.status, 8);
+            assert_eq!(
+                text,
+                "private: this job used secrets, so its output is private to the person"
+            );
         }
         for code in [T::JobList, T::JobCancel, T::JobNote] {
             let r = result(code, JobResultOutcome::Private, JobResultBody::None);
@@ -2040,7 +2045,7 @@ mod tests {
         // CC-U28 (ENV4): a tainted model call's handle delivery is the
         // private line and the handle, nothing the job produced.
         let r = result(T::ExecCmd, JobResultOutcome::Private, JobResultBody::None);
-        assert_eq!(r.status, 2);
+        assert_eq!(r.status, 8);
         let text = render_one(T::ExecCmd, &r, Some(view(Origin::Model, None))).unwrap();
         assert_eq!(
             text,

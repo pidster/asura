@@ -1865,10 +1865,13 @@ impl JobResultOutcome {
         match self {
             Self::Ok => 1,
             Self::NotFound => 3,
-            Self::NotPermitted | Self::Private => 2,
+            Self::NotPermitted => 2,
             Self::Busy | Self::Unavailable => 4,
             Self::Cancelled => 6,
             Self::Limit => 7,
+            // Its own status since 2026-11-01 (tool-job-controller.md,
+            // private tool result status): never `denied`.
+            Self::Private => 8,
         }
     }
     /// The outcome table: whether operation `code` may record this outcome.

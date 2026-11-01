@@ -5296,7 +5296,7 @@ mod tests {
             (O::Cancelled, 6, "cancelled"),
             (O::Unavailable, 4, "unavailable"),
             (O::Limit, 7, "limit"),
-            (O::Private, 2, "private"),
+            (O::Private, 8, "private"),
         ];
         for (index, (outcome, status, name)) in table.into_iter().enumerate() {
             assert_eq!(O::from_code(index as u8 + 1), Some(outcome));
@@ -5304,6 +5304,15 @@ mod tests {
         }
         assert_eq!(O::from_code(0), None);
         assert_eq!(O::from_code(9), None);
+        // PTS-U1: `private` fixes status 8; the former status 2 is invalid.
+        let private = result29(O::Private, [7; 16], JobResultBody::None);
+        assert_eq!(private.status, 8);
+        assert!(private.validate().is_ok());
+        let denied = JobResult {
+            status: 2,
+            ..private
+        };
+        assert!(denied.validate().is_err());
         // Allowed codes per outcome (the outcome table).
         use ToolOperation as T;
         let codes = [
@@ -5710,9 +5719,9 @@ mod tests {
         p.view[0].source_len = 5;
         p.view[0].digest = [9; 32];
         invalid(p);
-        // Outcome `private`: status 2, no body, codes 12 to 14 only.
+        // Outcome `private`: status 8 (PTS-R2), no body, codes 10 and 12 to 14.
         let private = result29(O::Private, [3; 16], JobResultBody::None);
-        assert_eq!(private.status, 2);
+        assert_eq!(private.status, 8);
         round_job(r29(private));
         for code in [
             ToolOperation::ExecCmd,

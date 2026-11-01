@@ -25,7 +25,10 @@ public struct ToolResult: Sendable {
         text: "tool_busy: call_pending; repeat this call after the pending result")
     /// A rejection returns its service-written text so the model can correct
     /// the call (TCR-D18). The text never repeats model text.
+    /// A private result (status 8, a tainted job) is its service text alone:
+    /// it is not a failure, so it never reads `Tool failed:` (PTS-R4).
     public var rendered: String {
+        if status == .private { return text }
         guard status == .success else {
             var value = "Tool failed: \(status)"
             if !text.isEmpty { value += "\n" + text }

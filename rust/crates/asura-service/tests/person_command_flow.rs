@@ -3134,9 +3134,11 @@ fn views_taint() -> Result<()> {
     assert_eq!(tools.len(), 4, "{tools:?}");
     for text in &tools[..3] {
         assert!(
-            text.contains("private: this job received a secret value"),
+            text.contains("private: this job used secrets, so its output is private to the person"),
             "{text}"
         );
+        // PTS-R4: status 8, never `Tool failed: denied`.
+        assert!(!text.contains("Tool failed"), "{text}");
     }
     let row = tools[3]
         .lines()
@@ -3259,8 +3261,8 @@ fn model_taint() -> Result<()> {
     assert_eq!(delivery.len(), 1, "{delivery:?}");
     assert!(
         delivery[0].contains(
-            "private: this command received a secret value; its output, result and counts are not shown to you"
-        ),
+            "private: this command used secrets, so its output is private to the person"
+        ) && !delivery[0].contains("Tool failed"),
         "{}",
         delivery[0]
     );
@@ -3347,9 +3349,11 @@ fn model_taint() -> Result<()> {
     assert_eq!(tools.len(), 4, "{tools:?}");
     for text in &tools[..3] {
         assert!(
-            text.contains("private: this job received a secret value"),
+            text.contains("private: this job used secrets, so its output is private to the person"),
             "{text}"
         );
+        // PTS-R4: status 8, never `Tool failed: denied`.
+        assert!(!text.contains("Tool failed"), "{text}");
     }
     let row = tools[3]
         .lines()
