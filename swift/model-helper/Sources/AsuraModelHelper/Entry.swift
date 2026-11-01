@@ -8,7 +8,7 @@ struct Main {
         if CommandLine.arguments == [CommandLine.arguments[0], "--version"] {
             let build = BuildIdentity.buildID.map { String(format: "%02x", $0) }.joined()
             let schema = BuildIdentity.schemaDigest.map { String(format: "%02x", $0) }.joined()
-            print("asura-model 0.1.0 build=\(build) schema=\(schema)")
+            print("asura-model 0.0.1 build=\(build) schema=\(schema)")
             return
         }
         guard CommandLine.arguments.count == 1 else { exit(2) }

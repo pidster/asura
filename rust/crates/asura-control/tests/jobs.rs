@@ -147,7 +147,7 @@ fn envelope_fields_57_to_67_and_capability_7_are_exact() {
     assert!(decode_body(&[0x5a, 2, 0x10, 8]).is_ok());
     assert!(decode_body(&[0x5a, 2, 0x10, 9]).is_err());
     let mut hello = envelope(Body::HelloReply(pb::HelloReply {
-        service_build: Some("asura/0.1.0".into()),
+        service_build: Some("asura/0.0.1".into()),
         capabilities: (1..=7).collect(),
         max_frame_bytes: Some(MAX_FRAME_BYTES as u32),
     }));

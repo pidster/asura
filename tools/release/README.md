@@ -68,7 +68,7 @@ Release (Developer ID identity, Developer ID profile, notarised and stapled):
 
 ```sh
 git status --short   # must print nothing
-tools/release/asura-bundle --release --out .build/bundles/release-0.1.0 \
+tools/release/asura-bundle --release --out .build/bundles/release-0.0.1 \
   --identity "Developer ID Application: <Name> (<TEAMID>)" \
   --team-id <TEAMID> \
   --profile .build/signing/<developer-id>.provisionprofile \

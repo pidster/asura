@@ -36,6 +36,10 @@ qualification on signed code on 2026-10-29
 secret store cases on the data-protection keychain pass, and a new notarised
 keg passes HD5, HD8 and the local HD9 checks. The keg's own service in the
 account home, publication and the clean host remain the owner's.
+On 2026-11-01 the owner also cancelled release 0.1.0 and named the first
+release **0.0.1**. No 0.1.0 tag or GitHub release was ever created. Records
+dated before 2026-11-01 name 0.1.0 because the product version was 0.1.0 when
+they ran; they are kept as run.
 
 What is fixed:
 
@@ -798,7 +802,8 @@ flowchart TD
 #### Build-host paths (SG4-O1)
 
 Selected design (packet SG4-O1, 2026-10-29). The owner decided on 2026-10-29
-that release 0.1.0 ships without build paths. Required behavior: no file in a
+that the first release ships without build paths (it was numbered 0.1.0
+then; the owner renamed it 0.0.1 on 2026-11-01). Required behavior: no file in a
 bundle that `asura-bundle` builds, in any mode, holds the build account's
 home directory, the repository's absolute path, or the account's user name as
 a path component. This covers `asura`, `asura-model`, `mlx.metallib`, the Hub
@@ -908,7 +913,7 @@ flowchart TD
 #### SG4 open items
 
 - **SG4-O1, embedded build-host paths: resolved.** The owner decided on
-  2026-10-29 to remove them before 0.1.0. See
+  2026-10-29 to remove them before the first release (now 0.0.1). See
   [build-host paths](#build-host-paths-sg4-o1).
 - **SG4-O2, immutable releases are disabled.** On 2026-10-28
   `gh api repos/pidster/asura/immutable-releases` returned
@@ -2032,7 +2037,7 @@ Signed artifacts:
 | S3 | Pass, first run. SS-I1, SS-I2, SS-I3, SS-I6, SS-I8, SS-I9, SS-I10 (256 test-group items counted) and SS-I11 passed on the data-protection keychain in `LFQFWCB8Y3.org.pidster.asura.test`; SS-I4, SS-I5 and SS-I7 were skipped as designed. Every other case also passed with the test-group store. `test-group-empty=yes` at the end of the run and again from `--purge-test-group` (0 items left to purge) | `sg5-s3-person-command-test-group.txt` |
 | S4, HR-P2 | Pass. With `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH` and `DYLD_PRINT_LIBRARIES` set, the Developer ID hardened fixture saw no `DYLD_` entry and dyld printed nothing; the ad hoc control saw both of its `DYLD_` entries | `sg5-hrp2.txt` |
 | S5 | Pass. Notary submission `54ea1de4-aebf-4438-8687-7a840ad44362`: `Accepted`; stapled; `step=done`. `check --release`: 52 passed, 0 failed, source `4d9263e` clean, `rustc 1.98.0`, archive SHA-256 `f063ad94…798ec25`, helper `97f2bccd…e801d4b3`. `tap-test --release`: 28 passed, 0 failed: `brew audit --strict`, HD5 (wrong digest fails, nothing installed), install, `brew test`, link into the keg, digests, `bin/asura --version`, Developer ID and timestamps of all three signed parts, `stapler validate`, Gatekeeper `Notarized Developer ID`, cleanup | `sg5-s5-bundle.txt`, `sg5-s5-check.txt`, `sg5-s5-formula.txt`, `sg5-s5-tap-test.txt` |
-| S6 | Pass. In the installed keg: deep strict signature, `stapler validate`, Gatekeeper `Notarized Developer ID`, `asura --version` 0.1.0, `host-paths` finds no build-host path. `test-asura-bundle --sandbox` on the keg's `Asura.app`: 32 passed, 0 skipped; HS-P7 denials; inventory, system, MLX (`mlx-community/Qwen3-1.7B-4bit`) and Ollama (`granite4.1:8b`) turns from the keg's helper code, `mlx.metallib` and Hub bundle; copy removal, crash and recovery. Uninstalled, untrusted and untapped; `bin/asura` absent | `sg5-s6-keg-journey.txt` |
+| S6 | Pass. In the installed keg: deep strict signature, `stapler validate`, Gatekeeper `Notarized Developer ID`, `asura --version` 0.1.0 (the product version then; renamed 0.0.1 on 2026-11-01), `host-paths` finds no build-host path. `test-asura-bundle --sandbox` on the keg's `Asura.app`: 32 passed, 0 skipped; HS-P7 denials; inventory, system, MLX (`mlx-community/Qwen3-1.7B-4bit`) and Ollama (`granite4.1:8b`) turns from the keg's helper code, `mlx.metallib` and Hub bundle; copy removal, crash and recovery. Uninstalled, untrusted and untapped; `bin/asura` absent | `sg5-s6-keg-journey.txt` |
 | Gate | `cargo fmt --all --check`, both clippy passes, `cargo test --workspace --all-features --no-fail-fast --locked`, `test-asura-bundle --static` (134 passed). The first workspace run failed nine native targets with `model_helper_unavailable`: the development helper was beside `target/debug`, not beside the test binaries in `target/debug/deps`. With the helper copied there, the nine targets were rerun alone and passed. `exec_cmd_process` was rerun unsigned after the fixture-copy fix and passed | `sg5-cargo-test.txt`, `sg5-cargo-test-rerun.txt`, `sg5-exec-cmd-process-unsigned.txt`, `sg5-bundle-static.txt` |
 
 No listed flake occurred. The SG3 signed qualification run (Q0 to Q7) passed
@@ -2564,7 +2569,7 @@ inspected. The [SG4 delivery](#sg4-delivery) record was added after the code
 and its checks; it changes no diagram.
 
 Updated 2026-10-29 for packet SG4-O1, after the owner's decision to remove
-build paths before 0.1.0. Evidence: raw byte scans of an ad hoc bundle from
+build paths before the first release (then 0.1.0, now 0.0.1). Evidence: raw byte scans of an ad hoc bundle from
 `446d719` and of the earlier dry run; `otool -l` and `nm -ap` of the helper;
 the installed tools (rustc 1.98.0 `88d9e12ae`, cargo 1.98.0, Apple Swift 6.4
 swiftlang-6.4.0.34.1 with clang-2100.3.34.1, ld-27037.1, Metal 32023.921,
