@@ -43,8 +43,8 @@ This overview combines three kinds of source:
 
 ## How to read the diagrams
 
-Every diagram uses the same three styles, shown by line style only, with no
-colour.
+Every diagram uses the same three styles, shown by line style only. The
+diagrams set no colours, so they follow the viewer's light or dark theme.
 
 | Status | Meaning | Border and edge |
 | --- | --- | --- |
@@ -107,13 +107,13 @@ flowchart TB
         LD["Designed, not built: dashed"]:::designed
         LP["Proposed, open: dotted"]:::proposed
     end
-    classDef built fill:#ffffff,stroke:#222222,stroke-width:2px,color:#111111
-    classDef designed fill:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray:8 4,color:#111111
-    classDef proposed fill:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray:2 3,color:#111111
-    classDef outside fill:#ffffff,stroke:#222222,stroke-width:1px,color:#111111
-    linkStyle 0,1,2,3,4,5 stroke:#222222,stroke-width:2px
-    linkStyle 6,7,8 stroke:#222222,stroke-width:2px,stroke-dasharray:8 4
-    linkStyle 9,10,11,12,13 stroke:#222222,stroke-width:2px,stroke-dasharray:2 3
+    classDef built stroke-width:3px
+    classDef designed stroke-width:2px,stroke-dasharray:8 4
+    classDef proposed stroke-width:2px,stroke-dasharray:2 3
+    classDef outside stroke-width:1px
+    linkStyle 0,1,2,3,4,5 stroke-width:2px
+    linkStyle 6,7,8 stroke-width:2px,stroke-dasharray:8 4
+    linkStyle 9,10,11,12,13 stroke-width:2px,stroke-dasharray:2 3
 ```
 
 - The TUI and the CLI are built. They are clients of one per-user service
@@ -201,11 +201,11 @@ flowchart TB
         LD["Designed, not built: dashed"]:::designed
         LP["Proposed, open: dotted"]:::proposed
     end
-    classDef built fill:#ffffff,stroke:#222222,stroke-width:2px,color:#111111
-    classDef designed fill:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray:8 4,color:#111111
-    classDef proposed fill:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray:2 3,color:#111111
-    linkStyle 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14 stroke:#222222,stroke-width:2px
-    linkStyle 15,16,17,18,19,20 stroke:#222222,stroke-width:2px,stroke-dasharray:2 3
+    classDef built stroke-width:3px
+    classDef designed stroke-width:2px,stroke-dasharray:8 4
+    classDef proposed stroke-width:2px,stroke-dasharray:2 3
+    linkStyle 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14 stroke-width:2px
+    linkStyle 15,16,17,18,19,20 stroke-width:2px,stroke-dasharray:2 3
 ```
 
 - One executable, `asura`, runs as the client, the service and the per-job
@@ -289,13 +289,13 @@ flowchart TB
         LD["Designed, not built: dashed"]:::designed
         LP["Proposed, open: dotted"]:::proposed
     end
-    classDef built fill:#ffffff,stroke:#222222,stroke-width:2px,color:#111111
-    classDef designed fill:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray:8 4,color:#111111
-    classDef proposed fill:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray:2 3,color:#111111
-    classDef outside fill:#ffffff,stroke:#222222,stroke-width:1px,color:#111111
-    linkStyle 0,1,2,3,4,5,6,7,8,9,10 stroke:#222222,stroke-width:2px
-    linkStyle 11,12 stroke:#222222,stroke-width:2px,stroke-dasharray:8 4
-    linkStyle 13,14,15 stroke:#222222,stroke-width:2px,stroke-dasharray:2 3
+    classDef built stroke-width:3px
+    classDef designed stroke-width:2px,stroke-dasharray:8 4
+    classDef proposed stroke-width:2px,stroke-dasharray:2 3
+    classDef outside stroke-width:1px
+    linkStyle 0,1,2,3,4,5,6,7,8,9,10 stroke-width:2px
+    linkStyle 11,12 stroke-width:2px,stroke-dasharray:8 4
+    linkStyle 13,14,15 stroke-width:2px,stroke-dasharray:2 3
 ```
 
 - Raw values stay in classes A, D2, E and F (rule F1). Today a model job can
@@ -347,10 +347,10 @@ flowchart LR
         LD["Designed, not built: dashed"]:::designed
         LP["Proposed, open: dotted"]:::proposed
     end
-    classDef built fill:#ffffff,stroke:#222222,stroke-width:2px,color:#111111
-    classDef designed fill:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray:8 4,color:#111111
-    classDef proposed fill:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray:2 3,color:#111111
-    linkStyle 0,1,2,3,4,5,6 stroke:#222222,stroke-width:2px
+    classDef built stroke-width:3px
+    classDef designed stroke-width:2px,stroke-dasharray:8 4
+    classDef proposed stroke-width:2px,stroke-dasharray:2 3
+    linkStyle 0,1,2,3,4,5,6 stroke-width:2px
 ```
 
 ### 4b. Proposed: the policy path
@@ -400,11 +400,11 @@ flowchart TB
         LD["Designed, not built: dashed"]:::designed
         LP["Proposed, open: dotted"]:::proposed
     end
-    classDef built fill:#ffffff,stroke:#222222,stroke-width:2px,color:#111111
-    classDef designed fill:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray:8 4,color:#111111
-    classDef proposed fill:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray:2 3,color:#111111
-    linkStyle 0 stroke:#222222,stroke-width:2px
-    linkStyle 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19 stroke:#222222,stroke-width:2px,stroke-dasharray:2 3
+    classDef built stroke-width:3px
+    classDef designed stroke-width:2px,stroke-dasharray:8 4
+    classDef proposed stroke-width:2px,stroke-dasharray:2 3
+    linkStyle 0 stroke-width:2px
+    linkStyle 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19 stroke-width:2px,stroke-dasharray:2 3
 ```
 
 - Today, model jobs run under the person's execution setting with no prompt per
@@ -463,12 +463,12 @@ flowchart LR
         LD["Designed, not built: dashed"]:::designed
         LP["Proposed, open: dotted"]:::proposed
     end
-    classDef built fill:#ffffff,stroke:#222222,stroke-width:2px,color:#111111
-    classDef designed fill:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray:8 4,color:#111111
-    classDef proposed fill:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray:2 3,color:#111111
-    linkStyle 0,1,2,3,4,5 stroke:#222222,stroke-width:2px
-    linkStyle 6,7,8,9,10 stroke:#222222,stroke-width:2px,stroke-dasharray:8 4
-    linkStyle 11 stroke:#222222,stroke-width:2px,stroke-dasharray:2 3
+    classDef built stroke-width:3px
+    classDef designed stroke-width:2px,stroke-dasharray:8 4
+    classDef proposed stroke-width:2px,stroke-dasharray:2 3
+    linkStyle 0,1,2,3,4,5 stroke-width:2px
+    linkStyle 6,7,8,9,10 stroke-width:2px,stroke-dasharray:8 4
+    linkStyle 11 stroke-width:2px,stroke-dasharray:2 3
 ```
 
 - The [context composer](context-composer.md) owns composition. Slices CC1, CC2
@@ -536,12 +536,12 @@ flowchart TB
         LD["Designed, not built: dashed"]:::designed
         LP["Proposed, open: dotted"]:::proposed
     end
-    classDef built fill:#ffffff,stroke:#222222,stroke-width:2px,color:#111111
-    classDef designed fill:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray:8 4,color:#111111
-    classDef proposed fill:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray:2 3,color:#111111
-    linkStyle 0,1,2,3,4,5,6,7 stroke:#222222,stroke-width:2px
-    linkStyle 8,9 stroke:#222222,stroke-width:2px,stroke-dasharray:8 4
-    linkStyle 10,11,12,13,14,15,16,17 stroke:#222222,stroke-width:2px,stroke-dasharray:2 3
+    classDef built stroke-width:3px
+    classDef designed stroke-width:2px,stroke-dasharray:8 4
+    classDef proposed stroke-width:2px,stroke-dasharray:2 3
+    linkStyle 0,1,2,3,4,5,6,7 stroke-width:2px
+    linkStyle 8,9 stroke-width:2px,stroke-dasharray:8 4
+    linkStyle 10,11,12,13,14,15,16,17 stroke-width:2px,stroke-dasharray:2 3
 ```
 
 - The command rewrite, the per-input Keychain items and the secret variables
