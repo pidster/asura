@@ -75,6 +75,14 @@ worker gains the requests `put_named`, `get_named`, `delete_named` and
 `secret.<valid name>` is unrecognized. Everything else in this document is
 unchanged.
 
+Revision of 2026-11-01, replace in place: a named replace is one
+`SecItemUpdate` of the item's data
+([replace in place](named-secrets.md#replace-in-place)). The platform gains
+`update_named` and the `Calls` method `update`; the port gains
+`update_named`. Input items are never updated: an input item is written once
+and deleted. The testing rules cover `SecItemUpdate` as they cover
+`SecItemAdd`.
+
 ## Scope
 
 The secret store holds values that must not enter any Asura record but must
@@ -198,7 +206,7 @@ not expose them.
 | --- | --- | --- |
 | `SecTaskCreateFromSelf`, `SecTaskCopyValueForEntitlement` | Production | The [access group check](release-signing.md#access-group-from-the-entitlements). Each returned object is taken under the create rule and released once |
 | `kSecUseAuthenticationUIFail` (static) | Production | The user-interaction value of every data-protection dictionary |
-| `SecItemAdd`, `SecItemCopyMatching`, `SecItemDelete` (from `security-framework-sys`) | Production | The data-protection calls, over dictionaries the backend builds itself so that KC-U1 can inspect them |
+| `SecItemAdd`, `SecItemCopyMatching`, `SecItemUpdate`, `SecItemDelete` (from `security-framework-sys`) | Production | The data-protection calls, over dictionaries the backend builds itself so that KC-U1 can inspect them. `SecItemUpdate` is used only for a named replace |
 | `getaudit_addr` and the `auditinfo_addr` layout (48 bytes, flags at offset 40, checked against the SDK header on macOS 27.0) | Production | The session flags of the [field evidence](release-signing.md#keychain-field-evidence) |
 
 `sysctlbyname`, `stat` and `getuid` come from `libc`. Every pointer passed is
@@ -537,6 +545,7 @@ call after a successful pre-check.
 | `errSecItemNotFound` (-25300) on `get` or `delete` | `missing` or `absent`. This holds only because the target pre-check returned 0 in the same step |
 | `errSecItemNotFound` (-25300) on list | Zero items (probe finding: a list with no match returns -25300, not an empty list) |
 | `errSecDuplicateItem` (-25299) on `put` | Read the item and compare digests: `exists_same` or `exists_different` |
+| `errSecItemNotFound` (-25300) on a named update | `absent`. This holds only because the target pre-check returned 0 in the same step |
 | `errSecAuthFailed` (-25293) or `errSecInteractionNotAllowed` (-25308) | Call `SecKeychainGetStatus` on the target. Unlock bit `0x1` clear: `locked`. Bit set: `denied`. A failed status call: `unavailable` |
 | `errSecInvalidOwnerEdit` (-25244) | `denied` |
 | `errSecNoSuchKeychain` (-25294), any other code | `unavailable`, with the code in audit |
@@ -563,6 +572,7 @@ platform results to replies with this table and nothing else:
 | `Added::Duplicate` | `get` the item, then compare digests: `exists_same` or `exists_different`; that `get`'s failure gives its own reply. A `get` that returns `Found::Missing` after the duplicate (the item was deleted between the two calls) gives `unavailable` with status -25300 |
 | `Found::Data`, `Found::Missing` | Decode and bind: `values` or `mismatch`; `missing` |
 | `Removed::Deleted`, `Removed::Absent` | `deleted`, `absent` |
+| `Updated::Changed`, `Updated::Absent` (named replace only) | `replaced`, `absent` ([replace in place](named-secrets.md#replace-in-place)) |
 | `Failure::Locked { status }` | `locked`, for `put`, `get` and `delete` alike; a locked delete leaves an orphan for the next sweep |
 | `Failure::Denied { status }` | `denied` (scratch backend only); a denied delete leaves an orphan for the next sweep |
 | `Failure::NotSigned { .. }` | `unavailable` with status -34018 and reason `not_signed`, in audit and in `last_status`. The worker enters its terminal `not_signed` state: every later request gets the same reply with no port call and no open |
@@ -592,6 +602,9 @@ pub(crate) trait KeychainPort: Send + 'static {
 }
 ```
 
+The named secrets revision adds `add_named`, `get_named`, `update_named` and
+`delete_named`, each with a `NamedKey`, to the same trait.
+
 - Production: `impl KeychainPort for asura_platform::keychain::Keychain`,
   one forwarding line per method. The worker opens it with `Keychain::open`
   on its own thread and owns it.
@@ -602,8 +615,9 @@ pub(crate) trait KeychainPort: Send + 'static {
   SS-U11, KC-U3, KC-U5, KC-U6). It never makes a Keychain call.
 - Integration tests: a gated port (`test-support` only) wraps the real
   `Keychain`. It can block before a call until the test releases it (SS-W4)
-  or return `Failure::Unavailable` once for a named call (SS-W8). Every other
-  call goes to the real scratch keychain.
+  or return `Failure::Unavailable` once for a named call kind (SS-W8). The
+  call kinds are add, get, update, delete and list. Every other call goes to
+  the real scratch keychain.
 
 The port carries platform types, so the store has no second status table and
 no raw `OSStatus` path.
@@ -655,7 +669,7 @@ Mapping to [AE-01–AE-07](../engineering.md#asynchronous-execution-and-recovery
 | Rule | Application |
 | --- | --- |
 | AE-01 | Every Security framework call runs on the one retained secret store worker thread. The reactor, control handlers and rendering never call it. |
-| AE-02 | Blocking calls, all on the worker thread: `SecItemAdd`, `SecItemCopyMatching`, `SecItemDelete` and `SecKeychainSetUserInteractionAllowed` (IPC to securityd, can wait); `SecTaskCreateFromSelf` and `SecTaskCopyValueForEntitlement` (once, at open); the evidence reads `sysctl`, `stat` of `/dev/console` and `getaudit_addr` (once per failed call); in tests `SecKeychainGetStatus`, `SecKeychainCreate`, `SecKeychainOpen`, `SecKeychainLock` and `SecKeychainDelete`. |
+| AE-02 | Blocking calls, all on the worker thread: `SecItemAdd`, `SecItemCopyMatching`, `SecItemUpdate`, `SecItemDelete` and `SecKeychainSetUserInteractionAllowed` (IPC to securityd, can wait); `SecTaskCreateFromSelf` and `SecTaskCopyValueForEntitlement` (once, at open); the evidence reads `sysctl`, `stat` of `/dev/console` and `getaudit_addr` (once per failed call); in tests `SecKeychainGetStatus`, `SecKeychainCreate`, `SecKeychainOpen`, `SecKeychainLock` and `SecKeychainDelete`. |
 | AE-03 | Queue: 16 requests, then `busy`. One request runs at a time. Deletes after settlement join the same queue; if it is full, the delete is left for the next sweep. Items: 256 per installation, counting every listed item. List: at most 257 attribute results per call, no item data. Read: one item's data, at most 8,307 bytes for any item this build can read; the codec rejects more. Payload: 8,307 bytes. Evidence: one status and four fixed-size session fields per failure reply. |
 | AE-04 | No time bound. A request ends by its reply. A submitter that stops waiting (client cancel or disconnect) leaves the request to finish; its result is applied or swept. A stalled securityd is a stalled dependency: the store reports `busy` and everything else continues. The locked-at-dispatch recheck is pacing (1, 1, 2, 3, 5 … s, at most 60 s) and ends nothing. |
 | AE-05 | Values are read at each dispatch, never relaunched after an unknown outcome. Orphans are reconciled against replay. |
@@ -776,9 +790,10 @@ tests still check after teardown that the person's search list is unchanged.
 
 Required for every test, probe and fixture (SSR6, 2026-10-22):
 
-1. No test, probe or fixture calls `SecItemAdd` unless the target pre-check of
-   its scratch keychain returned 0 in the same worker step. No `cargo test`
-   case calls `SecItemAdd` on the data-protection keychain.
+1. No test, probe or fixture calls `SecItemAdd` or `SecItemUpdate` unless the
+   target pre-check of its scratch keychain returned 0 in the same worker
+   step. No `cargo test` case calls `SecItemAdd` or `SecItemUpdate` on the
+   data-protection keychain.
 2. Teardown stops the worker before it deletes the scratch keychain
    (`SecKeychainDelete`, test-support).
 3. A test about a missing or deleted keychain checks the pre-check result only.
@@ -871,12 +886,12 @@ mapping and a scratch keychain only:
 | SS-U6 | Store half SS1-S (keep exactly the live set it is given); owner half P3-E (the live set built from a fixture replay state). States: queued, held, waiting, dispatched, settled, dropped, unknown input | Keep the first four; delete the rest |
 | SS-U7 | Store half SS1-S (`Store::new` takes a `Target`); harness half P3-E (`test_support.rs` creates the scratch keychain). Target selection from a scratch runtime root; a production build | Never the default keychain from the harness; `Target::Scratch` absent without `test-support` |
 | SS-U8 | Equal and different values SS1-S (keyed digest); retry after the item was deleted P3-E (needs the kind 31 request digest). Exact retry with equal and different values; retry after the item was deleted | Original input ID; `request_conflict`; original input ID with no new item |
-| SS-U9 | SS1-K, platform, scratch backend. Pre-check order with the recording `Calls` fixture | Every add, get, list and delete is preceded by a status call in the same platform call; a non-zero status prevents the item call |
+| SS-U9 | SS1-K, platform, scratch backend. Pre-check order with the recording `Calls` fixture | Every add, get, update, list and delete is preceded by a status call in the same platform call; a non-zero status prevents the item call |
 | SS-U10 | SS1-S. Scripted port returns each platform result of the [worker reply table](#status-mapping), including `Added::Duplicate` followed by each `get` result, and `Failure::Invalid` | Each worker reply as the table lists, each failure with its raw status and a session; `Invalid` gives `unavailable` with status 0, audit `invalid_request` and no session; `NotSigned` gives `unavailable` -34018 `not_signed` |
 | SS-U11 | SS1-S, revised SG3. Sweep over a scripted port: a denied delete; a later sweep where it succeeds; 2 unrecognized accounts; a truncated listing of 257 where the pass deletes 3, then a listing of 254; a truncated listing where the pass deletes nothing | Denied delete counted as `failed` and kept, then deleted by the later sweep; unrecognized counted, never deleted or read; second listing made, then sweep ends; no second listing when nothing was deleted, count 257 and `put` gives `full` |
 | SS-K2-1 | SS1-K2, platform. `list` with the recording fixture | The search asks for at most 257 results; 257 results set `truncated`; fewer leave it false |
-| KC-U1 | SG3, platform. The data-protection dictionary of each call kind (add, read, delete, list) | Each sets `kSecUseDataProtectionKeychain` true, the access group, `kSecAttrSynchronizable` false, `kSecUseAuthenticationUI` fail, the class and the service; none sets `kSecUseKeychain`; add also sets `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, the label and the data; list asks for at most 257 attribute results |
-| KC-U2 | SG3, platform. Data-protection status mapping with the recording fixture: 0, -25300 on read, delete and list, -25299, -25308, -34018, -25291 and another code | `Found::Missing`, `Removed::Absent`, an empty listing, `Added::Duplicate`, `Locked`, `NotSigned`, `Unavailable` with the code; no pre-check call; every failure carries its raw status |
+| KC-U1 | SG3, platform. The data-protection dictionary of each call kind (add, read, update query, delete, list) and the update's attribute dictionary | Each sets `kSecUseDataProtectionKeychain` true, the access group, `kSecAttrSynchronizable` false, `kSecUseAuthenticationUI` fail, the class and the service; none sets `kSecUseKeychain`; add also sets `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, the label and the data; list asks for at most 257 attribute results; the update's attribute dictionary holds `kSecValueData` alone |
+| KC-U2 | SG3, platform. Data-protection status mapping with the recording fixture: 0, -25300 on read, update, delete and list, -25299, -25308, -34018, -25291 and another code | `Found::Missing`, `Updated::Absent`, `Removed::Absent`, an empty listing, `Added::Duplicate`, `Locked`, `NotSigned`, `Unavailable` with the code; no pre-check call; every failure carries its raw status |
 | KC-U3 | SG3. The observation, `SecretStoreStatus` and the sweep audit event | No stranded field; fields 4 and 6 reserved; a sweep audit event with a `stranded` key is rejected |
 | KC-U4 | SG3, platform. Access group rules ([SG-F7](release-signing.md#sg-f7-access-group-check)) over entitlement values | The production and test groups accepted; absent, lower-case or nine-character team, another bundle ID, zero or two groups, a group that differs from the identifier, a mismatched team identifier and a wrong value type each refused |
 | KC-U5 | SG3. Session decoding (console owner, origin from audit flags) and the evidence on each failure reply | `self`, `other`, `none`, `unknown`; `remote` before `graphic`, `other`, `unknown`; every failure reply except `invalid_request` carries status and session; the audit event validation requires them together, on failure replies only |
