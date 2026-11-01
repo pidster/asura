@@ -677,7 +677,7 @@ section. Recommendations are the reports' recommendations, not decisions.
 | AD-16 | `unknown` classifier result: approval, or no tightening | Approval | [R-CED] §12 item 4, §11.3 |
 | AD-17 | cvc5 packaging for admission checks: bundled, developer-only or remote | Owner to decide | [R-CED] §12 item 6 |
 | AD-18 | A VM backend (Linux guests only) in product scope; includes legal advice on the Xcode licence for guests | Keep as the main App Store-only path if a store edition runs local jobs | [R-CED] §12 item 7; [R-DIST] §9.1, §13 item 4 |
-| AD-19 | Developer ID only for the first releases | Yes (high confidence) | [R-DIST] §13 item 1 |
+| AD-19 | Developer ID only for the first releases | **Decided by the owner, 2026-11-01: a signed, notarised DMG is the primary distribution, and Homebrew installs it through a cask.** That makes the first releases Developer ID; an App Store companion (AD-21) stays a later option | [R-DIST] §13 item 1 |
 | AD-20 | Goal 3 inside Developer ID: a sandboxed data owner, a group container socket and `NSDataAccessSecurityPolicy`; run IS-1 to IS-6 first | Yes (medium confidence) | [R-DIST] §11, §13 item 2 |
 | AD-21 | An App Store companion GUI later (shape 1) | Later and optional | [R-DIST] §13 item 3 |
 | AD-22 | Ask Apple whether PCC Foundation Models is available to Developer ID apps | Ask | [R-DIST] §12 item 4, §13 item 5 |
