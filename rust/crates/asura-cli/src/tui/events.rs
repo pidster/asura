@@ -337,7 +337,17 @@ mod tests {
             if cancel {
                 stop.store(true, Ordering::Release);
             } else {
-                assert_eq!(inbox.drain(1).unwrap().len(), 1);
+                // The inbox is full, so an empty drain only means the
+                // worker's admission attempt held the queue lock (drain
+                // never blocks on it); drain again until one event leaves.
+                let drained = loop {
+                    let drained = inbox.drain(1).unwrap();
+                    if !drained.is_empty() {
+                        break drained;
+                    }
+                    std::thread::yield_now();
+                };
+                assert_eq!(drained.len(), 1);
             }
             worker.thread().unpark();
             result
