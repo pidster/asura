@@ -187,4 +187,4 @@ A negotiated compatible helper range could keep model work available when a
 new package replaces an old one. It would require mixed-build schema,
 cancellation, resource and recovery tests. Exact matching makes a mismatch an
 explicit model-unavailable state until the service hands over or its verified
-matching helper returns. It cannot silently load a helper from a newer keg.
+matching helper returns. It cannot silently load a helper from a newer installed app.

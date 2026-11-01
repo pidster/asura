@@ -158,7 +158,7 @@ not embedded.
   the [release pipeline](release-distribution.md) builds from one clean
   workspace revision, so `cargo package` is not a supported path. A
   `cargo package` attempt fails at compile time rather than shipping without help.
-- The binary needs no runtime resource lookup, which avoids the keg relocation
+- The binary needs no runtime resource lookup, which avoids the installed-path
   concern in the release design.
 - A compile-time assertion, `const _: () = assert!(TOTAL_LEN <= 131_072);`,
   fails the build if the three files exceed 128 KiB together.

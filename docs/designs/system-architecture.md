@@ -88,17 +88,18 @@ different protocol reports `incompatible_protocol` and leaves it running. An ind
 TUI-owned service follows its launching TUI lifetime. Restart, logout and update
 behavior need real-process
 qualification. There is no LaunchAgent or Mach service in this I1 choice.
-The selected [Homebrew tap distribution](../decisions/0008-homebrew-tap-distribution.md)
-installs this standalone command. A formula update does not itself replace a
-live service; [release distribution](release-distribution.md) owns the proposed
+The selected [DMG and Homebrew cask distribution](../decisions/0008-homebrew-tap-distribution.md)
+installs this standalone command as `/Applications/Asura.app` with a
+`bin/asura` link. A cask upgrade does not itself replace a live service; [release distribution](release-distribution.md) owns the proposed
 upgrade and handover behavior. Upgrade and handover design is deferred until the
 first release (owner, 2026-10-17). The maintenance handshake, owner-generation-guarded
 drain and version negotiation needed to replace a live service belong to that
 deferred work. The owner lock remains authoritative for
 handover; a changed Homebrew symlink cannot transfer ownership.
-Homebrew may remove the old keg while its service is still alive. The old
-service cannot re-exec a path from that keg or dispatch through a helper or
-resource that disappeared. It preserves control and recovery, and settles
+A cask upgrade may replace, or an uninstall may remove, `/Applications/Asura.app`
+while its service is still alive. The old service cannot re-exec that path,
+which now holds another build or nothing, or dispatch through a helper or
+resource that changed or disappeared. It preserves control and recovery, and settles
 affected work under the [release resource-loss contract](release-distribution.md#service-lifecycle-across-homebrew-operations).
 
 On accepted connections the service obtains the kernel-provided effective
@@ -167,7 +168,7 @@ winner may remove after identity validation.
 | S6 | Old owner/helper survives a replacement attempt | It cannot append, dispatch or publish under a stale generation. |
 | S7 | Root absent, runtime-only, partial or corrupt at startup | Authority owner exposes Uninitialized only after fresh-layout validation; otherwise RepairRequired. Stage 2 reports authority unavailable. Never silently reset. |
 | S8 | Client and service protocol versions differ | Negotiate a supported version or reject without interpreting unknown frames. |
-| S9 | Old keg is removed while its service still runs | Service detects missing helper/resource before dependent dispatch, settles affected work, and never spawns from a missing or changed path. |
+| S9 | `/Applications/Asura.app` is replaced or removed while its service still runs | Service detects missing helper/resource before dependent dispatch, settles affected work, and never spawns from a missing or changed path. |
 | S10 | Handover races another accepted request | One serialized durable drain barrier accounts for every request accepted before it; no request disappears during ownership transfer. |
 
 Unit checks cover path/identity decisions, framing, revision and admission

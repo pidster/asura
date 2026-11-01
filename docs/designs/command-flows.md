@@ -47,8 +47,8 @@ flowchart TD
 
 `--logs DIR` is rejected for the TUI, help, version, and private startup-notice mode.
 `--version` prints only the version, like `--help` opens no log, runtime directory,
-service or Keychain, and serves the formula test
-([SG4](release-signing.md#asura---version)).
+service or Keychain, and serves the cask install check
+([SG4](release-signing.md#asura---version), [SG6](release-signing.md#local-tap-test)).
 Duplicate or missing log arguments are invalid. JSON status emits a failure object
 when logging fails. Lifecycle classification returns 3 for unavailable, 4 for
 incompatible, 5 for unsafe runtime, and 6 for an unconfirmed outcome. A successfully

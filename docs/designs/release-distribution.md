@@ -1,132 +1,150 @@
-# D7 release distribution through the Homebrew tap
+# D7 release distribution: a signed DMG and a Homebrew cask
 
-Status: proposed D7/I9 distribution design. [ADR-0008](../decisions/0008-homebrew-tap-distribution.md)
-selects the existing `pidster/homebrew-tap` and prebuilt GitHub release pattern.
-The exact Asura archive layout, signing/notarization procedure, formula update
-automation and service handover remain open. No release is implemented or
-qualified. The [release signing design](release-signing.md) (2026-10-23) now
-owns the signing, Hardened Runtime, notarisation and `Asura.app` layout
-contract. Its packet SG4 (2026-10-28) selects the archive names, the release
-checks, the formula and the owner's publication steps for the first release
-([SG4](release-signing.md#sg4-release-promotion-and-formula)). Packet SG5
-(2026-10-29) ran HD5, HD8 and the local HD9 checks on a notarised keg; HD1,
-HD6, HD11, HD12 and HD13 remain open
-([SG5 results](release-signing.md#sg5-results-2026-10-29)). Upgrade, handover and migration sections are deferred until the first
-release (owner, 2026-10-17). Before that release, no compatibility with older
-builds or data is required. Live build-mismatch detection stays in force: a
-control protocol mismatch reports `incompatible_protocol`, and the service checks
-the helper's exact `build_id` and `schema_digest`.
+Status: selected D7/I9 distribution design.
+[ADR-0008](../decisions/0008-homebrew-tap-distribution.md) (amended
+2026-11-01) selects one signed, notarised DMG per release, installed by the
+`asura` cask in `pidster/homebrew-tap` (owner, 2026-10-31; confirmed
+2026-11-01). The `.tar.gz` archive and the `asura` formula are removed;
+nothing was released, so no migration exists. The
+[release signing design](release-signing.md) owns signing, the Hardened
+Runtime, notarisation, the `Asura.app` layout and the release scripts. Its
+packet SG4 (2026-10-28) selected the release checks and the owner's
+publication steps; packet SG6 (2026-11-01) replaces the archive with the DMG
+and the formula with the cask ([SG6](release-signing.md#sg6-dmg-and-cask)).
+Packet SG5 (2026-10-29) ran HD5, HD8 and the local HD9 checks on a notarised
+formula keg; SG6 repeats them for the cask
+([SG6 delivery](release-signing.md#sg6-delivery)). HD1, HD6, HD11 and HD13
+remain open; HD12's precondition holds (immutable releases enabled on
+`pidster/asura`, 2026-11-01). Publication is on hold with the owner.
+Upgrade, handover and migration sections are deferred until the first release
+(owner, 2026-10-17). Before that release, no compatibility with older builds
+or data is required. Live build-mismatch detection stays in force: a control
+protocol mismatch reports `incompatible_protocol`, and the service checks the
+helper's exact `build_id` and `schema_digest`.
 
 The [system architecture](system-architecture.md) owns standalone service
 startup and protocol negotiation. The [authority recovery design](persistence-recovery.md)
-owns durable state and schema migration. This design owns distribution artifacts,
-formula behavior and installation/upgrade validation. The tap contains the
-[Wisp formula](https://github.com/pidster/homebrew-tap/blob/main/Formula/wisp.rb),
-which installs two prebuilt executables. Wisp's
-[release script](https://github.com/pidster/wisp/blob/main/scripts/release)
-builds both language components, packages the executables and `LICENSE`, hashes
-the archive and generates the formula. Its dry run performs local build and
-packaging but prints remote publication steps. These are reference behavior,
-not Asura implementation or proof of Wisp's signing. The
-[Wisp release guide](https://github.com/pidster/wisp/blob/main/docs/release.md)
-currently calls the package single-binary; Asura must test its actual archive
-contents against its own manifest instead of relying on prose alone.
+owns durable state and schema migration. This design owns the distribution
+artifact, cask behavior and installation/upgrade validation. The sibling
+project Wisp ships `Wisp.app` in a signed, notarised DMG
+([Wisp ADR 0072](https://github.com/pidster/wisp/blob/main/docs/decisions/0072-a-dmg-and-a-declared-layout.md))
+and a tarball formula. That is reference behavior, not Asura
+implementation; Asura uses a cask and must test its actual DMG contents
+against its own manifest.
 
-## Artifact and formula contract
+## Artifact and cask contract
 
-The release pipeline must produce a versioned macOS artifact for each supported
-architecture and macOS floor. For the first release, architecture support is
-Apple silicon and macOS 27 or later, matching the architecture baseline. The
-artifact must contain the `asura` command and all runtime libraries, helpers,
-resources and metadata needed by its CLI, TUI and per-user service. D2 decides
-whether these are one or several executables; Wisp's two-binary layout does not
-decide Asura's process topology. The release must state the exact minimum OS,
-architecture, protocol range and authority schema range. D2 must fix the
-Swift/Rust packaging layout and runtime resource lookup before a formula can
-name an asset. Relocating the archive into a Homebrew keg must not leave a
-runtime dependency on a build-tree path or the developer's machine.
+Required behavior. Each release produces one artifact for the supported
+architecture and macOS floor: `Asura-<version>.dmg`, with its
+`Asura-<version>.dmg.sha256` checksum file beside it. For the first release
+the host is Apple silicon with macOS 27 or later. The DMG holds `Asura.app`,
+which contains the `asura` command and every runtime library, helper,
+resource and metadata file that its CLI, TUI and per-user service need
+([bundle layout](release-signing.md#bundle-layout)). The release must state
+the exact minimum OS, architecture, protocol range and authority schema
+range. Installing the app into `/Applications` must not leave a runtime
+dependency on a build-tree path or on the developer's machine.
 The first Rust and Swift LSP adapters use identity-checked installed toolchains;
 the Asura artifact does not include those language servers. If a toolchain is
 absent or mismatched, Asura reports that LSP capability unavailable and retains
 ordinary source inspection. I9 must test both the qualified-toolchain and
-missing-toolchain paths from a relocated installation.
-The [local-model boundary proposal](swift-rust-boundary.md#artifact-and-resource-boundary)
-currently places a private Swift model helper beside the Rust command; D2 must
-qualify that layout before it becomes a release manifest.
+missing-toolchain paths from an installed app.
 
-The `asura` formula in `pidster/homebrew-tap` must use a versioned, immutable
-Asura GitHub release URL and its exact SHA-256. It must install only the declared
-release payload and run a no-state `--version` test for every installed Asura
-executable, as Wisp's formula does. [Homebrew formula tests](https://docs.brew.sh/Formula-Cookbook#add-a-test-to-the-formula)
-run with a temporary
-`HOME`, while Asura resolves the actual account home. I9 must therefore prove
-that every formula test performs no service startup or authority write. A
-version assertion alone is insufficient release evidence. The formula must
-also exercise one offline package/resource check without opening the service.
-SG4 selects it: `codesign --verify --deep --strict` of `Asura.app` and the
-helper, `metallib` and Hub bundle digests against `model-package.json`
-([formula](release-signing.md#formula)). The
-formula must declare the supported architecture and macOS floor. It must not launch the
-service, initialize `.asura`, migrate authority, or delete user data in install,
-upgrade, test or uninstall hooks. An archive digest verifies downloaded bytes;
-I9 must separately verify the selected code-signing and notarization contract.
-The formula update is published only after the artifact and fresh-install test
-pass. The canonical release version in every binary, archive, GitHub tag and
-formula must match. The prospective install command is
-`brew install pidster/tap/asura`; [Homebrew tap trust](https://docs.brew.sh/Tap-Trust#installing-from-a-tap)
-grants trust to that formula rather than requiring whole-tap trust.
+The `asura` cask (`Casks/asura.rb` in `pidster/homebrew-tap`) must:
+
+- name the versioned, immutable Asura GitHub release asset and its exact
+  SHA-256;
+- declare `depends_on arch: :arm64` and the macOS floor
+  (`depends_on macos: :golden_gate`, macOS 27 or later);
+- install `Asura.app` into `/Applications` (`app "Asura.app"`) and link the
+  command with `binary "#{appdir}/Asura.app/Contents/MacOS/asura"`, so that
+  `$(brew --prefix)/bin/asura` resolves to the bundle executable;
+- have no `preflight`, `postflight`, `uninstall` or `zap` stanza. The cask
+  must not launch the service, initialize `.asura`, migrate authority, or
+  delete user data in install, upgrade or uninstall.
+
+`zap` and `~/.asura` (open owner decision, default "keep"). `brew uninstall
+--cask asura` removes only `/Applications/Asura.app` and the `bin/asura` link.
+Without a `zap` stanza, `brew uninstall --zap` removes nothing more. Until the
+owner decides otherwise, no cask stanza removes `~/.asura` or any file in the
+account home.
+
+A cask has no `test` block. The offline package and resource check that a
+formula test gave therefore moves into the release scripts
+([SG6 tap test](release-signing.md#local-tap-test)): after a scripted cask
+install, `codesign --verify --deep --strict` of `/Applications/Asura.app`, the
+helper, `metallib` and Hub bundle digests against `model-package.json`, and
+`bin/asura --version`. `--version` opens no service, socket, log or Keychain
+(HD8). The helper is never started; it claims the App Sandbox.
+
+A digest verifies the downloaded bytes; I9 must separately verify the code
+signature and notarisation contract. Homebrew quarantines a cask download
+(`Cask::Download#quarantine`, Homebrew 7.0.11), so Gatekeeper assesses the
+installed app; the stapled DMG and the notarised app inside it must satisfy
+that assessment. The cask update is published only after the artifact and the
+fresh-install test pass. The canonical release version in every binary, DMG
+name, GitHub tag and cask must match. The prospective install command is
+`brew install --cask pidster/tap/asura`;
+[Homebrew tap trust](https://docs.brew.sh/Tap-Trust#installing-from-a-tap)
+grants trust to that cask rather than requiring whole-tap trust.
 
 ### Release promotion contract
 
-The release operator starts from one reviewed, clean source revision and a
-version not already tagged. A dry run executes the local preflight, build,
-package inspection and smoke checks without changing a tag, GitHub release or
-tap. The release pipeline records the source revision, locked dependencies,
-toolchains, artifact names, checksums and signature verification results. It
-checks that all expected executables and resources are present and no private
-path, credential, model weight or undeclared binary is packaged.
+Required behavior. The release operator starts from one reviewed, clean
+source revision and a version not already tagged. A dry run executes the local
+preflight, build, DMG packing, package inspection and smoke checks without
+changing a tag, GitHub release or tap. The release pipeline records the source
+revision, locked dependencies, toolchains, the DMG name, its checksum, the
+notary submission and the signature verification results. It checks that all
+expected executables and resources are present and that no private path,
+credential, model weight or undeclared binary is packaged.
 
 Before release, the repository must enable
 [GitHub release immutability](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/prevent-release-changes).
-The operator prepares a draft with all required assets, then publishes it and
-verifies that the release is marked immutable. GitHub documents that this locks
-the associated tag and assets after publication; the formula checksum still
-verifies the downloaded bytes independently. If immutability is unavailable
-before publication, the release stops. If publication succeeds but its
-immutability or downloaded bytes cannot be verified, the published release
-remains visible, but the tap update stops. A corrected artifact needs a new
-version and tag; the operator must not replace the published bytes. The operator
-verifies the downloaded asset against the local digest and signature before
-making the tap change. The tap
-formula is generated from that qualified version, asset URL and digest. Its
-audit, formula test and a clean-host installation against the published asset
-must pass before the tap commit is published. A failure after the release exists
-holds the tap update and retains the last published formula. SG4 specifies
-the script (`tools/release/asura-release`), the required checks, the signing
-identity and the publication permissions (owner only, SGQ9) in
-[SG-F9 and SG-F10](release-signing.md#sg-f9-release-build-and-prepublication-checks).
+`pidster/asura` has it enabled (`gh api repos/pidster/asura/immutable-releases`:
+`{"enabled":true}`, 2026-11-01). The operator prepares a draft with exactly
+the DMG and its `.sha256`, then publishes it and verifies that the release is
+marked immutable. GitHub documents that this locks the associated tag and
+assets after publication; the cask checksum still verifies the downloaded
+bytes independently. If immutability is unavailable before publication, the
+release stops. If publication succeeds but its immutability or downloaded
+bytes cannot be verified, the published release remains visible, but the tap
+update stops. A corrected artifact needs a new version and tag; the operator
+must not replace the published bytes. The operator verifies the downloaded
+DMG against the local digest and signature before making the tap change. The
+cask is generated from that qualified version and digest. Its audit, the
+cask install test and a clean-host installation against the published asset
+must pass before the tap commit is published. A failure after the release
+exists holds the tap update and retains the tap's prior state (no `asura`
+cask for the first release). [SG6](release-signing.md#sg6-dmg-and-cask)
+specifies the script (`tools/release/asura-release`), the required checks,
+the signing identity and the publication permissions (owner only, SGQ9).
 
 ### Publication path
 
-Proposed release view. Arrows show artifact promotion and consumer checks.
-The tap update follows artifact qualification; it does not build Asura.
+Selected release view. Solid arrows show artifact promotion and the checks
+that run on the owner's Mac before publication. Dashed arrows show the owner's
+publication steps and the checks after them; none has run. Labels show a check
+result. The tap update follows artifact qualification; it does not build Asura.
 
 ```mermaid
 flowchart TD
-    CI["Asura release build"] --> Artifact["Versioned signed artifact"]
-    Artifact --> Local["Local preflight, package and smoke checks"]
+    Build["asura-bundle --release: Asura.app, Asura-V.dmg"] --> Local["asura-release check: DMG, signatures, ticket, digests"]
     Local -->|Fail| HoldRelease["Hold release and tap"]
-    Local -->|Pass| Policy{"Release immutability enabled?"}
+    Local -->|Pass| TapLocal["asura-release tap-test --dmg: local cask tap, file URL"]
+    TapLocal -->|Fail| HoldRelease
+    TapLocal -->|Pass| Policy{"Release immutability enabled?"}
     Policy -->|No| HoldRelease
-    Policy -->|Yes| Release["Publish immutable GitHub release"]
-    Release --> Remote["Verify immutability, download and signature"]
-    Remote -->|Fail| HoldTap["Hold tap; retain published release"]
-    Remote -->|Pass| Formula["Formula URL, version and SHA-256"]
-    Formula --> Audit["Tap audit and install test"]
-    Audit -->|Pass| Publish["Publish tap change"]
-    Audit -->|Fail| HoldTap
-    Publish --> Install["User brew install or upgrade"]
+    Policy -.->|"Yes: owner"| Release["Publish immutable GitHub release: DMG and .sha256"]
+    Release -.-> Remote["verify-release: immutable, download, digest, check"]
+    Remote -.->|Fail| HoldTap["Hold tap; retain published release"]
+    Remote -.->|Pass| CaskFile["Cask: version, URL, SHA-256"]
+    CaskFile -.-> Audit["tap-test on the HTTPS asset, audit --online"]
+    Audit -.->|Fail| HoldTap
+    Audit -.->|"Pass: owner"| Publish["Publish Casks/asura.rb"]
+    Publish -.-> Install["User: brew install --cask pidster/tap/asura"]
 ```
+
 
 ## Service lifecycle across Homebrew operations
 
@@ -135,7 +153,7 @@ attaches to an existing service or starts one under the selected per-user
 contract. The service writer initializes a verified runtime-only root once
 under [conversation admission](conversation-admission.md#automatic-initialization-and-explicit-registration-workflow);
 partial or conflicting state requires repair. Homebrew itself is not a service
-supervisor.
+supervisor, and the cask has no stanza that starts or stops the service.
 
 Deferred until the first release (owner, 2026-10-17): the upgrade, handover, downgrade and migration rules in the
 rest of this section and the upgrade admission state below. They describe the
@@ -169,30 +187,32 @@ frame and all prior accepted requests before admission; it does not assume a
 successful handover. Neither case may create a second owner. D2-D3 must define the exact maintenance
 frame, drain result and settled-task criteria before implementation.
 
-Neither a formula hook nor a client version mismatch may kill the active
+Neither a cask stanza nor a client version mismatch may kill the active
 service, discard a task, start a competing owner or migrate data implicitly.
 An authority migration needs its own recorded operation and compatibility
-decision. It cannot be inferred from an updated Homebrew symlink.
+decision. It cannot be inferred from a replaced `/Applications/Asura.app` or an updated
+`bin/asura` link.
 
-If installation or formula publication fails, the prior published artifact and
-formula remain the rollback reference; Homebrew may have removed an old local
-keg. An older executable must reject an authority
+If installation or cask publication fails, the prior published DMG and cask
+remain the rollback reference; a cask upgrade may already have replaced the
+local `/Applications/Asura.app`. An older executable must reject an authority
 schema it cannot read; a binary downgrade cannot silently restore older
-authority files. Uninstall removes installed binaries, not `.asura`, the
-runtime guard or external SurrealDB. After uninstall, a running service may
+authority files. `brew uninstall --cask asura` removes `/Applications/Asura.app` and the
+`bin/asura` link, not `.asura`, the runtime guard or external SurrealDB. After uninstall, a running service may
 still exist; D2/I9 must select and validate the user-facing shutdown and
 reinstall behavior before release.
 
-[Homebrew normally removes old formula versions during upgrade](https://docs.brew.sh/FAQ#how-do-i-keep-old-versions-of-a-formula-when-upgrading).
-An old service can therefore outlive the executable, helper or resource path
-from which it started. It must not assume that path remains usable or re-exec
-it to hand over. Before each helper/resource-dependent action, the service
-checks that the required versioned resource remains available and authentic.
-The private Rust–Swift model channel requires the service's exact packaged
+A cask upgrade (`brew upgrade --cask asura`) replaces `/Applications/Asura.app`
+in place; it keeps no old version. An old service can therefore outlive the
+executable, helper and resources from which it started, while the same
+canonical path now holds another build. It must not assume that the path still
+holds its own build, and it must not re-exec it to hand over: a re-exec would
+start the new build. Before each helper/resource-dependent action, the service
+checks that the required versioned resource remains available and authentic. The private Rust–Swift model channel requires the service's exact packaged
 helper-build and protocol identities. This differs from the client-to-service
 control handshake, which may accept a compatible protocol range. An old
-service cannot substitute the newly installed helper when its matching keg
-disappears; it keeps control available and reports model work unavailable
+service cannot substitute the newly installed helper when its matching app is
+replaced or removed; it keeps control available and reports model work unavailable
 until a valid matching helper returns or service handover completes.
 If a required resource is unavailable, the service rejects new dependent work. It resolves
 accepted work through the
@@ -205,7 +225,7 @@ installed client starts its own
 verified executable only after the old owner releases the lock. D2 must select
 how long-running operations retain their resources and how to settle effects
 if a path disappears mid-operation; the design cannot claim seamless active
-work across Homebrew cleanup until those cases pass.
+work across a cask upgrade or uninstall until those cases pass.
 
 ### Upgrade admission state
 
@@ -230,24 +250,26 @@ stateDiagram-v2
 
 | ID | Scenario | Required evidence |
 | --- | --- | --- |
-| HD1 | Clean supported macOS host installs from tap | Formula resolves the exact qualified artifact; version, signature, resources and no-state install behavior pass. |
-| HD2 | Unsupported architecture or macOS | Formula or binary rejects before service or authority creation. |
+| HD1 | Clean supported macOS host installs from the tap | `brew install --cask pidster/tap/asura` resolves the exact qualified DMG; `/Applications/Asura.app` passes the signature, ticket, Gatekeeper and resource checks; `bin/asura --version` prints the version; the install creates no Asura state. |
+| HD2 | Unsupported architecture or macOS | The cask (`depends_on`) or the binary rejects before service or authority creation. |
 | HD3 | Upgrade while an old service has active work | Deferred until the first release (owner, 2026-10-17). New client negotiates compatibility or reports UpgradePending; the drain barrier accounts for every accepted request before handover. |
 | HD4 | Service crash during handover | Deferred until the first release (owner, 2026-10-17). Sole-owner recovery replays original requests and tasks before new admission. |
-| HD5 | Formula or download digest failure | Installation fails without changing `.asura` or the bound graph. |
-| HD6 | Uninstall then reinstall | User data persists; compatible reinstall reopens the original installation only after binding verification. |
+| HD5 | Cask or download digest failure | `brew install --cask` fails with a checksum error; no `/Applications/Asura.app`, no `bin/asura` link and no installed cask remain; `.asura` and the bound graph are unchanged. |
+| HD6 | Uninstall then reinstall | `brew uninstall --cask asura` removes the app and the link only; user data in `~/.asura` persists; a compatible reinstall reopens the original installation only after binding verification. |
 | HD7 | Older binary after authority schema migration | Deferred until the first release (owner, 2026-10-17). It rejects the unknown schema and does not write or roll back state. |
-| HD8 | Formula test runs on an account with existing Asura state | Version checks create no socket, service or authority write, regardless of Homebrew's temporary `HOME`. |
-| HD9 | Relocated archive includes several executables or runtime resources | Manifest, exact shared build and private-protocol identities, signature and executable resource lookup pass from an installed keg without build-tree paths. |
-| HD10 | Release dry run or prepublication check fails | No tag, release asset or tap commit is changed; the previous formula remains installable. |
-| HD11 | Homebrew removes the old keg while its service runs | Old owner neither re-execs a missing path nor dispatches with missing helpers; accepted effects reconcile, controls respond and new owner waits for the lock. |
+| HD8 | The cask install check runs on an account with existing Asura state | `bin/asura --version` creates no socket, service or authority write. |
+| HD9 | The DMG holds several executables and runtime resources | The DMG manifest, the exact shared build and private-protocol identities, the signatures, and executable resource lookup from `/Applications/Asura.app/Contents/Resources` pass without build-tree paths. |
+| HD10 | Release dry run or prepublication check fails | No tag, release asset or tap commit is changed; the tap stays in its prior state. |
+| HD11 | A cask upgrade replaces, or an uninstall removes, `/Applications/Asura.app` while its service runs | Deferred until the first release (owner, 2026-10-17) with the handover. The old owner neither re-execs the canonical path (now another build or absent) nor dispatches with a changed or missing helper; accepted effects reconcile, controls respond and the new owner waits for the lock. |
 | HD12 | GitHub release immutability is disabled or unverified | The release gate stops before tap publication; a checksum alone does not satisfy immutable-asset availability. |
-| HD13 | Remote asset or clean-install check fails after release publication | The published release remains, the tap stays on its prior formula, and any corrected artifact gets a new version. |
-| HD14 | Installed service finds a helper from another package build or private protocol | It rejects before model content, never substitutes a helper from a new keg, reaps any spawned mismatch and reports model unavailability while control remains usable. Unit identity checks, installed-artifact integration and CLI end-to-end evidence. |
+| HD13 | Remote asset or clean-install check fails after release publication | The published release remains, the tap stays in its prior state, and any corrected artifact gets a new version. |
+| HD14 | Installed service finds a helper from another package build or private protocol | It rejects before model content, never substitutes a helper from a replaced app, reaps any spawned mismatch and reports model unavailability while control remains usable. Unit identity checks, installed-artifact integration and CLI end-to-end evidence. |
 
 D7 must map each case to unit checks for version/admission decisions,
-integration checks for real artifact/formula/service interactions, and end-to-end
-checks on clean supported hosts. I9 must record commands, host versions, signing
-identity, artifact digest and observed results. The distribution design remains
-proposed until D2-D3 define exact service handover, D7 defines the release
-procedure and I9 has a runnable qualification packet.
+integration checks for real DMG, cask and service interactions, and
+end-to-end checks on clean supported hosts. I9 must record commands, host
+versions, signing identity, DMG digest, notary submission and observed
+results. [SG-V11](release-signing.md#validation) maps HD1, HD5, HD8, HD9,
+HD10, HD12 and HD13 to the release scripts and their checks. The
+distribution design remains open for the handover until D2-D3 define exact
+service handover and I9 has run on a clean host.

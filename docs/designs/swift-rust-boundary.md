@@ -640,25 +640,27 @@ resource location and other-UID isolation in the actual Homebrew package.
 
 ## Artifact and resource boundary
 
-The first macOS artifact candidate contains the Rust `asura` command, a Swift
-`asura-model` helper private to the package and declared runtime resources.
-The formula exposes `asura` in `bin`; it installs the helper and its resources
-in one versioned private location such as `libexec/asura`. Both executables
+The macOS artifact contains the Rust `asura` command, a Swift `asura-model`
+helper private to the package and declared runtime resources, in `Asura.app`
+([bundle layout](release-signing.md#bundle-layout)). The Homebrew cask
+installs the app into `/Applications` and links `asura` into `bin`. Both executables
 must report the same package-build identity and exact private-protocol
 identity without starting the service. That report is diagnostic, not proof
 that a file is authentic. The Rust service resolves the helper from its
 verified installed package, not `PATH`, a project directory or an attaching
 client's path. It checks the helper against the package manifest before spawn
 and rejects a handshake mismatch before model content. D2/D7 must select
-exact paths, identity generation and signature/manifest checks before packaging.
+exact paths, identity generation and signature/manifest checks before packaging;
+the [release signing design](release-signing.md) records them.
 
-Deferred until the first release (owner, 2026-10-17): keg removal and upgrade handling below. The live helper identity check
+Deferred until the first release (owner, 2026-10-17): app replacement and upgrade handling below. The live helper identity check
 (exact `build_id` and `schema_digest`) stays in force now.
 
-Homebrew can remove an old keg while its service runs. If the matching helper
-file or resource is gone before spawn, the old service rejects new model work
-and retains control availability. It must not use a helper from a new keg or
-an attaching client's package. If a running helper loses a lazy resource, the
+A cask upgrade can replace, or an uninstall remove, `/Applications/Asura.app`
+while its service runs. If the matching helper file or resource is changed or
+gone before spawn, the old service rejects new model work and retains control
+availability. It must not use a helper from a replaced app or an attaching
+client's package. If a running helper loses a lazy resource, the
 model operation follows the reconciliation rules above; it cannot be marked
 complete merely because the process exited. A new `asura` client may start
 its packaged helper only after the old service drains and releases ownership.
@@ -666,7 +668,7 @@ I9 must test cleanup during an admitted call and before a later helper spawn.
 Another platform may package a different local-model implementation and
 transport. Its release design must prove identity, resource lifetime, failure
 isolation and the same semantic contract before claiming support. The first
-Homebrew formula does not need to ship an unselected alternative.
+Homebrew cask does not need to ship an unselected alternative.
 
 ## Validation and remaining D2 decisions
 
@@ -697,7 +699,7 @@ the [design process](../design-process.md#design-readiness-lifecycle).
 | SR4 | Cancel while Swift model call is blocked | Rust stops admission, observes helper settlement or exit, and keeps control responsive. Unit state checks, process integration, CLI cancellation. |
 | SR5 | Helper crashes after a tool proposal | Rust never assumes the tool ran; it reconciles any separately admitted effect. Unit identity check, crash integration, CLI recovery. |
 | SR6 | Context generation changes before a late frame | Rust rejects the stale frame; no cross-context output or tool effect escapes. Unit generation check, process integration, multi-context CLI. |
-| SR7 | Old Homebrew keg disappears before helper spawn or during a call | Deferred until the first release (owner, 2026-10-17). No unverified executable starts; accepted effects reconcile, while status and cancellation work. Unit decision checks, real-upgrade integration, CLI recovery. |
+| SR7 | `/Applications/Asura.app` is replaced or removed before helper spawn or during a call | Deferred until the first release (owner, 2026-10-17). No unverified executable starts; accepted effects reconcile, while status and cancellation work. Unit decision checks, real-upgrade integration, CLI recovery. |
 | SR8 | Helper emits a malformed frame after a model call began | Rust rejects the frame, invalidates that helper generation and reconciles admitted work before any terminal claim. Unit decoder checks, process fault integration, CLI recovery. |
 | SR9 | Candidate lacks a required structured-result or tool capability | Service rejects that candidate before admission and returns explicit unavailability or selects an authorized eligible candidate. Unit matching and snapshot checks, two-implementation integration, CLI result. |
 | SR10 | Capability changes or another implementation appears while work runs | Admitted work remains pinned to its identity and capability snapshot; no silent replay or cross-implementation result is accepted. Unit generation checks, process integration with fault injection, CLI recovery. |
