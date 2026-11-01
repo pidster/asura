@@ -2203,3 +2203,63 @@ fn p3e2_secret_store_events() {
     }
     assert_eq!(over.validate(), Err(Error::Invalid));
 }
+
+/// NS-U13: the named secret events take their own reply codes, carry a
+/// status only with a failure (and `replace_failed`), bound their counts,
+/// and the closed schema refuses a name or value field.
+#[test]
+fn ns_u13_named_secret_events() {
+    use SecretStoreReply as R;
+    let put = |reply, status| Event::SecretStoreNamedPut {
+        reply,
+        status,
+        session: None,
+    };
+    for reply in [R::Stored, R::Replaced, R::Exists, R::Full] {
+        put(reply, None).validate().unwrap();
+        assert_eq!(put(reply, Some(1)).validate(), Err(Error::Invalid));
+    }
+    put(R::ReplaceFailed, Some(-25_291)).validate().unwrap();
+    assert_eq!(put(R::ReplaceFailed, None).validate(), Err(Error::Invalid));
+    put(R::Locked, Some(-25_308)).validate().unwrap();
+    assert_eq!(put(R::Read, None).validate(), Err(Error::Invalid));
+    let get = |reply, count| Event::SecretStoreNamedGet {
+        reply,
+        status: None,
+        session: None,
+        count,
+    };
+    get(R::Read, 16).validate().unwrap();
+    assert_eq!(get(R::Read, 0).validate(), Err(Error::Invalid));
+    assert_eq!(get(R::Read, 17).validate(), Err(Error::Invalid));
+    assert_eq!(get(R::Stored, 1).validate(), Err(Error::Invalid));
+    Event::SecretStoreNamedDelete {
+        reply: R::Absent,
+        status: None,
+        session: None,
+    }
+    .validate()
+    .unwrap();
+    let list = |reply, status, count| Event::SecretStoreNamedList {
+        reply,
+        status,
+        session: None,
+        count,
+    };
+    list(R::Listed, None, 64).validate().unwrap();
+    assert_eq!(list(R::Listed, None, 65).validate(), Err(Error::Invalid));
+    list(R::Unavailable, Some(-34_018), 0).validate().unwrap();
+    assert_eq!(
+        list(R::Unavailable, Some(-34_018), 1).validate(),
+        Err(Error::Invalid)
+    );
+    let text = serde_json::to_string(&put(R::Stored, None)).unwrap();
+    assert_eq!(
+        text,
+        r#"{"kind":"secret_store.named_put","details":{"reply":"stored"}}"#
+    );
+    let named: Result<Event, _> = serde_json::from_str(
+        r#"{"kind":"secret_store.named_put","details":{"reply":"stored","name":"X"}}"#,
+    );
+    assert!(named.is_err(), "a name field is refused");
+}

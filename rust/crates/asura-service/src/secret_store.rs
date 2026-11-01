@@ -29,8 +29,8 @@ mod port;
 mod worker;
 
 pub use codec::{
-    CodecError, DIGEST_BYTES, MAX_VARIABLE_BYTES, MAX_VARIABLES, MAX_WHOLE_COMMAND_BYTES,
-    SecretValue, Secrets, VERSION, binding,
+    CodecError, DIGEST_BYTES, MAX_NAMED_VALUE_BYTES, MAX_VARIABLE_BYTES, MAX_VARIABLES,
+    MAX_WHOLE_COMMAND_BYTES, SecretValue, Secrets, VERSION, binding, named_binding,
 };
 #[cfg(feature = "test-support")]
 pub use port::{Call, Gate};
@@ -53,6 +53,9 @@ use std::thread::JoinHandle;
 pub const QUEUE_BOUND: usize = 16;
 /// Secret items per installation. A put is refused with `full` at this count.
 pub const ITEM_LIMIT: u32 = 256;
+/// Named secrets per installation (named-secrets.md, counts). A put of a
+/// new name is refused with `full` at this count.
+pub const NAMED_LIMIT: usize = 64;
 /// The item count reported for a truncated listing: "more than 256".
 pub const COUNT_TRUNCATED: u32 = asura_platform::keychain::LIST_BOUND as u32;
 /// The `unavailable` reason of a missing entitlement (SG3).
@@ -156,6 +159,51 @@ pub enum GetReply {
 pub enum DeleteReply {
     Deleted,
     Absent,
+    Failed(StoreFailure),
+}
+
+/// Reply to [`Store::put_named`] (named-secrets.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamedPutReply {
+    Stored,
+    /// A replace deleted the old item and added the new one.
+    Replaced,
+    /// The name exists and the put did not ask to replace it.
+    Exists,
+    /// 64 named secrets or 256 items exist.
+    Full,
+    /// A replace deleted the old item, then the add failed: the name is
+    /// absent.
+    ReplaceFailed(StoreFailure),
+    Failed(StoreFailure),
+}
+
+/// Reply to [`Store::get_named`]: every value in request order, or the
+/// first problem.
+#[derive(PartialEq, Eq)]
+pub enum NamedGetReply {
+    Values(Vec<zeroize::Zeroizing<Vec<u8>>>),
+    Missing,
+    /// An item's data does not match its binding; it is kept.
+    Mismatch,
+    Failed(StoreFailure),
+}
+impl std::fmt::Debug for NamedGetReply {
+    /// Counts only: a value never reaches a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Values(values) => write!(f, "Values({})", values.len()),
+            Self::Missing => f.write_str("Missing"),
+            Self::Mismatch => f.write_str("Mismatch"),
+            Self::Failed(failure) => write!(f, "Failed({failure:?})"),
+        }
+    }
+}
+
+/// Reply to [`Store::list_named`]: the stored names in byte order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NamedListReply {
+    Names(Vec<String>),
     Failed(StoreFailure),
 }
 
@@ -266,6 +314,23 @@ pub(crate) enum Request {
     Sweep {
         live: BTreeSet<[u8; 16]>,
         reply: SyncSender<SweepReport>,
+    },
+    PutNamed {
+        name: String,
+        value: zeroize::Zeroizing<Vec<u8>>,
+        replace: bool,
+        reply: SyncSender<NamedPutReply>,
+    },
+    GetNamed {
+        names: Vec<String>,
+        reply: SyncSender<NamedGetReply>,
+    },
+    DeleteNamed {
+        name: String,
+        reply: SyncSender<DeleteReply>,
+    },
+    ListNamed {
+        reply: SyncSender<NamedListReply>,
     },
 }
 
@@ -414,6 +479,37 @@ impl Store {
     /// unrecognized accounts are counted and never touched.
     pub fn sweep(&self, live: BTreeSet<[u8; 16]>) -> Result<Ticket<SweepReport>, Refused> {
         self.submit(|reply| Request::Sweep { live, reply })
+    }
+
+    /// Stores one named secret; `replace` replaces an existing one
+    /// (named-secrets.md). The value stays in zeroizing memory.
+    pub fn put_named(
+        &self,
+        name: String,
+        value: zeroize::Zeroizing<Vec<u8>>,
+        replace: bool,
+    ) -> Result<Ticket<NamedPutReply>, Refused> {
+        self.submit(|reply| Request::PutNamed {
+            name,
+            value,
+            replace,
+            reply,
+        })
+    }
+
+    /// Reads the values of `names`, at most 16, for one command submit.
+    pub fn get_named(&self, names: Vec<String>) -> Result<Ticket<NamedGetReply>, Refused> {
+        self.submit(|reply| Request::GetNamed { names, reply })
+    }
+
+    /// Removes one named secret.
+    pub fn delete_named(&self, name: String) -> Result<Ticket<DeleteReply>, Refused> {
+        self.submit(|reply| Request::DeleteNamed { name, reply })
+    }
+
+    /// Lists the stored names.
+    pub fn list_named(&self) -> Result<Ticket<NamedListReply>, Refused> {
+        self.submit(|reply| Request::ListNamed { reply })
     }
 
     /// True while a request would be admitted.

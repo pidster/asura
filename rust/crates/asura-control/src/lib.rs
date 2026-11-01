@@ -4,6 +4,7 @@ use std::fmt;
 mod audit_query;
 pub mod jobs;
 pub mod path_guard;
+pub mod secrets;
 mod sensor_query;
 pub mod thinking;
 
@@ -95,7 +96,8 @@ impl ControlCodec {
         } else {
             Frame::Message(Box::new(decode_body(&self.bytes[HEADER_BYTES..])?))
         };
-        self.bytes.clear();
+        // A consumed frame can hold a SecretPut value (named-secrets.md).
+        zeroize::Zeroize::zeroize(&mut self.bytes);
         self.target = None;
         Ok(Some(frame))
     }
@@ -125,8 +127,10 @@ pub fn encode_frame(envelope: &pb::Envelope) -> Result<Vec<u8>, ProtocolError> {
     if length == 0 || length > MAX_FRAME_BYTES {
         return Err(ProtocolError::InvalidLength);
     }
-    let body = envelope.encode_to_vec();
-    decode_body(&body)?;
+    // Zeroized on drop: a SecretPut body holds a value (named-secrets.md).
+    let body = zeroize::Zeroizing::new(envelope.encode_to_vec());
+    let mut check = decode_body(&body)?;
+    secrets::scrub(&mut check);
     let mut frame = Vec::with_capacity(HEADER_BYTES + length);
     frame.extend_from_slice(&version_rejection());
     frame[8..12].copy_from_slice(&(length as u32).to_be_bytes());
@@ -292,7 +296,8 @@ pub fn validate_semantics(
             | Body::ObserveContext(_)
             | Body::ObserveService(_)
     ) || jobs::is_request(body)
-        || path_guard::is_request(body);
+        || path_guard::is_request(body)
+        || secrets::is_request(body);
     if request != (direction == Direction::ClientToServer) {
         return Err(ProtocolError::WrongDirection);
     }
@@ -476,6 +481,7 @@ pub fn validate_semantics(
         body if conversation::handles(body) => conversation::valid(body),
         body if jobs::handles(body) => jobs::valid(body),
         body if path_guard::handles(body) => path_guard::valid(body),
+        body if secrets::handles(body) => secrets::valid(body),
         Body::Stop(v) => v.expected_epoch == envelope.service_epoch,
         Body::Error(v) => {
             v.code

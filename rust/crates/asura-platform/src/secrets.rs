@@ -7,6 +7,7 @@
 mod arguments;
 pub mod environment;
 pub mod json;
+pub mod named;
 pub mod rewrite;
 mod rules;
 mod stream;

@@ -23,15 +23,16 @@ use crate::job_controller::{
     Admission, AgentKey, JobEvent, JobState, Origin, Pacing, Profile, Requester, StartRequest,
 };
 use crate::secret_store::{
-    self, DeleteReply, GetReply, Polled, PutReply, Refused, SecretValue, Secrets, Store,
-    StoreFailure, SweepReport, Ticket,
+    self, DeleteReply, GetReply, NamedGetReply, Polled, PutReply, Refused, SecretValue, Secrets,
+    Store, StoreFailure, SweepReport, Ticket,
 };
 use crate::tools;
 use asura_control::pb;
 use asura_platform::exec_cmd::environment as env;
 use asura_platform::keychain::Target;
 use asura_platform::secrets::{
-    self, JobRedaction, Plan, RefusalCode, RuleSet, SecretVariable, WHOLE_COMMAND,
+    self, JobRedaction, Plan, RefusalCode, RuleSet, SecretKind, SecretVariable, WHOLE_COMMAND,
+    named,
 };
 use asura_storage::audit::{
     Event, KeychainConsole, KeychainOrigin, KeychainSession, PersonCommandRefusal as Refusal,
@@ -176,6 +177,7 @@ pub(super) fn command_environment(person: &PersonCommandQueued) -> pb::CommandEn
         secret_variables: (!person.whole_command && !person.number_kinds.is_empty())
             .then_some(person.number_kinds.len() as u32),
         secret_command: person.whole_command.then_some(true),
+        named_secrets: person.named.iter().map(|(_, n)| n.clone()).collect(),
     }
 }
 
@@ -220,6 +222,9 @@ pub(super) fn queue_refusal(refusal: pb::QueueRefusal) -> Option<Refusal> {
         Q::SecretInCwd => Refusal::SecretInCwd,
         Q::PlaceholderNotAvailable => Refusal::PlaceholderNotAvailable,
         Q::SecretDetectionUnavailable => Refusal::SecretDetectionUnavailable,
+        Q::SecretNotFound => Refusal::SecretNotFound,
+        Q::SecretReferenceInvalid => Refusal::SecretReferenceInvalid,
+        Q::TooManySecrets => Refusal::TooManySecrets,
     })
 }
 
@@ -289,13 +294,16 @@ fn typed_refusal(refusal: Refusal) -> Option<pb::QueueRefusal> {
         Refusal::SecretInCwd => Q::SecretInCwd,
         Refusal::PlaceholderNotAvailable => Q::PlaceholderNotAvailable,
         Refusal::SecretDetectionUnavailable => Q::SecretDetectionUnavailable,
+        Refusal::SecretNotFound => Q::SecretNotFound,
+        Refusal::SecretReferenceInvalid => Q::SecretReferenceInvalid,
+        Refusal::TooManySecrets => Q::TooManySecrets,
         _ => return None,
     })
 }
 
 /// The refusal of a store failure at submit. `not_signed` is
 /// `secret_store_unavailable` with status 34018, which the TUI names.
-fn store_refusal(failure: StoreFailure) -> (Refusal, Option<u32>) {
+pub(super) fn store_refusal(failure: StoreFailure) -> (Refusal, Option<u32>) {
     match failure {
         StoreFailure::Locked { .. } => (Refusal::SecretStoreLocked, None),
         StoreFailure::Denied { .. } => (Refusal::SecretStoreDenied, None),
@@ -332,7 +340,7 @@ pub(super) fn audit_session(session: secret_store::Session) -> KeychainSession {
 /// The audit reply code, raw status and session of one store reply: a
 /// failure carries its status and, when a Keychain call failed, the
 /// session state (field evidence, SG3).
-type AuditReply = (StoreReply, Option<i32>, Option<KeychainSession>);
+pub(super) type AuditReply = (StoreReply, Option<i32>, Option<KeychainSession>);
 
 fn failure_reply(failure: &StoreFailure) -> AuditReply {
     let code = match failure {
@@ -361,6 +369,20 @@ fn get_reply(reply: &GetReply) -> AuditReply {
         GetReply::Mismatch => (StoreReply::Mismatch, None, None),
         GetReply::Failed(failure) => failure_reply(failure),
     }
+}
+pub(super) fn named_get_reply(reply: &NamedGetReply) -> AuditReply {
+    match reply {
+        NamedGetReply::Values(_) => (StoreReply::Read, None, None),
+        NamedGetReply::Missing => (StoreReply::Missing, None, None),
+        NamedGetReply::Mismatch => (StoreReply::Mismatch, None, None),
+        NamedGetReply::Failed(failure) => failure_reply(failure),
+    }
+}
+pub(super) fn failure_audit(failure: &StoreFailure) -> AuditReply {
+    failure_reply(failure)
+}
+pub(super) fn delete_audit(reply: &DeleteReply) -> AuditReply {
+    delete_reply(reply)
 }
 fn delete_reply(reply: &DeleteReply) -> AuditReply {
     match reply {
@@ -411,6 +433,10 @@ enum Stage {
     /// ticket before any Keychain call (ordering rule 6, P3-E2). The
     /// values wait here, zeroed on drop.
     Lookup(Box<Secrets>),
+    /// The named secrets the command references are being read
+    /// (named-secrets.md, NS-F2 step 5). The rewrite's values wait here,
+    /// zeroed on drop.
+    Named(Ticket<NamedGetReply>, Box<Secrets>),
     /// The item `put` is in flight (ordering rule 1).
     Put(Ticket<PutReply>),
     /// An exact retry: the original item is read to compare the values
@@ -481,12 +507,12 @@ enum Sweep {
 /// The person command state of the conversation owner.
 pub(super) struct Persons {
     /// The secret store, once the installation and the target are known.
-    store: Option<Store>,
+    pub(super) store: Option<Store>,
     /// The start-time target: `None` until read; `Some(None)` when this
     /// runtime has none.
-    target: Option<Option<Target>>,
+    pub(super) target: Option<Option<Target>>,
     /// The store worker could not start: every item call is unavailable.
-    store_failed: bool,
+    pub(super) store_failed: bool,
     /// The outside switch (`personCommands.allowOutsideSandbox`), shared
     /// with the controller's slot-grant check.
     switch: Arc<AtomicU8>,
@@ -512,6 +538,9 @@ pub(super) struct Persons {
     recovering: Option<BTreeSet<Id>>,
     /// Hold decisions waiting for the journal ticket.
     holds: VecDeque<Id>,
+    /// Named secret requests in flight (named-secrets.md), at most
+    /// [`super::named_secrets::IN_FLIGHT`].
+    pub(super) named: Vec<super::named_secrets::Pending>,
     /// The waiting reasons last published, by input (live display state).
     published: BTreeMap<Id, (i32, String)>,
     /// Test-support seam (SS-I3): kind 31 appends are held for this run.
@@ -539,6 +568,7 @@ impl Default for Persons {
             sweep: Sweep::NotStarted,
             recovering: None,
             holds: VecDeque::new(),
+            named: Vec::new(),
             published: BTreeMap::new(),
             #[cfg(feature = "test-support")]
             hold_append: false,
@@ -623,19 +653,25 @@ impl Persons {
 /// The raw text is re-planned with the running rule set; the plan must be
 /// the same rewrite with the same numbers and kinds, or the item does not
 /// belong to this record (`mismatch`).
-fn replan_rewrite(
+pub(super) fn replan_rewrite(
     rules: &'static RuleSet,
     record: &PersonCommandQueued,
     values: &[SecretValue],
 ) -> Option<Vec<SecretVariable>> {
-    let raw = restore(&record.command, values)?;
+    let raw = restore(&record.command, values, &record.named)?;
     let plan = secrets::rewrite_exec_cmd_call_with(rules, &raw, &record.cwd).ok()?;
     let Plan::Rewritten(rewrite) = plan else {
         return None;
     };
-    let same = rewrite.command == record.command
-        && rewrite.variables.len() == values.len()
-        && rewrite.variables.len() == record.number_kinds.len()
+    // Named references (named-secrets.md, dispatch check): the same
+    // resolution must give the same command and names.
+    let numbered = rewrite.variables.len();
+    let resolved = named::resolve(&rewrite.command, numbered).ok()?;
+    let named_values = values.get(numbered..)?;
+    let same = resolved.command == record.command
+        && resolved.names == record.named
+        && values.len() == record.number_kinds.len()
+        && numbered + record.named.len() == values.len()
         && rewrite
             .variables
             .iter()
@@ -645,13 +681,29 @@ fn replan_rewrite(
                 v.number() == u16::from(stored.number)
                     && v.value() == stored.value.as_slice()
                     && v.kind() == *kind
-            });
-    same.then_some(rewrite.variables)
+            })
+        && named_values
+            .iter()
+            .zip(&record.named)
+            .all(|(stored, (number, _))| stored.number == *number);
+    let mut variables = rewrite.variables;
+    variables.extend(
+        named_values
+            .iter()
+            .map(|v| SecretVariable::named(u16::from(v.number), &v.value)),
+    );
+    same.then_some(variables)
 }
 
 /// The raw command of a rewrite: each inserted variable form replaced by
-/// its stored value. `None` when a form names no stored number.
-fn restore(command: &str, values: &[SecretValue]) -> Option<Zeroizing<String>> {
+/// its stored value, or, for a named number, by its reference text
+/// `${ASURA_SECRET_<NAME>}` (never the value). `None` when a form names no
+/// stored number.
+pub(super) fn restore(
+    command: &str,
+    values: &[SecretValue],
+    names: &[(u8, String)],
+) -> Option<Zeroizing<String>> {
     let bytes = command.as_bytes();
     let mut out = Zeroizing::new(Vec::with_capacity(command.len()));
     let mut at = 0;
@@ -674,8 +726,18 @@ fn restore(command: &str, values: &[SecretValue]) -> Option<Zeroizing<String>> {
                     .ok()?
                     .parse()
                     .ok()?;
-                let value = values.iter().find(|v| v.number == number)?;
-                out.extend_from_slice(&value.value);
+                if let Some((_, name)) = names.iter().find(|(n, _)| *n == number) {
+                    if close == b'"' {
+                        out.push(b'"');
+                    }
+                    out.extend_from_slice(named::reference_text(name).as_bytes());
+                    if close == b'"' {
+                        out.push(b'"');
+                    }
+                } else {
+                    let value = values.iter().find(|v| v.number == number)?;
+                    out.extend_from_slice(&value.value);
+                }
                 at += prefix + digits + 1;
                 continue;
             }
@@ -897,6 +959,7 @@ impl Owner {
                 search_path: String::new(),
                 environment: Vec::new(),
                 declared: Vec::new(),
+                named: Vec::new(),
                 order_revision: 0,
                 number_kinds: Vec::new(),
                 unnumbered: 0,
@@ -986,7 +1049,33 @@ impl Owner {
                 .into());
             }
         };
-        let planned = planned(plan);
+        let mut planned = planned(plan);
+        // Named references (named-secrets.md, NS-F2 steps 1 to 4).
+        let references = named::references(command).map_err(|_| Refusal::SecretReferenceInvalid)?;
+        let mut names: Vec<(u8, String)> = Vec::new();
+        if !references.is_empty() {
+            if planned.whole
+                || planned
+                    .secrets
+                    .variables
+                    .iter()
+                    .any(|v| named::holds_reference(&v.value))
+            {
+                return Err(Refusal::SecretReferenceInvalid.into());
+            }
+            let resolved =
+                named::resolve(&planned.command, planned.number_kinds.len()).map_err(|error| {
+                    match error {
+                        named::ReferenceError::Invalid => Refusal::SecretReferenceInvalid,
+                        named::ReferenceError::TooMany => Refusal::TooManySecrets,
+                    }
+                })?;
+            planned.command = resolved.command;
+            planned
+                .number_kinds
+                .extend(resolved.names.iter().map(|_| SecretKind::EnvSecret));
+            names = resolved.names;
+        }
         let record = &mut submit.record;
         record.command = planned.command;
         record.display_command = planned.display;
@@ -1000,16 +1089,79 @@ impl Owner {
         record.search_path = search_path;
         record.environment = environment;
         record.declared = declared;
+        record.named = names;
         let values = planned.secrets;
-        submit.needs_item = !values.variables.is_empty() || values.whole_command.is_some();
+        submit.needs_item = !values.variables.is_empty()
+            || values.whole_command.is_some()
+            || !record.named.is_empty();
         record.digest =
             journal::request_digest(journal::Request::QueuePersonCommand(record.request()))
                 .map_err(|_| Refusing::from(Refusal::InvalidRequest))?;
         if self.replay.is_none() {
             return Err(Refusal::InstallationNotInitialized.into());
         }
+        if !submit.record.named.is_empty() {
+            let Some(store) = &self.persons.store else {
+                return Err(Refusal::SecretStoreUnavailable.into());
+            };
+            let names = submit.record.named.iter().map(|(_, n)| n.clone()).collect();
+            return match store.get_named(names) {
+                Ok(ticket) => {
+                    submit.stage = Stage::Named(ticket, Box::new(values));
+                    Ok(())
+                }
+                Err(Refused::Busy) => Err(Refusal::SecretStoreBusy.into()),
+                Err(Refused::Stopped) => Err(Refusal::SecretStoreUnavailable.into()),
+            };
+        }
         submit.stage = Stage::Lookup(Box::new(values));
         Ok(())
+    }
+
+    /// The named values of a submit (named-secrets.md, NS-F2 step 5): each
+    /// becomes the secret variable its reference was numbered, after the
+    /// rewrite's own values.
+    fn person_named(
+        &self,
+        submit: &mut Submit,
+        reply: NamedGetReply,
+        mut values: Box<Secrets>,
+    ) -> Result<(), Refusing> {
+        let (code, status, session) = named_get_reply(&reply);
+        self.audit_store(Event::SecretStoreNamedGet {
+            reply: code,
+            status,
+            session,
+            count: submit.record.named.len() as u32,
+        });
+        match reply {
+            NamedGetReply::Values(found) => {
+                let total = values
+                    .variables
+                    .iter()
+                    .map(|v| v.value.len())
+                    .sum::<usize>()
+                    + found.iter().map(|v| v.len()).sum::<usize>();
+                if total > secret_store::MAX_VARIABLE_BYTES
+                    || found.len() != submit.record.named.len()
+                {
+                    return Err(Refusal::TooManySecrets.into());
+                }
+                for ((number, _), value) in submit.record.named.iter().zip(found) {
+                    values.variables.push(SecretValue {
+                        number: *number,
+                        value,
+                    });
+                }
+                submit.stage = Stage::Lookup(values);
+                Ok(())
+            }
+            NamedGetReply::Missing | NamedGetReply::Mismatch => Err(Refusal::SecretNotFound.into()),
+            NamedGetReply::Failed(failure) => {
+                let (reason, status) = store_refusal(failure);
+                Err(Refusing { reason, status })
+            }
+        }
     }
 
     /// The journal lookup of a planned submit's request ID (ordering rule
@@ -1186,6 +1338,14 @@ impl Owner {
             }
             let result = match std::mem::replace(&mut submit.stage, Stage::Waiting) {
                 Stage::Waiting => self.person_plan(&mut submit),
+                Stage::Named(ticket, values) => match ticket.poll() {
+                    Polled::Pending => {
+                        submit.stage = Stage::Named(ticket, values);
+                        Ok(())
+                    }
+                    Polled::Ready(reply) => self.person_named(&mut submit, reply, values),
+                    Polled::Lost => Err(Refusal::SecretStoreUnavailable.into()),
+                },
                 Stage::Put(ticket) => match ticket.poll() {
                     Polled::Pending => {
                         submit.stage = Stage::Put(ticket);
@@ -1282,7 +1442,7 @@ impl Owner {
 
     /// Emits one `secret_store.*` audit event (operations and audit): the
     /// input, the reply code, the status of `unavailable` and counts only.
-    fn audit_store(&self, event: Event) {
+    pub(super) fn audit_store(&self, event: Event) {
         if let Some(emitter) = &self.audit_emitter {
             let _ = emitter.try_emit(event);
         }
@@ -2315,6 +2475,7 @@ impl Owner {
     pub(super) fn poll_persons(&mut self, now: Instant) {
         self.poll_paths();
         self.poll_store();
+        self.poll_named();
         self.poll_submits();
         self.drive_person_dispatch(now);
         if let Some(state) = self.replay.as_deref() {

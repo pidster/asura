@@ -183,7 +183,11 @@ pub(super) fn read(
                 | Event::SecretStorePut { .. }
                 | Event::SecretStoreGet { .. }
                 | Event::SecretStoreDelete { .. }
-                | Event::SecretStoreSweep { .. } => continue,
+                | Event::SecretStoreSweep { .. }
+                | Event::SecretStoreNamedPut { .. }
+                | Event::SecretStoreNamedGet { .. }
+                | Event::SecretStoreNamedDelete { .. }
+                | Event::SecretStoreNamedList { .. } => continue,
             }
             let Ok(line) = std::str::from_utf8(&bytes) else {
                 continue;

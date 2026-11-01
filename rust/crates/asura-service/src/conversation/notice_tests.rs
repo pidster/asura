@@ -551,6 +551,7 @@ fn person_settlement(n: u8, sequence: u64, outside: bool, whole: bool) -> Notice
         },
         environment: Vec::new(),
         declared: Vec::new(),
+        named: Vec::new(),
         order_revision: 1,
         number_kinds: Vec::new(),
         unnumbered: 0,

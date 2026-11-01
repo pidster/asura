@@ -249,3 +249,70 @@ pub(crate) fn value_digest(key: &[u8; DIGEST_BYTES], secrets: &Secrets) -> [u8; 
 pub(crate) fn digests_equal(a: &[u8; DIGEST_BYTES], b: &[u8; DIGEST_BYTES]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
+
+// ---- Named secrets (named-secrets.md, named item contract) ----------------
+
+/// The largest named secret value.
+pub const MAX_NAMED_VALUE_BYTES: usize = 4_096;
+/// The largest named payload: version, binding, length and value.
+pub const MAX_NAMED_PAYLOAD_BYTES: usize = 1 + DIGEST_BYTES + 2 + MAX_NAMED_VALUE_BYTES;
+const NAMED_DOMAIN: &[u8] = b"asura.named-secret";
+
+/// The named binding digest: SHA-256 over ASCII `asura.named-secret`, one
+/// zero byte, the installation ID and the name bytes.
+pub fn named_binding(installation: &[u8; 16], name: &str) -> [u8; DIGEST_BYTES] {
+    let mut hash = Sha256::new();
+    hash.update(NAMED_DOMAIN);
+    hash.update([0]);
+    hash.update(installation);
+    hash.update(name.as_bytes());
+    hash.finalize().into()
+}
+
+/// Encodes one named payload. The value is 1 to 4,096 bytes.
+pub(crate) fn encode_named(
+    binding: &[u8; DIGEST_BYTES],
+    value: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, CodecError> {
+    if value.is_empty() || value.len() > MAX_NAMED_VALUE_BYTES {
+        return Err(CodecError::Bound);
+    }
+    let mut out = Zeroizing::new(Vec::with_capacity(1 + DIGEST_BYTES + 2 + value.len()));
+    out.push(VERSION);
+    out.extend_from_slice(binding);
+    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    out.extend_from_slice(value);
+    Ok(out)
+}
+
+/// Decodes one named payload bound to `expected`.
+pub(crate) fn decode_named(
+    data: &[u8],
+    expected: &[u8; DIGEST_BYTES],
+) -> Result<Zeroizing<Vec<u8>>, CodecError> {
+    if data.len() > MAX_NAMED_PAYLOAD_BYTES {
+        return Err(CodecError::Oversize);
+    }
+    let header = 1 + DIGEST_BYTES + 2;
+    if data.len() < header {
+        return Err(CodecError::Truncated);
+    }
+    if data[0] != VERSION {
+        return Err(CodecError::Version);
+    }
+    let binding: &[u8; DIGEST_BYTES] = data[1..1 + DIGEST_BYTES]
+        .try_into()
+        .map_err(|_| CodecError::Truncated)?;
+    if !digests_equal(binding, expected) {
+        return Err(CodecError::Binding);
+    }
+    let len = usize::from(u16::from_be_bytes([data[header - 2], data[header - 1]]));
+    if len == 0 || len > MAX_NAMED_VALUE_BYTES {
+        return Err(CodecError::Bound);
+    }
+    match data.len().cmp(&(header + len)) {
+        std::cmp::Ordering::Less => Err(CodecError::Truncated),
+        std::cmp::Ordering::Greater => Err(CodecError::Trailing),
+        std::cmp::Ordering::Equal => Ok(Zeroizing::new(data[header..].to_vec())),
+    }
+}

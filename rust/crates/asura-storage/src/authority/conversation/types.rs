@@ -598,9 +598,12 @@ pub const MAX_PERSON_REWRITE_NUMBERS: usize = 16;
 /// fields): 105 bytes of IDs, digest, generation and flags, 8,196 each for
 /// the command and display text, 1,028 for the cwd, 4,100 for the search
 /// path, 18,013 for the terminal variables, 4,193 for the declared
-/// variables, 8 for the order revision and 303 for fields 14 to 22. Fields 8
-/// and 9 cannot both be full in one valid record, so this is an upper bound.
-pub const MAX_PERSON_COMMAND_PAYLOAD: usize = 44_142;
+/// variables, 8 for the order revision, 303 for fields 14 to 22 and 801 for
+/// the named references of field 24 (named-secrets.md). Fields 8 and 9
+/// cannot both be full in one valid record, so this is an upper bound.
+pub const MAX_PERSON_COMMAND_PAYLOAD: usize = 44_943;
+/// Kind 31 field 24: named references, at most the 16 secret variables.
+pub const MAX_PERSON_NAMED: usize = 16;
 
 /// The fields of a person command that the client supplies and the request
 /// digest covers (kind 31 fields 4 to 12 and 23). `conversation` is `None` for a
@@ -619,6 +622,8 @@ pub struct PersonCommandRequest<'a> {
     pub search_path: &'a str,
     pub environment: &'a [(u8, String)],
     pub declared: &'a [(String, String)],
+    /// Field 24: `(number, name)` of each named reference (named-secrets.md).
+    pub named: &'a [(u8, String)],
 }
 /// Kind 31, PersonCommandQueued (P2): a queued `!` or `!!` command, the
 /// lane entry that replaces kind 18 for that input. It holds the rewritten
@@ -658,6 +663,9 @@ pub struct PersonCommandQueued {
     pub environment: Vec<(u8, String)>,
     /// Field 23: the project's declared variables in increasing name order.
     pub declared: Vec<(String, String)>,
+    /// Field 24: the named references (named-secrets.md), `(number, name)`
+    /// in increasing number; the numbers are the last of `number_kinds`.
+    pub named: Vec<(u8, String)>,
     /// Field 13.
     pub order_revision: u64,
     /// Fields 14 and 15: entry i is the secret kind of
@@ -692,6 +700,7 @@ impl PersonCommandQueued {
             search_path: &self.search_path,
             environment: &self.environment,
             declared: &self.declared,
+            named: &self.named,
         }
     }
     /// The stored command text a person or model sees: the display text of

@@ -546,6 +546,7 @@ fn pc_u56_waiting_reasons_and_paced_recheck() {
         search_path: String::new(),
         environment: Vec::new(),
         declared: Vec::new(),
+        named: Vec::new(),
         order_revision: 1,
         number_kinds: Vec::new(),
         unnumbered: 0,
@@ -717,6 +718,7 @@ fn pc_u57_dispatch_read_outcomes_hold() {
             search_path: String::new(),
             environment: Vec::new(),
             declared: Vec::new(),
+            named: Vec::new(),
             order_revision: 1,
             number_kinds: Vec::new(),
             unnumbered: 0,
@@ -890,6 +892,7 @@ fn pe_u10_submit_environment_check_and_reply_facts() {
         search_path: "/bin".into(),
         environment: vec![(9, "/tmp/agent".into())],
         declared: Vec::new(),
+        named: Vec::new(),
         order_revision: 1,
         number_kinds: vec![journal::SecretKind::GithubToken; 2],
         unnumbered: 0,
@@ -990,6 +993,7 @@ fn stored_rewrite_replans() {
         search_path: "/usr/bin".into(),
         environment: Vec::new(),
         declared: Vec::new(),
+        named: Vec::new(),
         order_revision: 1,
         number_kinds: planned.number_kinds.clone(),
         unnumbered: planned.unnumbered,
@@ -1000,7 +1004,7 @@ fn stored_rewrite_replans() {
         fallback: None,
     };
     assert!(!record.command.contains(&token));
-    let restored = restore(&record.command, &planned.secrets.variables).unwrap();
+    let restored = restore(&record.command, &planned.secrets.variables, &[]).unwrap();
     assert_eq!(restored.as_str(), raw);
     let variables = replan_rewrite(rules, &record, &planned.secrets.variables).unwrap();
     assert_eq!(variables.len(), 1);
@@ -1008,6 +1012,119 @@ fn stored_rewrite_replans() {
     let mut other = planned.secrets.variables.clone();
     other[0].value = Zeroizing::new(b"ghp_other".to_vec());
     assert!(replan_rewrite(rules, &record, &other).is_none());
+}
+
+/// NS-U10 (owner half without a Keychain): a reference in an invalid form,
+/// beside a whole-command secret, or past 16 variables refuses before any
+/// store call; a valid reference with no store is `secret_store_unavailable`.
+/// The found, missing and locked cases run against a scratch keychain
+/// (NS-I1 to NS-I5).
+#[test]
+fn ns_u10_named_reference_refusals() {
+    let mut h = H::new();
+    let project = h.project();
+    let token = ["ghp_", &"aB3".repeat(12)].concat();
+    let refusal = |h: &mut H, command: &str| {
+        let reply = h.send(submit_body(project, None, command, false));
+        let Some(Body::ConversationQueueReply(value)) = reply.body else {
+            panic!("{command}: {reply:?}");
+        };
+        assert!(value.accepted_input_id.is_none(), "{command}");
+        assert!(!format!("{value:?}").contains(&token));
+        value.refusal
+    };
+    use pb::QueueRefusal as Q;
+    assert_eq!(
+        refusal(&mut h, "echo ${ASURA_SECRET_X:-y}"),
+        Some(Q::SecretReferenceInvalid as i32)
+    );
+    // A single-quoted token runs through the whole-command variable, which
+    // must be the only secret variable.
+    assert_eq!(
+        refusal(&mut h, &format!("echo '{token}' $ASURA_SECRET_X")),
+        Some(Q::SecretReferenceInvalid as i32)
+    );
+    let many: String = (0..17).map(|i| format!("$ASURA_SECRET_N{i} ")).collect();
+    assert_eq!(
+        refusal(&mut h, &format!("echo {many}")),
+        Some(Q::TooManySecrets as i32)
+    );
+    assert_eq!(
+        refusal(&mut h, "echo \"$ASURA_SECRET_GITHUB_TOKEN\""),
+        Some(Q::SecretStoreUnavailable as i32)
+    );
+}
+
+/// NS-U11: a record with named references re-plans at dispatch from the
+/// reference text, never the value; a changed name is a mismatch.
+#[test]
+fn ns_u11_named_references_replan() {
+    let rules = asura_platform::secrets::detection().unwrap();
+    let token = ["ghp_", &"aB3".repeat(12)].concat();
+    let raw = format!("curl -H \"Bearer {token}\" -u \"$ASURA_SECRET_NAMED\" ${{ASURA_SECRET_B}}");
+    let Plan::Rewritten(rewrite) = secrets::rewrite_exec_cmd_call_with(rules, &raw, ".").unwrap()
+    else {
+        panic!("rewrite");
+    };
+    let planned = planned(Plan::Rewritten(rewrite));
+    let resolved = named::resolve(&planned.command, planned.number_kinds.len()).unwrap();
+    assert_eq!(
+        resolved.names,
+        vec![(2, "NAMED".to_owned()), (3, "B".to_owned())]
+    );
+    let mut kinds = planned.number_kinds.clone();
+    kinds.extend([SecretKind::EnvSecret; 2]);
+    let record = PersonCommandQueued {
+        request: [1; 16],
+        digest: [0; 32],
+        input: [2; 16],
+        project: [3; 16],
+        conversation: [4; 16],
+        expected_generation: 0,
+        new_conversation: true,
+        outside_sandbox: false,
+        command: resolved.command.clone(),
+        display_command: String::new(),
+        cwd: ".".into(),
+        search_path: "/usr/bin".into(),
+        environment: Vec::new(),
+        declared: Vec::new(),
+        named: resolved.names.clone(),
+        order_revision: 1,
+        number_kinds: kinds,
+        unnumbered: planned.unnumbered,
+        command_cut: false,
+        whole_command: false,
+        rule_set_revision: rules.revision(),
+        rule_set_digest: rules.digest(),
+        fallback: None,
+    };
+    let mut values = planned.secrets.variables.clone();
+    for (number, value) in [(2u8, &b"named-one"[..]), (3, b"named-two")] {
+        values.push(SecretValue {
+            number,
+            value: Zeroizing::new(value.to_vec()),
+        });
+    }
+    let restored = restore(&record.command, &values, &record.named).unwrap();
+    assert!(!restored.contains("named-one") && restored.contains("${ASURA_SECRET_NAMED}"));
+    let variables = replan_rewrite(rules, &record, &values).unwrap();
+    assert_eq!(variables.len(), 3);
+    assert_eq!(variables[0].value(), token.as_bytes());
+    assert_eq!(
+        (variables[1].number(), variables[1].value()),
+        (2, &b"named-one"[..])
+    );
+    assert_eq!(variables[2].kind(), SecretKind::EnvSecret);
+    // A record whose names do not match its command is a mismatch; a
+    // consistent rename is caught by the item binding, which covers field 24
+    // through the request digest (NS-U9).
+    let short = PersonCommandQueued {
+        named: vec![(2, "NAMED".into())],
+        ..record.clone()
+    };
+    assert!(replan_rewrite(rules, &short, &values).is_none());
+    assert!(replan_rewrite(rules, &record, &values[..2]).is_none());
 }
 
 /// The display-only copy is cut at 8,192 bytes, never inside a placeholder.

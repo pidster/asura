@@ -72,6 +72,12 @@ message Envelope {
     PathGuardReply path_guard_reply = 70;
     PathGuardApprove path_guard_approve = 71;
     PathGuardRevoke path_guard_revoke = 72;
+    // Named secrets (named-secrets.md, control API). Put, List and Remove
+    // are replied to with SecretReply. Only SecretPut carries a value.
+    SecretPut secret_put = 73;
+    SecretList secret_list = 74;
+    SecretRemove secret_remove = 75;
+    SecretReply secret_reply = 76;
   }
   // Removed operations: direct ConversationSubmit (22) and its reply (23), and
   // the target-bearing ConversationEnqueue (35). Conversation input uses the queue.
@@ -426,6 +432,7 @@ message CommandEnvironment {
   repeated string project_names = 2;    // declared names, at most 32
   optional uint32 secret_variables = 3; // count of ASURA_SECRET_<n>, 1-16
   optional bool secret_command = 4;     // ASURA_SECRET_COMMAND
+  repeated string named_secrets = 5;    // kind 31 field 24 names in number order, at most 16
 }
 message ConversationQueueReorder {
   optional bytes request_id = 1;
@@ -545,6 +552,42 @@ enum QueueRefusal {
   QUEUE_REFUSAL_SECRET_IN_CWD = 11;
   QUEUE_REFUSAL_PLACEHOLDER_NOT_AVAILABLE = 12;
   QUEUE_REFUSAL_SECRET_DETECTION_UNAVAILABLE = 13;
+  // Named references (named-secrets.md, references in commands).
+  QUEUE_REFUSAL_SECRET_NOT_FOUND = 14;
+  QUEUE_REFUSAL_SECRET_REFERENCE_INVALID = 15;
+  QUEUE_REFUSAL_TOO_MANY_SECRETS = 16;
+}
+
+// Named secrets (named-secrets.md, control API). Only SecretPut carries a
+// value; both ends zeroize it after use.
+message SecretPut {
+  optional string name = 1;   // secret name, 1-48 bytes
+  optional bytes value = 2;   // 1-4096 bytes
+  optional bool replace = 3;  // true: replace an existing secret of this name
+}
+message SecretList {}
+message SecretRemove { optional string name = 1; }
+message SecretReply {
+  optional SecretResult result = 1;
+  repeated string names = 2;  // LISTED only: stored names in byte order, at most 64
+  optional uint32 status = 3; // |OSStatus| with LOCKED, UNAVAILABLE, DENIED or REPLACE_FAILED
+}
+enum SecretResult {
+  SECRET_RESULT_UNSPECIFIED = 0;
+  SECRET_RESULT_STORED = 1;
+  SECRET_RESULT_REPLACED = 2;
+  SECRET_RESULT_EXISTS = 3;
+  SECRET_RESULT_REMOVED = 4;
+  SECRET_RESULT_ABSENT = 5;
+  SECRET_RESULT_LISTED = 6;
+  SECRET_RESULT_LOCKED = 7;
+  SECRET_RESULT_NOT_SIGNED = 8;
+  SECRET_RESULT_UNAVAILABLE = 9;
+  SECRET_RESULT_DENIED = 10;
+  SECRET_RESULT_FULL = 11;
+  SECRET_RESULT_BUSY = 12;
+  SECRET_RESULT_INVALID = 13;
+  SECRET_RESULT_REPLACE_FAILED = 14;
 }
 
 message ToolProgress {

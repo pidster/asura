@@ -1006,13 +1006,24 @@ fn valid_person_request(p: &PersonCommandRequest<'_>) -> Result<()> {
             env::by_code(*code).is_some_and(|t| env::class_valid(t.class, value.as_bytes()))
         })
         && env::declared_valid(p.declared.iter().map(|(n, v)| (n.as_bytes(), v.as_bytes())));
+    // Field 24 (named-secrets.md): numbers ascending, names valid and
+    // distinct. The number rules against fields 14-15 are in `validate`.
+    use asura_platform::secrets::named;
+    let named_ok = p.named.len() <= MAX_PERSON_NAMED
+        && p.named.windows(2).all(|pair| pair[0].0 < pair[1].0)
+        && p.named.iter().all(|(_, name)| named::name_valid(name))
+        && p.named
+            .iter()
+            .enumerate()
+            .all(|(i, (_, a))| p.named[..i].iter().all(|(_, b)| a != b));
     require(
         p.project != [0; 16]
             && conversation
             && command
             && p.display_command.len() <= MAX_PERSON_COMMAND
             && valid_person_cwd(p.cwd)
-            && launch,
+            && launch
+            && named_ok,
     )
 }
 /// Kind 31 fields 7 to 12, then field 23, in their field encoding, shared
@@ -1035,6 +1046,12 @@ fn person_request_fields(w: &mut Writer, p: &PersonCommandRequest<'_>) {
         w.bytes(name.as_bytes());
         w.u16(value.len() as u16);
         w.bytes(value.as_bytes());
+    }
+    w.byte(p.named.len() as u8);
+    for (number, name) in p.named {
+        w.byte(*number);
+        w.byte(name.len() as u8);
+        w.bytes(name.as_bytes());
     }
 }
 impl PersonCommandQueued {
@@ -1061,6 +1078,15 @@ impl PersonCommandQueued {
         } else {
             self.display_command.is_empty() && !self.command_cut && self.fallback.is_none()
         };
+        // Field 24: the named numbers are the last of fields 14-15, each
+        // `env-secret`, and never with the whole-command variable.
+        let first_named = self.number_kinds.len().saturating_sub(self.named.len()) + 1;
+        let named = (self.named.is_empty() || !self.whole_command)
+            && self.named.len() <= self.number_kinds.len()
+            && self.named.iter().enumerate().all(|(i, (number, _))| {
+                usize::from(*number) == first_named + i
+                    && self.number_kinds[usize::from(*number) - 1] == SecretKind::EnvSecret
+            });
         let tokens = asura_platform::secrets::placeholder_tokens(self.command_text());
         let placeholders = !tokens.malformed
             && tokens.max as usize == self.number_kinds.len()
@@ -1073,6 +1099,7 @@ impl PersonCommandQueued {
                 && self.digest == request_digest(Request::QueuePersonCommand(request))?
                 && self.number_kinds.len() <= numbers
                 && form
+                && named
                 && placeholders
                 && self.rule_set_revision != 0
                 && self.rule_set_digest != [0; 32],
@@ -1145,6 +1172,14 @@ fn read_person_command(r: &mut Reader<'_>) -> Result<PersonCommandQueued> {
         let len = usize::from(r.u16()?);
         declared.push((name, text(r.take(len)?)?));
     }
+    let count = usize::from(r.byte()?);
+    require(count <= MAX_PERSON_NAMED)?;
+    let mut named = Vec::with_capacity(count);
+    for _ in 0..count {
+        let number = r.byte()?;
+        let len = usize::from(r.byte()?);
+        named.push((number, text(r.take(len)?)?));
+    }
     let order_revision = r.u64()?;
     let count = r.u16()? as usize;
     require(count <= MAX_TOOL_NUMBERS)?;
@@ -1191,6 +1226,7 @@ fn read_person_command(r: &mut Reader<'_>) -> Result<PersonCommandQueued> {
         search_path,
         environment,
         declared,
+        named,
         order_revision,
         number_kinds,
         unnumbered,
@@ -5991,6 +6027,7 @@ mod tests {
             search_path: "/usr/bin:/bin".into(),
             environment: vec![(1, "en_GB.UTF-8".into())],
             declared: vec![],
+            named: Vec::new(),
             order_revision: 7,
             number_kinds: vec![],
             unnumbered: 0,
@@ -6060,6 +6097,68 @@ mod tests {
             "{record:?}"
         );
     }
+    /// NS-U9: kind 31 field 24, named references (named-secrets.md).
+    #[test]
+    fn ns_u9_kind_31_named_references() {
+        // Two rewrite numbers, then two named numbers.
+        let named = |named: Vec<(u8, String)>, kinds: Vec<SecretKind>| {
+            sealed(PersonCommandQueued {
+                command: "a $ASURA_SECRET_1 $ASURA_SECRET_2 ${ASURA_SECRET_3} ${ASURA_SECRET_4}"
+                    .into(),
+                number_kinds: kinds,
+                named,
+                ..pc31()
+            })
+        };
+        use SecretKind::{EnvSecret as E, GithubToken as G};
+        let ok = named(
+            vec![(3, "GITHUB_TOKEN".into()), (4, "B".into())],
+            vec![G, G, E, E],
+        );
+        round31(ok.clone());
+        // The digest covers field 24.
+        let other = named(vec![(3, "OTHER".into()), (4, "B".into())], vec![G, G, E, E]);
+        assert_ne!(ok.digest, other.digest);
+        for bad in [
+            // Not the last numbers.
+            named(vec![(2, "A".into()), (3, "B".into())], vec![G, E, E, E]),
+            // A named number whose kind is not env-secret.
+            named(vec![(3, "A".into()), (4, "B".into())], vec![G, G, G, E]),
+            // Out of order, duplicate and invalid names: the request rules
+            // refuse them, so they cannot be sealed.
+            PersonCommandQueued {
+                named: vec![(4, "A".into()), (3, "B".into())],
+                ..ok.clone()
+            },
+            PersonCommandQueued {
+                named: vec![(3, "A".into()), (4, "A".into())],
+                ..ok.clone()
+            },
+            PersonCommandQueued {
+                named: vec![(3, "1A".into()), (4, "B".into())],
+                ..ok.clone()
+            },
+            // More names than numbers.
+            sealed(PersonCommandQueued {
+                named: vec![(1, "A".into())],
+                ..pc31()
+            }),
+        ] {
+            assert_eq!(
+                PersonCommandQueued::validate(&bad),
+                Err(ReplayError::Corrupt),
+                "{:?}",
+                bad.named
+            );
+        }
+        // Never with the whole-command variable.
+        let whole = sealed(PersonCommandQueued {
+            number_kinds: vec![E],
+            named: vec![(1, "A".into())],
+            ..whole31("show $ASURA_SECRET_1".into(), 1)
+        });
+        assert_eq!(whole.validate(), Err(ReplayError::Corrupt));
+    }
     /// Offset of field 7 (queue flags) and of field 8 in a kind 31 payload.
     const FLAGS31: usize = 16 + 32 + 16 + 16 + 16 + 8;
     #[test]
@@ -6091,8 +6190,17 @@ mod tests {
             ..pc31()
         });
         let bytes = round31(full);
-        let rewrite_max =
-            105 + 4 + 8192 + 4 + 1028 + 4100 + 18_013 + 4_193 + 8 + (2 + 16 + 4 + 1 + 4 + 32 + 4);
+        let rewrite_max = 105
+            + 4
+            + 8192
+            + 4
+            + 1028
+            + 4100
+            + 18_013
+            + 4_193
+            + 1
+            + 8
+            + (2 + 16 + 4 + 1 + 4 + 32 + 4);
         assert_eq!(bytes.len(), rewrite_max);
         // The whole-command bounds: 8,192 bytes of display text cut at the
         // limit, 256 numbers, the last secret kind and word 4,096.
@@ -6112,6 +6220,7 @@ mod tests {
             + (4 + 1)
             + (4 + 13)
             + (1 + 1 + 2 + 11)
+            + 1
             + 1
             + 8
             + (2 + 256 + 4 + 1 + 4 + 32 + 4);
@@ -6141,7 +6250,8 @@ mod tests {
             ..pc31()
         }));
         // The decode bound: both texts full is not a valid record, but the
-        // layout sums to the 44,142-byte payload and a 44,326-byte frame.
+        // layout sums to the 44,943-byte payload and a 45,127-byte frame,
+        // with 16 named references of 48-byte names (field 24).
         let mut both = whole31("z".repeat(MAX_PERSON_COMMAND), 0);
         both.command = "c".repeat(MAX_PERSON_COMMAND);
         both.cwd = "d".repeat(MAX_PERSON_CWD);
@@ -6149,9 +6259,10 @@ mod tests {
         both.environment = largest_terminal();
         both.declared = largest_declared();
         both.number_kinds = vec![SecretKind::Jwt; 256];
+        both.named = (1..=16u8).map(|i| (i, format!("N{i:047}"))).collect();
         let raw = raw31(&both);
         assert_eq!(raw.len(), MAX_PERSON_COMMAND_PAYLOAD);
-        assert_eq!(HEADER + TRAILER + MAX_PERSON_COMMAND_PAYLOAD, 44_326);
+        assert_eq!(HEADER + TRAILER + MAX_PERSON_COMMAND_PAYLOAD, 45_127);
         const { assert!(HEADER + TRAILER + MAX_PERSON_COMMAND_PAYLOAD <= MAX_FRAME) };
         assert_eq!(decode_record(31, &raw), Err(ReplayError::Corrupt));
         let mut over = raw;
@@ -6187,6 +6298,7 @@ mod tests {
         hash.update([1, 1, 0, 11]);
         hash.update(b"en_GB.UTF-8");
         hash.update([0]);
+        hash.update([0]); // field 24: no named references
         let expected: Hash = hash.finalize().into();
         assert_eq!(p.digest, expected);
         let outside = outside31();
@@ -6206,6 +6318,7 @@ mod tests {
         hash.update(b"RUST_LOG");
         hash.update([0, 5]);
         hash.update(b"debug");
+        hash.update([0]); // field 24
         let expected: Hash = hash.finalize().into();
         assert_eq!(outside.digest, expected);
         // Each covered field changes it; the order revision and secret

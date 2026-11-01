@@ -546,7 +546,9 @@ pub mod person {
     /// The highest `QueueWaitReason` value in this protocol revision.
     pub const MAX_WAIT_REASON: i32 = 15;
     /// The highest `QueueRefusal` value.
-    pub const MAX_REFUSAL: i32 = 13;
+    pub const MAX_REFUSAL: i32 = 16;
+    /// Named secrets in a reply's environment facts (named-secrets.md).
+    pub const MAX_NAMED_SECRETS: usize = 16;
     /// Command entry kind in `ConversationQueueEntry.kind`.
     pub const ENTRY_KIND: u32 = 3;
 
@@ -604,6 +606,13 @@ pub mod person {
             && e.secret_variables.is_none_or(|n| (1..=16).contains(&n))
             && e.secret_command.is_none_or(|w| w)
             && !(e.secret_variables.is_some() && e.secret_command.is_some())
+            && e.named_secrets.len() <= MAX_NAMED_SECRETS
+            && e.named_secrets
+                .iter()
+                .all(|n| !n.is_empty() && n.len() <= crate::secrets::MAX_NAME_BYTES)
+            && (e.named_secrets.is_empty()
+                || e.secret_variables
+                    .is_some_and(|n| n as usize >= e.named_secrets.len()))
     }
 
     /// The PCR9 working directory form: relative, no NUL, no `..`
@@ -1734,6 +1743,7 @@ mod tests {
             project_names: (0..32).map(|i| format!("V{i:02}")).collect(),
             secret_variables: Some(16),
             secret_command: None,
+            named_secrets: vec!["GITHUB_TOKEN".into()],
         };
         assert!(valid(&accepted(good.clone())));
         assert!(round_trips(accepted(good.clone()).body.unwrap()));
@@ -1763,6 +1773,21 @@ mod tests {
                 "both secrets",
                 pb::CommandEnvironment {
                     secret_command: Some(true),
+                    ..good.clone()
+                },
+            ),
+            (
+                "more names than variables",
+                pb::CommandEnvironment {
+                    secret_variables: Some(1),
+                    named_secrets: vec!["A".into(), "B".into()],
+                    ..good.clone()
+                },
+            ),
+            (
+                "a 49-byte name",
+                pb::CommandEnvironment {
+                    named_secrets: vec!["A".repeat(49)],
                     ..good.clone()
                 },
             ),

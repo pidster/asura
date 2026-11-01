@@ -576,7 +576,7 @@ the model typed itself.
 | Case | Result |
 | --- | --- |
 | `/secrets store` with a name the terminal does not set, or an invalid name | Local notice; nothing sent |
-| Keychain locked at a put, list or remove | `locked`; nothing changes |
+| Keychain locked at a put | `locked`; nothing changes. A list or remove can still succeed: a locked file keychain lists and deletes (probe SS-P2 (a)); before first unlock the data-protection keychain is unverified (KC-P3) |
 | Build not signed for the Keychain | `not_signed`, with no Keychain call after the first `not_signed` (worker terminal state) |
 | Keychain unavailable | `unavailable` with the status |
 | Scratch keychain denied (tests only) | `denied` |
@@ -683,7 +683,7 @@ data-protection keychain.
 | ID | Initial state and trigger | Required result |
 | --- | --- | --- |
 | NS-I1 | Real service and worker on a scratch keychain; `SecretPut` of a synthetic token, `SecretList`, `SecretPut` again, replace, `SecretRemove`, `SecretRemove` again | `stored`, the name listed, `exists`, `replaced`, `removed`, `absent`; the scratch keychain holds a `secret.` item only between the put and the remove |
-| NS-I2 | Locked scratch keychain; `SecretPut` and `SecretList`; unlocked; `SecretPut` | `locked` twice; then `stored` |
+| NS-I2 | Locked scratch keychain; `SecretPut` and `SecretList`; unlocked; `SecretPut` | `locked` for the put; the list still answers `listed`, because a locked file keychain lists attributes (probe SS-P2 (a)); then `stored` |
 | NS-I3 | Gated port holds the worker; 17 requests; then release | `busy` before the worker; the reactor answers other requests |
 | NS-I4 | A stored token; `!printf %s "$ASURA_SECRET_PE_TOKEN" \| shasum -a 256` and the same as `!!` | Each job receives the value (the digest matches); kind 31 field 24 names the secret; the job is tainted; the input item is deleted after settlement; the named item remains |
 | NS-I5 | A command that names a secret that does not exist | `secret_not_found`; nothing recorded |
@@ -732,8 +732,7 @@ One packet, NS, after this design: platform name rule, resolver and named
 keychain calls; worker requests and codec; control messages; owner handlers,
 submit stage and dispatch check; kind 31 field 24; audit events; client
 calls; TUI offer, `/secrets`, hints and env line; the tests above; user
-documentation in [commands](../user/commands.md) and the
-[guide](../user/guide.md).
+documentation in [commands](../user/commands.md).
 
 ## Design verification
 
@@ -744,5 +743,36 @@ Recorded on 2026-11-01: written from the code at `2c7e1a7`
 2026-10-31. Diagrams NS-O1, NS-F1, NS-Q1, NS-S1, NS-F2 and NS-Q2 were rendered
 with the local Mermaid CLI at scale 2 into a temporary directory outside the
 repository and inspected.
+
+### Implementation verification (2026-11-01)
+
+Implemented behavior, verified on macOS 27.0 with the debug build, a
+scratch keychain made through the Security framework and the ad hoc model
+helper:
+
+| Case | Evidence | Result |
+| --- | --- | --- |
+| NS-U1 to NS-U3 | `asura_platform::secrets::named` tests | Pass |
+| NS-U4 | `keychain::tests::ns_u4_listing_classifies_named_items` | Pass |
+| NS-U5 to NS-U7 | `secret_store::tests::ns_u5..ns_u7` (scripted port) | Pass |
+| NS-U8 | `asura_control::secrets::tests::ns_u8_secret_messages` | Pass |
+| NS-U9 | `codec::tests::ns_u9_kind_31_named_references` and the payload bound test | Pass |
+| NS-U10 | `person_command::tests::ns_u10_named_reference_refusals` (owner without a Keychain: invalid form, whole-command plan, too many, no store). The found, missing and locked outcomes are proved by NS-I1 to NS-I5 | Pass |
+| NS-U11 | `person_command::tests::ns_u11_named_references_replan` | Pass |
+| NS-U12 | `tui::ui::secrets::tests::ns_u12_secrets_command` and PE-U13 | Pass |
+| NS-U13 | `audit::tests::ns_u13_named_secret_events` | Pass |
+| NS-I1, NS-I2, NS-I4 to NS-I8 | `person_command_flow named` | Pass. NS-I6 is checked as a remove after submit, without a restart; the restart path of a held command uses the input item alone and is SS-I2's |
+| NS-E1 to NS-E5 | PTY journey `--person-named` | Pass |
+
+Not delivered or not verified:
+
+- NS-I3 (17 requests against a gated worker) is not built: the gate seam
+  works only for an in-process service, and the person command fixture runs
+  the service as a child. The owner's four-request bound and the worker's
+  16-request bound are covered by code review only.
+- The data-protection keychain (team Keychain store) is not exercised by
+  `cargo test` (SSR6); the signed qualification run covers it.
+- The replace window (delete then add) is unit-tested with a scripted port;
+  a real add failure after the delete was not provoked.
 
 Return to the [design index](README.md).

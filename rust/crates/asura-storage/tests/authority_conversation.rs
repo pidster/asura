@@ -4487,6 +4487,7 @@ fn pcq(
         search_path: "/usr/bin:/bin".into(),
         environment: vec![(2, "C".into())],
         declared: Vec::new(),
+        named: Vec::new(),
         order_revision: revision,
         number_kinds: vec![],
         unnumbered: 0,

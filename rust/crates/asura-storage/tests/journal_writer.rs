@@ -2930,6 +2930,7 @@ fn p2_command(
         search_path: "/bin".into(),
         environment: vec![],
         declared: Vec::new(),
+        named: Vec::new(),
         order_revision: 0,
         number_kinds: vec![],
         unnumbered: 0,

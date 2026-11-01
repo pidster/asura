@@ -16,6 +16,7 @@ mod project_admin;
 mod project_pages;
 mod queue;
 mod queue_watch;
+mod secrets;
 mod terminal;
 mod ui;
 use crossterm::event::{Event, KeyEventKind};
@@ -58,6 +59,7 @@ pub(crate) fn run(
     let mut queue_worker = queue::Worker::default();
     let mut project_admin_worker = project_admin::Worker::default();
     let mut path_guard_worker = path_guard::Worker::default();
+    let mut secrets_worker = secrets::Worker::default();
     let mut project_page_worker = project_pages::Worker::default();
     let mut context_worker = context::Worker::default();
     let mut queue_observer = queue_watch::Worker::default();
@@ -70,6 +72,8 @@ pub(crate) fn run(
     project_admin_worker.set_notice(router.notice(Source::Conversation));
     // `/paths` shares the conversation source; the router has no free bit.
     path_guard_worker.set_notice(router.notice(Source::Conversation));
+    // `/secrets` shares the conversation source too.
+    secrets_worker.set_notice(router.notice(Source::Conversation));
     project_page_worker.set_notice(router.notice(Source::Conversation));
     context_worker.set_notice(router.notice(Source::Context));
     queue_observer.set_notice(router.notice(Source::QueueWatch));
@@ -143,6 +147,9 @@ pub(crate) fn run(
             if app.take_path_guard_cancel() {
                 path_guard_worker.cancel();
             }
+            if app.take_secrets_cancel() {
+                secrets_worker.cancel();
+            }
             if app.take_project_page_cancel() {
                 project_page_worker.cancel();
             }
@@ -199,6 +206,12 @@ pub(crate) fn run(
                 && let Some(update) = path_guard_worker.poll()
             {
                 app.path_guard_finished(update);
+                dirty = true;
+            }
+            if has(Source::Conversation)
+                && let Some(update) = secrets_worker.poll()
+            {
+                app.secrets_finished(update);
                 dirty = true;
             }
             if has(Source::Conversation)
@@ -267,7 +280,8 @@ pub(crate) fn run(
                     conversation_worker.running()
                         || project_admin_worker.running()
                         || project_page_worker.running()
-                        || path_guard_worker.running(),
+                        || path_guard_worker.running()
+                        || secrets_worker.running(),
                 ),
                 (Source::Queue, queue_worker.running()),
                 (Source::Context, context_worker.running()),
@@ -344,6 +358,17 @@ pub(crate) fn run(
                     app.path_guard_finished(path_guard::Update {
                         request,
                         outcome: path_guard::Outcome::Definite(error),
+                    });
+                }
+                dirty = true;
+            }
+            if !secrets_worker.running()
+                && let Some((request, value)) = app.take_secrets_request()
+            {
+                if let Err(error) = secrets_worker.submit(resolve, request.clone(), value) {
+                    app.secrets_finished(secrets::Update {
+                        request,
+                        outcome: secrets::Outcome::Definite(error),
                     });
                 }
                 dirty = true;
@@ -456,6 +481,7 @@ pub(crate) fn run(
     queue_worker.disconnect();
     project_admin_worker.cancel();
     path_guard_worker.cancel();
+    secrets_worker.cancel();
     project_page_worker.cancel();
     config_worker.cancel();
     models_worker.cancel();

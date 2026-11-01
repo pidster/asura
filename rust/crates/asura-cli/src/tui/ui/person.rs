@@ -9,6 +9,7 @@ use crate::tui::jobs::{self as worker, Command as JobCommand, FoldTarget, FoldUp
 use asura_control::{pb, person as rules};
 use asura_platform::exec_cmd::environment::{self as env, NotPassed};
 use asura_platform::secrets::environment::Finding;
+use asura_platform::secrets::named;
 use std::sync::{Arc, OnceLock};
 
 // Composer roles (person-command-mode.md PCR5, PCR22, PCR26; composer
@@ -448,6 +449,14 @@ impl Launch {
             .collect();
         Some(Ok((path, variables)))
     }
+    /// The captured value of `name` in zeroizing memory, for a `/secrets`
+    /// store (named-secrets.md). Never shown.
+    pub(super) fn value(&self, name: &str) -> Option<asura_control::secrets::Zeroizing<Vec<u8>>> {
+        self.environment
+            .iter()
+            .find(|(n, _)| n.as_slice() == name.as_bytes())
+            .map(|(_, v)| asura_control::secrets::Zeroizing::new(v.clone()))
+    }
     /// Whether the captured environment sets `name`.
     fn sets(&self, name: &str) -> bool {
         self.environment
@@ -488,7 +497,9 @@ fn scan(captured: &[(Vec<u8>, Vec<u8>)]) -> Scan {
 }
 
 /// The launch report (PE-R7): the flagged names and kinds, never a value;
-/// at most 8 names, then a count. `None` with nothing flagged.
+/// at most 8 names, then a count. Each name with a valid secret name
+/// carries its store action (named-secrets.md, NS-R1). `None` with nothing
+/// flagged.
 pub(super) fn launch_report(scan: &Scan) -> Option<String> {
     if scan.unavailable {
         return Some(
@@ -503,14 +514,24 @@ pub(super) fn launch_report(scan: &Scan) -> Option<String> {
         .flagged
         .iter()
         .take(8)
-        .map(|(name, finding)| format!("{} ({})", literal(name, 64), finding.label()))
+        .map(|(name, finding)| {
+            let label = format!("{} ({})", literal(name, 64), finding.label());
+            if named::name_valid(name) {
+                format!("{label}: /secrets store {name}")
+            } else {
+                label
+            }
+        })
         .collect();
     if scan.flagged.len() > 8 {
-        names.push(format!("and {} more", scan.flagged.len() - 8));
+        names.push(format!(
+            "and {} more; /secrets lists them",
+            scan.flagged.len() - 8
+        ));
     }
     Some(format!(
-        "Not passed to ! and !! commands because they may be secrets: {}. Asura never shows their values.",
-        names.join(", ")
+        "Not passed to ! and !! commands because they may be secrets: {}. Asura never shows their values. A stored secret reaches a command that names $ASURA_SECRET_<NAME>.",
+        names.join("; ")
     ))
 }
 
@@ -565,6 +586,10 @@ pub(super) fn environment_line(
     } else if let Some(n) = facts.secret_variables.filter(|n| *n > 0) {
         let names: Vec<String> = (1..=n).map(|i| format!("ASURA_SECRET_{i}")).collect();
         parts.push(format!("secret {}", names.join(" ")));
+    }
+    if !facts.named_secrets.is_empty() {
+        let names: Vec<String> = facts.named_secrets.iter().map(|n| literal(n, 48)).collect();
+        parts.push(format!("named {}", names.join(" ")));
     }
     if outside && let Some(job) = job {
         parts.push(format!("job ASURA_JOB_{}", worker::handle(&job)));
@@ -625,6 +650,10 @@ pub(super) fn not_passed_hints(
             continue;
         }
         let reason = match launch.not_passed(name) {
+            Some(NotPassed::Flagged(finding)) if named::name_valid(name) => format!(
+                "it may be a secret ({}); store it with /secrets store {name} and use $ASURA_SECRET_{name}",
+                finding.label()
+            ),
             Some(NotPassed::Flagged(finding)) => {
                 format!("it may be a secret ({})", finding.label())
             }
@@ -666,6 +695,9 @@ pub(super) fn refusal_text(refusal: pb::QueueRefusal, status: Option<u32>) -> St
         R::SecretInCwd => "Command refused: the working directory holds a secret.".into(),
         R::PlaceholderNotAvailable => "Command refused: it names a reserved $ASURA_SECRET_ placeholder.".into(),
         R::SecretDetectionUnavailable => "Command refused: secret detection is unavailable in this service.".into(),
+        R::SecretNotFound => "This command names a secret that is not stored. Store it with /secrets store NAME, or list the stored names with /secrets.".into(),
+        R::SecretReferenceInvalid => "This command names a secret in a form Asura cannot pass. Use $ASURA_SECRET_NAME or ${ASURA_SECRET_NAME}, and do not combine it with a secret typed in a form Asura must filter.".into(),
+        R::TooManySecrets => "This command uses more secrets than one command can carry (16 values, 8,192 bytes).".into(),
         R::Unspecified => "Command refused.".into(),
     }
 }
@@ -1944,6 +1976,8 @@ pub(super) struct Person {
     pub paths: super::path_guard::Paths,
     /// The launch report was shown (PE-R7).
     pub reported: bool,
+    /// `/secrets` (named-secrets.md).
+    pub secrets: super::secrets::Secrets,
 }
 
 #[cfg(test)]
@@ -2552,7 +2586,7 @@ mod tests {
         press(&mut app, KeyCode::Char('!'));
         assert_eq!(
             app.notice,
-            "Not passed to ! and !! commands because they may be secrets: GITHUB_TOKEN (github-token). Asura never shows their values."
+            "Not passed to ! and !! commands because they may be secrets: GITHUB_TOKEN (github-token): /secrets store GITHUB_TOKEN. Asura never shows their values. A stored secret reaches a command that names $ASURA_SECRET_<NAME>."
         );
         assert!(!app.notice.contains("fixture"));
         // Once per session.
@@ -2572,14 +2606,15 @@ mod tests {
         let facts = pb::CommandEnvironment {
             terminal_names: Some(1 | 1 << 14),
             project_names: vec!["RUST_LOG".into()],
-            secret_variables: Some(1),
+            secret_variables: Some(2),
             secret_command: None,
+            named_secrets: vec!["GITHUB_TOKEN".into()],
         };
         let line = environment_line(&facts, true, Some([0xab; 16]));
         assert_eq!(
             line,
             format!(
-                "env  Asura HOME USER LOGNAME SHELL TMPDIR TERM GIT_TERMINAL_PROMPT · terminal PATH LANG · toolchain CARGO_HOME · project RUST_LOG · secret ASURA_SECRET_1 · job ASURA_JOB_{}",
+                "env  Asura HOME USER LOGNAME SHELL TMPDIR TERM GIT_TERMINAL_PROMPT · terminal PATH LANG · toolchain CARGO_HOME · project RUST_LOG · secret ASURA_SECRET_1 ASURA_SECRET_2 · named GITHUB_TOKEN · job ASURA_JOB_{}",
                 "ab".repeat(16)
             )
         );
@@ -2589,7 +2624,7 @@ mod tests {
         assert_eq!(
             hints,
             [
-                "$GITHUB_TOKEN was not passed: it may be a secret (github-token)".to_owned(),
+                "$GITHUB_TOKEN was not passed: it may be a secret (github-token); store it with /secrets store GITHUB_TOKEN and use $ASURA_SECRET_GITHUB_TOKEN".to_owned(),
                 format!(
                     "$JAVA_OPTS was not passed: it is not on the list; declare it in personCommands.environment.{}",
                     "01".repeat(16)

@@ -45,6 +45,9 @@ use std::sync::Arc;
 pub const SERVICE_PREFIX: &str = "asura.secret-store.";
 /// Account attribute prefix; the input ID follows in lowercase hex.
 pub const ACCOUNT_PREFIX: &str = "input.";
+/// Account attribute prefix of a named secret; the secret name follows
+/// (named-secrets.md, named item contract).
+pub const NAMED_PREFIX: &str = "secret.";
 /// Label of every secret item.
 pub const LABEL: &str = "Asura queued command secrets";
 /// Largest item data the store writes: the largest payload of the design.
@@ -179,7 +182,10 @@ pub enum Removed {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Listing {
     pub inputs: Vec<[u8; 16]>,
-    /// Items under this service whose account is not `input.<32 hex>`.
+    /// The names of named secrets: accounts `secret.<valid name>`.
+    pub named: Vec<String>,
+    /// Items under this service whose account is neither `input.<32 hex>`
+    /// nor `secret.<valid name>`.
     pub unrecognized: usize,
     /// [`LIST_BOUND`] results returned, so more items may exist than listed.
     pub truncated: bool,
@@ -206,6 +212,38 @@ impl ItemKey {
             input: parse_account(account)?,
         })
     }
+}
+
+/// One named secret item's service and account attributes. Every call
+/// with it refuses an invalid name with [`Failure::Invalid`] and no
+/// Keychain call.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NamedKey {
+    pub installation: [u8; 16],
+    pub name: String,
+}
+
+impl NamedKey {
+    pub fn service(&self) -> String {
+        service_name(&self.installation)
+    }
+    pub fn account(&self) -> String {
+        format!("{NAMED_PREFIX}{}", self.name)
+    }
+    fn valid(&self) -> Result<(), Failure> {
+        if crate::secrets::named::name_valid(&self.name) {
+            Ok(())
+        } else {
+            Err(Failure::Invalid)
+        }
+    }
+}
+
+/// The secret name of a named item's account, when it follows the contract.
+fn parse_named(account: &str) -> Option<&str> {
+    account
+        .strip_prefix(NAMED_PREFIX)
+        .filter(|name| crate::secrets::named::name_valid(name))
 }
 
 pub fn service_name(installation: &[u8; 16]) -> String {
@@ -385,6 +423,24 @@ impl Keychain {
         delete_with(self.calls(), key)
     }
 
+    /// Adds one named secret item (named-secrets.md).
+    pub fn add_named(&self, key: &NamedKey, data: &[u8]) -> Result<Added, Failure> {
+        key.valid()?;
+        add_raw_with(self.calls(), &key.service(), &key.account(), data)
+    }
+
+    /// Reads one named secret item's data into a zeroizing buffer.
+    pub fn get_named(&self, key: &NamedKey) -> Result<Found, Failure> {
+        key.valid()?;
+        get_raw_with(self.calls(), &key.service(), &key.account())
+    }
+
+    /// Deletes one named secret item.
+    pub fn delete_named(&self, key: &NamedKey) -> Result<Removed, Failure> {
+        key.valid()?;
+        delete_raw_with(self.calls(), &key.service(), &key.account())
+    }
+
     /// Lists the items of one installation, at most [`LIST_BOUND`] of them.
     /// Items of other installations are never listed.
     pub fn list(&self, installation: &[u8; 16]) -> Result<Listing, Failure> {
@@ -556,8 +612,16 @@ fn add_raw_with<C: Calls + ?Sized>(
 }
 
 pub(crate) fn get_with<C: Calls + ?Sized>(calls: &C, key: &ItemKey) -> Result<Found, Failure> {
+    get_raw_with(calls, &key.service(), &key.account())
+}
+
+fn get_raw_with<C: Calls + ?Sized>(
+    calls: &C,
+    service: &str,
+    account: &str,
+) -> Result<Found, Failure> {
     precheck(calls)?;
-    match calls.copy(&key.service(), &key.account()) {
+    match calls.copy(service, account) {
         Ok(data) => Ok(Found::Data(data)),
         // Missing only because the call named an entitled group (KC-P4), or
         // the scratch pre-check returned 0 in this call.
@@ -567,8 +631,16 @@ pub(crate) fn get_with<C: Calls + ?Sized>(calls: &C, key: &ItemKey) -> Result<Fo
 }
 
 pub(crate) fn delete_with<C: Calls + ?Sized>(calls: &C, key: &ItemKey) -> Result<Removed, Failure> {
+    delete_raw_with(calls, &key.service(), &key.account())
+}
+
+fn delete_raw_with<C: Calls + ?Sized>(
+    calls: &C,
+    service: &str,
+    account: &str,
+) -> Result<Removed, Failure> {
     precheck(calls)?;
-    match calls.delete(&key.service(), &key.account()) {
+    match calls.delete(service, account) {
         Ok(()) => Ok(Removed::Deleted),
         Err(ERR_SEC_ITEM_NOT_FOUND) => Ok(Removed::Absent),
         Err(code) => Err(calls.classify(code)),
@@ -593,9 +665,12 @@ pub(crate) fn list_with<C: Calls + ?Sized>(
                 ..Listing::default()
             };
             for account in accounts {
-                match parse_account(&account) {
-                    Some(input) => listing.inputs.push(input),
-                    None => listing.unrecognized += 1,
+                if let Some(input) = parse_account(&account) {
+                    listing.inputs.push(input);
+                } else if let Some(name) = parse_named(&account) {
+                    listing.named.push(name.to_owned());
+                } else {
+                    listing.unrecognized += 1;
                 }
             }
             Ok(listing)

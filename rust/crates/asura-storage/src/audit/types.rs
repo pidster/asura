@@ -297,6 +297,10 @@ pub enum PersonCommandRefusal {
     SecretInCwd,
     PlaceholderNotAvailable,
     SecretDetectionUnavailable,
+    // `QueueRefusal` values 14-16 (named-secrets.md).
+    SecretNotFound,
+    SecretReferenceInvalid,
+    TooManySecrets,
     // Queue submit `Error` tokens.
     StaleGeneration,
     ConversationBusy,
@@ -401,12 +405,27 @@ pub enum SecretStoreReply {
     /// is not signed for the Keychain (-34018); the status is 0 for a
     /// request the worker refused as a defect.
     Unavailable,
+    /// `named_put`: a replace deleted and added the item.
+    Replaced,
+    /// `named_put`: the name exists and no replace was asked.
+    Exists,
+    /// `named_put`: a replace deleted the item, then the add failed.
+    ReplaceFailed,
+    /// `named_list`: the names were listed.
+    Listed,
 }
 impl SecretStoreReply {
     fn allowed(self, call: &str) -> bool {
         use SecretStoreReply as R;
         matches!(self, R::Locked | R::Denied | R::Unavailable)
             || match call {
+                "named_put" => matches!(
+                    self,
+                    R::Stored | R::Replaced | R::Exists | R::Full | R::ReplaceFailed
+                ),
+                "named_get" => matches!(self, R::Read | R::Missing | R::Mismatch),
+                "named_delete" => matches!(self, R::Deleted | R::Absent),
+                "named_list" => self == R::Listed,
                 "put" => matches!(
                     self,
                     R::Stored | R::ExistsSame | R::ExistsDifferent | R::Full
@@ -815,6 +834,61 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<KeychainSession>,
     },
+    /// One named secret put (named-secrets.md, audit). Never a value, a
+    /// name, a digest or a payload size.
+    #[serde(rename = "secret_store.named_put")]
+    SecretStoreNamedPut {
+        reply: SecretStoreReply,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present_i32"
+        )]
+        status: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<KeychainSession>,
+    },
+    /// One named secret read for a command submit: `count` names, 1-16.
+    #[serde(rename = "secret_store.named_get")]
+    SecretStoreNamedGet {
+        reply: SecretStoreReply,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present_i32"
+        )]
+        status: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<KeychainSession>,
+        count: u32,
+    },
+    /// One named secret removal.
+    #[serde(rename = "secret_store.named_delete")]
+    SecretStoreNamedDelete {
+        reply: SecretStoreReply,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present_i32"
+        )]
+        status: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<KeychainSession>,
+    },
+    /// One named secret listing: `count` names, 0-64.
+    #[serde(rename = "secret_store.named_list")]
+    SecretStoreNamedList {
+        reply: SecretStoreReply,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present_i32"
+        )]
+        status: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<KeychainSession>,
+        count: u32,
+    },
     /// The startup sweep (SS-F1): the counts of its last listing pass,
     /// with `deleted` summed over every pass.
     #[serde(rename = "secret_store.sweep")]
@@ -1074,6 +1148,37 @@ impl Event {
                     && reply.allowed("delete")
                     && Self::status_rule(*reply, *status, session)
             }
+            Self::SecretStoreNamedPut {
+                reply,
+                status,
+                session,
+            } => reply.allowed("named_put") && Self::named_status_rule(*reply, *status, session),
+            Self::SecretStoreNamedGet {
+                reply,
+                status,
+                session,
+                count,
+            } => {
+                reply.allowed("named_get")
+                    && Self::status_rule(*reply, *status, session)
+                    && (1..=16).contains(count)
+            }
+            Self::SecretStoreNamedDelete {
+                reply,
+                status,
+                session,
+            } => reply.allowed("named_delete") && Self::status_rule(*reply, *status, session),
+            Self::SecretStoreNamedList {
+                reply,
+                status,
+                session,
+                count,
+            } => {
+                reply.allowed("named_list")
+                    && Self::status_rule(*reply, *status, session)
+                    && *count <= 64
+                    && (*reply == SecretStoreReply::Listed || *count == 0)
+            }
             Self::SecretStoreSweep {
                 reply,
                 status,
@@ -1105,6 +1210,18 @@ impl Event {
         use SecretStoreReply as R;
         let failure = matches!(reply, R::Locked | R::Denied | R::Unavailable);
         status.is_some() == failure && (session.is_none() || status.is_some_and(|s| s != 0))
+    }
+    /// [`Self::status_rule`] where `replace_failed` is also a failure: it
+    /// carries the failed add's status.
+    fn named_status_rule(
+        reply: SecretStoreReply,
+        status: Option<i32>,
+        session: &Option<KeychainSession>,
+    ) -> bool {
+        if reply == SecretStoreReply::ReplaceFailed {
+            return status.is_some() && (session.is_none() || status.is_some_and(|s| s != 0));
+        }
+        Self::status_rule(reply, status, session)
     }
     /// The kind 28 outcome rules, applied to the facts `job.settled` carries.
     fn settled_facts(&self) -> bool {

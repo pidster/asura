@@ -184,6 +184,7 @@ dependencies = [
  "prost-build",
  "prost-types",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

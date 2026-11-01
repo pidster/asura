@@ -8,6 +8,9 @@ publish = false
 
 [dependencies]
 prost = "=0.14.3"
+# Named secrets: SecretPut values and frame buffers are zeroized
+# (named-secrets.md, control API). The version already locked for the platform.
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 
 [build-dependencies]
 prost = "=0.14.3"

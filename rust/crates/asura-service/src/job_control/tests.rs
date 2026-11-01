@@ -219,6 +219,7 @@ fn person_command(input: Id, command: &str, outside: bool) -> journal::PersonCom
         },
         environment: Vec::new(),
         declared: Vec::new(),
+        named: Vec::new(),
         order_revision: 1,
         number_kinds: Vec::new(),
         unnumbered: 0,

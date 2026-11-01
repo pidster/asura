@@ -101,6 +101,7 @@ mod tests {
             search_path: "/bin".into(),
             environment: Vec::new(),
             declared: Vec::new(),
+            named: Vec::new(),
             order_revision: 1,
             number_kinds: vec![SecretKind::GithubToken; kinds],
             unnumbered: 0,

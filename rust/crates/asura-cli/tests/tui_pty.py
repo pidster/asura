@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production TUI journeys using only an isolated CLI fixture executable.
 
-Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--context-views|--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer|--thinking|--jobs|--job-viewer|--job-retention|--execution-setting|--job-notices|--person-commands|--person-outside|--person-model|--person-restart|--person-secrets|--path-guard]
+Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--context-views|--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer|--thinking|--jobs|--job-viewer|--job-retention|--execution-setting|--job-notices|--person-commands|--person-outside|--person-model|--person-restart|--person-secrets|--person-named|--path-guard]
 The job journeys (--jobs, --job-viewer, --job-retention, --execution-setting)
 need a service that lists CAPABILITY_JOBS; they run after packet J34-E.
 --job-notices needs the J5 job notice; it runs after packet J5-E.
@@ -1986,8 +1986,9 @@ def exec_cmd_capture(fixture, source):
         trial.until(b"DIGEST-DONE", offset, plain=True, limit=60, reject="Incomplete response")
         # ENV4: the job received the whole-command variable, so the model's
         # delivery and `job read` are private; the digest is not shown to it.
-        assert "private: this command received a secret value" in tool_messages[-2], tool_messages[-2:]
-        assert "private: this job received a secret value" in tool_messages[-1], tool_messages[-2:]
+        assert "private: this command used secrets, so its output is private to the person" in tool_messages[-2], tool_messages[-2:]
+        assert "private: this job used secrets, so its output is private to the person" in tool_messages[-1], tool_messages[-2:]
+        assert not any("Tool failed" in m for m in tool_messages[-2:]), tool_messages[-2:]
         assert all(digest not in m and third not in m for m in tool_messages)
         handle = re.search(r"^job: ([0-9a-f]{32})$", tool_messages[-2], re.M).group(1)
         trial.send(b"\x1b[17~\r")  # F6 response history; Enter expands the latest activity.
@@ -2255,8 +2256,8 @@ def tool_call_records(fixture, source):
         assert secret not in screen, "raw secret on screen"
         # ENV4: the job received a secret variable, so the model's delivery
         # and its `job read` are private.
-        assert "private: this command received a secret value" in tool_messages[-2], tool_messages[-2:]
-        assert "private: this job received a secret value" in tool_messages[-1], tool_messages[-2:]
+        assert "private: this command used secrets, so its output is private to the person" in tool_messages[-2], tool_messages[-2:]
+        assert "private: this job used secrets, so its output is private to the person" in tool_messages[-1], tool_messages[-2:]
         # The delivery does not wait for the job: wait for its file.
         end = time.monotonic() + 30
         while not (project / "out.txt").exists() or not (project / "out.txt").read_text():
@@ -4288,7 +4289,8 @@ def person_outside_journey(fixture, source):
         offset = len(trial.output)
         trial.send(b"!")
         notice_until(trial, "Not passed to ! and !! commands because they may be secrets: "
-                     "PE_FIXTURE_TOKEN (github-token). Asura never shows their values.", offset, limit=20)
+                     "PE_FIXTURE_TOKEN (github-token): /secrets store PE_FIXTURE_TOKEN. "
+                     "Asura never shows their values.", offset, limit=20)
         trial.send(b"\x7f")
         trial.idle(0.2)
         # The footer hint was drawn at the report: only its changed cells
@@ -4896,7 +4898,7 @@ def context_views_journey(fixture, source):
         def cite_e8(tools):
             found = re.search(r"^job: ([0-9a-f]{32})$", tools[-1], re.M)
             delivered["handle"] = found.group(1) if found else None
-            return f"E8-PRIVATE {'private: this command received a secret value' in tools[-1]}"
+            return f"E8-PRIVATE {'private: this command used secrets, so its output is private to the person' in tools[-1]}"
 
         before = len(harness.chats)
         harness.script[:] = [("exec_cmd", {"command": model_command}), cite_e8]
@@ -4911,7 +4913,7 @@ def context_views_journey(fixture, source):
         trial.idle(0.3)
 
         def cite_e8_read(tools):
-            return f"E8-READ {'private: this job received a secret value' in tools[-1]}"
+            return f"E8-READ {'private: this job used secrets, so its output is private to the person' in tools[-1]}"
 
         harness.script[:] = [("job", {"command": "read", "job": handle, "stream": "stdout"}), cite_e8_read]
         trial.send(b"What did it print?\r")
@@ -5077,6 +5079,91 @@ def person_secrets_journey(fixture, source):
         server.join(timeout=3)
         listener.close()
         if trial is not None:
+            trial.close()
+        harness.close()
+
+
+def person_named_journey(fixture, source):
+    """--person-named: NS-E1 to NS-E5 (named-secrets.md, end to end). The
+    TUI is launched with a synthetic GitHub-form token in PE_TOKEN. NS-E1:
+    the launch report names it with its store action and never its value.
+    NS-E2: /secrets store, the exists reply on a second store, replace, and
+    the /secrets panel. NS-E3: a `!` command naming $ASURA_SECRET_PE_TOKEN
+    prints the token's digest; its env line says `named PE_TOKEN`. NS-E4:
+    after /secrets remove the same command is refused with the
+    secret_not_found text and the draft is kept. NS-E5: no file in the
+    fixture's Asura home and no TUI output byte holds the token. The scratch
+    keychain is made by the fixture binary; no `security` command runs."""
+    import hashlib
+    harness = PersonHarness(fixture, source)
+    project = harness.project("named")
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    token = "ghp_" + "".join(alphabet[b % 62] for b in os.urandom(36))
+    fixture.env["PE_TOKEN"] = token
+    trial = None
+    try:
+        fixture.start()
+        harness.add_project(project)
+        trial = fixture.launch()
+        trial.resize(160, 48)
+        harness.select(trial, project)
+        harness.enable(trial)
+        # NS-E1: the report offers the store action, never the value.
+        offset = len(trial.output)
+        trial.send(b"!")
+        notice_until(trial, "PE_TOKEN (github-token): /secrets store PE_TOKEN", offset, limit=20)
+        trial.send(b"\x7f")
+        trial.idle(0.2)
+        # NS-E2: store, exists, replace, the panel.
+        for command, notice in [
+            ("/secrets store PE_TOKEN",
+             "Stored PE_TOKEN as a named secret. Use $ASURA_SECRET_PE_TOKEN in a ! or !! command."),
+            ("/secrets store PE_TOKEN",
+             "A named secret PE_TOKEN exists. Replace it with /secrets replace PE_TOKEN, or keep it."),
+            ("/secrets replace PE_TOKEN", "Replaced the named secret PE_TOKEN."),
+        ]:
+            offset = len(trial.output)
+            trial.send(f"{command}\r".encode())
+            notice_until(trial, notice, offset, limit=20)
+        offset = len(trial.output)
+        trial.send(b"/secrets\r")
+        trial.until(b"Stored named secrets", offset, plain=True, limit=20)
+        notice_until(trial, "PE_TOKEN (github-token): stored; use $ASURA_SECRET_PE_TOKEN", offset, limit=10)
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        print("PASS NS-E1 NS-E2: the report offers the store; stored, exists, replaced, listed")
+        # NS-E3: the command receives the value; the env line names it.
+        command = 'printf %s "$ASURA_SECRET_PE_TOKEN" | shasum -a 256'
+        harness.run(trial, command)
+        trial.until(hashlib.sha256(token.encode()).hexdigest().encode(), plain=True, limit=30)
+        notice_until(trial, "named PE_TOKEN", limit=10)
+        print("PASS NS-E3: the command ran with the stored value; env line names it")
+        # NS-E4: remove, then the same command is refused; the draft stays.
+        offset = len(trial.output)
+        trial.send(b"/secrets remove PE_TOKEN\r")
+        notice_until(trial, "Removed the named secret PE_TOKEN.", offset, limit=20)
+        offset = len(trial.output)
+        trial.send(b"!")
+        trial.send(b'printf x "$ASURA_SECRET_PE_TOKEN"')
+        harness.enter(trial)
+        notice_until(trial, "This command names a secret that is not stored.", offset, limit=20)
+        joined = "".join(row.strip() for row in trial.screen.text().splitlines())
+        assert 'printf x "$ASURA_SECRET_PE_TOKEN"' in joined, trial.screen.text()
+        print("PASS NS-E4: removed; the command is refused and the draft kept")
+        assert token.encode() not in bytes(trial.output), "the TUI showed the token"
+        trial.close()
+        trial = None
+        fixture.stop()
+        # NS-E5: no Asura file and no TUI output holds the token.
+        needle = token.encode()
+        home = fixture.root / "home"
+        for path in home.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                assert needle not in path.read_bytes(), f"{path} holds the token"
+        print("PASS NS-E5: no file in the Asura home holds the token")
+    finally:
+        if trial is not None:
+            assert token.encode() not in bytes(trial.output), "the TUI showed the token"
             trial.close()
         harness.close()
 
@@ -5331,6 +5418,7 @@ def main():
                  "--person-model": person_model_journey,
                  "--person-restart": person_restart_journey,
                  "--person-secrets": person_secrets_journey,
+                 "--person-named": person_named_journey,
                  "--context-views": context_views_journey,
                  "--path-guard": path_guard_journey}
     job_mode = job_modes.get(sys.argv[2]) if len(sys.argv) == 3 else None

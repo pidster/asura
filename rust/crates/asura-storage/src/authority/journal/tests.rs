@@ -2137,6 +2137,7 @@ fn person31(
         search_path: "/usr/bin".into(),
         environment: vec![],
         declared: Vec::new(),
+        named: Vec::new(),
         order_revision: h.state().order_revision + 1,
         number_kinds: vec![],
         unnumbered: 0,

@@ -3260,9 +3260,9 @@ fn model_taint() -> Result<()> {
         .collect();
     assert_eq!(delivery.len(), 1, "{delivery:?}");
     assert!(
-        delivery[0].contains(
-            "private: this command used secrets, so its output is private to the person"
-        ) && !delivery[0].contains("Tool failed"),
+        delivery[0]
+            .contains("private: this command used secrets, so its output is private to the person")
+            && !delivery[0].contains("Tool failed"),
         "{}",
         delivery[0]
     );
@@ -3543,6 +3543,7 @@ fn main() {
         ("views_taint", views_taint),
         ("environment", environment),
         ("model_taint", model_taint),
+        ("named", named),
     ];
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {
@@ -3563,6 +3564,265 @@ fn main() {
         }
     }
     println!("person command flow qualification passed");
+}
+
+/// Standard base64 of `bytes`, to sweep for an encoded value.
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(TABLE[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// NS-I1, NS-I2, NS-I4, NS-I5, NS-I6 (remove after submit), NS-I7 and
+/// NS-I8 (named-secrets.md): store, list, exists, replace and remove a
+/// synthetic token over the real service and a scratch keychain; a locked
+/// keychain; `!` and `!!` commands that name it receive the value, are
+/// tainted and keep only names in kind 31; a missing name refuses; a
+/// queued command keeps its copy after a remove; a restart's sweep keeps
+/// the named item; and no chat request the model received, journal frame,
+/// audit line, log or other file in the home holds the value, its SHA-256
+/// hex digest or its base64 form.
+fn named() -> Result<()> {
+    use pb::SecretResult as R;
+    let model = Model::start()?;
+    model.set_context(1_048_576);
+    let mut env = Env::new("pc-named")?;
+    env.start_audited()?;
+    let (project, directory) = env.project("project")?;
+    env.fixture.model(&model.endpoint)?;
+    let value = token("nM4");
+    let other = token("oP6");
+    let put = |env: &Env, name: &str, replace: bool, v: &str| -> Result<pb::SecretReply> {
+        Ok(env.fixture.attach()?.secret_put(
+            pb::SecretPut {
+                name: Some(name.into()),
+                value: Some(v.as_bytes().to_vec()),
+                replace: Some(replace),
+            },
+            &|| false,
+        )?)
+    };
+    let result = |reply: &pb::SecretReply| R::try_from(reply.result.unwrap_or(0)).ok();
+    let list = |env: &Env| -> Result<pb::SecretReply> {
+        Ok(env.fixture.attach()?.secret_list(&|| false)?)
+    };
+    let named_items = |env: &Env| -> Result<Vec<String>> {
+        let installation = env.installation()?;
+        Ok(Keychain::open(env.target())
+            .and_then(|k| k.list(&installation))
+            .map_err(|e| format!("list: {e:?}"))?
+            .named)
+    };
+    // NS-I1.
+    assert_eq!(
+        result(&put(&env, "PE_TOKEN", false, &value)?),
+        Some(R::Stored)
+    );
+    let listed = list(&env)?;
+    assert_eq!(
+        (result(&listed), listed.names.clone()),
+        (Some(R::Listed), vec!["PE_TOKEN".to_owned()])
+    );
+    assert_eq!(
+        result(&put(&env, "PE_TOKEN", false, &other)?),
+        Some(R::Exists)
+    );
+    assert_eq!(
+        result(&put(&env, "PE_TOKEN", true, &other)?),
+        Some(R::Replaced)
+    );
+    assert_eq!(
+        result(&put(&env, "PE_TOKEN", true, &value)?),
+        Some(R::Replaced)
+    );
+    assert_eq!(
+        result(&put(&env, "COMMAND", false, &value)?),
+        Some(R::Invalid)
+    );
+    let absent = env
+        .fixture
+        .attach()?
+        .secret_remove("NOT_STORED".into(), &|| false)?;
+    assert_eq!(result(&absent), Some(R::Absent));
+    if !env.test_group {
+        assert_eq!(named_items(&env)?, ["PE_TOKEN"]);
+        // NS-I2: a locked keychain refuses the put and the list.
+        keychain::scratch::lock(env.target()).map_err(|e| format!("lock: {e:?}"))?;
+        let locked = put(&env, "PE_LOCKED", false, &value)?;
+        assert_eq!(result(&locked), Some(R::Locked), "{locked:?}");
+        assert!(locked.status.is_some_and(|s| s > 0));
+        // A listing reads attributes only, and a locked file keychain lists
+        // (probe SS-P2 (a)).
+        assert_eq!(result(&list(&env)?), Some(R::Listed));
+        keychain::scratch::unlock(env.target()).map_err(|e| format!("unlock: {e:?}"))?;
+    }
+    println!("PASS NS-I1 NS-I2: stored, listed, exists, replaced, invalid, absent; locked refused");
+    // A model turn gives the conversation the commands join.
+    model.script(&[Step::Final]);
+    let first = env
+        .fixture
+        .submit(project, "Hello.")
+        .map_err(|e| format!("first turn: {e}"))?;
+    env.fixture.finish(first, Duration::from_secs(60))?;
+    let (conversation, generation) = turn_of(&env, first)?;
+    // NS-I5: a missing name refuses and records nothing.
+    let before = records(&env)?.len();
+    let missing = at_generation(
+        request(
+            project,
+            Some(conversation),
+            "printf %s \"$ASURA_SECRET_NOPE\"",
+            None,
+        ),
+        generation,
+    );
+    assert_eq!(refused(&env, &missing)?, pb::QueueRefusal::SecretNotFound);
+    assert_eq!(records(&env)?.len(), before, "nothing recorded");
+    // NS-I4: `!` and `!!` commands that name the secret.
+    let command = "printf %s \"$ASURA_SECRET_PE_TOKEN\" | /usr/bin/shasum -a 256; printf '%s\\n' ${ASURA_SECRET_PE_TOKEN}";
+    let (sandboxed, _) = queued(
+        &env,
+        &at_generation(
+            request(project, Some(conversation), command, None),
+            generation,
+        ),
+    )?;
+    let (unsandboxed, _) = queued(
+        &env,
+        &at_generation(
+            outside(project, Some(conversation), command, &launch(&env, &[])),
+            generation,
+        ),
+    )?;
+    let derived = sha256_hex(value.as_bytes());
+    for input in [sandboxed, unsandboxed] {
+        let q = kind_31(&env, input)?;
+        assert_eq!(q.named, vec![(1, "PE_TOKEN".to_owned())], "{q:?}");
+        assert!(q.received_secret_values(), "tainted: {q:?}");
+        assert!(!q.command.contains("PE_TOKEN"), "{}", q.command);
+        let settled = wait_settled(&env, input, Duration::from_secs(60))?;
+        assert_eq!(settled.outcome, JobOutcome::Exited, "{settled:?}");
+        let output = String::from_utf8(stdout(&env, input)?)?;
+        assert!(output.contains(&derived), "the value ran: {output}");
+        assert!(output.contains("$ASURA_SECRET_1"), "placeholder: {output}");
+        assert!(!output.contains(&value), "no value retained");
+    }
+    wait_for(Duration::from_secs(20), "input items deleted", || {
+        env.items().is_ok_and(|i| i.is_empty())
+    })?;
+    if !env.test_group {
+        assert_eq!(named_items(&env)?, ["PE_TOKEN"], "the named item remains");
+    }
+    println!(
+        "PASS NS-I4 NS-I5: ! and !! received the value, tainted, names only; missing name refused"
+    );
+    // NS-I6 (remove after submit): a queued command keeps its copy.
+    let (blocker, _) = queued(
+        &env,
+        &at_generation(
+            request(project, Some(conversation), BLOCKER, None),
+            generation,
+        ),
+    )?;
+    wait_for(Duration::from_secs(30), "blocker running", || {
+        intent_committed(&env, blocker).unwrap_or(false)
+    })?;
+    let (behind, _) = queued(
+        &env,
+        &at_generation(
+            request(project, Some(conversation), command, None),
+            generation,
+        ),
+    )?;
+    let removed = env
+        .fixture
+        .attach()?
+        .secret_remove("PE_TOKEN".into(), &|| false)?;
+    assert_eq!(result(&removed), Some(R::Removed));
+    std::fs::write(directory.join("release"), b"")?;
+    wait_settled(&env, blocker, Duration::from_secs(60))?;
+    wait_settled(&env, behind, Duration::from_secs(60))?;
+    assert!(String::from_utf8(stdout(&env, behind)?)?.contains(&derived));
+    assert_eq!(list(&env)?.names, Vec::<String>::new());
+    println!("PASS NS-I6: a command queued before the remove ran with its copy");
+    // NS-I7: a restart's sweep keeps a named item.
+    assert_eq!(
+        result(&put(&env, "PE_TOKEN", false, &value)?),
+        Some(R::Stored)
+    );
+    env.fixture.stop()?;
+    env.start()?;
+    wait_for(
+        Duration::from_secs(20),
+        "named item listed after restart",
+        || list(&env).is_ok_and(|l| l.names == ["PE_TOKEN"]),
+    )?;
+    println!("PASS NS-I7: the startup sweep kept the named item");
+    // NS-I8: the model reads the tainted job; nothing it receives, and no
+    // file in the home, holds the value or a derived form.
+    let handle = job_fixture::hex(&job_of(sandboxed));
+    model.script(&[
+        call(
+            "job",
+            serde_json::json!({"command": "read", "job": handle, "stream": "stdout"}),
+        ),
+        Step::Final,
+    ]);
+    let before = model.chats().len();
+    let next = env
+        .fixture
+        .follow(project, first, "What happened?")
+        .map_err(|e| format!("second turn: {e}"))?;
+    env.fixture.finish(next, Duration::from_secs(90))?;
+    let chats: Vec<String> = model.chats()[before..].to_vec();
+    assert!(!chats.is_empty());
+    let encoded = base64(value.as_bytes());
+    for chat in model.chats() {
+        for leak in [value.as_str(), derived.as_str(), encoded.as_str()] {
+            assert!(!chat.contains(leak), "a model request held a derived form");
+        }
+    }
+    let read = chat_messages(chats.last().ok_or("chat")?)?
+        .into_iter()
+        .filter(|(role, _)| role == "tool")
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>();
+    assert!(
+        read.iter()
+            .any(|t| t.contains("private: this job used secrets")),
+        "{read:?}"
+    );
+    job_fixture::sweep(env.home(), &[value.as_bytes(), encoded.as_bytes()])?;
+    assert!(
+        !audit_text(env.home())?.contains("PE_TOKEN"),
+        "no name in audit"
+    );
+    let audit = audit_text(env.home())?;
+    for event in [
+        "secret_store.named_put",
+        "secret_store.named_get",
+        "secret_store.named_delete",
+        "secret_store.named_list",
+    ] {
+        assert!(audit.contains(event), "{event}");
+    }
+    println!(
+        "PASS NS-I8: no model request, journal, audit, log or file held the value, its digest or base64"
+    );
+    Ok(())
 }
 
 /// The child service: the shared fixture child with this binary as the

@@ -164,6 +164,27 @@ The setting changes `execution.enabled` and `execution.projects.ID` in
 | `/paths approve all` | Approve every implicit-execution file that the list shows as not approved or changed |
 | `/paths revoke PATH` | Remove the approval of PATH |
 
+## Named secret commands
+
+| Command | Action |
+| --- | --- |
+| `/secrets` | List your named secrets and the variables of this terminal that look like secrets; `/secrets store`, `/secrets replace` and `/secrets remove` change them |
+
+| Form | Action |
+| --- | --- |
+| `/secrets` | Show the stored names, then each variable of this terminal that Asura did not pass because it may be a secret, with its store action |
+| `/secrets store NAME` | Store the value of this terminal's variable NAME as a named secret in the Keychain; Asura never shows the value |
+| `/secrets replace NAME` | Replace the stored secret NAME with this terminal's current value |
+| `/secrets remove NAME` | Remove the stored secret NAME |
+
+A `!` or `!!` command uses a stored secret by naming it as
+`$ASURA_SECRET_NAME`, for example
+`!GITHUB_TOKEN="$ASURA_SECRET_GITHUB_TOKEN" gh pr list`. The command receives
+the value; its output is then private to you, and the model sees only that it
+ran. A store never overwrites a secret of the same name: Asura says that it
+exists, and you replace it or keep it. A command that is already queued keeps
+the value it was submitted with.
+
 ## Job limits
 
 The `jobs` settings limit how many command jobs the service runs and queues.

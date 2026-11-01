@@ -185,6 +185,7 @@ fn every_item_call_follows_a_precheck() {
         list_with(&f, &INSTALLATION),
         Ok(Listing {
             inputs: vec![[3; 16]],
+            named: Vec::new(),
             unrecognized: 0,
             truncated: false,
         })
@@ -304,10 +305,43 @@ fn status_table_rows() {
         list_with(&f, &INSTALLATION),
         Ok(Listing {
             inputs: vec![[4; 16], [5; 16]],
+            named: Vec::new(),
             unrecognized: 1,
             truncated: false,
         })
     );
+}
+
+/// NS-U4: the listing classifies input, named and unrecognized accounts;
+/// an invalid named key makes no Keychain call.
+#[test]
+fn ns_u4_listing_classifies_named_items() {
+    let f = Fixture::statuses(&[Ok(0x7)]).accounts(Ok(vec![
+        key(4).account(),
+        "secret.GITHUB_TOKEN".to_owned(),
+        "secret.1BAD".to_owned(),
+        "other".to_owned(),
+    ]));
+    assert_eq!(
+        list_with(&f, &INSTALLATION),
+        Ok(Listing {
+            inputs: vec![[4; 16]],
+            named: vec!["GITHUB_TOKEN".to_owned()],
+            unrecognized: 2,
+            truncated: false,
+        })
+    );
+    let named = NamedKey {
+        installation: INSTALLATION,
+        name: "GITHUB_TOKEN".into(),
+    };
+    assert_eq!(named.account(), "secret.GITHUB_TOKEN");
+    assert_eq!(named.service(), key(1).service());
+    let bad = NamedKey {
+        installation: INSTALLATION,
+        name: "COMMAND".into(),
+    };
+    assert_eq!(bad.valid(), Err(Failure::Invalid));
 }
 
 #[test]
@@ -755,6 +789,7 @@ mod scratch_keychain {
             keychain.list(&INSTALLATION),
             Ok(Listing {
                 inputs: vec![[1; 16]],
+                named: Vec::new(),
                 unrecognized: 0,
                 truncated: false,
             })
@@ -896,6 +931,7 @@ mod scratch_keychain {
             keychain.list(&INSTALLATION),
             Ok(Listing {
                 inputs: vec![],
+                named: Vec::new(),
                 unrecognized: 1,
                 truncated: false,
             })
@@ -936,6 +972,7 @@ mod scratch_keychain {
             keychain.list(&INSTALLATION),
             Ok(Listing {
                 inputs: vec![[1; 16]],
+                named: Vec::new(),
                 unrecognized: 1,
                 truncated: false,
             })

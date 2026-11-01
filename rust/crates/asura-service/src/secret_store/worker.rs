@@ -5,11 +5,12 @@
 use super::codec::{self, DIGEST_BYTES};
 use super::port::KeychainPort;
 use super::{
-    COUNT_TRUNCATED, DeleteReply, GetReply, INVALID_REQUEST, ITEM_LIMIT, NOT_SIGNED, Observation,
-    PutReply, Request, Session, Shared, StoreFailure, SweepReport,
+    COUNT_TRUNCATED, DeleteReply, GetReply, INVALID_REQUEST, ITEM_LIMIT, NAMED_LIMIT, NOT_SIGNED,
+    NamedGetReply, NamedListReply, NamedPutReply, Observation, PutReply, Request, Session, Shared,
+    StoreFailure, SweepReport,
 };
 use asura_platform::keychain::{
-    Added, Failure, Found, ItemKey, Listing, MISSING_ENTITLEMENT, Removed,
+    Added, Failure, Found, ItemKey, Listing, MISSING_ENTITLEMENT, NamedKey, Removed,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -99,6 +100,28 @@ where
                 }
                 Request::Sweep { live, reply } => {
                     let answer = self.sweep(live);
+                    self.answer(reply, answer);
+                }
+                Request::PutNamed {
+                    name,
+                    value,
+                    replace,
+                    reply,
+                } => {
+                    let answer = self.put_named(name, &value, replace);
+                    drop(value);
+                    self.answer(reply, answer);
+                }
+                Request::GetNamed { names, reply } => {
+                    let answer = self.get_named(&names);
+                    self.answer(reply, answer);
+                }
+                Request::DeleteNamed { name, reply } => {
+                    let answer = self.delete_named(name);
+                    self.answer(reply, answer);
+                }
+                Request::ListNamed { reply } => {
+                    let answer = self.list_named();
                     self.answer(reply, answer);
                 }
             }
@@ -211,7 +234,8 @@ where
         let count = if listing.truncated {
             COUNT_TRUNCATED
         } else {
-            ((listing.inputs.len() + listing.unrecognized) as u32).saturating_sub(removed)
+            ((listing.inputs.len() + listing.named.len() + listing.unrecognized) as u32)
+                .saturating_sub(removed)
         };
         self.count = Some(count);
         count
@@ -335,6 +359,115 @@ where
         }
     }
 
+    fn named_key(&self, name: String) -> NamedKey {
+        NamedKey {
+            installation: self.installation,
+            name,
+        }
+    }
+
+    /// One listing for the named requests: it refreshes the count and the
+    /// unrecognized count, and returns the stored names.
+    fn named_listing(&mut self) -> Result<Listing, StoreFailure> {
+        let installation = self.installation;
+        let listing = self.call(|port| port.list(&installation))?;
+        self.unrecognized = listing.unrecognized as u32;
+        self.set_count(&listing, 0);
+        Ok(listing)
+    }
+
+    /// named-secrets.md, NS-Q1: a new name is refused at 64 names or 256
+    /// items; an existing name is `exists` unless `replace`, which deletes
+    /// then adds (not atomic: an add that fails after the delete is
+    /// `replace_failed`).
+    fn put_named(&mut self, name: String, value: &[u8], replace: bool) -> NamedPutReply {
+        let binding = codec::named_binding(&self.installation, &name);
+        let Ok(payload) = codec::encode_named(&binding, value) else {
+            return NamedPutReply::Failed(self.failure(Failure::Invalid));
+        };
+        if !asura_platform::secrets::named::name_valid(&name) {
+            return NamedPutReply::Failed(self.failure(Failure::Invalid));
+        }
+        let listing = match self.named_listing() {
+            Ok(listing) => listing,
+            Err(failure) => return NamedPutReply::Failed(failure),
+        };
+        let exists = listing.named.contains(&name);
+        let count = self.count.unwrap_or(COUNT_TRUNCATED);
+        if !exists && (listing.named.len() >= NAMED_LIMIT || count >= ITEM_LIMIT) {
+            return NamedPutReply::Full;
+        }
+        let key = self.named_key(name);
+        match self.call(|port| port.add_named(&key, &payload)) {
+            Ok(Added::Stored) => {
+                self.adjust_count(true);
+                NamedPutReply::Stored
+            }
+            Ok(Added::Duplicate) if !replace => NamedPutReply::Exists,
+            Ok(Added::Duplicate) => {
+                match self.call(|port| port.delete_named(&key)) {
+                    Ok(Removed::Deleted) => self.adjust_count(false),
+                    Ok(Removed::Absent) => {}
+                    Err(failure) => return NamedPutReply::Failed(failure),
+                }
+                match self.call(|port| port.add_named(&key, &payload)) {
+                    Ok(Added::Stored) => {
+                        self.adjust_count(true);
+                        NamedPutReply::Replaced
+                    }
+                    // Another writer added the name between the calls.
+                    Ok(Added::Duplicate) => NamedPutReply::Exists,
+                    Err(failure) => NamedPutReply::ReplaceFailed(failure),
+                }
+            }
+            Err(failure) => NamedPutReply::Failed(failure),
+        }
+    }
+
+    fn get_named(&mut self, names: &[String]) -> NamedGetReply {
+        if names.is_empty() || names.len() > codec::MAX_VARIABLES {
+            return NamedGetReply::Failed(self.failure(Failure::Invalid));
+        }
+        let mut values = Vec::with_capacity(names.len());
+        for name in names {
+            let binding = codec::named_binding(&self.installation, name);
+            let key = self.named_key(name.clone());
+            match self.call(|port| port.get_named(&key)) {
+                Ok(Found::Data(data)) => match codec::decode_named(&data, &binding) {
+                    Ok(value) => values.push(value),
+                    Err(_) => return NamedGetReply::Mismatch,
+                },
+                Ok(Found::Missing) => return NamedGetReply::Missing,
+                Err(failure) => return NamedGetReply::Failed(failure),
+            }
+        }
+        NamedGetReply::Values(values)
+    }
+
+    fn delete_named(&mut self, name: String) -> DeleteReply {
+        let key = self.named_key(name);
+        match self.call(|port| port.delete_named(&key)) {
+            Ok(Removed::Deleted) => {
+                self.adjust_count(false);
+                DeleteReply::Deleted
+            }
+            Ok(Removed::Absent) => DeleteReply::Absent,
+            Err(failure) => DeleteReply::Failed(failure),
+        }
+    }
+
+    fn list_named(&mut self) -> NamedListReply {
+        match self.named_listing() {
+            Ok(listing) => {
+                let mut names = listing.named;
+                names.sort_unstable();
+                names.truncate(NAMED_LIMIT);
+                NamedListReply::Names(names)
+            }
+            Err(failure) => NamedListReply::Failed(failure),
+        }
+    }
+
     /// SS-F1. Lists again only while the listing was truncated and the pass
     /// deleted an item, so each repeat shrinks a finite set.
     fn sweep(&mut self, live: BTreeSet<[u8; 16]>) -> SweepReport {
@@ -350,7 +483,11 @@ where
                 }
             };
             report.listings += 1;
-            let mut pass = SweepReport::default();
+            // Named items are never orphans (named-secrets.md, sweep).
+            let mut pass = SweepReport {
+                kept: listing.named.len() as u32,
+                ..SweepReport::default()
+            };
             let mut removed = 0u32;
             for &input in &listing.inputs {
                 if live.contains(&input) || self.written.contains(&input) {

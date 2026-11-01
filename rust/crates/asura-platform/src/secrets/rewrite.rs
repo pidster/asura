@@ -43,6 +43,16 @@ impl SecretVariable {
     pub fn name(&self) -> String {
         format!("ASURA_SECRET_{}", self.number)
     }
+    /// A named secret's value as secret variable `number`, kind
+    /// `env-secret` (named-secrets.md, references in commands). The
+    /// caller reads the value from the secret store.
+    pub fn named(number: u16, value: &[u8]) -> Self {
+        Self {
+            number,
+            kind: SecretKind::EnvSecret,
+            value: Zeroizing::new(value.to_vec()),
+        }
+    }
     /// Any number and value, to exercise `ExecCmdRequest` validation.
     #[cfg(test)]
     pub(crate) fn for_test(number: u16, value: &[u8]) -> Self {

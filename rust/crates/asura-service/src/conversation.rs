@@ -6,6 +6,7 @@ mod job_tool;
 mod jobs;
 mod memory_create;
 mod memory_tools;
+mod named_secrets;
 mod notice;
 mod path_guard;
 mod person_command;
@@ -133,6 +134,9 @@ pub(crate) fn handles(request: &pb::Envelope) -> bool {
                 | Body::PathGuardList(_)
                 | Body::PathGuardApprove(_)
                 | Body::PathGuardRevoke(_)
+                | Body::SecretPut(_)
+                | Body::SecretList(_)
+                | Body::SecretRemove(_)
         )
     ) || request.body.as_ref().is_some_and(job_control::handles)
 }
@@ -1617,6 +1621,14 @@ impl Owner {
     pub(crate) fn request(&mut self, request: pb::Envelope, now: Instant) -> Option<pb::Envelope> {
         if matches!(request.body, Some(Body::ConversationQueueCommandSubmit(_))) {
             return self.person_submit(request);
+        }
+        // Named secrets: routed before the audit copy below, so the
+        // SecretPut value is never cloned (named-secrets.md).
+        if matches!(
+            request.body,
+            Some(Body::SecretPut(_) | Body::SecretList(_) | Body::SecretRemove(_))
+        ) {
+            return self.secret_request(request);
         }
         let original = request.clone();
         let result = self.request_inner(request, now);

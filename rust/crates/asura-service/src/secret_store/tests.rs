@@ -5,7 +5,7 @@
 use super::codec::{self, CodecError, decode, encode};
 use super::*;
 use asura_platform::keychain::{
-    Added, Failure, Found, ItemKey, LIST_BOUND, Listing, MAX_ITEM_BYTES, Removed,
+    Added, Failure, Found, ItemKey, LIST_BOUND, Listing, MAX_ITEM_BYTES, NamedKey, Removed,
 };
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -153,6 +153,18 @@ impl port::KeychainPort for Script {
         );
         self.enter("list", None, |s| s.lists.pop_front())
     }
+    fn add_named(&self, key: &NamedKey, _: &[u8]) -> Result<Added, Failure> {
+        assert_eq!(key.installation, INSTALLATION);
+        self.enter("add_named", None, |s| s.adds.pop_front())
+    }
+    fn get_named(&self, key: &NamedKey) -> Result<Found, Failure> {
+        assert_eq!(key.installation, INSTALLATION);
+        self.enter("get_named", None, |s| s.gets.pop_front())
+    }
+    fn delete_named(&self, key: &NamedKey) -> Result<Removed, Failure> {
+        assert_eq!(key.installation, INSTALLATION);
+        self.enter("delete_named", None, |s| s.deletes.pop_front())
+    }
 }
 
 fn start(script: &Script) -> Store {
@@ -165,8 +177,212 @@ fn listing(inputs: impl IntoIterator<Item = u16>, unrecognized: usize) -> Listin
     Listing {
         truncated: inputs.len() + unrecognized == LIST_BOUND,
         inputs,
+        named: Vec::new(),
         unrecognized,
     }
+}
+
+// ---- Named secrets (named-secrets.md) -----------------------------------
+
+fn named_listing(names: &[&str], inputs: usize) -> Listing {
+    Listing {
+        named: names.iter().map(|n| n.to_string()).collect(),
+        ..listing(1..=inputs as u16, 0)
+    }
+}
+
+fn named_data(name: &str, value: &[u8]) -> Found {
+    Found::Data(
+        codec::encode_named(&codec::named_binding(&INSTALLATION, name), value).expect("encode"),
+    )
+}
+
+fn put_named(store: &Store, name: &str, replace: bool) -> NamedPutReply {
+    store
+        .put_named(name.into(), Zeroizing::new(b"synthetic".to_vec()), replace)
+        .expect("admitted")
+        .wait()
+        .expect("reply")
+}
+
+/// NS-U5: the named payload codec.
+#[test]
+fn ns_u5_named_codec() {
+    let binding = codec::named_binding(&INSTALLATION, "GITHUB_TOKEN");
+    for len in [1, MAX_NAMED_VALUE_BYTES] {
+        let value = bytes(len, 7);
+        let data = codec::encode_named(&binding, &value).unwrap();
+        assert!(data.len() <= codec::MAX_NAMED_PAYLOAD_BYTES);
+        assert!(data.len() <= MAX_ITEM_BYTES);
+        assert_eq!(*codec::decode_named(&data, &binding).unwrap(), *value);
+    }
+    assert_eq!(codec::MAX_NAMED_PAYLOAD_BYTES, 4_131);
+    assert_eq!(
+        codec::encode_named(&binding, &bytes(MAX_NAMED_VALUE_BYTES + 1, 1)),
+        Err(CodecError::Bound)
+    );
+    assert_eq!(codec::encode_named(&binding, b""), Err(CodecError::Bound));
+    let data = codec::encode_named(&binding, b"value").unwrap();
+    let other = codec::named_binding(&INSTALLATION, "OTHER");
+    assert_eq!(codec::decode_named(&data, &other), Err(CodecError::Binding));
+    let mut trailing = data.to_vec();
+    trailing.push(0);
+    assert_eq!(
+        codec::decode_named(&trailing, &binding),
+        Err(CodecError::Trailing)
+    );
+    assert_eq!(
+        codec::decode_named(&data[..10], &binding),
+        Err(CodecError::Truncated)
+    );
+    let mut version = data.to_vec();
+    version[0] = 2;
+    assert_eq!(
+        codec::decode_named(&version, &binding),
+        Err(CodecError::Version)
+    );
+}
+
+/// NS-U6: named requests over the scripted port.
+#[test]
+fn ns_u6_named_requests() {
+    let script = Script::default();
+    let store = start(&script);
+    // New name: stored.
+    script
+        .list(Ok(named_listing(&[], 1)))
+        .add(Ok(Added::Stored));
+    assert_eq!(
+        put_named(&store, "GITHUB_TOKEN", false),
+        NamedPutReply::Stored
+    );
+    // Existing name without replace: exists, no delete.
+    script
+        .list(Ok(named_listing(&["GITHUB_TOKEN"], 1)))
+        .add(Ok(Added::Duplicate));
+    assert_eq!(
+        put_named(&store, "GITHUB_TOKEN", false),
+        NamedPutReply::Exists
+    );
+    assert_eq!(script.calls("delete_named"), 0);
+    // Replace: delete then add.
+    script
+        .list(Ok(named_listing(&["GITHUB_TOKEN"], 1)))
+        .add(Ok(Added::Duplicate))
+        .delete(Ok(Removed::Deleted))
+        .add(Ok(Added::Stored));
+    assert_eq!(
+        put_named(&store, "GITHUB_TOKEN", true),
+        NamedPutReply::Replaced
+    );
+    // Replace whose add fails after the delete.
+    script
+        .list(Ok(named_listing(&["GITHUB_TOKEN"], 1)))
+        .add(Ok(Added::Duplicate))
+        .delete(Ok(Removed::Deleted))
+        .add(Err(unavailable(-25_291)));
+    assert_eq!(
+        put_named(&store, "GITHUB_TOKEN", true),
+        NamedPutReply::ReplaceFailed(store_unavailable(-25_291))
+    );
+    // A replace whose delete fails keeps the old value.
+    script
+        .list(Ok(named_listing(&["GITHUB_TOKEN"], 1)))
+        .add(Ok(Added::Duplicate))
+        .delete(Err(Failure::Locked { status: -25_308 }));
+    assert_eq!(
+        put_named(&store, "GITHUB_TOKEN", true),
+        NamedPutReply::Failed(StoreFailure::Locked {
+            status: -25_308,
+            session: ev()
+        })
+    );
+    // 64 names: a new name is full; an existing one may be replaced.
+    let many: Vec<String> = (0..NAMED_LIMIT).map(|i| format!("N{i}")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    script.list(Ok(named_listing(&many, 0)));
+    assert_eq!(put_named(&store, "NEW", false), NamedPutReply::Full);
+    // 256 items: full.
+    script.list(Ok(named_listing(&[], 256)));
+    assert_eq!(put_named(&store, "NEW", false), NamedPutReply::Full);
+    // An invalid name makes no port call.
+    let before = script.log().len();
+    assert!(matches!(
+        put_named(&store, "COMMAND", false),
+        NamedPutReply::Failed(StoreFailure::Unavailable {
+            reason: Some(INVALID_REQUEST),
+            ..
+        })
+    ));
+    assert_eq!(script.log().len(), before);
+    // Remove, list, get.
+    script.delete(Ok(Removed::Deleted));
+    let removed = store.delete_named("GITHUB_TOKEN".into()).unwrap().wait();
+    assert_eq!(removed, Some(DeleteReply::Deleted));
+    script.list(Ok(named_listing(&["B", "A"], 2)));
+    let listed = store.list_named().unwrap().wait();
+    assert_eq!(
+        listed,
+        Some(NamedListReply::Names(vec!["A".into(), "B".into()]))
+    );
+    script
+        .get(Ok(named_data("A", b"one")))
+        .get(Ok(named_data("B", b"two")));
+    match store
+        .get_named(vec!["A".into(), "B".into()])
+        .unwrap()
+        .wait()
+    {
+        Some(NamedGetReply::Values(values)) => {
+            assert_eq!(values.len(), 2);
+            assert_eq!((&**values[0], &**values[1]), (&b"one"[..], &b"two"[..]));
+        }
+        other => panic!("{other:?}"),
+    }
+    script
+        .get(Ok(named_data("A", b"one")))
+        .get(Ok(Found::Missing));
+    assert_eq!(
+        store
+            .get_named(vec!["A".into(), "B".into()])
+            .unwrap()
+            .wait(),
+        Some(NamedGetReply::Missing)
+    );
+    // An item bound to another name is a mismatch.
+    script.get(Ok(named_data("OTHER", b"x")));
+    assert_eq!(
+        store.get_named(vec!["A".into()]).unwrap().wait(),
+        Some(NamedGetReply::Mismatch)
+    );
+    // not_signed is terminal: no later port call.
+    script.list(Err(Failure::NotSigned { item_call: true }));
+    assert!(matches!(
+        put_named(&store, "X", false),
+        NamedPutReply::Failed(f) if f.not_signed()
+    ));
+    let before = script.log().len();
+    assert!(matches!(
+        store.list_named().unwrap().wait(),
+        Some(NamedListReply::Failed(f)) if f.not_signed()
+    ));
+    assert_eq!(script.log().len(), before);
+    store.close().join().unwrap();
+}
+
+/// NS-U7: the sweep keeps named items and counts them.
+#[test]
+fn ns_u7_sweep_keeps_named_items() {
+    let script = Script::default();
+    let store = start(&script);
+    script.list(Ok(named_listing(&["GITHUB_TOKEN", "OTHER"], 1)));
+    script.delete(Ok(Removed::Deleted));
+    let report = store.sweep(BTreeSet::new()).unwrap().wait().unwrap();
+    assert_eq!((report.kept, report.deleted), (2, 1));
+    assert_eq!(script.calls("delete_named"), 0);
+    assert_eq!(script.calls("delete"), 1);
+    assert_eq!(store.observation().item_count, Some(2));
+    store.close().join().unwrap();
 }
 
 fn data(secrets: &Secrets, binding: &[u8; 32]) -> Found {

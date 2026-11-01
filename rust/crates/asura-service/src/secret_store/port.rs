@@ -1,7 +1,9 @@
 //! The store's only route to the platform (`docs/designs/secret-store.md`,
 //! worker seam for tests). The port carries platform types, so the store has
 //! no second status table and no raw `OSStatus` path.
-use asura_platform::keychain::{Added, Failure, Found, ItemKey, Keychain, Listing, Removed};
+use asura_platform::keychain::{
+    Added, Failure, Found, ItemKey, Keychain, Listing, NamedKey, Removed,
+};
 
 /// The four item calls the worker makes. Production forwards to
 /// [`Keychain`]; unit tests use a scripted port; integration tests use the
@@ -11,6 +13,10 @@ pub(crate) trait KeychainPort: Send + 'static {
     fn get(&self, key: &ItemKey) -> Result<Found, Failure>;
     fn delete(&self, key: &ItemKey) -> Result<Removed, Failure>;
     fn list(&self, installation: &[u8; 16]) -> Result<Listing, Failure>;
+    /// Named secret items (named-secrets.md).
+    fn add_named(&self, key: &NamedKey, data: &[u8]) -> Result<Added, Failure>;
+    fn get_named(&self, key: &NamedKey) -> Result<Found, Failure>;
+    fn delete_named(&self, key: &NamedKey) -> Result<Removed, Failure>;
 }
 
 impl KeychainPort for Keychain {
@@ -25,6 +31,15 @@ impl KeychainPort for Keychain {
     }
     fn list(&self, installation: &[u8; 16]) -> Result<Listing, Failure> {
         Keychain::list(self, installation)
+    }
+    fn add_named(&self, key: &NamedKey, data: &[u8]) -> Result<Added, Failure> {
+        Keychain::add_named(self, key, data)
+    }
+    fn get_named(&self, key: &NamedKey) -> Result<Found, Failure> {
+        Keychain::get_named(self, key)
+    }
+    fn delete_named(&self, key: &NamedKey) -> Result<Removed, Failure> {
+        Keychain::delete_named(self, key)
     }
 }
 
@@ -138,6 +153,21 @@ mod gated {
             self.gate
                 .enter(Call::List)
                 .map_or_else(|| self.keychain.list(installation), Err)
+        }
+        fn add_named(&self, key: &NamedKey, data: &[u8]) -> Result<Added, Failure> {
+            self.gate
+                .enter(Call::Add)
+                .map_or_else(|| self.keychain.add_named(key, data), Err)
+        }
+        fn get_named(&self, key: &NamedKey) -> Result<Found, Failure> {
+            self.gate
+                .enter(Call::Get)
+                .map_or_else(|| self.keychain.get_named(key), Err)
+        }
+        fn delete_named(&self, key: &NamedKey) -> Result<Removed, Failure> {
+            self.gate
+                .enter(Call::Delete)
+                .map_or_else(|| self.keychain.delete_named(key), Err)
         }
     }
 }

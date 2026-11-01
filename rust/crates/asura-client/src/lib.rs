@@ -269,7 +269,10 @@ fn write_frame_until(
     envelope: &pb::Envelope,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
-    let bytes = encode_frame(envelope).map_err(|_| Error::Protocol)?;
+    // Zeroized on drop: a SecretPut frame holds a value (named-secrets.md).
+    let bytes = asura_control::secrets::Zeroizing::new(
+        encode_frame(envelope).map_err(|_| Error::Protocol)?,
+    );
     let mut offset = 0;
     while offset < bytes.len() {
         slice(cancelled)?;
@@ -425,17 +428,24 @@ impl Client {
         self.runtime.validate()?;
         self.witness.validate()?;
         self.counter = self.counter.checked_add(1).ok_or(Error::Protocol)?;
-        let request = pb::Envelope {
+        let mut request = pb::Envelope {
             service_epoch: Some(self.epoch.to_vec()),
             attachment_id: Some(self.attachment.to_vec()),
             request_counter: Some(self.counter),
             body: Some(body),
         };
-        validate_semantics(&request, Direction::ClientToServer).map_err(|_| Error::Protocol)?;
+        let valid = validate_semantics(&request, Direction::ClientToServer);
+        if valid.is_err() {
+            asura_control::secrets::scrub(&mut request);
+            return Err(Error::Protocol);
+        }
         // A cancelled or lost wait leaves a reply in flight: this attachment
         // is retired and refuses further requests.
-        let result = write_frame_until(&mut self.stream, &request, cancelled)
-            .and_then(|()| read_frame_until(&mut self.stream, &mut self.codec, cancelled));
+        let written = write_frame_until(&mut self.stream, &request, cancelled);
+        // A SecretPut value leaves memory once written (named-secrets.md).
+        asura_control::secrets::scrub(&mut request);
+        let result =
+            written.and_then(|()| read_frame_until(&mut self.stream, &mut self.codec, cancelled));
         if result.is_err() {
             self.abandoned = true;
         }
@@ -767,6 +777,43 @@ impl Client {
         };
         match reply {
             pb::envelope::Body::PathGuardReply(reply) => Ok(reply),
+            _ => Err(Error::Protocol),
+        }
+    }
+    /// Stores a named secret (named-secrets.md, control API). Not a
+    /// journal mutation, but its effect is durable: only `cancelled` or a
+    /// lost connection ends the wait, as `OutcomeUnconfirmed`, and the
+    /// caller never retries it. The value is cleared after the write.
+    pub fn secret_put(
+        &mut self,
+        request: pb::SecretPut,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<pb::SecretReply> {
+        match self.mutation(pb::envelope::Body::SecretPut(request), cancelled)? {
+            pb::envelope::Body::SecretReply(reply) => Ok(reply),
+            _ => Err(Error::Protocol),
+        }
+    }
+    /// Lists the stored secret names.
+    pub fn secret_list(&mut self, cancelled: &dyn Fn() -> bool) -> Result<pb::SecretReply> {
+        match self
+            .request_cancellable(pb::envelope::Body::SecretList(pb::SecretList {}), cancelled)?
+        {
+            pb::envelope::Body::SecretReply(reply) => Ok(reply),
+            _ => Err(Error::Protocol),
+        }
+    }
+    /// Removes a named secret; as [`Self::secret_put`] for its wait.
+    pub fn secret_remove(
+        &mut self,
+        name: String,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<pb::SecretReply> {
+        match self.mutation(
+            pb::envelope::Body::SecretRemove(pb::SecretRemove { name: Some(name) }),
+            cancelled,
+        )? {
+            pb::envelope::Body::SecretReply(reply) => Ok(reply),
             _ => Err(Error::Protocol),
         }
     }

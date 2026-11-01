@@ -8,6 +8,7 @@ mod markdown;
 mod paging;
 mod path_guard;
 mod person;
+mod secrets;
 mod thinking;
 use super::editor::{CommandHeader, Editor, MAX_DRAFT_BYTES};
 use composer::{Focus, Picker, selection_style};
@@ -110,7 +111,7 @@ const GAUGE_AMBER: Color = Color::Rgb(0xF2, 0xB9, 0x50);
 /// The TUI commands: completion, help and dispatch. `/jobs`, `/job` and
 /// `/execution` (tool-job-controller.md, J4 TUI; execution-setting.md)
 /// take arguments and dispatch before the no-argument check.
-const LOCAL_COMMANDS: [&str; 20] = [
+const LOCAL_COMMANDS: [&str; 21] = [
     "/help",
     "/quit",
     "/exit",
@@ -131,6 +132,7 @@ const LOCAL_COMMANDS: [&str; 20] = [
     "/execution",
     "/status",
     "/paths",
+    "/secrets",
 ];
 
 enum Overlay {
@@ -2053,6 +2055,11 @@ impl App {
             if clear {
                 self.editor = Editor::new();
             }
+        } else if self.secrets_stop() {
+            // A `/secrets` wait has no time bound; /cancel and Escape stop it.
+            if clear {
+                self.editor = Editor::new();
+            }
         } else if self.audit_draft.is_some() {
             self.audit_cancel = true;
             if clear {
@@ -2418,6 +2425,10 @@ impl App {
         }
         if name == "/paths" {
             self.paths_command(draft);
+            return false;
+        }
+        if name == "/secrets" {
+            self.secrets_command(draft);
             return false;
         }
         if name == "/status" {
