@@ -6196,6 +6196,13 @@ flowchart LR
 | PTS-I1 | Integration | CC-I16 and CC-I18 | Every private result the scripted model receives has status 8 and the new text |
 | PTS-E1 | End to end | CC-E8 | The model's `job read` result is status 8 with the private text |
 
+Verified 2026-11-01 on macOS 27.0 with the ad hoc helper rebuilt from the
+changed `model.proto`: PTS-U1 to PTS-U4 (storage, service, control and
+Swift `swift test`, 127 tests), PTS-I1 (`person_command_flow views_taint`
+and `model_taint`, `tool_call_flow`, `capture_flow`: no tool message holds
+`Tool failed`) and PTS-E1 (PTY `--context-views` CC-E8 and
+`--exec-cmd-capture`).
+
 ### J5 failure handling
 
 | Case | Result |

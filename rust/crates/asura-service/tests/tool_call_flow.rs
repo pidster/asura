@@ -716,7 +716,8 @@ fn exec_cmd_secret() -> Result<()> {
     let delivered = model.tool_messages();
     assert_eq!(delivered.len(), 1, "{delivered:?}");
     assert!(
-        delivered[0].contains("private: this command used secrets, so its output is private to the person"),
+        delivered[0]
+            .contains("private: this command used secrets, so its output is private to the person"),
         "{}",
         delivered[0]
     );
