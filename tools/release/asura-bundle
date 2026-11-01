@@ -1,6 +1,7 @@
 #!/bin/sh
-# Build, sign and check Asura.app (release signing design, packet SG1:
-# docs/designs/release-signing.md#sg1-package-script).
+# Build, sign and check Asura.app, then pack, sign and (release) notarise the
+# DMG (release signing design, packets SG1 and SG6:
+# docs/designs/release-signing.md#sg1-package-script, #sg6-dmg-and-cask).
 #
 #   asura-bundle --ad-hoc      --out DIR [--swift-scratch DIR]
 #   asura-bundle --development --out DIR [--swift-scratch DIR]
@@ -359,48 +360,68 @@ verify_bundle() {
 verify_bundle 'after bundle signing'
 [ "$mode" = ad-hoc ] || details "$app" | grep '^Authority=' | sed 's/^/asura-bundle: /'
 
-# --- 10. Notarise and staple (release only) ---------------------------------
+# --- 10. Pack the DMG (ad hoc and release; SG6) -----------------------------
+dmg=
+if [ "$mode" != development ]; then
+    step=dmg
+    dmg=Asura-$version.dmg
+    [ "$mode" = release ] || dmg=Asura-$version-adhoc-unstapled.dmg
+    stage=$work/dmg
+    mkdir "$stage" || fail 'cannot create the DMG staging folder'
+    copy "$app" "$stage/Asura.app"
+    ln -s /Applications "$stage/Applications"
+    cp "$root/LICENSE" "$stage/LICENSE"
+    sed "s/@VERSION@/$version/g" "$root/tools/release/dmg-readme.txt.in" > "$stage/README.txt"
+    ! grep -q '@[A-Z_]*@' "$stage/README.txt" || fail 'a read-me placeholder is left'
+    # SG4-O1 and RS11: nothing that the volume holds may name the build host.
+    /usr/bin/python3 -I "$root/tools/release/host-paths" --repository "$root" "$stage" >&2 ||
+        fail 'the DMG staging folder holds a build-host path (files above)'
+    hdiutil create -quiet -volname Asura -srcfolder "$stage" -fs APFS -format UDZO "$out/$dmg" ||
+        fail 'hdiutil create failed'
+    hdiutil verify -quiet "$out/$dmg" || fail 'hdiutil verify failed'
+
+    # --- 11. Sign the DMG ---------------------------------------------------
+    step='dmg signature'
+    sign --identifier org.pidster.asura.dmg "$out/$dmg" || fail 'cannot sign the DMG'
+    codesign --verify --strict "$out/$dmg" || fail 'the DMG does not verify'
+    [ "$(field "$out/$dmg" Identifier)" = org.pidster.asura.dmg ] || fail 'the DMG has the wrong identifier'
+    require_signer "$out/$dmg"
+fi
+
+# --- 12. Notarise and staple the DMG (release only, one submission) ---------
 if [ "$mode" = release ]; then
     step=notarisation
-    ditto -c -k --keepParent "$app" "$work/Asura.zip" || fail 'cannot zip Asura.app'
-    note 'submitting to the notary service; this waits for its reply (Ctrl-C cancels)'
-    xcrun notarytool submit "$work/Asura.zip" --keychain-profile "$notary" --wait \
+    note 'submitting the DMG to the notary service; this waits for its reply (Ctrl-C cancels)'
+    xcrun notarytool submit "$out/$dmg" --keychain-profile "$notary" --wait \
         --output-format plist > "$out/notary-submit.plist" || :
     submission=$(plutil -extract id raw -o - "$out/notary-submit.plist" 2>/dev/null || :)
     status=$(plutil -extract status raw -o - "$out/notary-submit.plist" 2>/dev/null || :)
     note "notary submission ${submission:-unknown}: ${status:-no status}"
     if [ "$status" != Accepted ]; then
         [ -z "$submission" ] || xcrun notarytool log "$submission" --keychain-profile "$notary" "$out/notary-log.json" || :
-        fail "not accepted (${status:-no reply}); see $out/notary-log.json; query later with: xcrun notarytool info ${submission:-<id>} --keychain-profile <name>"
+        fail "not accepted (${status:-no reply}); see $out/notary-log.json; never resubmit an unknown result: xcrun notarytool info ${submission:-<id>} --keychain-profile <name>"
     fi
     step=stapling
     delay=1
-    until xcrun stapler staple "$app"; do
+    until xcrun stapler staple "$out/$dmg"; do
         note "ticket not stapled; retry in ${delay}s (Ctrl-C cancels)"
         sleep "$delay"
         delay=$((delay * 2)); [ "$delay" -le 60 ] || delay=60
     done
-    xcrun stapler validate "$app" || fail 'stapler validate failed'
-    spctl --assess --type execute --verbose=2 "$app" || fail 'Gatekeeper assessment failed'
-    verify_bundle 'after stapling'
+    xcrun stapler validate "$out/$dmg" || fail 'stapler validate failed'
+    spctl --assess --type open --context context:primary-signature --verbose=2 "$out/$dmg" ||
+        fail 'Gatekeeper does not accept the DMG'
+    verify_bundle 'after notarisation'
 fi
 
-# --- 11. Archive ------------------------------------------------------------
-step=archive
-if [ "$mode" = development ]; then
-    archive=
-else
-    archive=asura-$version-macos-arm64.tar.gz
-    [ "$mode" = release ] || archive=asura-$version-macos-arm64-adhoc-unstapled.tar.gz
-    COPYFILE_DISABLE=1 tar --no-mac-metadata -czf "$out/$archive" -C "$out" Asura.app -C "$root" LICENSE ||
-        fail 'cannot write the archive'
-    (cd "$out" && shasum -a 256 "$archive" > "$archive.sha256")
-fi
+# --- 13. Checksum, written last ---------------------------------------------
+step=checksum
+[ -z "$dmg" ] || (cd "$out" && shasum -a 256 "$dmg" > "$dmg.sha256") || fail 'cannot write the checksum'
 rm -rf "$work"
 step=done
 note "Asura.app: $app"
 note "development package: $pkg"
-[ -z "$archive" ] || note "archive: $out/$archive"
+[ -z "$dmg" ] || note "DMG: $out/$dmg"
 note "build_id $build_id"
 note "helper $helper_sha"
 note "metallib $metallib_sha"

@@ -1,18 +1,19 @@
 #!/bin/sh
-# Release promotion checks and the formula (release signing design, packet SG4:
-# docs/designs/release-signing.md#sg4-release-promotion-and-formula).
+# Release promotion checks and the cask (release signing design, packets SG4
+# and SG6: docs/designs/release-signing.md#sg4-release-promotion-and-formula,
+# #sg6-dmg-and-cask).
 #
 #   asura-release preflight --version V
-#   asura-release check --archive A --version V (--release --team-id T | --ad-hoc)
-#   asura-release formula --archive A --version V --out FILE
-#   asura-release tap-test --formula F --version V [--archive A] [--release --team-id T]
-#   asura-release verify-release --version V --archive A --revision R --team-id T
+#   asura-release check --dmg D --version V (--release --team-id T | --ad-hoc)
+#   asura-release cask --dmg D --version V --out FILE
+#   asura-release tap-test --cask F --version V [--dmg D] [--release --team-id T]
+#   asura-release verify-release --version V --dmg D --revision R --team-id T
 #
 # No mode publishes: creating the tag and the GitHub release, uploading assets
 # and pushing the tap are the owner's manual commands (SGQ9, tools/release/README.md).
 # Every mode prints PASS, FAIL and NOTE lines and exits 1 when any check fails.
 # Nothing here calls `security`, reads a keychain or has a time bound; network
-# reads and brew calls end with their reply or Ctrl-C.
+# reads, disk image and brew calls end with their reply or Ctrl-C.
 set -eu
 umask 022
 PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH
@@ -35,20 +36,20 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P) || refuse 'cannot fin
 release=$root/tools/release
 cli_version=$(sed -n 's/^version = "\([0-9][0-9.]*\)"$/\1/p' "$root/rust/crates/asura-cli/Cargo.toml" | head -n 1)
 
-version= archive= kind= team= out= formula= revision=
+version= dmg= kind= team= out= cask= revision=
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --release|--ad-hoc)
             [ -z "$kind" ] || refuse 'exactly one of --release or --ad-hoc'
             kind=${1#--} ;;
-        --version|--archive|--team-id|--out|--formula|--revision)
+        --version|--dmg|--team-id|--out|--cask|--revision)
             [ "$#" -ge 2 ] && [ -n "$2" ] || refuse "$1 needs a value"
             case "$1" in
                 --version) version=$2 ;;
-                --archive) archive=$2 ;;
+                --dmg) dmg=$2 ;;
                 --team-id) team=$2 ;;
                 --out) out=$2 ;;
-                --formula) formula=$2 ;;
+                --cask) cask=$2 ;;
                 --revision) revision=$2 ;;
             esac
             shift ;;
@@ -61,16 +62,17 @@ need_version() {
     [ -n "$version" ] || refuse '--version V is required'
     printf '%s\n' "$version" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' || refuse 'the version must be MAJOR.MINOR.PATCH'
 }
-need_archive() {
-    [ -n "$archive" ] || refuse '--archive A is required'
-    [ -f "$archive" ] && [ ! -L "$archive" ] || refuse "the archive must be a regular file: $archive"
-    case "$archive" in /*) ;; *) archive=$(pwd -P)/$archive ;; esac
+need_dmg() {
+    [ -n "$dmg" ] || refuse '--dmg D is required'
+    [ -f "$dmg" ] && [ ! -L "$dmg" ] || refuse "the DMG must be a regular file: $dmg"
+    case "$dmg" in /*) ;; *) dmg=$(pwd -P)/$dmg ;; esac
 }
 need_team() {
     [ -n "$team" ] || refuse '--team-id T is required'
     printf '%s\n' "$team" | grep -Eqx '[A-Z0-9]{10}' || refuse 'the team ID must be ten upper-case letters or digits'
 }
-release_name() { printf 'asura-%s-macos-arm64.tar.gz' "$1"; }
+release_name() { printf 'Asura-%s.dmg' "$1"; }
+adhoc_name() { printf 'Asura-%s-adhoc-unstapled.dmg' "$1"; }
 sha() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
 # Hub bundle digest (release-signing.md#hub-bundle-digest-encoding).
 tree_sha() {
@@ -81,10 +83,11 @@ value() { /usr/libexec/PlistBuddy -c "Print :$1" "$2" 2>/dev/null; }
 details() { codesign -d --verbose=2 "$1" 2>&1; }
 has_line() { printf '%s\n' "$1" | grep -Eq -- "$2"; }
 scratch() { mktemp -d "${TMPDIR:-/tmp}/asura-release.XXXXXXXX"; }
+realpath_of() { /usr/bin/python3 -I -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
 
-# Release signature checks shared by `check` and `tap-test` (the Developer ID
-# authority of the team, a secure timestamp, the stapled ticket, Gatekeeper).
-release_signature_checks() { # APP TEAM
+# Developer ID authority of the team and a secure timestamp, for each signed
+# part of the app (shared by `check` and `tap-test`).
+app_signature_checks() { # APP TEAM
     for code in "$1" "$1/Contents/MacOS/asura-model" "$1/Contents/Resources/swift-transformers_Hub.bundle"; do
         info=$(details "$code")
         name=${code#"$1"}; name=${name:-/Asura.app}
@@ -92,14 +95,21 @@ release_signature_checks() { # APP TEAM
         check "$name: TeamIdentifier $2" has_line "$info" "^TeamIdentifier=$2\$"
         check "$name: secure timestamp" has_line "$info" '^Timestamp='
     done
-    check 'stapler validate' xcrun stapler validate "$1"
+}
+# Gatekeeper's execute assessment of an app: a PASS line in release mode, a
+# NOTE otherwise (an ad hoc app is rejected by design).
+gatekeeper_execute() { # APP KIND LABEL
     assessment=$(spctl --assess --type execute --verbose=2 "$1" 2>&1 || :)
-    check 'Gatekeeper accepts it as Notarized Developer ID' sh -c \
-        'printf "%s\n" "$1" | grep -q ": accepted$" && printf "%s\n" "$1" | grep -qx "source=Notarized Developer ID"' sh "$assessment"
+    if [ "$2" = release ]; then
+        check "$3: Gatekeeper accepts the app as Notarized Developer ID" sh -c \
+            'printf "%s\n" "$1" | grep -q ": accepted$" && printf "%s\n" "$1" | grep -qx "source=Notarized Developer ID"' sh "$assessment"
+    else
+        note "$3: Gatekeeper: $(printf '%s' "$assessment" | tr '\n' ' ')"
+    fi
 }
 
-# Digests inside a bundle against its manifest, and the bundle's version.
-package_checks() { # APP VERSION
+# Digests inside a bundle against its manifest.
+package_checks() { # APP
     manifest=$1/Contents/Resources/model-package.json
     field() { plutil -extract "$1" raw -o - "$manifest" 2>/dev/null; }
     check 'manifest format 0.1' [ "$(field format)" = 0.1 ]
@@ -110,51 +120,92 @@ package_checks() { # APP VERSION
 }
 
 # --- check -------------------------------------------------------------------
-check_archive() { # ARCHIVE VERSION KIND TEAM
-    a=$1 v=$2 k=$3 t=$4
-    base=$(basename -- "$a")
-    if [ "$k" = release ]; then expected=$(release_name "$v"); else expected=asura-$v-macos-arm64-adhoc-unstapled.tar.gz; fi
-    check "archive name is $expected" [ "$base" = "$expected" ]
-    sumfile=$a.sha256
+volume=
+eject_volume() {
+    if [ -n "$volume" ] && [ -d "$volume" ]; then
+        diskutil eject "$volume" >/dev/null 2>&1 || bad "eject the volume: run diskutil eject $volume"
+    fi
+    volume=
+}
+check_dmg() { # DMG VERSION KIND TEAM
+    d=$1 v=$2 k=$3 t=$4
+    base=$(basename -- "$d")
+    if [ "$k" = release ]; then expected=$(release_name "$v"); else expected=$(adhoc_name "$v"); fi
+    check "DMG name is $expected" [ "$base" = "$expected" ]
+    sumfile=$d.sha256
     if [ -f "$sumfile" ]; then
-        check 'the .sha256 file is one line for this archive' sh -c \
+        check 'the .sha256 file is one line for this DMG' sh -c \
             '[ "$(wc -l < "$1" | tr -d " ")" = 1 ] && grep -Eqx "[0-9a-f]{64}  $2" "$1"' sh "$sumfile" "$base"
-        check 'the archive matches its .sha256 file' [ "$(cut -d ' ' -f 1 < "$sumfile")" = "$(sha "$a")" ]
+        check 'the DMG matches its .sha256 file' [ "$(cut -d ' ' -f 1 < "$sumfile")" = "$(sha "$d")" ]
     else
-        bad "no $base.sha256 beside the archive"
+        bad "no $base.sha256 beside the DMG"
     fi
     x=$(scratch)
-    if ! tar -xzf "$a" -C "$x" 2>/dev/null; then
-        bad 'the archive extracts'
+    check 'hdiutil verify' hdiutil verify -quiet "$d"
+    if diskutil image info --plist "$d" > "$x/info.plist" 2>/dev/null; then
+        check 'image format UDZO' [ "$(plutil -extract 'Image Format' raw -o - "$x/info.plist" 2>/dev/null)" = UDZO ]
+        check 'one APFS volume named Asura' sh -c \
+            'plutil -convert json -o - "$1" | /usr/bin/python3 -I -c "import json,sys; p=json.load(sys.stdin)[\"Partitions\"]; v=[x for x in p if x.get(\"content-hint\")==\"Apple_APFS_Volume\"]; sys.exit(0 if len(v)==1 and v[0].get(\"volume-name\")==\"Asura\" else 1)"' sh "$x/info.plist"
+    else
+        bad 'diskutil image info reads the DMG'
+    fi
+    info=$(details "$d")
+    check 'DMG signature verifies' codesign --verify --strict "$d"
+    check 'DMG signing identifier org.pidster.asura.dmg' has_line "$info" '^Identifier=org.pidster.asura.dmg$'
+    dmg_gk=$(spctl --assess --type open --context context:primary-signature --verbose=2 "$d" 2>&1 || :)
+    if [ "$k" = release ]; then
+        check "DMG: Developer ID Application of team $t" has_line "$info" "^Authority=Developer ID Application: .*\\($t\\)\$"
+        check "DMG: TeamIdentifier $t" has_line "$info" "^TeamIdentifier=$t\$"
+        check 'DMG: secure timestamp' has_line "$info" '^Timestamp='
+        check 'DMG: stapler validate' xcrun stapler validate "$d"
+        check 'DMG: Gatekeeper accepts it as Notarized Developer ID' sh -c \
+            'printf "%s\n" "$1" | grep -q ": accepted$" && printf "%s\n" "$1" | grep -qx "source=Notarized Developer ID"' sh "$dmg_gk"
+    else
+        check 'DMG: ad hoc signature, no team' sh -c 'printf "%s\n" "$1" | grep -qx "Signature=adhoc" && printf "%s\n" "$1" | grep -qx "TeamIdentifier=not set"' sh "$info"
+        note "DMG: Gatekeeper: $(printf '%s' "$dmg_gk" | tr '\n' ' ')"
+    fi
+    volume=$x/volume
+    if ! diskutil image attach --readOnly --nobrowse --mountPoint "$volume" "$d" > "$x/attach.log" 2>&1; then
+        bad 'the DMG attaches read-only'; sed 's/^/  /' "$x/attach.log"
+        volume=
         rm -rf "$x"
         return
     fi
-    app=$x/Asura.app
+    pass 'the DMG attaches read-only'
+    diskutil info -plist "$volume" > "$x/volume.plist" 2>/dev/null || :
+    check 'volume name Asura' [ "$(plutil -extract VolumeName raw -o - "$x/volume.plist" 2>/dev/null)" = Asura ]
+    check 'volume file system APFS' [ "$(plutil -extract FilesystemType raw -o - "$x/volume.plist" 2>/dev/null)" = apfs ]
+    app=$volume/Asura.app
     contents=$app/Contents
-    check 'top level holds exactly Asura.app and LICENSE' [ "$(ls -A "$x" | LC_ALL=C sort | tr '\n' ' ')" = 'Asura.app LICENSE ' ]
-    check 'no link or special file' [ -z "$(find "$x" ! -type f ! -type d)" ]
-    # SG4-O1 (owner, 2026-10-29): no file may name the build host
+    check 'volume holds exactly Applications, Asura.app, LICENSE and README.txt' \
+        [ "$(ls -A "$volume" | LC_ALL=C sort | tr '\n' ' ')" = 'Applications Asura.app LICENSE README.txt ' ]
+    check 'Applications is a link to /Applications' sh -c '[ -L "$1" ] && [ "$(readlink "$1")" = /Applications ]' sh "$volume/Applications"
+    check 'no other link or special file' [ -z "$(find "$volume" ! -type f ! -type d ! -path "$volume/Applications")" ]
+    check "README.txt names version $v and the cask" sh -c \
+        'grep -Fq "Asura $2 " "$1" && grep -Fq "brew install --cask pidster/tap/asura" "$1"' sh "$volume/README.txt" "$v"
+    # SG4-O1 (owner, 2026-10-29), RS11: no file may name the build host
     # (release-signing.md#build-host-paths-sg4-o1).
-    if report=$(/usr/bin/python3 -I "$release/host-paths" --repository "$root" "$x/Asura.app" "$x/LICENSE" 2>&1); then
+    if report=$(/usr/bin/python3 -I "$release/host-paths" --repository "$root" "$volume" 2>&1); then
         pass 'no file holds the account home, the repository path or the user name (SG4-O1)'
     else
         bad 'no file holds the account home, the repository path or the user name (SG4-O1)'
-        printf '%s\n' "$report" | sed 's/^/  /'
+        printf '%s\n' "$report" | sed "s|^volume/|  |; s|^\([^ ]\)|  \1|"
     fi
-    required='LICENSE Asura.app/Contents/Info.plist Asura.app/Contents/_CodeSignature/CodeResources Asura.app/Contents/MacOS/asura Asura.app/Contents/MacOS/asura-model Asura.app/Contents/Resources/mlx.metallib Asura.app/Contents/Resources/model-package.json Asura.app/Contents/Resources/swift-transformers_Hub.bundle/Contents/Info.plist'
-    signed='Asura.app/Contents/CodeResources Asura.app/Contents/embedded.provisionprofile'
-    for path in $required; do check "manifest: $path" [ -f "$x/$path" ]; done
+    required='Asura.app/Contents/Info.plist Asura.app/Contents/_CodeSignature/CodeResources Asura.app/Contents/MacOS/asura Asura.app/Contents/MacOS/asura-model Asura.app/Contents/Resources/mlx.metallib Asura.app/Contents/Resources/model-package.json Asura.app/Contents/Resources/swift-transformers_Hub.bundle/Contents/Info.plist LICENSE README.txt'
+    signed='Asura.app/Contents/embedded.provisionprofile'
+    for path in $required; do check "manifest: $path" [ -f "$volume/$path" ]; done
     for path in $signed; do
-        if [ "$k" = release ]; then check "manifest: $path" [ -f "$x/$path" ]; else check "ad hoc: no $path" [ ! -e "$x/$path" ]; fi
+        if [ "$k" = release ]; then check "manifest: $path" [ -f "$volume/$path" ]; else check "ad hoc: no $path" [ ! -e "$volume/$path" ]; fi
     done
-    extra=$( (cd "$x" && find . -type f | sed 's|^\./||') | while IFS= read -r path; do
+    check 'the app carries no stapled ticket (the DMG holds it)' [ ! -e "$contents/CodeResources" ]
+    extra=$( (cd "$volume" && find . -type f | sed 's|^\./||') | while IFS= read -r path; do
         case " $required $signed " in (*" $path "*) continue ;; esac
         case "$path" in (Asura.app/Contents/Resources/swift-transformers_Hub.bundle/*) continue ;; esac
         printf '%s ' "$path"
     done)
     check "no undeclared file${extra:+ ($extra)}" [ -z "$extra" ]
-    machos=$( (cd "$x" && find . -type f | sed 's|^\./||' | LC_ALL=C sort) | while IFS= read -r path; do
-        case "$(file -b "$x/$path")" in (*Mach-O*) printf '%s ' "$path" ;; esac
+    machos=$( (cd "$volume" && find . -type f | sed 's|^\./||' | LC_ALL=C sort) | while IFS= read -r path; do
+        case "$(file -b "$volume/$path")" in (*Mach-O*) printf '%s ' "$path" ;; esac
     done)
     check 'exactly two Mach-O files: asura and asura-model' [ "$machos" = 'Asura.app/Contents/MacOS/asura Asura.app/Contents/MacOS/asura-model ' ]
     check 'bundle identifier org.pidster.asura' [ "$(value CFBundleIdentifier "$contents/Info.plist")" = org.pidster.asura ]
@@ -177,7 +228,7 @@ check_archive() { # ARCHIVE VERSION KIND TEAM
         rm -f "$x/actual.plist" "$x/expected.plist"
     done
     if [ "$k" = release ]; then
-        release_signature_checks "$app" "$t"
+        app_signature_checks "$app" "$t"
         p=$x/profile.plist
         if openssl smime -verify -noverify -inform DER -in "$contents/embedded.provisionprofile" -out "$p" 2>/dev/null; then
             check "profile team $t" sh -c 'plutil -extract TeamIdentifier json -o - "$1" | grep -Fq "\"$2\""' sh "$p" "$t"
@@ -188,7 +239,8 @@ check_archive() { # ARCHIVE VERSION KIND TEAM
             bad 'the embedded profile decodes'
         fi
     fi
-    package_checks "$app" "$v"
+    gatekeeper_execute "$app" "$k" 'app in the DMG'
+    package_checks "$app"
     manifest=$contents/Resources/model-package.json
     check 'schema digest equals contracts/model/v1/model.proto' [ "$(sha "$root/contracts/model/v1/model.proto")" = "$(plutil -extract schema_sha256 raw -o - "$manifest")" ]
     check 'asura embeds the helper and Hub digests and the build ID' /usr/bin/python3 -I -c \
@@ -197,7 +249,7 @@ check_archive() { # ARCHIVE VERSION KIND TEAM
         "$(plutil -extract hub_bundle_sha256 raw -o - "$manifest")" "$(plutil -extract build_id raw -o - "$manifest")"
     check "asura --version prints $v" [ "$("$contents/MacOS/asura" --version 2>/dev/null)" = "$v" ]
     record "version $v"
-    record "archive $base sha256 $(sha "$a")"
+    record "DMG $base sha256 $(sha "$d")"
     record "source revision $(git -C "$root" rev-parse HEAD) clean=$([ -z "$(git -C "$root" status --porcelain)" ] && echo yes || echo no)"
     record "Cargo.lock sha256 $(sha "$root/Cargo.lock")"
     [ ! -f "$root/swift/model-helper/Package.resolved" ] || record "Package.resolved sha256 $(sha "$root/swift/model-helper/Package.resolved")"
@@ -208,104 +260,113 @@ check_archive() { # ARCHIVE VERSION KIND TEAM
     for key in build_id helper_sha256 metallib_sha256 hub_bundle_sha256; do
         record "$key $(plutil -extract "$key" raw -o - "$manifest")"
     done
-    details "$app" | sed -n 's/^\(Authority=.*\)$/RECORD \1/p; s/^\(TeamIdentifier=.*\)$/RECORD \1/p; s/^\(Timestamp=.*\)$/RECORD \1/p'
-    submit=$(dirname -- "$a")/notary-submit.plist
+    details "$app" | sed -n 's/^\(Authority=.*\)$/RECORD app \1/p; s/^\(TeamIdentifier=.*\)$/RECORD app \1/p; s/^\(Timestamp=.*\)$/RECORD app \1/p'
+    printf '%s\n' "$info" | sed -n 's/^\(Authority=.*\)$/RECORD DMG \1/p; s/^\(TeamIdentifier=.*\)$/RECORD DMG \1/p; s/^\(Timestamp=.*\)$/RECORD DMG \1/p'
+    submit=$(dirname -- "$d")/notary-submit.plist
     if [ "$k" = release ] && [ -f "$submit" ]; then
         record "notary submission $(plutil -extract id raw -o - "$submit" 2>/dev/null || echo unknown) $(plutil -extract status raw -o - "$submit" 2>/dev/null || echo unknown)"
     fi
+    eject_volume
     rm -rf "$x"
 }
 
 # --- tap-test ------------------------------------------------------------------
+# ASURA_RELEASE_TEST_APPDIR stands in for /Applications in the --static
+# refusal cases only: with it set, tap-test always refuses before any change.
+appdir=${ASURA_RELEASE_TEST_APPDIR:-/Applications}
 tap_dir= installed=0
 tap_cleanup() {
     if [ "$installed" -eq 1 ]; then
-        brew uninstall --formula "$tap/asura" >/dev/null 2>&1 || bad 'cleanup: brew uninstall'
+        brew uninstall --cask "$tap/asura" >/dev/null 2>&1 || bad 'cleanup: brew uninstall --cask'
         installed=0
     fi
     if [ -n "$tap_dir" ]; then
-        brew untrust --formula "$tap/asura" >/dev/null 2>&1 || :
+        brew untrust --cask "$tap/asura" >/dev/null 2>&1 || :
         brew untap "$tap" >/dev/null 2>&1 || bad "cleanup: brew untap $tap"
         tap_dir=
     fi
-    trust=${XDG_CONFIG_HOME:-$HOME/.homebrew}/trust.json
+    trust=$HOME/.homebrew/trust.json
     [ -n "${XDG_CONFIG_HOME:-}" ] && trust=$XDG_CONFIG_HOME/homebrew/trust.json
     check "cleanup: no $tap entry left in the Homebrew trust list" sh -c '[ ! -f "$1" ] || ! grep -Fq "$2" "$1"' sh "$trust" "$tap"
-    rm -rf "$x"
+    check "cleanup: the tap $tap is gone" sh -c '! brew tap | grep -qx "$1"' sh "$tap"
+    check 'cleanup: no asura cask installed' sh -c '! brew list --cask asura' sh
+    if [ -e "$appdir/Asura.app" ] || [ -L "$appdir/Asura.app" ]; then bad "cleanup: $appdir/Asura.app absent afterwards"; else pass "cleanup: $appdir/Asura.app absent afterwards"; fi
     if [ -e "$prefix/bin/asura" ] || [ -L "$prefix/bin/asura" ]; then bad 'cleanup: bin/asura absent afterwards'; else pass 'cleanup: bin/asura absent afterwards'; fi
+    rm -rf "$x"
 }
 no_install() { # LABEL
-    check "$1: no asura formula installed" sh -c '! brew list --formula asura' sh
+    check "$1: no asura cask installed" sh -c '! brew list --cask asura' sh
+    check "$1: no $appdir/Asura.app" sh -c '[ ! -e "$1" ] && [ ! -L "$1" ]' sh "$appdir/Asura.app"
     check "$1: no bin/asura link" sh -c '[ ! -e "$1" ] && [ ! -L "$1" ]' sh "$prefix/bin/asura"
 }
 tap_test() {
     export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1
     command -v brew >/dev/null 2>&1 || refuse 'brew is not on PATH'
     prefix=$(brew --prefix)
+    [ ! -e "$appdir/Asura.app" ] && [ ! -L "$appdir/Asura.app" ] || refuse "$appdir/Asura.app exists; remove it first"
     [ ! -e "$prefix/bin/asura" ] && [ ! -L "$prefix/bin/asura" ] || refuse "$prefix/bin/asura exists; remove it first"
+    ! brew list --cask asura >/dev/null 2>&1 || refuse 'a cask named asura is installed; uninstall it first'
     ! brew list --formula asura >/dev/null 2>&1 || refuse 'a formula named asura is installed; uninstall it first'
     ! brew tap | grep -qx "$tap" || refuse "the tap $tap exists; untap it first"
+    [ -z "${ASURA_RELEASE_TEST_APPDIR:-}" ] || refuse 'ASURA_RELEASE_TEST_APPDIR is for refusal tests only; nothing was installed'
     trap 'tap_cleanup; finish; exit $?' EXIT
     trap 'exit 130' INT TERM
     note "Homebrew $(brew --version | head -n 1)"
     brew tap-new --no-git "$tap" >/dev/null || { bad "brew tap-new $tap"; return; }
     tap_dir=$(brew --repository "$tap")
-    # Trust only this formula of the local test tap; cleanup removes the entry.
-    brew trust --formula "$tap/asura" >/dev/null 2>&1 || { bad "brew trust --formula $tap/asura"; return; }
-    target=$tap_dir/Formula/asura.rb
-    # Audit the formula exactly as it would be published.
-    cp "$formula" "$target"
-    online=; [ -n "$archive" ] || online=--online
-    if brew audit --formula --strict $online "$tap/asura" > "$x/audit.log" 2>&1; then
-        pass "brew audit --strict${online:+ $online}"
+    mkdir -p "$tap_dir/Casks"
+    # Trust only this cask of the local test tap; cleanup removes the entry.
+    brew trust --cask "$tap/asura" >/dev/null 2>&1 || { bad "brew trust --cask $tap/asura"; return; }
+    target=$tap_dir/Casks/asura.rb
+    # Audit the cask exactly as it would be published.
+    cp "$cask" "$target"
+    online=; [ -n "$dmg" ] || online=--online
+    if brew audit --cask --strict $online "$tap/asura" > "$x/audit.log" 2>&1; then
+        pass "brew audit --cask --strict${online:+ $online}"
     else
-        bad "brew audit --strict${online:+ $online}"; sed 's/^/  /' "$x/audit.log"
+        bad "brew audit --cask --strict${online:+ $online}"; sed 's/^/  /' "$x/audit.log"
     fi
-    if [ -n "$archive" ]; then
-        # Prepublication: only the url line changes (a file URL), plus the version
-        # that Homebrew can no longer read from the published asset name.
-        sed "s|^  url \".*\"\$|  url \"file://$archive\"\\
-  version \"$version\"|" "$formula" > "$x/asura.rb"
-        changed=$(diff "$formula" "$x/asura.rb" | grep -E '^[<>]' | sed 's/^\([<>]\) *\([a-z0-9]*\) .*/\1\2/' | tr '\n' ' ' || :)
-        check 'the tap copy changes only the url (and adds the version)' [ "$changed" = '<url >url >version ' ]
+    if [ -n "$dmg" ]; then
+        # Prepublication: only the url line changes, to a file URL.
+        sed "s|^  url \".*\"\$|  url \"file://$dmg\"|" "$cask" > "$x/asura.rb"
+        changed=$(diff "$cask" "$x/asura.rb" | grep -E '^[<>]' | sed 's/^\([<>]\) *\([a-z0-9_]*\) .*/\1\2/' | tr '\n' ' ' || :)
+        check 'the tap copy changes only the url' [ "$changed" = '<url >url ' ]
     else
-        cp "$formula" "$x/asura.rb"
+        cp "$cask" "$x/asura.rb"
     fi
     # HD5: a digest mismatch fails the install and leaves nothing installed.
     sed 's/^  sha256 "[0-9a-f]*"$/  sha256 "'"$(printf '0%.0s' $(seq 64))"'"/' "$x/asura.rb" > "$target"
-    if brew install --formula "$tap/asura" > "$x/hd5.log" 2>&1; then
+    if brew install --cask "$tap/asura" > "$x/hd5.log" 2>&1; then
         installed=1
         bad 'HD5: an install with a wrong digest fails'
         return
     fi
     pass 'HD5: an install with a wrong digest fails'
-    if grep -Eqi 'checksum (mismatch|of downloaded file)|reports different checksum' "$x/hd5.log"; then
+    if grep -Eqi 'checksum (mismatch|of downloaded file)|reports different checksum|SHA-?256 mismatch' "$x/hd5.log"; then
         pass 'HD5: Homebrew reports the checksum mismatch'
     else
         bad 'HD5: Homebrew reports the checksum mismatch'; tail -n 15 "$x/hd5.log" | sed 's/^/  /'
     fi
     no_install 'HD5'
     cp "$x/asura.rb" "$target"
-    if brew install --formula "$tap/asura"; then
+    if brew install --cask "$tap/asura" > "$x/install.log" 2>&1; then
         installed=1
-        pass 'brew install'
+        pass "brew install --cask $tap/asura"
     else
-        bad 'brew install'
+        bad "brew install --cask $tap/asura"; tail -n 20 "$x/install.log" | sed 's/^/  /'
+        # A failed install may still leave files; cleanup checks for them.
+        installed=1
         return
     fi
-    check 'brew test' brew test "$tap/asura"
-    opt=$(brew --prefix "$tap/asura")
-    app=$opt/libexec/Asura.app
-    check 'bin/asura resolves into the keg Asura.app' [ "$(/usr/bin/python3 -I -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$prefix/bin/asura")" = \
-        "$(/usr/bin/python3 -I -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$app/Contents/MacOS/asura")" ]
-    package_checks "$app" "$version"
+    app=$appdir/Asura.app
+    check "$app exists" [ -d "$app" ]
+    check 'bin/asura is a link' [ -L "$prefix/bin/asura" ]
+    check "bin/asura resolves to $app/Contents/MacOS/asura" [ "$(realpath_of "$prefix/bin/asura")" = "$(realpath_of "$app/Contents/MacOS/asura")" ]
+    package_checks "$app"
     check "bin/asura --version prints $version" [ "$("$prefix/bin/asura" --version 2>/dev/null)" = "$version" ]
-    [ "$kind" != release ] || release_signature_checks "$app" "$team"
-    note "keg quarantine attributes: $(xattr -lr "$app" 2>/dev/null | grep -c com.apple.quarantine || :)"
-    cache=$(brew --cache "$tap/asura" 2>/dev/null || :)
-    if [ -n "$cache" ] && [ -e "$cache" ]; then
-        note "download cache attributes: $(xattr "$cache" 2>/dev/null | tr '\n' ' ')"
-    fi
+    [ "$kind" != release ] || app_signature_checks "$app" "$team"
+    note "installed app quarantine: $(xattr -p com.apple.quarantine "$app" 2>/dev/null || echo none)"
+    gatekeeper_execute "$app" "${kind:-ad-hoc}" 'installed app'
 }
 
 # --- modes ---------------------------------------------------------------------
@@ -326,42 +387,45 @@ case "$mode" in
             [ "$(gh api "repos/$repo/immutable-releases" --jq .enabled 2>/dev/null || :)" = true ]
         finish ;;
     check)
-        need_version; need_archive
+        need_version; need_dmg
         [ -n "$kind" ] || refuse 'choose --release or --ad-hoc'
         if [ "$kind" = release ]; then need_team; else [ -z "$team" ] || refuse 'the ad hoc check takes no team ID'; fi
-        check_archive "$archive" "$version" "$kind" "$team"
+        trap 'eject_volume' EXIT
+        trap 'exit 130' INT TERM
+        check_dmg "$dmg" "$version" "$kind" "$team"
         finish ;;
-    formula)
-        need_version; need_archive
+    cask)
+        need_version; need_dmg
         [ -n "$out" ] || refuse '--out FILE is required'
         [ ! -e "$out" ] && [ ! -L "$out" ] || refuse "the output must not exist: $out"
-        [ -f "$archive.sha256" ] || refuse "no $(basename -- "$archive").sha256 beside the archive"
-        digest=$(sha "$archive")
-        [ "$(cut -d ' ' -f 1 < "$archive.sha256")" = "$digest" ] || refuse 'the archive does not match its .sha256 file'
-        case "$(basename -- "$archive")" in
+        [ -f "$dmg.sha256" ] || refuse "no $(basename -- "$dmg").sha256 beside the DMG"
+        digest=$(sha "$dmg")
+        [ "$(cut -d ' ' -f 1 < "$dmg.sha256")" = "$digest" ] || refuse 'the DMG does not match its .sha256 file'
+        case "$(basename -- "$dmg")" in
             "$(release_name "$version")") ;;
-            "asura-$version-macos-arm64-adhoc-unstapled.tar.gz") note 'an ad hoc archive: this formula is for a local tap test only; never publish it' ;;
-            *) refuse "the archive name does not match version $version" ;;
+            "$(adhoc_name "$version")") note 'an ad hoc DMG: this cask is for a local tap test only; never publish it' ;;
+            *) refuse "the DMG name does not match version $version" ;;
         esac
         sed -e "s/@VERSION@/$version/g" -e "s/@SHA256@/$digest/g" "$release/asura.rb.in" > "$out"
-        if grep -q '@' "$out"; then rm -f "$out"; refuse 'a template placeholder is left'; fi
-        pass "formula written: $out (version $version, sha256 $digest)"
+        if grep -q '@[A-Z0-9_]*@' "$out"; then rm -f "$out"; refuse 'a template placeholder is left'; fi
+        pass "cask written: $out (version $version, sha256 $digest)"
         finish ;;
     tap-test)
         need_version
-        [ -n "$formula" ] && [ -f "$formula" ] || refuse '--formula F must name the generated formula'
-        grep -Fqx "  url \"https://github.com/$repo/releases/download/v$version/$(release_name "$version")\"" "$formula" ||
-            refuse "the formula url is not the v$version release asset"
-        if [ -n "$archive" ]; then need_archive; fi
+        [ -n "$cask" ] && [ -f "$cask" ] || refuse '--cask F must name the generated cask'
+        grep -Fqx "  version \"$version\"" "$cask" || refuse "the cask version is not $version"
+        grep -Fqx '  url "https://github.com/pidster/asura/releases/download/v#{version}/Asura-#{version}.dmg"' "$cask" ||
+            refuse 'the cask url is not the release asset'
+        if [ -n "$dmg" ]; then need_dmg; fi
         if [ "$kind" = release ]; then need_team; elif [ -n "$kind" ]; then refuse 'tap-test takes --release or nothing'; fi
         x=$(scratch)
         tap_test
         exit 0 ;;
     verify-release)
-        need_version; need_archive; need_team
+        need_version; need_dmg; need_team
         [ -n "$revision" ] || refuse '--revision R is required'
         name=$(release_name "$version")
-        [ "$(basename -- "$archive")" = "$name" ] || refuse "the local archive must be $name"
+        [ "$(basename -- "$dmg")" = "$name" ] || refuse "the local DMG must be $name"
         view=$(gh release view "v$version" -R "$repo" --json isDraft,isImmutable,tagName,assets \
             --jq '"\(.isDraft) \(.isImmutable) \(.tagName) \([.assets[].name] | sort | join(","))"' 2>/dev/null || :)
         [ -n "$view" ] || bad "GitHub release v$version is readable"
@@ -369,21 +433,22 @@ case "$mode" in
         check 'the release is published, not a draft' [ "${1:-}" = false ]
         check 'the release is immutable (HD12)' [ "${2:-}" = true ]
         check "the release tag is v$version" [ "${3:-}" = "v$version" ]
-        check 'the release holds exactly the archive and its .sha256' [ "${4:-}" = "$name,$name.sha256" ]
+        check 'the release holds exactly the DMG and its .sha256' [ "${4:-}" = "$name,$name.sha256" ]
         tagged=$(git -C "$root" ls-remote origin "refs/tags/v$version^{}" "refs/tags/v$version" | sort -r -k 2 | head -n 1 | cut -f 1)
         check "tag v$version points to $revision" [ "$tagged" = "$revision" ]
-        d=$(scratch)
+        dl=$(scratch)
+        trap 'eject_volume; rm -rf "$dl"' EXIT
+        trap 'exit 130' INT TERM
         base_url=https://github.com/$repo/releases/download/v$version
-        if curl -fsSL -o "$d/$name" "$base_url/$name" && curl -fsSL -o "$d/$name.sha256" "$base_url/$name.sha256"; then
+        if curl -fsSL -o "$dl/$name" "$base_url/$name" && curl -fsSL -o "$dl/$name.sha256" "$base_url/$name.sha256"; then
             pass 'the assets download over HTTPS'
-            check 'the downloaded archive equals the local archive (HD13)' [ "$(sha "$d/$name")" = "$(sha "$archive")" ]
-            check 'the published .sha256 equals the local .sha256' cmp -s "$d/$name.sha256" "$archive.sha256"
-            note "download quarantine attributes: $(xattr "$d/$name" 2>/dev/null | tr '\n' ' ')"
-            check_archive "$d/$name" "$version" release "$team"
+            check 'the downloaded DMG equals the local DMG (HD13)' [ "$(sha "$dl/$name")" = "$(sha "$dmg")" ]
+            check 'the published .sha256 equals the local .sha256' cmp -s "$dl/$name.sha256" "$dmg.sha256"
+            note "download quarantine attributes: $(xattr "$dl/$name" 2>/dev/null | tr '\n' ' ')"
+            check_dmg "$dl/$name" "$version" release "$team"
         else
             bad 'the assets download over HTTPS'
         fi
-        rm -rf "$d"
         finish ;;
-    *) sed -n '2,16p' "$0" >&2; exit 2 ;;
+    *) sed -n '2,17p' "$0" >&2; exit 2 ;;
 esac
