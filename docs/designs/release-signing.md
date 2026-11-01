@@ -1056,8 +1056,8 @@ hold with the owner.
 | Disk image verbs | `hdiutil create` and `hdiutil verify`; `diskutil image info`, `diskutil image attach --readOnly --nobrowse --mountPoint` and `diskutil eject` | On macOS 27.0, `hdiutil imageinfo`, `attach` and `detach` print "is deprecated. Please use 'diskutil …' instead"; `create` and `verify` print no warning. A read-only, non-browsed mount adds no `.fseventsd` or other hidden entry |
 | Asset names | `Asura-<version>.dmg` and `Asura-<version>.dmg.sha256` | Owner example; the same form as Wisp's DMG. One architecture is supported, so the name carries none |
 | Checksum rule | One `shasum -a 256` line: 64 lower-case hex digits, two spaces, the DMG name | Unchanged from SG4. `hdiutil` leaves a `com.apple.FinderInfo` attribute on the DMG; extended attributes are not part of the file bytes or the upload |
-| Cask stanzas | See [cask](#cask) | `brew audit --cask --strict` of the template ([SG6 delivery](#sg6-delivery)); the cask `desc` audit refuses "macOS"; `depends_on macos:` defaults to `>=` (Homebrew `Cask::DSL::DependsOn`) |
-| Quarantine | Homebrew always quarantines a cask download | `Cask::Download#quarantine` calls `Quarantine.cask!` for every download, and installation propagates the attribute to the installed app; Homebrew 7.0.11 has no `--no-quarantine` option. Gatekeeper therefore assesses `/Applications/Asura.app` |
+| Cask stanzas | See [cask](#cask) | `brew audit --cask --strict` passed on the generated cask ([SG6 delivery](#sg6-delivery)); the cask `desc` audit refuses "macOS"; `depends_on macos:` defaults to `>=` (Homebrew `Cask::DSL::DependsOn`) |
+| Quarantine | Homebrew always quarantines a cask download | `Cask::Download#quarantine` calls `Quarantine.cask!` for every download, and installation propagates the attribute to the installed app; Homebrew 7.0.11 has no `--no-quarantine` option. Gatekeeper therefore assesses `/Applications/Asura.app`. Measured: both test installs carried `com.apple.quarantine` flag `0181`; Gatekeeper accepted the notarised app as `Notarized Developer ID` and rejected the ad hoc app ([SG6 delivery](#sg6-delivery)) |
 | `zap` | None; `~/.asura` is kept | Open owner question, default keep ([SG6 open items](#sg6-open-items)) |
 
 #### DMG build
@@ -2622,7 +2622,7 @@ after. No tag, GitHub release, asset or tap commit was created; the owner's
 - `tools/release/asura-bundle`: the development `get-task-allow` fix and the
   final `asura-bundle: step=done` line.
 - `tools/release/asura-release` and `tools/release/asura.rb.in`
-  ([modes](#sg4-asura-release-modes), [formula](#formula)).
+  ([modes](#sg4-asura-release-modes); the formula, replaced by the [cask](#cask) in SG6).
 - `tools/release/test-asura-bundle`: SG4 static checks, and the ad hoc
   archive check and formula under `--bundle`.
 - `asura-cli`: `asura --version` ([contract](#asura---version)).
@@ -2776,6 +2776,62 @@ Proof limits and residual risks:
   check and the clean-host install (HD1, HD12, HD13) remain the owner's.
   Immutable releases stay disabled (SG4-O2).
 
+### SG6 delivery
+
+Delivered 2026-11-01 on the SG6 worktree branch, on the owner's Mac (macOS
+27.0 26A428, Apple silicon, Xcode 27.1 27A9275, Homebrew 7.0.11-10-g20e162d,
+rustc 1.98.0, Apple Swift 6.4), by a delegated agent with the owner's
+authority to sign with the team's Developer ID Application identity and to
+make one notary submission of a release-mode DMG. `security list-keychains
+-d user` listed only the login keychain before and after. No tag, GitHub
+release, upload, push or tap change was made; `pidster/tap` and
+`pidster/homebrew-tap` were not touched. The Asura service was not started
+and `~/.asura` was not used: the only Asura process was `asura --version`.
+`gh release list` and the tag list of `pidster/asura` were empty (no 0.1.0
+or other tag or release exists).
+
+- Version: the first release is 0.0.1 (owner, 2026-11-01): crate versions,
+  `Cargo.lock`, the helper's `--version` and the `asura/<version>` test
+  build strings.
+- `tools/release/asura-bundle` steps 10 to 13, `asura-release` (`check`,
+  `cask`, `tap-test`, `verify-release` for the DMG and the cask),
+  `asura.rb.in` (the cask), `dmg-readme.txt.in`, `test-asura-bundle`,
+  README. The archive and formula code is removed.
+- The SG-V9 unit case names `/Applications/Asura.app`; the HD8 test note
+  names the cask.
+
+| Case | Layer | Evidence |
+| --- | --- | --- |
+| SG-V11, SG-V12, HD10 | Unit | `test-asura-bundle --static`: 141 passed, 0 failed (cask and read-me templates, no archive or formula code, no publishing command, 15 `asura-release` refusals including the removed `--archive` and `formula` and an existing `Asura.app`, the generated cask, the scanner cases and the planted and clean DMGs) |
+| SG-V11, SG-V12, HD9 | Integration | Ad hoc dry run `asura-bundle --ad-hoc` (`.build/bundles/dry-run-1`, before the code commit; repeated as `dry-run-2` from `c00ac7a`): `step=done`, `Asura-0.0.1-adhoc-unstapled.dmg`. `asura-release check --ad-hoc`: 51 passed, 0 failed (UDZO, one APFS volume `Asura`, ad hoc DMG signature `org.pidster.asura.dmg`, the four volume entries and the `/Applications` link, the path rule, manifest, entitlements, digests, `asura --version` 0.0.1, eject). `test-asura-bundle --bundle`: 52 passed, 0 failed, including the planted `LICENSE` DMG that fails only the path rule. Gatekeeper rejects the ad hoc DMG and app (`NOTE`) |
+| SG-V11, HD1, HD5, HD8, HD9 | Integration | `tap-test --dmg` with the ad hoc DMG: 22 passed, 0 failed. `brew audit --cask --strict` passes; the wrong-digest install fails with Homebrew's checksum error and leaves no app, link or cask; `brew install --cask` puts `Asura.app` in `/Applications` and links `bin/asura` to `Contents/MacOS/asura`; signature, digests and `bin/asura --version` pass; cleanup leaves no app, link, cask, tap or trust entry. The installed app carried `com.apple.quarantine` `0181;…;Homebrew Cask;…`; Gatekeeper rejected it, and `asura --version` still ran from this shell |
+| SG-V11, SG-V12, HD9, RS12 | End to end | `asura-bundle --release` from the clean tree at `c00ac7a`: one notary submission of the DMG, `51778283-667f-4277-81ed-3e2c03879e56`, `Accepted`, log `issues: null`; its ticket lists the DMG, `Asura.app`, `asura`, `asura-model` and the Hub bundle. The DMG was stapled; `stapler validate` and `spctl --assess --type open` (`Notarized Developer ID`) passed; `step=done`. DMG SHA-256 `775e8672…3012940`, build ID `3e9f548b…bb8bfd7d`, helper `72426878…ef870d82` |
+| SG-V11, HD9 | End to end | `asura-release check --release --team-id LFQFWCB8Y3 --version 0.0.1`: 67 passed, 0 failed: the DMG's Developer ID signature, timestamp, stapled ticket and Gatekeeper `open`; the volume, manifest and path rule; the app's Developer ID signatures and timestamps, profile, entitlements and digests; Gatekeeper `execute` accepts the unstapled app as `Notarized Developer ID` (online ticket); `asura --version` 0.0.1 |
+| SG-V11, HD1, HD5, HD8, HD9 | End to end | `tap-test --dmg --release`: 32 passed, 0 failed: audit, HD5, install into `/Applications`, link, digests, `bin/asura --version` 0.0.1, Developer ID authority and timestamp of the app, helper and Hub bundle, and Gatekeeper accepts the installed, quarantined app (`0181;…;;…`) as `Notarized Developer ID`; cleanup complete |
+| Gate | — | `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings` with and without `--all-features`; `swift test --package-path swift/model-helper` (127 tests). `cargo test --workspace --all-features --no-fail-fast --locked`: 42 suites, 1,633 passed, 3 ignored; one target failed, `asura-cli --test lifecycle`, in the `--path-guard` PTY journey (`tui_pty.py` line 5349: the `!! make` job was still running when the journey sent Esc). The same journey fails the same way when built from the base commit `f8d1412` (two runs), so it predates SG6; reruns of the target alone failed again (twice at that line, once in `--queue-reorder`) on a host with load average about 7. The native targets used a development helper package built from the generated sources (README steps 4 to 6), copied beside the test binaries. A second dry run from the committed scripts repeated `--static` (141), `--bundle` (52), `check --ad-hoc` (51) and the ad hoc `tap-test` (22), all with 0 failed |
+
+Proof limits:
+
+- Not run (owner, publication on hold): `verify-release`, the HTTPS tap test
+  with `brew audit --cask --strict --online`, the tap commit and the
+  clean-host install (HD1 end to end, HD13).
+- SG6-O2: Gatekeeper accepted the installed app with the network on. The
+  offline first launch of the unstapled app is not proven.
+- The service, the guardian and the helper never ran from
+  `/Applications/Asura.app`. The resource lookup from
+  `/Applications/Asura.app/Contents/Resources` rests on the SG-V9 unit case
+  and the path-only rule (SG-F5); the `--sandbox` journey was not run on the
+  installed app. KC-P2 remains the evidence that a `bin/asura` link start
+  keeps the entitlements.
+- The quarantine agent name differed between the ad hoc install (`Homebrew
+  Cask`) and the release install (empty). Both carried the quarantine flag;
+  the cause was not investigated.
+- The DMG is not byte-reproducible; the published digest is per build.
+- The first `test-asura-bundle --bundle` run on `dry-run-1` stopped without
+  a count line after the build-host rule check (exit 1); the cause was not
+  captured. The planted-DMG steps now report a `FAIL` with the `hdiutil`
+  output instead of exiting under `set -e`. Every later run passed.
+
 ## Design verification
 
 Recorded on 2026-10-23. Written from the draft of the same day and the owner's
@@ -2869,5 +2925,24 @@ SG5 results and delivery, SG-V4, SG-V6, SG-V8, SG-V9, the SG5 owned paths and
 readiness, and a note on the SG3 delivery. Diagram SG-F12 was rendered with
 Mermaid CLI 12.0.0 (`mmdc -s 2`) into a temporary directory outside the
 repository and inspected.
+
+Updated 2026-11-01 for packet SG6, after the owner decisions of 2026-10-31
+and 2026-11-01 (DMG primary, cask, Developer ID, first release 0.0.1).
+Evidence: Apple's "Customizing the notarization workflow" and "Packaging Mac
+software for distribution" (read on 2026-11-01 through the documentation
+JSON); the Homebrew 7.0.11 sources (`cask/audit.rb`, `cask/download.rb`,
+`cask/quarantine.rb`, `cask/dsl/depends_on.rb`, the `desc` RuboCop helper);
+Wisp's `scripts/wisp-dmg`, `scripts/release`, ADR 0069, ADR 0072,
+`docs/release.md` and `docs/guide/install.md` (read only); `hdiutil` and
+`diskutil` on macOS 27.0; and the runs in the [SG6 delivery](#sg6-delivery).
+Changed: the status block, the open items, RS11, RS12, D-S4, the bundle
+layout note, SG-O1, SG-F1, the Apple facts, the modes table, steps 10 to 13,
+SG-F4, the SG4 section (DMG manifest, modes, DMG check, local tap test,
+cask, SG-F9, SG-F10, failure handling, open items), the scanner users,
+SG-F11, the new [SG6 section](#sg6-dmg-and-cask) (SG-O2, SG-F13), limits,
+AE-02, AE-04, SG-V11, SG-V12, SG-P, the packet table and readiness. Diagrams
+SG-O1, SG-F1, SG-F4, SG-F9, SG-F10, SG-F11, SG-O2, SG-F13 and SG-P were
+rendered with the local Mermaid CLI (`mmdc -s 2`) into a temporary directory
+outside the repository and inspected; they set no colour.
 
 Return to the [design index](README.md).
