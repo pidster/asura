@@ -27,7 +27,10 @@ parallel implementation used only by tests.
 This rule covers all format, API and protocol version numbers. The wire protocol
 stays at **0.1**. The journal format stays at **1**. Change these or other format,
 API or protocol version numbers only on the repository owner's explicit instruction.
-Feature work and schema changes do not authorize a number increase.
+Feature work and schema changes do not authorize a number increase. The owner
+decided on 2026-11-01 that protocol 0.1 and journal format 1 stay the same until
+release 1.0.0, whatever breaking changes are made before it. Pre-1.0 releases,
+starting with 0.0.1, do not change them.
 
 Schemas and operations may evolve within the current numbers for authorized feature
 work. Follow the normal design, ownership and testing rules. Keep producers,
