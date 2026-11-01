@@ -166,15 +166,16 @@ pub enum DeleteReply {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NamedPutReply {
     Stored,
-    /// A replace deleted the old item and added the new one.
+    /// A replace updated the item's data in place.
     Replaced,
     /// The name exists and the put did not ask to replace it.
     Exists,
+    /// A replace found no item of this name (never stored, or removed
+    /// before the update); nothing was written.
+    Absent,
     /// 64 named secrets or 256 items exist.
     Full,
-    /// A replace deleted the old item, then the add failed: the name is
-    /// absent.
-    ReplaceFailed(StoreFailure),
+    /// No item changed. For a replace, the stored value is the old one.
     Failed(StoreFailure),
 }
 

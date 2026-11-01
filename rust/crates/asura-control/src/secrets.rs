@@ -55,9 +55,7 @@ pub(crate) fn valid(body: &Body) -> bool {
                     .iter()
                     .all(|n| !n.is_empty() && n.len() <= MAX_NAME_BYTES)
                 && match result {
-                    R::Locked | R::Unavailable | R::Denied | R::ReplaceFailed => {
-                        v.status.is_some_and(|s| s > 0)
-                    }
+                    R::Locked | R::Unavailable | R::Denied => v.status.is_some_and(|s| s > 0),
                     _ => v.status.is_none(),
                 }
         }

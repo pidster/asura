@@ -72,19 +72,28 @@ pub(super) fn reply_notice(kind: &Kind, reply: &pb::SecretReply) -> String {
         R::Removed => format!(
             "Removed the named secret {name}. Commands already queued keep their copy."
         ),
+        R::Absent if matches!(kind, Kind::Replace(_)) => format!(
+            "No named secret {name} exists to replace. Store it with /secrets store {name}."
+        ),
         R::Absent => format!("No named secret {name} exists."),
         R::Listed => "Secrets".into(),
-        R::ReplaceFailed => format!(
-            "{name} could not be replaced and is no longer stored: the Keychain failed (OSStatus -{status}). Store it again with /secrets store {name}."
-        ),
-        R::Locked => "The Keychain is locked until this Mac is unlocked after start-up. Unlock it, then try again.".into(),
-        R::NotSigned => "This Asura build is not signed for the Keychain, so it cannot store secrets.".into(),
-        R::Unavailable => format!("The Keychain is unavailable (OSStatus -{status})."),
-        R::Denied => "macOS denied Asura access to the Keychain item.".into(),
+        R::Locked => unchanged(kind, &name, "The Keychain is locked until this Mac is unlocked after start-up. Unlock it, then try again."),
+        R::NotSigned => unchanged(kind, &name, "This Asura build is not signed for the Keychain, so it cannot store secrets."),
+        R::Unavailable => unchanged(kind, &name, &format!("The Keychain is unavailable (OSStatus -{status}).")),
+        R::Denied => unchanged(kind, &name, "macOS denied Asura access to the Keychain item."),
         R::Full => "The secret store is full: 64 named secrets or 256 items. Remove one with /secrets remove NAME.".into(),
         R::Busy => "Keychain requests are queued; try again.".into(),
         R::Invalid => format!("{name} {INVALID}"),
         R::Unspecified => "Secrets request failed.".into(),
+    }
+}
+
+/// A Keychain failure's notice; after a replace it adds that the stored value
+/// is unchanged (named-secrets.md, replace in place).
+fn unchanged(kind: &Kind, name: &str, reason: &str) -> String {
+    match kind {
+        Kind::Replace(_) => format!("{reason} The named secret {name} is unchanged."),
+        _ => reason.to_owned(),
     }
 }
 
@@ -256,8 +265,42 @@ mod tests {
             reply_notice(&store, &reply(R::Exists, None)),
             "A named secret GITHUB_TOKEN exists. Replace it with /secrets replace GITHUB_TOKEN, or keep it."
         );
-        assert!(reply_notice(&store, &reply(R::ReplaceFailed, Some(25_291))).contains("-25291"));
+        assert_eq!(
+            reply_notice(&store, &reply(R::Unavailable, Some(25_291))),
+            "The Keychain is unavailable (OSStatus -25291)."
+        );
         assert!(reply_notice(&store, &reply(R::Locked, Some(25_308))).contains("locked"));
+        // Replace in place: a failure says the stored value is unchanged;
+        // a missing name names the store command.
+        let replace = Kind::Replace("GITHUB_TOKEN".into());
+        assert_eq!(
+            reply_notice(&replace, &reply(R::Replaced, None)),
+            "Replaced the named secret GITHUB_TOKEN."
+        );
+        assert_eq!(
+            reply_notice(&replace, &reply(R::Unavailable, Some(25_291))),
+            "The Keychain is unavailable (OSStatus -25291). The named secret GITHUB_TOKEN is unchanged."
+        );
+        assert_eq!(
+            reply_notice(&replace, &reply(R::Locked, Some(25_308))),
+            "The Keychain is locked until this Mac is unlocked after start-up. Unlock it, then try again. The named secret GITHUB_TOKEN is unchanged."
+        );
+        for result in [R::NotSigned, R::Denied] {
+            assert!(
+                reply_notice(&replace, &reply(result, Some(1)))
+                    .ends_with("The named secret GITHUB_TOKEN is unchanged."),
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            reply_notice(&replace, &reply(R::Absent, None)),
+            "No named secret GITHUB_TOKEN exists to replace. Store it with /secrets store GITHUB_TOKEN."
+        );
+        let remove = Kind::Remove("GITHUB_TOKEN".into());
+        assert_eq!(
+            reply_notice(&remove, &reply(R::Absent, None)),
+            "No named secret GITHUB_TOKEN exists."
+        );
         assert!(reply_notice(&store, &reply(R::NotSigned, None)).contains("not signed"));
         assert!(reply_notice(&store, &reply(R::Full, None)).contains("64 named secrets"));
         let launch = Launch::scanned(

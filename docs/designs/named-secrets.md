@@ -9,6 +9,13 @@ also records the resolution of the secrets study's question OD-10 (AD-10) for
 named references in person commands. Protocol numbering remains `0.1`;
 journal format remains `1`.
 
+Revision of 2026-11-01, replace in place (selected, engineering): a replace
+changes the stored item's data with one `SecItemUpdate` call instead of a
+delete then an add, so a failed replace keeps the old value. The reply
+`replace_failed` and `SECRET_RESULT_REPLACE_FAILED` (14) are removed; a
+replace of a name that is not stored is `absent`. See
+[replace in place](#replace-in-place).
+
 ## Owner decision (2026-11-01)
 
 | ID | Decision | Applied in |
@@ -67,6 +74,7 @@ and the secrets study (trust classes and flow rules F1 to F7).
 | NS-R8 | A locked keychain, an unsigned build, a full store and a busy worker each give the person a reason and a next action; nothing falls back to disk | SSR4 |
 | NS-R9 | No step has a time bound. Each Keychain call runs on the secret store worker; each wait ends by its reply, a cancel, a disconnect or shutdown | AE-01 to AE-04 |
 | NS-R10 | Protocol `0.1` and journal format `1` stay; schemas change in place | Engineering standard |
+| NS-R11 | A replace never loses the stored value. It changes the item's data in one Keychain call. When that call fails, the stored value stays and the reply says so. A replace of a name that is not stored stores nothing and says so | ENV-O1, NS-R4 |
 
 ## Terms
 
@@ -84,7 +92,7 @@ Selected (engineering). The design adds no process, thread, worker or queue.
 | Behavior | Canonical owner | Change |
 | --- | --- | --- |
 | Secret name rule; named reference parser and resolver (pure) | New module `asura_platform::secrets::named` | New. One rule serves the TUI, the service and the record codec |
-| Named item attributes: `NamedKey`, the `secret.` account, listing of named accounts | `asura_platform::keychain` | `Listing` gains `named`; `Keychain` gains `add_named`, `get_named`, `delete_named` over the existing call table |
+| Named item attributes: `NamedKey`, the `secret.` account, listing of named accounts | `asura_platform::keychain` | `Listing` gains `named`; `Keychain` gains `add_named`, `get_named`, `update_named`, `delete_named` over the existing call table |
 | Named payload codec, named requests, named counts | Secret store worker (`asura-service::secret_store`) | New requests `put_named`, `get_named`, `delete_named`, `list_named`; the sweep keeps named items |
 | `SecretPut`, `SecretList`, `SecretRemove` admission and replies; reference resolution at submit; audit | Conversation owner (`conversation/person_command.rs`, new `conversation/named_secrets.rs`) | New control handlers; a submit stage reads the named values |
 | Wire shape | Control crate (`asura-control::secrets`) | New messages, envelope fields 73 to 76; the frame write and read buffers are zeroized |
@@ -184,8 +192,7 @@ reply arrives, and one `/secrets` request runs at a time.
 | `replaced` | `Replaced the named secret GITHUB_TOKEN.` |
 | `exists` | `A named secret GITHUB_TOKEN exists. Replace it with /secrets replace GITHUB_TOKEN, or keep it.` |
 | `removed` | `Removed the named secret GITHUB_TOKEN. Commands already queued keep their copy.` |
-| `absent` | `No named secret GITHUB_TOKEN exists.` |
-| `replace_failed` | `GITHUB_TOKEN could not be replaced and is no longer stored: <reason>. Store it again with /secrets store GITHUB_TOKEN.` |
+| `absent` | `No named secret GITHUB_TOKEN exists.` After `/secrets replace`: `No named secret GITHUB_TOKEN exists to replace. Store it with /secrets store GITHUB_TOKEN.` |
 | `locked` | `The Keychain is locked until this Mac is unlocked after start-up. Unlock it, then try again.` |
 | `not_signed` | `This Asura build is not signed for the Keychain, so it cannot store secrets.` |
 | `unavailable` | `The Keychain is unavailable (OSStatus -N).` |
@@ -193,6 +200,12 @@ reply arrives, and one `/secrets` request runs at a time.
 | `full` | `The secret store is full: 64 named secrets or 256 items. Remove one with /secrets remove NAME.` |
 | `busy` | `Keychain requests are queued; try again.` |
 | `invalid` | `NAME is not a valid secret name: 1 to 48 letters, digits or _, not starting with a digit.` |
+
+After `/secrets replace NAME`, the notice of `locked`, `not_signed`,
+`unavailable` and `denied` ends with `The named secret NAME is unchanged.`
+For example: `The Keychain is unavailable (OSStatus -25291). The named secret
+GITHUB_TOKEN is unchanged.` A `busy` reply never reached the Keychain, so the
+value is also unchanged.
 
 "Keep" needs no request: the person does nothing, and the stored value stays.
 
@@ -218,9 +231,9 @@ flowchart TD
     Choice -->|"keep: no action"| Kept["Stored value unchanged"]
     Replace --> RReply{"Reply"}
     RReply -->|replaced| RDone["Notice: replaced"]
-    RReply -->|"replace_failed"| Lost["Notice: no longer stored; store again"]
+    RReply -->|absent| RAbsent["Notice: nothing to replace; store it"]
     Reply -->|"locked, not_signed, unavailable, full, busy"| Fail["Notice with reason; nothing stored"]
-    RReply -->|"locked, not_signed, unavailable, busy"| RFail["Notice with reason; old value kept"]
+    RReply -->|"locked, not_signed, unavailable, denied, busy"| RFail["Notice with reason; value unchanged"]
     Send -.->|"disconnect or cancel before the reply"| Unknown["Notice: outcome unknown; /secrets lists the names"]
 ```
 
@@ -256,7 +269,7 @@ message SecretRemove { optional string name = 1; }
 message SecretReply {
   optional SecretResult result = 1;
   repeated string names = 2;   // SecretList only: stored names in byte order, at most 64
-  optional uint32 status = 3;  // |OSStatus| with UNAVAILABLE, LOCKED, DENIED or REPLACE_FAILED
+  optional uint32 status = 3;  // |OSStatus| with UNAVAILABLE, LOCKED or DENIED
 }
 enum SecretResult {
   SECRET_RESULT_UNSPECIFIED = 0;
@@ -273,7 +286,8 @@ enum SecretResult {
   SECRET_RESULT_FULL = 11;
   SECRET_RESULT_BUSY = 12;
   SECRET_RESULT_INVALID = 13;
-  SECRET_RESULT_REPLACE_FAILED = 14;
+  reserved 14;  // SECRET_RESULT_REPLACE_FAILED, removed by replace in place
+  reserved "SECRET_RESULT_REPLACE_FAILED";
 }
 ```
 
@@ -281,7 +295,7 @@ enum SecretResult {
 | --- | --- |
 | `SecretPut` | `name` 1–48 bytes; `value` 1–4,096 bytes; `replace` present |
 | `SecretRemove` | `name` 1–48 bytes |
-| `SecretReply` | `result` 1–14; `names` only with `LISTED`, at most 64, each 1–48 bytes; `status` only with `LOCKED`, `UNAVAILABLE`, `DENIED` or `REPLACE_FAILED` |
+| `SecretReply` | `result` 1–13; `names` only with `LISTED`, at most 64, each 1–48 bytes; `status` only with `LOCKED`, `UNAVAILABLE` or `DENIED` |
 
 The service checks the name rule and answers `INVALID`, so the TUI shows one
 reason for every form fault. The control crate checks byte bounds only.
@@ -330,26 +344,137 @@ sequenceDiagram
     alt store not started or 4 named requests in flight
         O-->>S: SecretReply BUSY or UNAVAILABLE
     else admitted
-        O->>W: put_named (value)
+        O->>W: put_named (value), replace false
         W->>K: List this installation (count, names)
         K-->>W: Accounts
         W->>K: Add secret.GITHUB_TOKEN (value)
         alt added
             K-->>W: Stored
             W-->>O: stored
-        else duplicate and replace false
+        else duplicate
             K-->>W: Duplicate
             W-->>O: exists
-        else duplicate and replace true
-            W->>K: Delete, then add (value)
-            K-->>W: Stored, or a failure after the delete
-            W-->>O: replaced, or replace_failed
         end
         O->>A: secret_store.named_put: reply code, status, session
         O-->>S: SecretReply
     end
     S-->>T: Reply, request zeroized
     T-->>P: Notice
+```
+
+The replace request (`replace` true) takes the same path to the worker and
+then follows [NS-Q3](#ns-q3-replace-in-place) instead of the list and add.
+
+## Replace in place
+
+Selected (engineering, 2026-11-01). It replaces the earlier delete then add,
+whose failed add after the delete lost the secret (`replace_failed`).
+
+The worker serves `put_named` with `replace` true by one call,
+`update_named`: `SecItemUpdate` with a query for the named item and an
+attribute dictionary that holds only the new data (`kSecValueData`). The
+worker makes no listing, no add and no delete for a replace.
+
+- **Query.** The query is the same dictionary as a read or delete of the
+  item: class, service, account, and in production the data-protection flag,
+  the access group, `kSecAttrSynchronizable` false and
+  `kSecUseAuthenticationUI` fail (KC-U1). It never carries `kSecUseKeychain`.
+- **Attributes to update.** `kSecValueData` only. The label, the
+  accessibility class, the service and the account stay as the add set them.
+  The new data is a full named payload with the same binding, because the
+  installation and the name do not change.
+- **Scratch backend (tests).** The same call through `security-framework`'s
+  `update_item`, with a search list that holds only the scratch keychain.
+  The target pre-check (`SecKeychainGetStatus` returned 0) runs first in the
+  same platform call, as for every scratch item call. A non-zero pre-check
+  makes no update.
+- **Counts.** A replace never adds an item, so it is never `full` and the
+  worker's item count does not change.
+
+Worker replies:
+
+| Platform result | Reply | Stored value afterwards |
+| --- | --- | --- |
+| `Updated::Changed` (status 0) | `replaced` | The new value |
+| `Updated::Absent` (-25300) | `absent` | No item; nothing written |
+| `Failure::Locked`, `Denied`, `NotSigned` or `Unavailable` | `locked`, `denied`, `unavailable` (with `not_signed` when -34018) | The old value |
+| `Failure::Invalid` (bound or name rule; no call) | `unavailable` with reason `invalid_request` | The old value |
+
+**The item disappears before the update.** Another writer can remove the
+item after the person saw `exists` and before the update reaches the
+Keychain: `/secrets remove` from another TUI, or another team-signed Asura
+process. The update then finds no item and returns -25300. The worker replies
+`absent` and writes nothing. It does not add the value: the person asked to
+replace a stored secret, and an add would silently undo the other writer's
+remove (NS-R4). The person stores the value with `/secrets store NAME` if
+they still want it. A replace of a name that was never stored gets the same
+reply.
+
+**Failure atomicity.** A failed `SecItemUpdate` returns a non-zero status. The
+worker treats the stored data as unchanged, because the call is one Keychain
+operation on one item and Asura makes no other call for the replace. Apple's
+documentation does not state the atomicity of a failed update. The tests prove
+it for failures that the Keychain reports before it writes (a locked scratch
+keychain, a gated failure). A failure inside the Keychain after a partial
+write was not provoked; that case is a stated proof limit, not a guarantee.
+
+### NS-F3: replace on the worker
+
+Selected design. Arrows lead to the next step; labels are platform results.
+Every end is one reply; no path makes a second item call.
+
+```mermaid
+flowchart TD
+    Req["put_named, replace true (value)"] --> Rule{"Name rule and payload bound hold?"}
+    Rule -->|No| Inv["unavailable, invalid_request: no call; old value kept"]
+    Rule -->|Yes| Signed{"Worker in not_signed state?"}
+    Signed -->|Yes| NS["unavailable, not_signed: no call; old value kept"]
+    Signed -->|No| Pre{"Scratch backend: pre-check returned 0?"}
+    Pre -->|"No (tests only)"| PreFail["unavailable: no update made; old value kept"]
+    Pre -->|"Yes, or production (no pre-check)"| Up["SecItemUpdate: query for secret.NAME, data only"]
+    Up -->|"0"| Done["replaced: new value stored"]
+    Up -->|"-25300, item gone"| Absent["absent: nothing written"]
+    Up -->|"-25308, or a locked scratch keychain"| Locked["locked: old value kept"]
+    Up -->|"-34018"| NotSigned["unavailable, not_signed: terminal; old value kept"]
+    Up -->|"denied (scratch only)"| Denied["denied: old value kept"]
+    Up -->|"other status"| Unav["unavailable with the status: old value kept"]
+```
+
+### NS-Q3: replace in place
+
+Selected design. Solid arrows are calls or messages; dashed arrows are
+replies. Only the arrows labelled "value" carry the value. The optional block
+is the race: another writer removes the item between the person's `exists`
+reply and the update.
+
+```mermaid
+sequenceDiagram
+    participant P as Person
+    participant T as TUI and its secrets worker
+    participant O as Conversation owner
+    participant W as Secret store worker
+    participant K as Keychain
+    participant X as Another writer
+    P->>T: /secrets replace GITHUB_TOKEN
+    T->>O: SecretPut (value), replace true
+    O->>W: put_named (value), replace true
+    opt race: the item is removed first
+        X->>K: Delete secret.GITHUB_TOKEN
+    end
+    W->>K: SecItemUpdate secret.GITHUB_TOKEN (value)
+    alt status 0
+        K-->>W: Updated
+        W-->>O: replaced
+    else -25300, the item is gone
+        K-->>W: Not found
+        W-->>O: absent, nothing written
+    else any failure status
+        K-->>W: Failure, item unchanged
+        W-->>O: locked, denied or unavailable with the status
+    end
+    O->>O: Audit secret_store.named_put
+    O-->>T: SecretReply
+    T-->>P: Notice (a failure notice says the value is unchanged)
 ```
 
 ## Named item contract
@@ -393,18 +518,20 @@ named items in `kept`.
 
 ### NS-S1: named secret lifecycle
 
-Selected design. Arrows are requests with their outcomes. A replace is a
-delete then an add on the worker; the two calls are not atomic.
+Selected design. Arrows are requests with their outcomes. A replace is one
+in-place update on the worker ([replace in place](#replace-in-place)); no
+transition of a replace leads from `Stored` to `Absent`.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Absent
     Absent --> Stored: put, added
     Absent --> Absent: put fails (locked, not_signed, unavailable, full, busy)
+    Absent --> Absent: replace (absent), nothing written
     Stored --> Stored: put without replace (exists), person keeps it
-    Stored --> Stored: replace, delete and add succeed
-    Stored --> Absent: replace, add fails after the delete (replace_failed)
-    Stored --> Stored: replace or remove fails before the delete
+    Stored --> Stored: replace, update succeeds (new value)
+    Stored --> Stored: replace, update fails (old value kept)
+    Stored --> Stored: remove fails
     Stored --> Absent: remove succeeds
     Stored --> Stored: resolved at a submit (value copied to the input item)
     Absent --> Absent: remove (absent)
@@ -580,12 +707,13 @@ the model typed itself.
 | Build not signed for the Keychain | `not_signed`, with no Keychain call after the first `not_signed` (worker terminal state) |
 | Keychain unavailable | `unavailable` with the status |
 | Scratch keychain denied (tests only) | `denied` |
-| 64 named secrets or 256 items | `full` at a put; a replace of an existing name is not `full` |
+| 64 named secrets or 256 items | `full` at a put; a replace never adds an item and is never `full` |
 | Worker queue full, or 4 named requests in flight in the owner | `busy` |
 | Secret store not started (start-time read pending) | `busy` |
 | This runtime has no Keychain target | `unavailable` with status 25291 |
-| Replace: delete succeeds, add fails | `replace_failed` with the add's status; the name is absent |
-| Replace: delete fails | The delete's failure reply; the old value stays |
+| Replace: the update fails | The failure reply (`locked`, `denied`, `unavailable`) with the update's status; the old value stays; the notice says it is unchanged |
+| Replace of a name that is not stored | `absent`; nothing written |
+| Replace: the item is removed between the person's `exists` reply and the update | The update returns -25300: `absent`; nothing written; the worker does not add the value |
 | Disconnect or cancel before a `SecretPut` reply | `OutcomeUnconfirmed`; the request finishes or fails on the worker; `/secrets` shows the result |
 | Submit names a missing secret | `secret_not_found`; draft kept; nothing recorded |
 | Submit names a secret and the Keychain is locked | `secret_store_locked`; draft kept |
@@ -602,7 +730,7 @@ size, as the existing `secret_store.*` events.
 
 | Event | Fields | Replies |
 | --- | --- | --- |
-| `secret_store.named_put` | `reply`, `status`, `session` | `stored`, `replaced`, `exists`, `full`, `replace_failed`, `locked`, `denied`, `unavailable` |
+| `secret_store.named_put` | `reply`, `status`, `session` | `stored`, `replaced`, `exists`, `absent`, `full`, `locked`, `denied`, `unavailable` |
 | `secret_store.named_get` | `reply`, `status`, `session`, `count` (names requested, 1–16) | `read`, `missing`, `mismatch`, `locked`, `denied`, `unavailable` |
 | `secret_store.named_delete` | `reply`, `status`, `session` | `deleted`, `absent`, `locked`, `denied`, `unavailable` |
 | `secret_store.named_list` | `reply`, `status`, `session`, `count` (names listed, 0–64) | `listed`, `locked`, `denied`, `unavailable` |
@@ -643,7 +771,7 @@ values 14 `SECRET_NOT_FOUND`, 15 `SECRET_REFERENCE_INVALID` and 16
 
 | Call | Owner and isolation | Bound and closure |
 | --- | --- | --- |
-| `SecItemAdd`, `SecItemCopyMatching`, `SecItemDelete` for named items | Secret store worker thread | The existing 16-request queue; one call at a time; no time bound; ends by its reply |
+| `SecItemAdd`, `SecItemCopyMatching`, `SecItemUpdate`, `SecItemDelete` for named items | Secret store worker thread | The existing 16-request queue; one call at a time; a replace is one update; no time bound; ends by its reply |
 | Named requests in the owner | Conversation owner on the reactor | At most 4 in flight, then `busy`; each ends by its worker reply or shutdown |
 | `/secrets` request in the TUI | New TUI secrets worker thread, one per TUI process | One request at a time; the client waits with no response budget; ends by reply, TUI exit cancel or disconnect |
 | Reference parse and resolve | Conversation owner on the reactor | At most 8,192 bytes of command; bounded in-memory work |
@@ -669,26 +797,29 @@ data-protection keychain.
 | NS-U3 | Resolver: two references to one name and one to another after 2 rewrite variables; 15 rewrite variables and 2 names; a result over 8,192 bytes | Numbers 3 and 4 by first appearance; `too_many_secrets`; `too_many_secrets` |
 | NS-U4 | Platform listing over accounts `input.<hex>`, `secret.GITHUB_TOKEN`, `secret.1BAD`, `other` | One input, one named, two unrecognized |
 | NS-U5 | Named payload codec at 1 and 4,096 value bytes, 4,097, a wrong binding, trailing bytes | Round trip; each fault rejected or `mismatch` |
-| NS-U6 | Worker over a scripted port: put new, put existing, replace (delete and add), replace where the add fails, put at 64 named, remove, list, get of two names with one missing, `not_signed` | `stored`, `exists`, `replaced`, `replace_failed`, `full`, `removed`, the names, missing, `not_signed` with no port call afterwards |
+| NS-U6 | Worker over a scripted port: put new, put existing, put at 64 named, remove, list, get of two names with one missing, `not_signed` | `stored`, `exists`, `full`, `removed`, the names, missing, `not_signed` with no port call afterwards |
 | NS-U7 | Sweep over a listing with named items and an empty live set | Named items kept and counted; never deleted |
 | NS-U8 | Control codec: `SecretPut` with value 0 and 4,097 bytes, a name of 49 bytes; `SecretReply` with names and a non-list result; `scrub` | Each rejected; a valid set round-trips; `scrub` leaves no value byte |
 | NS-U9 | Kind 31 field 24: bounds, order, a number past `number_kinds`, a kind other than `env-secret`, with the whole-command bit; the digest | Exact round trip; each fault `Corrupt`; the digest changes with field 24 |
 | NS-U10 | Owner submit with a reference: found, missing, locked, busy, with a whole-command plan | Kind 31 with field 24 and the input item values; `secret_not_found`; `secret_store_locked`; `secret_store_busy`; `secret_reference_invalid` |
 | NS-U11 | Dispatch re-plan of a record with field 24 | Same command and names accepted; a changed name or number is `mismatch` |
-| NS-U12 | TUI: report with flagged names, one name over 48 bytes; `/secrets` parse; each reply notice; the env line with named secrets; the flagged hint | One action per valid name; the long name without one; each notice exact; `named GITHUB_TOKEN` on the env line; the hint names the store action |
-| NS-U13 | Audit: the four new events with each reply; a status on a success reply; a name field | Valid events round-trip; the faults are invalid |
+| NS-U12 | TUI: report with flagged names, one name over 48 bytes; `/secrets` parse; each reply notice, for store and for replace; the env line with named secrets; the flagged hint | One action per valid name; the long name without one; each notice exact, the replace failures ending with the unchanged sentence and the replace `absent` naming the store command; `named GITHUB_TOKEN` on the env line; the hint names the store action |
+| NS-U13 | Audit: the four new events with each reply, including `absent` for `named_put`; a status on a success reply; the removed `replace_failed`; a name field | Valid events round-trip; the faults are invalid |
+| NS-U14 | Worker over a scripted port that keeps the named data it accepted: replace of a stored name; replace whose update fails with `locked`, then with `unavailable` -25291; replace whose update finds no item (removed after the check); replace at 64 names and 256 items | `replaced` and the new data, with one `update_named` and no list, add or delete; each failure reply with its status, the old data still stored and no add or delete; `absent` with nothing stored and no add; `replaced`, never `full` |
+| NS-U15 | Platform: `update_named` with the recording `Calls` fixture, scratch and data-protection tables: status 0, -25300, -25293 with the lock bit clear, -34018, -25291; a non-zero pre-check; an invalid name; data of 0 and 8,308 bytes. KC-U1 for the update dictionaries | `Changed`, `Absent`, `Locked`, `NotSigned`, `Unavailable`; scratch: a status call before every update and no update after a non-zero pre-check; `Invalid` with no call. The query sets the data-protection flag, the group, synchronizable false, UI fail, class, service and account, and no `kSecUseKeychain`; the attribute dictionary holds `kSecValueData` only |
 
 ### Integration
 
 | ID | Initial state and trigger | Required result |
 | --- | --- | --- |
-| NS-I1 | Real service and worker on a scratch keychain; `SecretPut` of a synthetic token, `SecretList`, `SecretPut` again, replace, `SecretRemove`, `SecretRemove` again | `stored`, the name listed, `exists`, `replaced`, `removed`, `absent`; the scratch keychain holds a `secret.` item only between the put and the remove |
-| NS-I2 | Locked scratch keychain; `SecretPut` and `SecretList`; unlocked; `SecretPut` | `locked` for the put; the list still answers `listed`, because a locked file keychain lists attributes (probe SS-P2 (a)); then `stored` |
+| NS-I1 | Real service and worker on a scratch keychain; `SecretPut` of a synthetic token, `SecretList`, `SecretPut` again, replace with another token and back, replace of a name not stored, `SecretRemove`, `SecretRemove` again | `stored`, the name listed, `exists`, `replaced` twice, `absent` with no new item, `removed`, `absent`; the scratch keychain holds a `secret.` item only between the put and the remove |
+| NS-I2 | Locked scratch keychain; `SecretPut`, a replace of the stored name with another token, and `SecretList`; unlocked; then NS-I4's command | `locked` for the put and the replace; the list still answers `listed`, because a locked file keychain lists attributes (probe SS-P2 (a)); the command prints the digest of the value stored before the locked replace |
 | NS-I3 | Gated port holds the worker; 17 requests; then release | `busy` before the worker; the reactor answers other requests |
 | NS-I4 | A stored token; `!printf %s "$ASURA_SECRET_PE_TOKEN" \| shasum -a 256` and the same as `!!` | Each job receives the value (the digest matches); kind 31 field 24 names the secret; the job is tainted; the input item is deleted after settlement; the named item remains |
 | NS-I5 | A command that names a secret that does not exist | `secret_not_found`; nothing recorded |
 | NS-I6 | Restart with a held command that used a named secret, after `SecretRemove` | Resume runs it with the submitted value; no named read |
 | NS-I7 | Sweep: the startup sweep with a stored named secret and no live inputs | The named item stays |
+| NS-I9 | Worker layer on a scratch keychain (`tests/secret_store.rs`, gated port): store a named value; replace; a gated update failure; a locked update; an update held at the gate while the test removes the item through its own handle, then released | `replaced` and the new data read back; the gate records list and add for the store and one update alone for each replace; the gated failure and `locked` replies each keep the previous data; the held replace answers `absent` and no item exists afterwards |
 | NS-I8 | Value sweep: after NS-I4 and a scripted model turn that runs `job read` of the tainted job and receives a notice | No chat request the model received, no journal frame, no audit line, no service log line and no payload file holds the token, its SHA-256 hex digest or its base64 form |
 
 ### End to end
@@ -696,9 +827,9 @@ data-protection keychain.
 | ID | Initial state and trigger | Required result |
 | --- | --- | --- |
 | NS-E1 | PTY journey, TUI launched with a synthetic `PE_TOKEN` variable that the scanner flags; enter `!` | The report names `PE_TOKEN` with `/secrets store PE_TOKEN` and no value |
-| NS-E2 | Same TUI: `/secrets store PE_TOKEN`; `/secrets store PE_TOKEN` again; `/secrets replace PE_TOKEN`; `/secrets` | `Stored…`; `…exists. Replace it with /secrets replace PE_TOKEN, or keep it.`; `Replaced…`; the panel lists `PE_TOKEN` as stored |
+| NS-E2 | Same TUI: `/secrets store PE_TOKEN`; `/secrets store PE_TOKEN` again; `/secrets replace PE_TOKEN`; the scratch keychain locked, `/secrets replace PE_TOKEN`, unlocked; `/secrets` | `Stored…`; `…exists. Replace it with /secrets replace PE_TOKEN, or keep it.`; `Replaced…`; the locked notice ending `The named secret PE_TOKEN is unchanged.`; the panel lists `PE_TOKEN` as stored |
 | NS-E3 | `!printf %s "$ASURA_SECRET_PE_TOKEN" \| shasum -a 256` | The env line shows `named PE_TOKEN`; the output is the token's digest; the screen shows no token |
-| NS-E4 | `/secrets remove PE_TOKEN`; the same command again | `Removed…`; the command is refused with the `secret_not_found` text and the draft is kept |
+| NS-E4 | `/secrets remove PE_TOKEN`; the same command again; `/secrets replace PE_TOKEN` | `Removed…`; the command is refused with the `secret_not_found` text and the draft is kept; `No named secret PE_TOKEN exists to replace. Store it with /secrets store PE_TOKEN.` |
 | NS-E5 | The whole journey, then a raw-byte sweep of the scratch home (journal, payloads, logs, audit, configuration) | No byte sequence of the token is found |
 
 Every `--person-*` PTY journey keeps passing; PE-E1 checks the new report
@@ -720,9 +851,16 @@ text.
 - **Value source: the captured environment only.** A typed or pasted value
   needs the paste scanner and a prompt that keeps the value off the screen;
   both are later work (study 12.1).
-- **Replace by delete then add.** Rejected for now: `SecItemUpdate`, which
-  needs a new call in both backends and their tests. The non-atomic window is
-  reported as `replace_failed` and costs the person one more store.
+- **Replace in place by `SecItemUpdate`** (selected, revision of
+  2026-11-01). One call changes the data; a failure keeps the old value.
+  Rejected: delete then add, the first delivery, whose failed add after the
+  delete lost the secret (`replace_failed`); and add under a temporary
+  account, then delete and rename, which needs three calls and still has a
+  window, because the Keychain has no rename.
+- **A replace of a missing name is `absent`** (selected). Rejected: add the
+  value. A replace that finds no item would then undo a concurrent remove
+  without saying so (NS-R4), and a replace would need the listing and the
+  `full` check again.
 - **No name in audit events.** The existing secret store events carry no
   name; a name could itself say what the person holds.
 
@@ -773,6 +911,34 @@ Not delivered or not verified:
 - The data-protection keychain (team Keychain store) is not exercised by
   `cargo test` (SSR6); the signed qualification run covers it.
 - The replace window (delete then add) is unit-tested with a scripted port;
-  a real add failure after the delete was not provoked.
+  a real add failure after the delete was not provoked. Superseded by
+  [replace in place](#replace-in-place), which removes the window.
+
+### Replace in place verification (2026-11-01)
+
+Implemented behavior, verified on macOS 27.0 with the debug build, scratch
+keychains made through the Security framework fixtures and the ad hoc model
+helper. Diagrams NS-F1, NS-Q1, NS-F3, NS-Q3 and NS-S1 were rendered with the
+local Mermaid CLI at scale 2 into a temporary directory outside the
+repository and inspected.
+
+| Case | Evidence | Result |
+| --- | --- | --- |
+| NS-U6, NS-U14 | `secret_store::tests::ns_u6_named_requests`, `ns_u14_replace_in_place` (scripted port that keeps accepted data) | Pass |
+| NS-U12 | `tui::ui::secrets::tests::ns_u12_secrets_command` (replace notices) | Pass |
+| NS-U13 | `audit::tests::ns_u13_named_secret_events` (`absent`; `replace_failed` refused) | Pass |
+| NS-U15, KC-U1, KC-U2 | `keychain::tests::ns_u15_update_named`, `every_data_protection_dictionary_names_the_keychain_and_group`; the scratch case `scratch_keychain::update_named_in_place` (update, locked update keeps the data, missing item `Absent`) | Pass |
+| NS-I9 | `tests/secret_store.rs` `ns_i9_replace_in_place` | Pass |
+| NS-I1, NS-I2 | `person_command_flow named`: replace of a name not stored is `absent` with no item; a locked replace is `locked` and NS-I4 still prints the digest of the earlier value | Pass |
+| NS-E2, NS-E4 | PTY journey `--person-named`: the locked replace notice ends with the unchanged sentence; a replace after the remove gets the `absent` replace notice | Pass |
+
+Not verified:
+
+- The data-protection `SecItemUpdate` (production) is not exercised by
+  `cargo test` (SSR6). KC-U1 checks its dictionaries; the signed
+  qualification run (`person_command_flow` in the test group) covers the call.
+  That run was not repeated for this revision.
+- A Keychain failure after a partial write of the update was not provoked
+  ([failure atomicity](#replace-in-place)).
 
 Return to the [design index](README.md).

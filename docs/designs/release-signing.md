@@ -1328,8 +1328,8 @@ Selected, replacing rows of the
 
 | Property | Team Keychain store |
 | --- | --- |
-| Keychain | Data-protection keychain: `kSecUseDataProtectionKeychain = true` on every add, query and delete. Production no longer uses `kSecUseKeychain` or `SecKeychainCopyDefault` |
-| Access group | `kSecAttrAccessGroup` is set in every add, query and delete, to the group the process reads from its own entitlements ([access group](#access-group-from-the-entitlements)): `<TeamID>.org.pidster.asura`, or `<TeamID>.org.pidster.asura.test` in the qualification bundle. Never omitted: KC-P1 showed that a process with no Keychain entitlement that omits the group gets -25300, which reads as "absent" (F2) |
+| Keychain | Data-protection keychain: `kSecUseDataProtectionKeychain = true` on every add, query, update and delete. Production no longer uses `kSecUseKeychain` or `SecKeychainCopyDefault` |
+| Access group | `kSecAttrAccessGroup` is set in every add, query, update and delete, to the group the process reads from its own entitlements ([access group](#access-group-from-the-entitlements)): `<TeamID>.org.pidster.asura`, or `<TeamID>.org.pidster.asura.test` in the qualification bundle. Never omitted: KC-P1 showed that a process with no Keychain entitlement that omits the group gets -25300, which reads as "absent" (F2) |
 | Accessibility | `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (KQ1). "ThisDeviceOnly" keeps the item out of backups to other devices and out of migration |
 | Synchronizable | `false`, explicitly |
 | User interaction | `kSecUseAuthenticationUI = kSecUseAuthenticationUIFail` in every dictionary, so a call that would need a dialog fails with -25308 instead. The process-wide `SecKeychainSetUserInteractionAllowed(false)` also stays: it costs one call at worker start and also covers the test-only file backend. KC-P4 saw no dialog for any call |
@@ -1341,7 +1341,10 @@ sets `kSecUseDataProtectionKeychain`, the access group, `kSecAttrSynchronizable
 = false` and the user-interaction key. A dictionary without the flag would
 reach the file-based keychain (TN3137: `SecItem` "defaults to targeting the
 file-based keychain"). Unit test KC-U1 asserts this for every call kind, and
-asserts that no dictionary carries `kSecUseKeychain`.
+asserts that no dictionary carries `kSecUseKeychain`. `SecItemUpdate`, used
+only for a [named replace](named-secrets.md#replace-in-place), takes its query
+from the same builder; its second dictionary, the attributes to update, holds
+`kSecValueData` alone.
 
 ### Access group from the entitlements
 
@@ -1437,7 +1440,7 @@ the raw status and the session state ([field evidence](#keychain-field-evidence)
 | Status | Reply | Evidence |
 | --- | --- | --- |
 | 0 | Success | KC-P1, KC-P4 (add, read, list, delete) |
-| `errSecItemNotFound` (-25300) | `absent` on delete, `missing` on read, zero items on list. This holds only because the call named an entitled group: a process that omits the group and has no entitlement also gets -25300 (F2), which is why no call omits it | KC-P4 (list, read and delete of a missing item) |
+| `errSecItemNotFound` (-25300) | `absent` on delete and on a named update, `missing` on read, zero items on list. This holds only because the call named an entitled group: a process that omits the group and has no entitlement also gets -25300 (F2), which is why no call omits it | KC-P4 (list, read and delete of a missing item) |
 | `errSecDuplicateItem` (-25299) | Existing duplicate rule | KC-P4 |
 | `errSecInteractionNotAllowed` (-25308) | `locked`: the Mac has not been unlocked since start-up. The existing paced recheck applies | **Unverified**: KC-P3 case B was not run. The audit event records each occurrence with its session state |
 | `errSecMissingEntitlement` (-34018) | `unavailable`, reason `not_signed`: "This Asura build is not signed for the Keychain." Returned for any group the process is not entitled to, not only for an unsigned build (F1). Terminal: the worker makes no further Keychain call | KC-P1 (unsigned list and add naming the group), KC-P4 (`list-unclaimed-group`) |

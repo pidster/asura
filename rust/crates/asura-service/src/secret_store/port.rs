@@ -2,10 +2,10 @@
 //! worker seam for tests). The port carries platform types, so the store has
 //! no second status table and no raw `OSStatus` path.
 use asura_platform::keychain::{
-    Added, Failure, Found, ItemKey, Keychain, Listing, NamedKey, Removed,
+    Added, Failure, Found, ItemKey, Keychain, Listing, NamedKey, Removed, Updated,
 };
 
-/// The four item calls the worker makes. Production forwards to
+/// The item calls the worker makes. Production forwards to
 /// [`Keychain`]; unit tests use a scripted port; integration tests use the
 /// gated port (`test-support`).
 pub(crate) trait KeychainPort: Send + 'static {
@@ -16,6 +16,8 @@ pub(crate) trait KeychainPort: Send + 'static {
     /// Named secret items (named-secrets.md).
     fn add_named(&self, key: &NamedKey, data: &[u8]) -> Result<Added, Failure>;
     fn get_named(&self, key: &NamedKey) -> Result<Found, Failure>;
+    /// A replace in place: `SecItemUpdate` of the data alone.
+    fn update_named(&self, key: &NamedKey, data: &[u8]) -> Result<Updated, Failure>;
     fn delete_named(&self, key: &NamedKey) -> Result<Removed, Failure>;
 }
 
@@ -37,6 +39,9 @@ impl KeychainPort for Keychain {
     }
     fn get_named(&self, key: &NamedKey) -> Result<Found, Failure> {
         Keychain::get_named(self, key)
+    }
+    fn update_named(&self, key: &NamedKey, data: &[u8]) -> Result<Updated, Failure> {
+        Keychain::update_named(self, key, data)
     }
     fn delete_named(&self, key: &NamedKey) -> Result<Removed, Failure> {
         Keychain::delete_named(self, key)
@@ -60,6 +65,7 @@ mod gated {
     pub enum Call {
         Add,
         Get,
+        Update,
         Delete,
         List,
     }
@@ -163,6 +169,11 @@ mod gated {
             self.gate
                 .enter(Call::Get)
                 .map_or_else(|| self.keychain.get_named(key), Err)
+        }
+        fn update_named(&self, key: &NamedKey, data: &[u8]) -> Result<Updated, Failure> {
+            self.gate
+                .enter(Call::Update)
+                .map_or_else(|| self.keychain.update_named(key, data), Err)
         }
         fn delete_named(&self, key: &NamedKey) -> Result<Removed, Failure> {
             self.gate

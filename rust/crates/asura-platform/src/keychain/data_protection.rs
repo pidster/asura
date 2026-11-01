@@ -24,7 +24,9 @@ use security_framework_sys::item::{
     kSecClass, kSecClassGenericPassword, kSecMatchLimit, kSecReturnAttributes, kSecReturnData,
     kSecUseAuthenticationUI, kSecValueData,
 };
-use security_framework_sys::keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete};
+use security_framework_sys::keychain_item::{
+    SecItemAdd, SecItemCopyMatching, SecItemDelete, SecItemUpdate,
+};
 use std::ffi::c_void;
 use zeroize::Zeroizing;
 
@@ -212,6 +214,12 @@ pub(crate) enum Op<'a> {
         service: &'a str,
         account: &'a str,
     },
+    /// The query of a `SecItemUpdate`: the item, as for a delete. The data
+    /// goes in the separate attribute dictionary ([`update_attributes`]).
+    Update {
+        service: &'a str,
+        account: &'a str,
+    },
     /// Attributes of at most `max` items, of one service or of the group.
     List {
         service: Option<&'a str>,
@@ -275,7 +283,7 @@ pub(crate) fn pairs(group: &str, op: Op<'_>) -> Vec<(CFString, CFType)> {
                 pairs.push((key(kSecMatchLimit), key(kSecMatchLimitOne).as_CFType()));
             }
         }
-        Op::Delete { service, account } => item(service, account),
+        Op::Delete { service, account } | Op::Update { service, account } => item(service, account),
         Op::List { service, max } => {
             // SAFETY: Security framework constants, as above.
             unsafe {
@@ -291,6 +299,14 @@ pub(crate) fn pairs(group: &str, op: Op<'_>) -> Vec<(CFString, CFType)> {
         }
     }
     pairs
+}
+
+/// The attributes a `SecItemUpdate` changes: the data alone (named-secrets.md,
+/// replace in place). Label, accessibility, service and account stay as the
+/// add set them.
+pub(crate) fn update_attributes(data: &CFData) -> Vec<(CFString, CFType)> {
+    // SAFETY: a Security framework constant, valid for the process lifetime.
+    vec![(unsafe { key(kSecValueData) }, data.as_CFType())]
 }
 
 /// The key a dictionary must never carry (KC-U1).
@@ -426,6 +442,22 @@ impl Calls for DataProtection {
             .and_then(|v| v.downcast::<CFData>())
             .map(|data| Zeroizing::new(data.bytes().to_vec()))
             .ok_or(super::UNEXPECTED_RESULT_STATUS)
+    }
+    fn update(&self, service: &str, account: &str, data: &[u8]) -> Result<(), i32> {
+        let query = self.dictionary(Op::Update { service, account });
+        // CF uses this zeroizing buffer without copying and drops it when the
+        // attribute dictionary is released.
+        let buffer = std::sync::Arc::new(Zeroizing::new(data.to_vec()));
+        let data = CFData::from_arc(buffer);
+        let attributes = CFDictionary::from_CFType_pairs(&update_attributes(&data));
+        // SAFETY: `query` and `attributes` are live dictionaries for the call.
+        let code = unsafe {
+            SecItemUpdate(
+                query.as_concrete_TypeRef(),
+                attributes.as_concrete_TypeRef(),
+            )
+        };
+        if code == 0 { Ok(()) } else { Err(code) }
     }
     fn delete(&self, service: &str, account: &str) -> Result<(), i32> {
         let query = self.dictionary(Op::Delete { service, account });

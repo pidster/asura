@@ -405,12 +405,10 @@ pub enum SecretStoreReply {
     /// is not signed for the Keychain (-34018); the status is 0 for a
     /// request the worker refused as a defect.
     Unavailable,
-    /// `named_put`: a replace deleted and added the item.
+    /// `named_put`: a replace updated the item in place.
     Replaced,
     /// `named_put`: the name exists and no replace was asked.
     Exists,
-    /// `named_put`: a replace deleted the item, then the add failed.
-    ReplaceFailed,
     /// `named_list`: the names were listed.
     Listed,
 }
@@ -421,7 +419,7 @@ impl SecretStoreReply {
             || match call {
                 "named_put" => matches!(
                     self,
-                    R::Stored | R::Replaced | R::Exists | R::Full | R::ReplaceFailed
+                    R::Stored | R::Replaced | R::Exists | R::Absent | R::Full
                 ),
                 "named_get" => matches!(self, R::Read | R::Missing | R::Mismatch),
                 "named_delete" => matches!(self, R::Deleted | R::Absent),
@@ -1152,7 +1150,7 @@ impl Event {
                 reply,
                 status,
                 session,
-            } => reply.allowed("named_put") && Self::named_status_rule(*reply, *status, session),
+            } => reply.allowed("named_put") && Self::status_rule(*reply, *status, session),
             Self::SecretStoreNamedGet {
                 reply,
                 status,
@@ -1210,18 +1208,6 @@ impl Event {
         use SecretStoreReply as R;
         let failure = matches!(reply, R::Locked | R::Denied | R::Unavailable);
         status.is_some() == failure && (session.is_none() || status.is_some_and(|s| s != 0))
-    }
-    /// [`Self::status_rule`] where `replace_failed` is also a failure: it
-    /// carries the failed add's status.
-    fn named_status_rule(
-        reply: SecretStoreReply,
-        status: Option<i32>,
-        session: &Option<KeychainSession>,
-    ) -> bool {
-        if reply == SecretStoreReply::ReplaceFailed {
-            return status.is_some() && (session.is_none() || status.is_some_and(|s| s != 0));
-        }
-        Self::status_rule(reply, status, session)
     }
     /// The kind 28 outcome rules, applied to the facts `job.settled` carries.
     fn settled_facts(&self) -> bool {

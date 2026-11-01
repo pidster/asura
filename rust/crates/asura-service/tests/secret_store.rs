@@ -11,11 +11,12 @@
 use asura_platform::PollInterest;
 use asura_platform::events::wake_pair;
 use asura_platform::keychain::{
-    Added, ItemKey, Keychain, LIST_BOUND, MAX_ITEM_BYTES, Target, scratch, service_name,
+    Added, ItemKey, Keychain, LIST_BOUND, MAX_ITEM_BYTES, NamedKey, Removed, Target, scratch,
+    service_name,
 };
 use asura_service::secret_store::{
-    Call, DeleteReply, Gate, GetReply, Polled, PutReply, QUEUE_BOUND, Refused, SecretValue,
-    Secrets, Store, StoreFailure, SweepReport,
+    Call, DeleteReply, Gate, GetReply, NamedGetReply, NamedPutReply, Polled, PutReply, QUEUE_BOUND,
+    Refused, SecretValue, Secrets, Store, StoreFailure, SweepReport,
 };
 use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
@@ -542,5 +543,99 @@ fn ss_w10_truncated_listing_is_swept_in_passes() {
     assert_eq!(store.observation().item_count, Some(0));
     stop(store);
     assert_eq!(scratch.listed(), 0);
+    scratch.delete_keychain();
+}
+
+fn put_named(store: &Store, name: &str, value: &[u8], replace: bool) -> NamedPutReply {
+    store
+        .put_named(name.into(), Zeroizing::new(value.to_vec()), replace)
+        .expect("admitted")
+        .wait()
+        .expect("reply")
+}
+
+/// The stored value of `name`, read through the worker.
+fn named_value(store: &Store, name: &str) -> Option<Vec<u8>> {
+    match store
+        .get_named(vec![name.into()])
+        .expect("admitted")
+        .wait()
+        .expect("reply")
+    {
+        NamedGetReply::Values(values) => Some(values[0].to_vec()),
+        NamedGetReply::Missing => None,
+        other => panic!("get_named: {other:?}"),
+    }
+}
+
+/// NS-I9 (named-secrets.md, replace in place): on a scratch keychain a
+/// replace is one update that changes the stored value; a gated update
+/// failure and a locked keychain each keep the previous value; an update
+/// held while the item is removed answers `absent` and adds nothing.
+#[test]
+fn ns_i9_replace_in_place() {
+    let mut scratch = Scratch::new();
+    let gate = Gate::default();
+    let store = scratch.gated(&gate);
+    assert_eq!(
+        put_named(&store, "PE_TOKEN", b"first", false),
+        NamedPutReply::Stored
+    );
+    assert_eq!(gate.calls(), vec![Call::List, Call::Add]);
+    assert_eq!(
+        put_named(&store, "PE_TOKEN", b"second", true),
+        NamedPutReply::Replaced
+    );
+    assert_eq!(gate.calls()[2..], [Call::Update], "one update alone");
+    assert_eq!(
+        named_value(&store, "PE_TOKEN").as_deref(),
+        Some(&b"second"[..])
+    );
+    // A gated update failure keeps the previous value.
+    gate.fail_once(Call::Update);
+    assert!(matches!(
+        put_named(&store, "PE_TOKEN", b"third", true),
+        NamedPutReply::Failed(StoreFailure::Unavailable { .. })
+    ));
+    assert_eq!(
+        named_value(&store, "PE_TOKEN").as_deref(),
+        Some(&b"second"[..])
+    );
+    // A locked scratch keychain refuses the update after a pre-check of 0
+    // and keeps the previous value.
+    scratch::lock(&scratch.target()).expect("lock scratch keychain");
+    assert!(matches!(
+        put_named(&store, "PE_TOKEN", b"fourth", true),
+        NamedPutReply::Failed(StoreFailure::Locked { .. })
+    ));
+    scratch::unlock(&scratch.target()).expect("unlock scratch keychain");
+    assert_eq!(
+        named_value(&store, "PE_TOKEN").as_deref(),
+        Some(&b"second"[..])
+    );
+    // The item is removed between the person's check and the update.
+    gate.hold();
+    let ticket = store
+        .put_named("PE_TOKEN".into(), Zeroizing::new(b"fifth".to_vec()), true)
+        .expect("admitted");
+    gate.wait_blocked();
+    let key = NamedKey {
+        installation: scratch.installation,
+        name: "PE_TOKEN".into(),
+    };
+    assert_eq!(scratch.keychain().delete_named(&key), Ok(Removed::Deleted));
+    gate.release();
+    assert_eq!(ticket.wait(), Some(NamedPutReply::Absent));
+    let calls = gate.calls();
+    assert_eq!(calls.last(), Some(&Call::Update));
+    assert!(!calls.contains(&Call::Delete), "the worker deleted nothing");
+    assert_eq!(calls.iter().filter(|c| **c == Call::Add).count(), 1);
+    assert_eq!(named_value(&store, "PE_TOKEN"), None, "nothing was added");
+    let listing = scratch
+        .keychain()
+        .list(&scratch.installation)
+        .expect("list");
+    assert!(listing.named.is_empty());
+    stop(store);
     scratch.delete_keychain();
 }
