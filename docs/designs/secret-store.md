@@ -66,6 +66,15 @@ command has an item only when its command holds a secret, as a `!` command
 does. Earlier text that names the `!!` launch environment describes the
 superseded design.
 
+Revision of 2026-11-01 (owner decision ENV-O1): the store also holds the
+person's **named secrets**, durable items with the account `secret.<NAME>`
+([named secrets](named-secrets.md#named-item-contract)). They count toward
+the 256-item limit (at most 64 of them), the sweep never deletes them, and the
+worker gains the requests `put_named`, `get_named`, `delete_named` and
+`list_named`. An account that is neither `input.<32 hex>` nor
+`secret.<valid name>` is unrecognized. Everything else in this document is
+unchanged.
+
 ## Scope
 
 The secret store holds values that must not enter any Asura record but must
@@ -131,7 +140,8 @@ its job's later output deletion.
 | Access group | The keychain access group the process reads from its own signed entitlements; every production call names it ([access group](release-signing.md#access-group-from-the-entitlements)) |
 | Target pre-check | The `SecKeychainGetStatus` call that the scratch backend makes before every item call ([target pre-check](#target-pre-check)). Test-only |
 | Orphan item | A secret item whose input the journal does not reference as live |
-| Unrecognized item | An item under this installation's service attribute whose account is not `input.<32 lowercase hex>`. Asura never writes one |
+| Unrecognized item | An item under this installation's service attribute whose account is neither `input.<32 lowercase hex>` nor `secret.<valid secret name>` (2026-11-01). Asura never writes one |
+| Named item | An item whose account is `secret.<NAME>`: one [named secret](named-secrets.md). Never an orphan |
 | Field evidence | The raw `OSStatus` and the session state that every Keychain error records in its audit event ([field evidence](release-signing.md#keychain-field-evidence)) |
 
 ## Ownership
@@ -494,7 +504,8 @@ refused with `full` until the person removes items.
 | `put` | Installation, input ID, binding, payload | `stored`, `exists_same`, `exists_different`, `locked`, `denied`, `unavailable`, `full` |
 | `get` | Installation, input ID, binding | `values`, `missing`, `mismatch`, `locked`, `denied`, `unavailable` |
 | `delete` | Installation, input ID | `deleted`, `absent`, `locked`, `denied`, `unavailable` |
-| `sweep` | Installation, live input IDs from replay | Counts: kept, deleted, failed, unrecognized; whether the last listing was truncated |
+| `sweep` | Installation, live input IDs from replay | Counts: kept, deleted, failed, unrecognized; whether the last listing was truncated. Named items are kept |
+| `put_named`, `get_named`, `delete_named`, `list_named` | Installation, names, the value for a put | [Named secrets](named-secrets.md#control-api) (2026-11-01) |
 
 Every failure reply (`locked`, `denied`, `unavailable`) carries the raw
 `OSStatus` and the session state that the worker read when the call failed

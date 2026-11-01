@@ -897,6 +897,10 @@ enum QueueRefusal {
   QUEUE_REFUSAL_SECRET_IN_CWD = 11;
   QUEUE_REFUSAL_PLACEHOLDER_NOT_AVAILABLE = 12;
   QUEUE_REFUSAL_SECRET_DETECTION_UNAVAILABLE = 13;
+  // Named references (named-secrets.md, 2026-11-01).
+  QUEUE_REFUSAL_SECRET_NOT_FOUND = 14;
+  QUEUE_REFUSAL_SECRET_REFERENCE_INVALID = 15;
+  QUEUE_REFUSAL_TOO_MANY_SECRETS = 16;
 }
 ```
 
@@ -966,6 +970,9 @@ TUI texts for refusals:
 | `cwd_invalid` | "The working directory cannot be used for commands." |
 | `secret_store_*` | The [secret store](secret-store.md#failure-handling) texts; `secret_store_busy` reads "The Keychain is busy. Press Enter again." |
 | `secret_in_cwd`, `placeholder_not_available`, `secret_detection_unavailable` | The [secret detection](secret-detection.md#refusal) texts |
+| `secret_not_found` | "This command names a secret that is not stored. Store it with /secrets store NAME, or list the stored names with /secrets." |
+| `secret_reference_invalid` | "This command names a secret in a form Asura cannot pass. Use $ASURA_SECRET_NAME or ${ASURA_SECRET_NAME}, and do not combine it with a secret typed in a form Asura must filter." |
+| `too_many_secrets` | "This command uses more secrets than one command can carry (16 values, 8,192 bytes)." |
 
 Each refusal returns the row's text to the editor in its mode under the
 existing outbox rejection rule.
@@ -1228,6 +1235,7 @@ as SL5 requires.
 | 20 | fallback reason | u8 | 0 unless field 17 bit 1; then the rewrite's refusal code, not 1, 12 or 14 (kind 14 field 21) |
 | 21 | fallback kind | u8 | 0 or a secret kind 1–33 (kind 14 field 22) |
 | 22 | fallback word | u16 | 0, or the 1-based word index 1–4,096 (kind 14 field 23) |
+| 24 | named references | u8 count, then entries | 0–16 entries: u8 number, u8 name length 1–48, name ([named secrets](named-secrets.md#kind-31-field-24), 2026-11-01) |
 | 23 | declared variables | u8 count, then entries | 0–32 entries in increasing name byte order: u8 name length 1–64, name, u16 value length 1–1,024, value; at most 4,096 bytes of names and values ([declared variables](person-command-environment.md#declared-variables), ENV1) |
 
 The maximum payload is 44,142 bytes (revised 2026-10-31, ENV1): 105 bytes of

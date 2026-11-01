@@ -755,7 +755,7 @@ job received a raw secret value. Today one source exists:
 
 | Taint source (code) | Record and fields | Meaning |
 | --- | --- | --- |
-| `person_secret_values` (1) | Kind 31 field 14–15 `number_kinds` not empty, or field 17 bit 1 `whole_command` | The person command ran with stored secret variables `$ASURA_SECRET_<n>` or with the whole-command variable `ASURA_SECRET_COMMAND` (secret store, SL5) |
+| `person_secret_values` (1) | Kind 31 field 14–15 `number_kinds` not empty, or field 17 bit 1 `whole_command` | The person command ran with stored secret variables `$ASURA_SECRET_<n>` or with the whole-command variable `ASURA_SECRET_COMMAND` (secret store, SL5). A [named reference](named-secrets.md#references-in-commands) adds numbers to `number_kinds`, so it taints the job with no new rule (2026-11-01) |
 | `model_secret_values` (2) | Kind 14 with operation `exec_cmd` and `number_kinds` not empty, or `whole_command` set (ENV4, 2026-10-31) | The model's command ran with SL3 secret variables or the SL7 whole-command variable |
 
 Source 2 is interim: the broker work (AD-4) will forbid raw delivery to model

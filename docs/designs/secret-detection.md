@@ -581,7 +581,11 @@ The same function serves both origins.
 ### Steps
 
 1. Reject a command that references `$ASURA_SECRET_<n>` or
-   `${ASURA_SECRET_<n>}` with `placeholder_not_available`. A placeholder seen
+   `${ASURA_SECRET_<n>}` with `placeholder_not_available`. A named reference
+   `$ASURA_SECRET_<NAME>` is not a placeholder: for a person command the
+   conversation owner resolves it after the rewrite
+   ([named secrets](named-secrets.md#references-in-commands), 2026-11-01);
+   for a model command it stays text. A placeholder seen
    in earlier output names no value in a new execution, because no variable is
    reused across commands.
 2. Scan the whole command with the rule set in whole-buffer mode: the same

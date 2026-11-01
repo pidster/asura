@@ -5,11 +5,10 @@ Status: selected design, 2026-10-31, under the owner's decisions of that date
 allow-list of `!` commands and the PCR21 launch environment of `!!` commands in
 [person command mode](person-command-mode.md). Mechanisms marked "selected
 (engineering)" are engineering choices under the
-[iteration rules](../design-process.md#iteration-and-escalation). One open
-decision remains, [ENV-O1](#env-o1-the-offer-to-store-a-variable-as-a-secret):
-what the offer to store a flagged variable as a secret creates. It does not
-block the rest of this design; the offer action is not built until the owner
-answers. Protocol numbering remains `0.1`; journal format remains `1`.
+[iteration rules](../design-process.md#iteration-and-escalation). The owner
+answered [ENV-O1](#env-o1-the-offer-to-store-a-variable-as-a-secret) on
+2026-11-01: the offer creates a durable named secret, designed in
+[named secrets](named-secrets.md). Protocol numbering remains `0.1`; journal format remains `1`.
 
 ## Owner decisions (2026-10-31)
 
@@ -65,9 +64,9 @@ and the [taint exclusion hook](context-composer.md#taint-exclusion-hook).
 | PE-R2 | The base list is fixed ([base list](#base-list)). Asura sets some names itself; the others come from the TUI's environment, checked by value class | ENV1 |
 | PE-R3 | The toolchain list is fixed ([toolchain list](#toolchain-list)). Each value comes from the TUI's environment, checked by value class | ENV1 |
 | PE-R4 | Declared variables are names and values in the person's configuration, one mapping per project. They are non-secret: a value the scanner flags is refused when it is set | ENV1 |
-| PE-R5 | A secret value reaches a command only as a secret variable: `$ASURA_SECRET_<n>` or `ASURA_SECRET_COMMAND`, from the existing command rewrite and its Keychain item. Such a job is tainted (T1) | ENV1 |
+| PE-R5 | A secret value reaches a command only as a secret variable: `$ASURA_SECRET_<n>` or `ASURA_SECRET_COMMAND`, from the existing command rewrite and its Keychain item, or from a [named reference](named-secrets.md#references-in-commands) `$ASURA_SECRET_<NAME>` resolved at submit (2026-11-01). Such a job is tainted (T1) | ENV1, ENV-O1 |
 | PE-R6 | A deterministic scanner (rules and entropy, no model) checks every variable of the TUI's captured environment. A flagged variable is never passed, even when its name is listed | ENV1 |
-| PE-R7 | The TUI reports flagged variables by name and kind, never by value. The report offers to store a flagged variable as a secret; the mechanism of that offer is open ([ENV-O1](#env-o1-the-offer-to-store-a-variable-as-a-secret)) | ENV1 |
+| PE-R7 | The TUI reports flagged variables by name and kind, never by value. The report offers to store each listed variable as a named secret ([named secrets](named-secrets.md#the-offer), ENV-O1) | ENV1, ENV-O1 |
 | PE-R8 | The person sees which variables a command received, by name and source, never by value | ENV1 |
 | PE-R9 | When a command names `$X` and the terminal sets `X` but the command did not receive it, the TUI shows "`$X` was not passed" with the reason | ENV1 |
 | PE-R10 | A `!!` command receives the same environment as a `!` command, plus the job marker `ASURA_JOB_<jobhex>=1` | ENV2 |
@@ -291,8 +290,10 @@ Keychain item and the guardian's own environment, never in FD 11. The
 guardian preamble makes each one an unexported shell variable. Such a job is
 tainted under T1 ([taint source 1](context-composer.md#taint-exclusion-hook)).
 
-This is the "stored secret variable" of ENV1. No other secret source exists
-until ENV-O1 is answered.
+This is the "stored secret variable" of ENV1. Since 2026-11-01 a command can
+also name a stored named secret as `$ASURA_SECRET_<NAME>`; the service
+resolves it at submit into a numbered secret variable in the same item
+([named secrets](named-secrets.md#references-in-commands)).
 
 ### Name sets and precedence
 
@@ -462,8 +463,9 @@ Not passed to ! and !! commands because they may be secrets: GITHUB_TOKEN (githu
 ```
 
 The list holds at most 8 names, then `and N more`. When the launch scan has
-not finished, the report waits until it does. The offer to store a flagged
-variable as a secret is added to this report once ENV-O1 is answered.
+not finished, the report waits until it does. Since 2026-11-01 each listed
+name carries its store action (`/secrets store NAME`); the text is in
+[named secrets](named-secrets.md#launch-report).
 
 **Environment line.** The accepted reply of a command submit carries the
 names the command will receive, with their sources
@@ -488,7 +490,7 @@ that the command does not receive, and that the shell does not set itself
 
 | Reason | Hint |
 | --- | --- |
-| Flagged | `$GITHUB_TOKEN was not passed: it may be a secret (github-token)` |
+| Flagged | `$GITHUB_TOKEN was not passed: it may be a secret (github-token); store it with /secrets store GITHUB_TOKEN and use $ASURA_SECRET_GITHUB_TOKEN` (2026-11-01) |
 | Not listed | `$JAVA_OPTS was not passed: it is not on the list; declare it in personCommands.environment.<project ID>` |
 | Invalid value | `$GOPATH was not passed: its value is not a valid path list` |
 
@@ -498,7 +500,11 @@ what it received.
 
 ### ENV-O1: the offer to store a variable as a secret
 
-Open decision for the owner. ENV1 asks for an offer to store a flagged
+Resolved by the owner on 2026-11-01: option B, a durable named secret in the
+team Keychain store, used by explicit reference with raw delivery and taint.
+Brokers and host binding stay later work. The mechanism is
+[named secrets](named-secrets.md). The text below is the question as it was
+put. ENV1 asks for an offer to store a flagged
 variable as a secret. Today a "stored secret variable" exists only per
 command: the person types the value in the command, and the rewrite stores it
 in that command's Keychain item until the job settles. No durable, named
@@ -792,8 +798,8 @@ The PTY harness presses Enter again while the TUI shows "Checking this
 terminal's environment; press Enter again", because a debug build's launch
 scan can outlast the first keypress under load.
 
-Not verified: the store-as-secret offer (ENV-O1 is open, so no store action
-exists); toolchain names other than those a fixture sets; a terminal whose
+Not verified then: the store-as-secret offer (ENV-O1 was open; it is built
+under [named secrets](named-secrets.md)); toolchain names other than those a fixture sets; a terminal whose
 values exceed the class bounds in a real session.
 
 Return to the [design index](README.md).
