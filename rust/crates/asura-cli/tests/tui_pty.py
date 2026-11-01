@@ -320,7 +320,7 @@ class Fixture:
                     trial.send(b"\x1b")
                     end = time.monotonic() + remaining()
                     while "Use this directory as a project?" in trial.screen.text():
-                        assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
+                        assert time.monotonic() < end, trial.screen.text()
                         trial.read(0.025)
             return trial
         except Exception:
@@ -900,7 +900,7 @@ def repeated_initialization(fixture):
         trial.send(b"\x1b")
         end = time.monotonic() + remaining()
         while "Use this directory as a project?" in trial.screen.text():
-            assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
+            assert time.monotonic() < end, trial.screen.text()
             trial.read(0.025)
         code, projects, _ = fixture.command("project", "list")
         assert code == 0 and b"No projects." in projects, projects
@@ -938,7 +938,7 @@ def repeated_initialization(fixture):
         # Wait for the panel to close before the next command.
         end = time.monotonic() + remaining()
         while "Setup · Esc closes" in trial.screen.text():
-            assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
+            assert time.monotonic() < end, trial.screen.text()
             trial.read(0.025)
 
     def command(trial, text, expected):
@@ -962,7 +962,7 @@ def repeated_initialization(fixture):
                 trial.send(b"\x1b")
                 end = time.monotonic() + remaining(5)
                 while "Tools · Esc closes" in trial.screen.text():
-                    assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
+                    assert time.monotonic() < end, trial.screen.text()
                     trial.read(0.025)
             screen = command(trial, "/audit 4", "Audit · Esc closes")
             trial.until(b"Window: recent", plain=True)
@@ -970,7 +970,7 @@ def repeated_initialization(fixture):
             trial.send(b"\x1b")
             end = time.monotonic() + remaining(5)
             while "Audit · Esc closes" in trial.screen.text():
-                assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
+                assert time.monotonic() < end, trial.screen.text()
                 trial.read(0.025)
             screen = command(trial, "/audit 17", "Use /audit [limit]")
             assert "/audit 17" in screen, screen
@@ -1212,7 +1212,7 @@ def queue_history_with_provider(fixture, source, endpoint):
             trial.send(b"\x1b")
             end = time.monotonic() + remaining(5)
             while "Input queue" in trial.screen.text():
-                assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
+                assert time.monotonic() < end, trial.screen.text()
                 trial.read(0.025)
             trial.send(f"queue-history-admission-{count}\r".encode())
             trial.until(b"Generating", plain=True, limit=30, reject="request_conflict")
@@ -2703,7 +2703,7 @@ def long_observation(fixture, source):
         end = time.monotonic() + remaining(110)
         while not chatting.is_set():
             assert not errors, errors
-            assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
+            assert time.monotonic() < end, trial.screen.text()
             trial.read(0.025)
         started = time.monotonic()
         typed = False
@@ -5338,10 +5338,15 @@ def path_guard_journey(fixture, source):
         offset = len(trial.output)
         trial.send(b"\r")
         notice_until(trial, "Command confirmed; Asura checks its paths again, then runs it", offset)
-        # Once the entry is no longer held, Esc leaves the log (whose view
-        # stays where it was while focused).
+        # The confirmed entry waits with `path_check` while Asura checks its
+        # paths again, and Esc on a checking entry drops it (EPG-T record).
+        # Wait until the command has started (its output shows; the log's
+        # view stays where it was while focused, so its exit row may be
+        # below the view) and the hint shows neither lead: the queue update
+        # of the check came before the start, so Esc then leaves the log.
+        entry_rows(trial, "!! make", "made-once")
         end = time.monotonic() + remaining(10)
-        while "↵ run the held command" in trial.screen.text():
+        while any(lead in trial.screen.text() for lead in ("↵ run the held command", "Esc drop the command")):
             assert time.monotonic() < end, trial.screen.text()
             trial.read(0.025)
         trial.send(b"\x1b")

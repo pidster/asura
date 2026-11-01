@@ -526,6 +526,15 @@ report:
 Environments: the macOS 27 host with `sandbox-exec`, scratch Asura home,
 scratch HOME and a scratch project.
 
+In EPG-E4, a confirmed entry waits with `path_check` while Asura checks its
+paths again, and Esc on a checking entry drops it. The journey therefore
+waits until the command's output shows and the log hint has neither "↵ run
+the held command" nor "Esc drop the command" before it presses Esc to leave
+the log. Before the allow-list environment (`2c7e1a7`), a `!!` command read
+its Keychain item before the path check. That read delayed the check, so the
+journey's early Esc usually reached the log before the check started. The
+product behaviour is unchanged (recorded 2026-11-01).
+
 ## Packets
 
 Selected plan. Each packet owns its paths alone; the primary agent integrates.
