@@ -261,7 +261,9 @@ now holds ordinal 1 (1–9), name 2, arguments 3, arguments_bytes 4, name_bytes 
 and source 6. `ToolResult` ordinal may be 9 only with status 7.
 ToolResult contains ordinal 1, status 2, bounded text 3, optional next offset 4
 and explicit truncated flag 5. Known status values distinguish success, denied,
-invalid arguments, unavailable, timeout, cancelled and resource limit.
+invalid arguments, unavailable, timeout, cancelled, resource limit and, since
+2026-11-01, private (8): a tainted job's result, which the helper shows as its
+text alone ([private tool result status](tool-job-controller.md#private-tool-result-status-2026-11-01)).
 
 The service sends results; helpers send calls. Only ordinals 1 through 8 are
 valid. A helper retains at most one suspended callback. Concurrent callbacks fail

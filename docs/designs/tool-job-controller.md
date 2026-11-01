@@ -3972,7 +3972,7 @@ TCR-O5). Encodings follow the existing codec.
 | # | Field | Encoding | Bounds and rule |
 | --- | --- | --- | --- |
 | 1–3 | operation, generation, ordinal | ID, u64, u32 | The operation's pending `run` kind 14 with operation code 10–16; ordinal 1–200 |
-| 4 | status | u8 | Wire `ToolStatus` 1–7, fixed by field 5 |
+| 4 | status | u8 | Wire `ToolStatus` 1–8, fixed by field 5 (8 `private` since 2026-11-01) |
 | 5 | outcome | u8 | 1 `ok`, 2 `not_found`, 3 `not_permitted`, 4 `busy`, 5 `cancelled`, 6 `unavailable`, 7 `limit`, 8 `private` (T1, 2026-10-31) |
 | 6 | job ID | ID | Zero for code 10 (derived), for code 11, and with outcome `not_found`; otherwise a job of the turn's conversation |
 | 7 | body | By operation code, never stored | Below |
@@ -3986,7 +3986,7 @@ TCR-O5). Encodings follow the existing codec.
 | `cancelled` | 6 cancelled | 10, 11, 12, 13, 14, 16 |
 | `unavailable` | 4 unavailable | 11–16 |
 | `limit` | 7 limit | 16 |
-| `private` | 2 denied | 10, 12, 13, 14: the job is tainted ([taint exclusion hook](context-composer.md#taint-exclusion-hook)); no body. Code 10 since 2026-10-31 ([model jobs with secret variables](#model-jobs-with-secret-variables-2026-10-31)) |
+| `private` | 8 private (2 denied before 2026-11-01) | 10, 12, 13, 14: the job is tainted ([taint exclusion hook](context-composer.md#taint-exclusion-hook)); no body. Code 10 since 2026-10-31 ([model jobs with secret variables](#model-jobs-with-secret-variables-2026-10-31)) |
 
 **State block** (codes 10, 12, 14 and 15 with outcome `ok`, and code 10 with
 `cancelled`):
@@ -4287,8 +4287,8 @@ activity row are unchanged.
 | `limit` | `limit: this job has no room for more notes` |
 | `cancelled` (codes 11–16) | `cancelled` |
 | Note `ok` | `note: recorded on job <handle>` |
-| `private` (codes 12–14, T1) | `private: this job received a secret value; its output, result and counts are not shown to you` (revised 2026-10-31: origin-neutral, since model jobs can be tainted) |
-| `private` (code 10, ENV4) | `private: this command received a secret value; its output, result and counts are not shown to you`, then the `job:` handle line |
+| `private` (codes 12–14, T1) | `private: this job used secrets, so its output is private to the person` (revised 2026-11-01, [private tool result status](#private-tool-result-status-2026-11-01)) |
+| `private` (code 10, ENV4) | `private: this command used secrets, so its output is private to the person`, then the `job:` handle line (revised 2026-11-01) |
 
 Every result stays within the 16,384-byte per-result limit (L21, kept): a page
 is at most 8,192 bytes of text plus a header under 512 bytes; a list is at most
@@ -6132,8 +6132,9 @@ follows (selected, engineering):
   result could show nothing the model may see. As soon as the job's kind 26
   commits (JR13), it appends kind 29 with outcome `private` and no body. The
   rendered text holds the private line and the handle. The outcome fixes
-  status 2, so the helper presents the result as a denied tool result; the
-  text says that the command runs as the named job. A turn that ends
+  status 8 `private` ([private tool result status](#private-tool-result-status-2026-11-01));
+  the helper shows the text as it is, not as a failed tool call. The text
+  says that the command runs as the named job. A turn that ends
   before delivery still cancels the job (TJ-04), and the call still records
   `private`. The job then runs on as any delivered job.
 - **Later calls.** `job status`, `job read` and `job wait` of the job record
@@ -6148,6 +6149,52 @@ follows (selected, engineering):
 
 The person sees the job's output and facts in the job viewer and `/jobs`, as
 for any job.
+
+### Private tool result status (2026-11-01)
+
+Selected (engineering) under T1 and the owner's packet request of
+2026-11-01. Before this revision, kind 29 outcome `private` fixed wire
+`ToolStatus` 2 (`denied`). The helper renders every status other than
+success as `Tool failed: <status>`, so the model read a tainted job's result
+as `Tool failed: denied`. A model that reads a denial can retry the call or
+look for another way to run the command. Neither helps: the job ran, and its
+output is the person's.
+
+Required behavior:
+
+| ID | Rule |
+| --- | --- |
+| PTS-R1 | `ToolStatus` gains value 8, `TOOL_STATUS_PRIVATE`, in `contracts/model/v1/model.proto`, in place under protocol `0.1` |
+| PTS-R2 | Kind 29 outcome `private` fixes status 8. No other outcome uses status 8. Kind 29 field 4 allows 1–8 |
+| PTS-R3 | The model-visible text is a reference fact only: the output is private to the person because the command used secrets. It holds no body, exit status, line or byte count, duration or advice. Code 10 adds the `job:` handle line |
+| PTS-R4 | The helper renders a status 8 result as its text alone: no `Tool failed:` prefix and no `[truncated: …]` line |
+| PTS-R5 | The service's model codec accepts status 8 only with `truncated` false and no `next_offset`. Kind 15 records keep statuses 1–7: no kind 15 result is private |
+| PTS-R6 | The `tool.finished` audit outcome gains `private` (8); the TUI activity line shows `private` for status 8 |
+
+#### PTS-F1: private result decision
+
+Selected design. Arrows are the decisions for one job tool result, from the
+taint check to the text the model sees.
+
+```mermaid
+flowchart LR
+    Taint{"Job tainted (T1)?"} -->|No| Normal["Outcome by the normal rules; status 1-7"]
+    Taint -->|"Yes: codes 10, 12, 13, 14"| K29["Kind 29 outcome private, no body"]
+    K29 --> Status["Status 8 private"]
+    Status --> Wire["ToolResult: status 8, private text, truncated false"]
+    Wire --> Helper{"Helper: status?"}
+    Helper -->|"8 private"| Text["Model sees the text alone"]
+    Helper -->|"2-7"| Failed["Tool failed: status, then the text"]
+```
+
+| ID | Layer | Case | Required result |
+| --- | --- | --- | --- |
+| PTS-U1 | Unit, storage | Kind 29 with outcome `private` and status 8, and with status 2 | Status 8 round-trips; status 2 with `private` is `Corrupt`; `JobResultOutcome::Private.status()` is 8 |
+| PTS-U2 | Unit, service | Render codes 10 and 12 to 14 with outcome `private` | The exact texts of the result table; no exit status, count, duration or output |
+| PTS-U3 | Unit, control | Model codec `ToolResult` with status 8; with status 8 and `truncated` true; with status 9 | Accepted; rejected; rejected |
+| PTS-U4 | Unit, Swift | `ToolResult(status: .private, text:)` rendered | The text alone, with no `Tool failed:` prefix and no truncation line |
+| PTS-I1 | Integration | CC-I16 and CC-I18 | Every private result the scripted model receives has status 8 and the new text |
+| PTS-E1 | End to end | CC-E8 | The model's `job read` result is status 8 with the private text |
 
 ### J5 failure handling
 

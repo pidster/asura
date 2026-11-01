@@ -787,9 +787,9 @@ and the handle.
 | Surface | Untainted | Tainted |
 | --- | --- | --- |
 | Turn notice entry (J5) | Full entry, with a CC3 view | The origin label, `command:`, `directory:`, `result: private (the command received a secret value; its output, result and counts are not shown to you)`, `job:`; no `output:` line and no view |
-| Handle delivery of a model `exec_cmd` (code 10, source 2) | State block after the yield window, with a stage A view | Kind 29 outcome `private` with no body, delivered as soon as the job's kind 26 commits, with no yield wait; text `private: this command received a secret value; its output, result and counts are not shown to you` and the `job:` handle line |
+| Handle delivery of a model `exec_cmd` (code 10, source 2) | State block after the yield window, with a stage A view | Kind 29 outcome `private` with no body, delivered as soon as the job's kind 26 commits, with no yield wait; status 8 `private` (2026-11-01); text `private: this command used secrets, so its output is private to the person` and the `job:` handle line |
 | Reference form of an entry, and a prior turn's rebuilt notice | `[job <handle>: <origin>, <outcome>; stdout N bytes; stderr N bytes…]` | `[job <handle>: <origin>, private]` |
-| `job status`, `job read`, `job wait` (codes 12 to 14) | State block, page or wait result, with a stage A view | Kind 29 outcome `private` with no body; text `private: this job received a secret value; its output, result and counts are not shown to you`. No page read and no wait starts |
+| `job status`, `job read`, `job wait` (codes 12 to 14) | State block, page or wait result, with a stage A view | Kind 29 outcome `private` with no body, status 8 `private` (2026-11-01); text `private: this job used secrets, so its output is private to the person`. No page read and no wait starts |
 | `job list` row (code 11) | Handle, origin, state, byte counts, excerpt | `- <handle> · <origin> · private · <excerpt>` |
 | `job cancel`, `job note` | Unchanged (`not_permitted` for a person job; a note is recorded) | Unchanged: neither result shows output or a fact the job produced |
 | Live line of the notice (J5-E4) | Counts unsettled jobs | Unchanged: it counts jobs, not output (the timing limit below) |
@@ -1282,9 +1282,12 @@ with an unreadable state has 0 bytes; at most 3 ranges; ranges of one stream do
 not overlap. A count above 0 needs outcome `ok`. Replay adds, with the
 operation code: a view only on codes 10, 12 and 14.
 
-Kind 29 outcome 8, `private` (T1): status 2 (`denied`), no body, allowed for
-codes 12, 13 and 14, and it names the job as the other outcomes of those codes
-do. Replay applies the existing job rules and does not re-derive the taint:
+Kind 29 outcome 8, `private` (T1): status 8 (`private`), no body, allowed for
+code 10 and codes 12, 13 and 14, and it names the job as the other outcomes of
+those codes do. Revised 2026-11-01: the outcome first fixed status 2
+(`denied`), so the helper showed the model `Tool failed: denied` and the model
+could retry or try to work around a denial. Status 8 is the
+[private tool result status](tool-job-controller.md#private-tool-result-status-2026-11-01). Replay applies the existing job rules and does not re-derive the taint:
 the outcome records the decision made when the result was built.
 
 #### CC3 notice views
