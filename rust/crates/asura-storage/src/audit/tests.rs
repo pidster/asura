@@ -2205,7 +2205,7 @@ fn p3e2_secret_store_events() {
 }
 
 /// NS-U13: the named secret events take their own reply codes, carry a
-/// status only with a failure (and `replace_failed`), bound their counts,
+/// status only with a failure, bound their counts,
 /// and the closed schema refuses a name or value field.
 #[test]
 fn ns_u13_named_secret_events() {
@@ -2215,12 +2215,17 @@ fn ns_u13_named_secret_events() {
         status,
         session: None,
     };
-    for reply in [R::Stored, R::Replaced, R::Exists, R::Full] {
+    for reply in [R::Stored, R::Replaced, R::Exists, R::Absent, R::Full] {
         put(reply, None).validate().unwrap();
         assert_eq!(put(reply, Some(1)).validate(), Err(Error::Invalid));
     }
-    put(R::ReplaceFailed, Some(-25_291)).validate().unwrap();
-    assert_eq!(put(R::ReplaceFailed, None).validate(), Err(Error::Invalid));
+    // `replace_failed` was removed by replace in place: the name is unknown.
+    assert!(
+        serde_json::from_str::<Event>(
+            r#"{"kind":"secret_store.named_put","details":{"reply":"replace_failed","status":-25291}}"#
+        )
+        .is_err()
+    );
     put(R::Locked, Some(-25_308)).validate().unwrap();
     assert_eq!(put(R::Read, None).validate(), Err(Error::Invalid));
     let get = |reply, count| Event::SecretStoreNamedGet {

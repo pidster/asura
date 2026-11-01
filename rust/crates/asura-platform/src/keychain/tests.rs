@@ -94,6 +94,11 @@ impl Calls for Fixture {
             .expect("unscripted copy")
             .map(Zeroizing::new)
     }
+    fn update(&self, service: &str, account: &str, _: &[u8]) -> Result<(), i32> {
+        assert!(service.starts_with(SERVICE_PREFIX) && account.starts_with(NAMED_PREFIX));
+        self.log.borrow_mut().push("update");
+        self.item.borrow_mut().take().expect("unscripted update")
+    }
     fn delete(&self, _: &str, _: &str) -> Result<(), i32> {
         self.log.borrow_mut().push("delete");
         self.item.borrow_mut().take().expect("unscripted delete")
@@ -344,6 +349,79 @@ fn ns_u4_listing_classifies_named_items() {
     assert_eq!(bad.valid(), Err(Failure::Invalid));
 }
 
+fn named(name: &str) -> NamedKey {
+    NamedKey {
+        installation: INSTALLATION,
+        name: name.into(),
+    }
+}
+
+fn update(f: &Fixture, key: &NamedKey, data: &[u8]) -> Result<Updated, Failure> {
+    key.valid()?;
+    update_raw_with(f, &key.service(), &key.account(), data)
+}
+
+/// NS-U15: the update path. Scratch: a status call before every update and
+/// no update after a non-zero pre-check; the status table maps 0, -25300,
+/// a locked -25293 and another code. Data protection: no pre-check, and
+/// -34018 is `NotSigned`. Bounds and the name rule make no call.
+#[test]
+fn ns_u15_update_named() {
+    let key = named("GITHUB_TOKEN");
+    let f = Fixture::statuses(&[Ok(0x7)]).item(Ok(()));
+    assert_eq!(update(&f, &key, b"v"), Ok(Updated::Changed));
+    assert_eq!(f.log(), ["status", "update"]);
+    let f = Fixture::statuses(&[Ok(0x7)]).item(Err(-25_300));
+    assert_eq!(update(&f, &key, b"v"), Ok(Updated::Absent));
+    let f = Fixture::statuses(&[Ok(0x2), Ok(0x2)]).item(Err(-25_293));
+    assert_eq!(
+        update(&f, &key, b"v"),
+        Err(Failure::Locked { status: -25_293 })
+    );
+    assert_eq!(f.log(), ["status", "update", "status"]);
+    let f = Fixture::statuses(&[Ok(0x7)]).item(Err(-25_291));
+    assert_eq!(
+        update(&f, &key, b"v"),
+        Err(Failure::Unavailable {
+            status: -25_291,
+            item_call: true
+        })
+    );
+    let f = Fixture::statuses(&[Err(-25_294)]);
+    assert_eq!(
+        update(&f, &key, b"v"),
+        Err(Failure::Unavailable {
+            status: -25_294,
+            item_call: false
+        })
+    );
+    assert_eq!(f.log(), ["status"], "no update after a non-zero pre-check");
+    let dp = Fixture::data_protection;
+    let f = dp().item(Ok(()));
+    assert_eq!(update(&f, &key, b"v"), Ok(Updated::Changed));
+    assert_eq!(f.log(), ["update"]);
+    let f = dp().item(Err(-25_300));
+    assert_eq!(update(&f, &key, b"v"), Ok(Updated::Absent));
+    let f = dp().item(Err(-25_308));
+    assert_eq!(
+        update(&f, &key, b"v"),
+        Err(Failure::Locked { status: -25_308 })
+    );
+    let f = dp().item(Err(-34_018));
+    assert_eq!(
+        update(&f, &key, b"v"),
+        Err(Failure::NotSigned { item_call: true })
+    );
+    for size in [0, MAX_ITEM_BYTES + 1] {
+        let f = Fixture::default();
+        assert_eq!(update(&f, &key, &vec![1; size]), Err(Failure::Invalid));
+        assert!(f.log().is_empty());
+    }
+    let f = Fixture::default();
+    assert_eq!(update(&f, &named("COMMAND"), b"v"), Err(Failure::Invalid));
+    assert!(f.log().is_empty());
+}
+
 #[test]
 fn add_bounds_need_no_keychain_call() {
     for size in [0, MAX_ITEM_BYTES + 1] {
@@ -428,6 +506,13 @@ fn every_data_protection_dictionary_names_the_keychain_and_group() {
             },
         ),
         (
+            "update",
+            Op::Update {
+                service: "s",
+                account: "a",
+            },
+        ),
+        (
             "list",
             Op::List {
                 service: Some("s"),
@@ -472,6 +557,33 @@ fn every_data_protection_dictionary_names_the_keychain_and_group() {
     };
     assert_eq!(find(&add, &accessible), [after_first_unlock.as_CFType()]);
     assert_eq!(find(&add, &label), [CFString::new(LABEL).as_CFType()]);
+    // The update's query returns nothing and sets no data; its attribute
+    // dictionary holds the data alone (named-secrets.md, replace in place).
+    let query = pairs(
+        group,
+        Op::Update {
+            service: "s",
+            account: "a",
+        },
+    );
+    // SAFETY: Security framework constants, as above.
+    let (value, return_data, limit) = unsafe {
+        (
+            key(sys::kSecValueData),
+            key(sys::kSecReturnData),
+            key(sys::kSecMatchLimit),
+        )
+    };
+    for absent in [&value, &return_data, &limit, &label, &accessible] {
+        assert!(
+            find(&query, absent).is_empty(),
+            "update query sets {absent}"
+        );
+    }
+    let attributes = data_protection::update_attributes(&data);
+    assert_eq!(attributes.len(), 1);
+    assert_eq!(attributes[0].0, value);
+    assert_eq!(attributes[0].1, data.as_CFType());
     // A group-wide listing (the qualification purge) still names the group.
     let purge = pairs(
         group,
@@ -836,6 +948,46 @@ mod scratch_keychain {
             Ok(Found::Data(Zeroizing::new(b"two".to_vec())))
         );
         assert_eq!(keychain.add(&key(3), b"three"), Ok(Added::Stored));
+        drop(keychain);
+        scratch.delete_keychain();
+    }
+
+    /// NS-U15 on a real scratch keychain: an update changes the data in
+    /// place; a locked keychain refuses it after a pre-check of 0 and keeps
+    /// the old data; an update of a missing item is `Absent` and adds none.
+    #[test]
+    fn update_named_in_place() {
+        let mut scratch = Scratch::new();
+        let keychain = scratch.open();
+        let key = NamedKey {
+            installation: INSTALLATION,
+            name: "PE_TOKEN".into(),
+        };
+        assert_eq!(keychain.add_named(&key, b"old"), Ok(Added::Stored));
+        assert_eq!(keychain.update_named(&key, b"new"), Ok(Updated::Changed));
+        assert_eq!(
+            keychain.get_named(&key),
+            Ok(Found::Data(Zeroizing::new(b"new".to_vec())))
+        );
+        assert_eq!(scratch::lock(scratch.target()), Ok(()));
+        let flags = keychain.status().expect("pre-check 0 while locked");
+        assert_eq!(flags & STATUS_UNLOCKED, 0, "flags {flags:#x}");
+        assert!(
+            matches!(
+                keychain.update_named(&key, b"locked"),
+                Err(Failure::Locked { .. })
+            ),
+            "locked update"
+        );
+        assert_eq!(scratch::unlock(scratch.target()), Ok(()));
+        assert_eq!(
+            keychain.get_named(&key),
+            Ok(Found::Data(Zeroizing::new(b"new".to_vec()))),
+            "a failed update keeps the data"
+        );
+        assert_eq!(keychain.delete_named(&key), Ok(Removed::Deleted));
+        assert_eq!(keychain.update_named(&key, b"gone"), Ok(Updated::Absent));
+        assert_eq!(keychain.list(&INSTALLATION), Ok(Listing::default()));
         drop(keychain);
         scratch.delete_keychain();
     }

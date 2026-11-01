@@ -3648,6 +3648,15 @@ fn named() -> Result<()> {
         result(&put(&env, "PE_TOKEN", true, &value)?),
         Some(R::Replaced)
     );
+    // Replace in place: a name that is not stored is absent, and no item
+    // is added.
+    assert_eq!(
+        result(&put(&env, "NOT_STORED", true, &value)?),
+        Some(R::Absent)
+    );
+    if !env.test_group {
+        assert_eq!(named_items(&env)?, ["PE_TOKEN"]);
+    }
     assert_eq!(
         result(&put(&env, "COMMAND", false, &value)?),
         Some(R::Invalid)
@@ -3664,12 +3673,19 @@ fn named() -> Result<()> {
         let locked = put(&env, "PE_LOCKED", false, &value)?;
         assert_eq!(result(&locked), Some(R::Locked), "{locked:?}");
         assert!(locked.status.is_some_and(|s| s > 0));
+        // A locked replace keeps the stored value: NS-I4's command below
+        // still prints the digest of `value`, not of `other`.
+        let replace = put(&env, "PE_TOKEN", true, &other)?;
+        assert_eq!(result(&replace), Some(R::Locked), "{replace:?}");
+        assert!(replace.status.is_some_and(|s| s > 0));
         // A listing reads attributes only, and a locked file keychain lists
         // (probe SS-P2 (a)).
         assert_eq!(result(&list(&env)?), Some(R::Listed));
         keychain::scratch::unlock(env.target()).map_err(|e| format!("unlock: {e:?}"))?;
     }
-    println!("PASS NS-I1 NS-I2: stored, listed, exists, replaced, invalid, absent; locked refused");
+    println!(
+        "PASS NS-I1 NS-I2: stored, listed, exists, replaced, replace absent, invalid, absent; locked put and replace refused"
+    );
     // A model turn gives the conversation the commands join.
     model.script(&[Step::Final]);
     let first = env

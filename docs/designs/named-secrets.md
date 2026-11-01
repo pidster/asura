@@ -914,4 +914,31 @@ Not delivered or not verified:
   a real add failure after the delete was not provoked. Superseded by
   [replace in place](#replace-in-place), which removes the window.
 
+### Replace in place verification (2026-11-01)
+
+Implemented behavior, verified on macOS 27.0 with the debug build, scratch
+keychains made through the Security framework fixtures and the ad hoc model
+helper. Diagrams NS-F1, NS-Q1, NS-F3, NS-Q3 and NS-S1 were rendered with the
+local Mermaid CLI at scale 2 into a temporary directory outside the
+repository and inspected.
+
+| Case | Evidence | Result |
+| --- | --- | --- |
+| NS-U6, NS-U14 | `secret_store::tests::ns_u6_named_requests`, `ns_u14_replace_in_place` (scripted port that keeps accepted data) | Pass |
+| NS-U12 | `tui::ui::secrets::tests::ns_u12_secrets_command` (replace notices) | Pass |
+| NS-U13 | `audit::tests::ns_u13_named_secret_events` (`absent`; `replace_failed` refused) | Pass |
+| NS-U15, KC-U1, KC-U2 | `keychain::tests::ns_u15_update_named`, `every_data_protection_dictionary_names_the_keychain_and_group`; the scratch case `scratch_keychain::update_named_in_place` (update, locked update keeps the data, missing item `Absent`) | Pass |
+| NS-I9 | `tests/secret_store.rs` `ns_i9_replace_in_place` | Pass |
+| NS-I1, NS-I2 | `person_command_flow named`: replace of a name not stored is `absent` with no item; a locked replace is `locked` and NS-I4 still prints the digest of the earlier value | Pass |
+| NS-E2, NS-E4 | PTY journey `--person-named`: the locked replace notice ends with the unchanged sentence; a replace after the remove gets the `absent` replace notice | Pass |
+
+Not verified:
+
+- The data-protection `SecItemUpdate` (production) is not exercised by
+  `cargo test` (SSR6). KC-U1 checks its dictionaries; the signed
+  qualification run (`person_command_flow` in the test group) covers the call.
+  That run was not repeated for this revision.
+- A Keychain failure after a partial write of the update was not provoked
+  ([failure atomicity](#replace-in-place)).
+
 Return to the [design index](README.md).

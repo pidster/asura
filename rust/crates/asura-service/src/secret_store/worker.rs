@@ -10,7 +10,7 @@ use super::{
     StoreFailure, SweepReport,
 };
 use asura_platform::keychain::{
-    Added, Failure, Found, ItemKey, Listing, MISSING_ENTITLEMENT, NamedKey, Removed,
+    Added, Failure, Found, ItemKey, Listing, MISSING_ENTITLEMENT, NamedKey, Removed, Updated,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -377,9 +377,9 @@ where
     }
 
     /// named-secrets.md, NS-Q1: a new name is refused at 64 names or 256
-    /// items; an existing name is `exists` unless `replace`, which deletes
-    /// then adds (not atomic: an add that fails after the delete is
-    /// `replace_failed`).
+    /// items; an existing name is `exists`. A replace is one in-place update
+    /// (NS-F3): no listing, add or delete, so a failure keeps the old value
+    /// and a missing item is `absent` with nothing written.
     fn put_named(&mut self, name: String, value: &[u8], replace: bool) -> NamedPutReply {
         let binding = codec::named_binding(&self.installation, &name);
         let Ok(payload) = codec::encode_named(&binding, value) else {
@@ -387,6 +387,14 @@ where
         };
         if !asura_platform::secrets::named::name_valid(&name) {
             return NamedPutReply::Failed(self.failure(Failure::Invalid));
+        }
+        if replace {
+            let key = self.named_key(name);
+            return match self.call(|port| port.update_named(&key, &payload)) {
+                Ok(Updated::Changed) => NamedPutReply::Replaced,
+                Ok(Updated::Absent) => NamedPutReply::Absent,
+                Err(failure) => NamedPutReply::Failed(failure),
+            };
         }
         let listing = match self.named_listing() {
             Ok(listing) => listing,
@@ -403,23 +411,7 @@ where
                 self.adjust_count(true);
                 NamedPutReply::Stored
             }
-            Ok(Added::Duplicate) if !replace => NamedPutReply::Exists,
-            Ok(Added::Duplicate) => {
-                match self.call(|port| port.delete_named(&key)) {
-                    Ok(Removed::Deleted) => self.adjust_count(false),
-                    Ok(Removed::Absent) => {}
-                    Err(failure) => return NamedPutReply::Failed(failure),
-                }
-                match self.call(|port| port.add_named(&key, &payload)) {
-                    Ok(Added::Stored) => {
-                        self.adjust_count(true);
-                        NamedPutReply::Replaced
-                    }
-                    // Another writer added the name between the calls.
-                    Ok(Added::Duplicate) => NamedPutReply::Exists,
-                    Err(failure) => NamedPutReply::ReplaceFailed(failure),
-                }
-            }
+            Ok(Added::Duplicate) => NamedPutReply::Exists,
             Err(failure) => NamedPutReply::Failed(failure),
         }
     }

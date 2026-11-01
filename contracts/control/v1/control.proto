@@ -570,7 +570,7 @@ message SecretRemove { optional string name = 1; }
 message SecretReply {
   optional SecretResult result = 1;
   repeated string names = 2;  // LISTED only: stored names in byte order, at most 64
-  optional uint32 status = 3; // |OSStatus| with LOCKED, UNAVAILABLE, DENIED or REPLACE_FAILED
+  optional uint32 status = 3; // |OSStatus| with LOCKED, UNAVAILABLE or DENIED
 }
 enum SecretResult {
   SECRET_RESULT_UNSPECIFIED = 0;
@@ -587,7 +587,8 @@ enum SecretResult {
   SECRET_RESULT_FULL = 11;
   SECRET_RESULT_BUSY = 12;
   SECRET_RESULT_INVALID = 13;
-  SECRET_RESULT_REPLACE_FAILED = 14;
+  reserved 14; // SECRET_RESULT_REPLACE_FAILED, removed by replace in place
+  reserved "SECRET_RESULT_REPLACE_FAILED";
 }
 
 message ToolProgress {

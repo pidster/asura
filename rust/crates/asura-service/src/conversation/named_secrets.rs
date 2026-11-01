@@ -158,11 +158,8 @@ impl Owner {
             NamedPutReply::Stored => (StoreReply::Stored, None, None),
             NamedPutReply::Replaced => (StoreReply::Replaced, None, None),
             NamedPutReply::Exists => (StoreReply::Exists, None, None),
+            NamedPutReply::Absent => (StoreReply::Absent, None, None),
             NamedPutReply::Full => (StoreReply::Full, None, None),
-            NamedPutReply::ReplaceFailed(failure) => {
-                let (_, status, session) = failure_audit(failure);
-                (StoreReply::ReplaceFailed, status, session)
-            }
             NamedPutReply::Failed(failure) => failure_audit(failure),
         };
         self.audit_store(Event::SecretStoreNamedPut {
@@ -174,13 +171,8 @@ impl Owner {
             NamedPutReply::Stored => (R::Stored, None),
             NamedPutReply::Replaced => (R::Replaced, None),
             NamedPutReply::Exists => (R::Exists, None),
+            NamedPutReply::Absent => (R::Absent, None),
             NamedPutReply::Full => (R::Full, None),
-            NamedPutReply::ReplaceFailed(failure) => (
-                R::ReplaceFailed,
-                Some(failure.status().unsigned_abs())
-                    .filter(|s| *s != 0)
-                    .or(Some(NO_KEYCHAIN)),
-            ),
             NamedPutReply::Failed(failure) => failure_result(&failure),
         };
         secret_reply(result, Vec::new(), status)

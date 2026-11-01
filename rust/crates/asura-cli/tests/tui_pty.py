@@ -5125,13 +5125,24 @@ def person_named_journey(fixture, source):
             offset = len(trial.output)
             trial.send(f"{command}\r".encode())
             notice_until(trial, notice, offset, limit=20)
+        # Replace in place: a locked keychain refuses the update and the
+        # notice says the stored value is unchanged.
+        assert harness.keychain_action("--lock-scratch-keychain") == b"locked\n"
+        try:
+            offset = len(trial.output)
+            trial.send(b"/secrets replace PE_TOKEN\r")
+            notice_until(trial, "The named secret PE_TOKEN is unchanged.", offset, limit=20)
+            joined = "".join(row.strip() for row in trial.screen.text().splitlines())
+            assert "The Keychain is locked" in joined, trial.screen.text()
+        finally:
+            assert harness.keychain_action("--unlock-scratch-keychain") == b"unlocked\n"
         offset = len(trial.output)
         trial.send(b"/secrets\r")
         trial.until(b"Stored named secrets", offset, plain=True, limit=20)
         notice_until(trial, "PE_TOKEN (github-token): stored; use $ASURA_SECRET_PE_TOKEN", offset, limit=10)
         trial.send(b"\x1b")
         trial.idle(0.2)
-        print("PASS NS-E1 NS-E2: the report offers the store; stored, exists, replaced, listed")
+        print("PASS NS-E1 NS-E2: the report offers the store; stored, exists, replaced, a locked replace left the value unchanged, listed")
         # NS-E3: the command receives the value; the env line names it.
         command = 'printf %s "$ASURA_SECRET_PE_TOKEN" | shasum -a 256'
         harness.run(trial, command)
@@ -5149,7 +5160,17 @@ def person_named_journey(fixture, source):
         notice_until(trial, "This command names a secret that is not stored.", offset, limit=20)
         joined = "".join(row.strip() for row in trial.screen.text().splitlines())
         assert 'printf x "$ASURA_SECRET_PE_TOKEN"' in joined, trial.screen.text()
-        print("PASS NS-E4: removed; the command is refused and the draft kept")
+        # A replace of a name that is no longer stored stores nothing.
+        # Select the kept draft and delete it, then leave command mode.
+        trial.send(b"\x01\x7f")
+        trial.idle(0.2)
+        trial.send(b"\x7f")
+        trial.idle(0.2)
+        offset = len(trial.output)
+        trial.send(b"/secrets replace PE_TOKEN\r")
+        notice_until(trial, "No named secret PE_TOKEN exists to replace. Store it with /secrets store PE_TOKEN.",
+                     offset, limit=20)
+        print("PASS NS-E4: removed; the command is refused and the draft kept; a replace stores nothing")
         assert token.encode() not in bytes(trial.output), "the TUI showed the token"
         trial.close()
         trial = None

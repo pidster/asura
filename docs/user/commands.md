@@ -174,7 +174,7 @@ The setting changes `execution.enabled` and `execution.projects.ID` in
 | --- | --- |
 | `/secrets` | Show the stored names, then each variable of this terminal that Asura did not pass because it may be a secret, with its store action |
 | `/secrets store NAME` | Store the value of this terminal's variable NAME as a named secret in the Keychain; Asura never shows the value |
-| `/secrets replace NAME` | Replace the stored secret NAME with this terminal's current value |
+| `/secrets replace NAME` | Replace the stored secret NAME with this terminal's current value. If the Keychain refuses the change, the stored value stays as it was; if NAME is not stored, nothing is stored |
 | `/secrets remove NAME` | Remove the stored secret NAME |
 
 A `!` or `!!` command uses a stored secret by naming it as

@@ -32,7 +32,8 @@ use core_foundation::base::TCFType;
 use core_foundation::data::CFData;
 #[cfg(feature = "test-support")]
 use security_framework::item::{
-    ItemAddOptions, ItemAddValue, ItemClass, ItemSearchOptions, Limit, Location, SearchResult,
+    ItemAddOptions, ItemAddValue, ItemClass, ItemSearchOptions, ItemUpdateOptions, ItemUpdateValue,
+    Limit, Location, SearchResult, update_item,
 };
 #[cfg(feature = "test-support")]
 use security_framework_sys::base::SecKeychainRef;
@@ -168,6 +169,16 @@ pub enum Added {
 pub enum Found {
     Data(Zeroizing<Vec<u8>>),
     Missing,
+}
+
+/// Reply to [`Keychain::update_named`] (named-secrets.md, replace in place).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Updated {
+    /// The item's data now holds the new payload.
+    Changed,
+    /// No item has this service and account (`errSecItemNotFound`); nothing
+    /// was written.
+    Absent,
 }
 
 /// Reply to [`Keychain::delete`].
@@ -435,6 +446,15 @@ impl Keychain {
         get_raw_with(self.calls(), &key.service(), &key.account())
     }
 
+    /// Replaces one named secret item's data in place with `SecItemUpdate`
+    /// (named-secrets.md, replace in place). No other attribute changes. A
+    /// failure leaves the item's data as it was; a missing item is
+    /// [`Updated::Absent`] and nothing is written.
+    pub fn update_named(&self, key: &NamedKey, data: &[u8]) -> Result<Updated, Failure> {
+        key.valid()?;
+        update_raw_with(self.calls(), &key.service(), &key.account(), data)
+    }
+
     /// Deletes one named secret item.
     pub fn delete_named(&self, key: &NamedKey) -> Result<Removed, Failure> {
         key.valid()?;
@@ -462,6 +482,8 @@ pub(crate) trait Calls {
     fn classify(&self, code: i32) -> Failure;
     fn add(&self, service: &str, account: &str, data: &[u8]) -> Result<(), i32>;
     fn copy(&self, service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>, i32>;
+    /// `SecItemUpdate` of one item's data alone.
+    fn update(&self, service: &str, account: &str, data: &[u8]) -> Result<(), i32>;
     fn delete(&self, service: &str, account: &str) -> Result<(), i32>;
     /// The account attributes of at most `max` items under `service`.
     fn accounts(&self, service: &str, max: usize) -> Result<Vec<String>, i32>;
@@ -550,6 +572,15 @@ impl Calls for FileKeychain {
             _ => Err(UNEXPECTED_RESULT_STATUS),
         }
     }
+    fn update(&self, service: &str, account: &str, data: &[u8]) -> Result<(), i32> {
+        // The search list holds only the scratch keychain; the update
+        // dictionary holds only the data, in a zeroizing buffer that CF uses
+        // without copying.
+        let buffer = Arc::new(Zeroizing::new(data.to_vec()));
+        let mut update = ItemUpdateOptions::new();
+        update.set_value(ItemUpdateValue::Data(CFData::from_arc(buffer)));
+        update_item(self.search(service).account(account), &update).map_err(|error| error.code())
+    }
     fn delete(&self, service: &str, account: &str) -> Result<(), i32> {
         self.search(service)
             .account(account)
@@ -626,6 +657,27 @@ fn get_raw_with<C: Calls + ?Sized>(
         // Missing only because the call named an entitled group (KC-P4), or
         // the scratch pre-check returned 0 in this call.
         Err(ERR_SEC_ITEM_NOT_FOUND) => Ok(Found::Missing),
+        Err(code) => Err(calls.classify(code)),
+    }
+}
+
+/// The one update path: bounds, pre-check, update and status mapping. Only
+/// named items are updated; an input item is written once.
+pub(crate) fn update_raw_with<C: Calls + ?Sized>(
+    calls: &C,
+    service: &str,
+    account: &str,
+    data: &[u8],
+) -> Result<Updated, Failure> {
+    if data.is_empty() || data.len() > MAX_ITEM_BYTES {
+        return Err(Failure::Invalid);
+    }
+    precheck(calls)?;
+    match calls.update(service, account, data) {
+        Ok(()) => Ok(Updated::Changed),
+        // Absent only because the call named an entitled group, or the
+        // scratch pre-check returned 0 in this call.
+        Err(ERR_SEC_ITEM_NOT_FOUND) => Ok(Updated::Absent),
         Err(code) => Err(calls.classify(code)),
     }
 }

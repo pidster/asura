@@ -5,7 +5,7 @@
 use super::codec::{self, CodecError, decode, encode};
 use super::*;
 use asura_platform::keychain::{
-    Added, Failure, Found, ItemKey, LIST_BOUND, Listing, MAX_ITEM_BYTES, NamedKey, Removed,
+    Added, Failure, Found, ItemKey, LIST_BOUND, Listing, MAX_ITEM_BYTES, NamedKey, Removed, Updated,
 };
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -70,6 +70,11 @@ struct ScriptState {
     gets: VecDeque<Result<Found, Failure>>,
     deletes: VecDeque<Result<Removed, Failure>>,
     lists: VecDeque<Result<Listing, Failure>>,
+    updates: VecDeque<Result<Updated, Failure>>,
+    /// The named data the port accepted: a successful scripted add or
+    /// update writes it, a successful delete removes it, and a failure
+    /// leaves it. NS-U14 reads it to see what a replace kept.
+    named: std::collections::BTreeMap<String, Vec<u8>>,
     log: Vec<(&'static str, Option<[u8; 16]>)>,
     held: bool,
     blocked: usize,
@@ -95,6 +100,12 @@ impl Script {
     }
     fn list(&self, result: Result<Listing, Failure>) -> &Self {
         self.with(|s| s.lists.push_back(result))
+    }
+    fn update(&self, result: Result<Updated, Failure>) -> &Self {
+        self.with(|s| s.updates.push_back(result))
+    }
+    fn named(&self, name: &str) -> Option<Vec<u8>> {
+        self.0.0.lock().unwrap().named.get(name).cloned()
     }
     fn log(&self) -> Vec<(&'static str, Option<[u8; 16]>)> {
         self.0.0.lock().unwrap().log.clone()
@@ -153,9 +164,25 @@ impl port::KeychainPort for Script {
         );
         self.enter("list", None, |s| s.lists.pop_front())
     }
-    fn add_named(&self, key: &NamedKey, _: &[u8]) -> Result<Added, Failure> {
+    fn add_named(&self, key: &NamedKey, data: &[u8]) -> Result<Added, Failure> {
         assert_eq!(key.installation, INSTALLATION);
-        self.enter("add_named", None, |s| s.adds.pop_front())
+        self.enter("add_named", None, |s| {
+            let result = s.adds.pop_front();
+            if let Some(Ok(Added::Stored)) = result {
+                s.named.insert(key.name.clone(), data.to_vec());
+            }
+            result
+        })
+    }
+    fn update_named(&self, key: &NamedKey, data: &[u8]) -> Result<Updated, Failure> {
+        assert_eq!(key.installation, INSTALLATION);
+        self.enter("update_named", None, |s| {
+            let result = s.updates.pop_front();
+            if let Some(Ok(Updated::Changed)) = result {
+                s.named.insert(key.name.clone(), data.to_vec());
+            }
+            result
+        })
     }
     fn get_named(&self, key: &NamedKey) -> Result<Found, Failure> {
         assert_eq!(key.installation, INSTALLATION);
@@ -163,7 +190,13 @@ impl port::KeychainPort for Script {
     }
     fn delete_named(&self, key: &NamedKey) -> Result<Removed, Failure> {
         assert_eq!(key.installation, INSTALLATION);
-        self.enter("delete_named", None, |s| s.deletes.pop_front())
+        self.enter("delete_named", None, |s| {
+            let result = s.deletes.pop_front();
+            if let Some(Ok(Removed::Deleted)) = result {
+                s.named.remove(&key.name);
+            }
+            result
+        })
     }
 }
 
@@ -243,6 +276,119 @@ fn ns_u5_named_codec() {
     );
 }
 
+fn replace(store: &Store, name: &str, value: &[u8]) -> NamedPutReply {
+    store
+        .put_named(name.into(), Zeroizing::new(value.to_vec()), true)
+        .expect("admitted")
+        .wait()
+        .expect("reply")
+}
+
+fn named_value(script: &Script, name: &str) -> Option<Vec<u8>> {
+    script.named(name).map(|data| {
+        codec::decode_named(&data, &codec::named_binding(&INSTALLATION, name))
+            .expect("bound payload")
+            .to_vec()
+    })
+}
+
+/// NS-U14: a replace is one in-place update. It never lists, adds or
+/// deletes; a failed update keeps the old value; an item removed before
+/// the update is `absent` and nothing is added; 64 names or 256 items do
+/// not make a replace `full`.
+#[test]
+fn ns_u14_replace_in_place() {
+    let script = Script::default();
+    let store = start(&script);
+    script
+        .list(Ok(named_listing(&[], 0)))
+        .add(Ok(Added::Stored));
+    assert_eq!(
+        store
+            .put_named("TOKEN".into(), Zeroizing::new(b"old".to_vec()), false)
+            .unwrap()
+            .wait(),
+        Some(NamedPutReply::Stored)
+    );
+    let item_calls = |s: &Script| {
+        (
+            s.calls("list"),
+            s.calls("add_named"),
+            s.calls("delete_named"),
+            s.calls("update_named"),
+        )
+    };
+    assert_eq!(item_calls(&script), (1, 1, 0, 0));
+    // Replace: one update; the new value is stored.
+    script.update(Ok(Updated::Changed));
+    assert_eq!(replace(&store, "TOKEN", b"new"), NamedPutReply::Replaced);
+    assert_eq!(named_value(&script, "TOKEN").as_deref(), Some(&b"new"[..]));
+    assert_eq!(item_calls(&script), (1, 1, 0, 1));
+    // A locked update keeps the old value.
+    script.update(Err(Failure::Locked { status: -25_308 }));
+    assert_eq!(
+        replace(&store, "TOKEN", b"lost?"),
+        NamedPutReply::Failed(StoreFailure::Locked {
+            status: -25_308,
+            session: ev()
+        })
+    );
+    assert_eq!(named_value(&script, "TOKEN").as_deref(), Some(&b"new"[..]));
+    // An unavailable update keeps the old value.
+    script.update(Err(unavailable(-25_291)));
+    assert_eq!(
+        replace(&store, "TOKEN", b"lost?"),
+        NamedPutReply::Failed(store_unavailable(-25_291))
+    );
+    assert_eq!(named_value(&script, "TOKEN").as_deref(), Some(&b"new"[..]));
+    assert_eq!(item_calls(&script), (1, 1, 0, 3), "no list, add or delete");
+    // The item is removed after the person's check, before the update:
+    // absent, and nothing is added.
+    script.delete(Ok(Removed::Deleted));
+    assert_eq!(
+        store.delete_named("TOKEN".into()).unwrap().wait(),
+        Some(DeleteReply::Deleted)
+    );
+    script.update(Ok(Updated::Absent));
+    assert_eq!(replace(&store, "TOKEN", b"again"), NamedPutReply::Absent);
+    assert_eq!(named_value(&script, "TOKEN"), None);
+    assert_eq!(item_calls(&script), (1, 1, 1, 4), "no add after absent");
+    // A full store does not make a replace `full`: no listing is made.
+    script.update(Ok(Updated::Changed));
+    assert_eq!(replace(&store, "N0", b"v"), NamedPutReply::Replaced);
+    assert_eq!(script.calls("list"), 1);
+    // An invalid name or an oversize value makes no call.
+    let before = script.log().len();
+    assert!(matches!(
+        replace(&store, "COMMAND", b"v"),
+        NamedPutReply::Failed(StoreFailure::Unavailable {
+            reason: Some(INVALID_REQUEST),
+            ..
+        })
+    ));
+    assert!(matches!(
+        replace(&store, "TOKEN", &vec![1; MAX_NAMED_VALUE_BYTES + 1]),
+        NamedPutReply::Failed(StoreFailure::Unavailable {
+            reason: Some(INVALID_REQUEST),
+            ..
+        })
+    ));
+    assert_eq!(script.log().len(), before);
+    // not_signed from the update is terminal.
+    script.update(Err(Failure::NotSigned { item_call: true }));
+    assert!(matches!(
+        replace(&store, "TOKEN", b"v"),
+        NamedPutReply::Failed(f) if f.not_signed()
+    ));
+    let before = script.log().len();
+    assert!(matches!(
+        replace(&store, "TOKEN", b"v"),
+        NamedPutReply::Failed(f) if f.not_signed()
+    ));
+    assert_eq!(script.log().len(), before);
+    store.close().join().unwrap();
+}
+
 /// NS-U6: named requests over the scripted port.
 #[test]
 fn ns_u6_named_requests() {
@@ -265,38 +411,6 @@ fn ns_u6_named_requests() {
         NamedPutReply::Exists
     );
     assert_eq!(script.calls("delete_named"), 0);
-    // Replace: delete then add.
-    script
-        .list(Ok(named_listing(&["GITHUB_TOKEN"], 1)))
-        .add(Ok(Added::Duplicate))
-        .delete(Ok(Removed::Deleted))
-        .add(Ok(Added::Stored));
-    assert_eq!(
-        put_named(&store, "GITHUB_TOKEN", true),
-        NamedPutReply::Replaced
-    );
-    // Replace whose add fails after the delete.
-    script
-        .list(Ok(named_listing(&["GITHUB_TOKEN"], 1)))
-        .add(Ok(Added::Duplicate))
-        .delete(Ok(Removed::Deleted))
-        .add(Err(unavailable(-25_291)));
-    assert_eq!(
-        put_named(&store, "GITHUB_TOKEN", true),
-        NamedPutReply::ReplaceFailed(store_unavailable(-25_291))
-    );
-    // A replace whose delete fails keeps the old value.
-    script
-        .list(Ok(named_listing(&["GITHUB_TOKEN"], 1)))
-        .add(Ok(Added::Duplicate))
-        .delete(Err(Failure::Locked { status: -25_308 }));
-    assert_eq!(
-        put_named(&store, "GITHUB_TOKEN", true),
-        NamedPutReply::Failed(StoreFailure::Locked {
-            status: -25_308,
-            session: ev()
-        })
-    );
     // 64 names: a new name is full; an existing one may be replaced.
     let many: Vec<String> = (0..NAMED_LIMIT).map(|i| format!("N{i}")).collect();
     let many: Vec<&str> = many.iter().map(String::as_str).collect();
