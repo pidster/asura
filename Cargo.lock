@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "asura-cli"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "asura-client",
  "asura-control",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "asura-client"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "asura-control",
  "asura-platform",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "asura-control"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "prost",
  "prost-build",
@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "asura-platform"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aho-corasick",
  "core-foundation",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "asura-service"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "asura-client",
  "asura-control",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "asura-storage"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "asura-platform",
  "serde",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "asura-toolchain-bootstrap"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "flate2",
  "libc",

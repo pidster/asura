@@ -1,17 +1,23 @@
 # Release packaging
 
-`asura-bundle` builds, signs and checks `Asura.app`. The
+`asura-bundle` builds, signs and checks `Asura.app`, then packs it into the
+release DMG. The
 [release signing design](../../docs/designs/release-signing.md#sg1-package-script)
-governs it. Only the owner signs with a real identity and notarises, on the
-owner's Mac (SGQ9). No test and no CI job holds an identity or a notary
+governs it, with [SG6](../../docs/designs/release-signing.md#sg6-dmg-and-cask)
+for the DMG and the Homebrew cask. Each release has one artifact: the signed,
+notarised `Asura-<version>.dmg`. There is no archive and no formula.
+
+Only the owner signs with a real identity and notarises, on the owner's Mac
+(SGQ9). No test and no CI job holds an identity or a notary
 profile.
 
 | File | Purpose |
 | --- | --- |
 | `asura-bundle` | The package script: `--ad-hoc` (dry run), `--development` or `--release` |
-| `asura-release` | Release promotion checks and the formula (SG4): `preflight`, `check`, `formula`, `tap-test`, `verify-release`. It never publishes |
+| `asura-release` | Release promotion checks and the cask (SG4, SG6): `preflight`, `check` (the DMG), `cask`, `tap-test` (a local cask tap), `verify-release`. It never publishes |
 | `host-paths` | The SG4-O1 scanner: reports any file that holds the account home, the repository path or the user name as a path component. `asura-bundle` and `asura-release check` run it |
-| `asura.rb.in` | The Homebrew formula template for `pidster/homebrew-tap` (`Formula/asura.rb`) |
+| `asura.rb.in` | The Homebrew cask template for `pidster/homebrew-tap` (`Casks/asura.rb`) |
+| `dmg-readme.txt.in` | `README.txt` on the DMG volume; `@VERSION@` is the `asura-cli` version |
 | `test-asura-bundle` | Checks: `--static` (tracked files and refusals), `--bundle APP` (an ad hoc bundle), `--sandbox APP` (the helper App Sandbox with an ad hoc bundle, SG-V5) |
 | `sandbox-probe.c` | The SG-V5 negative fixture that `--sandbox` builds and signs with the helper's sandbox list |
 | `secret-store-qualification` | The signed qualification of the team Keychain store (SG3, SGQ6): builds, signs and runs `AsuraKeychainQualification.app` with the test App ID |
@@ -50,6 +56,9 @@ tools/release/test-asura-bundle --static
 tools/release/test-asura-bundle --bundle .build/bundles/dry-run-1/Asura.app
 ```
 
+The dry run writes `Asura-<version>-adhoc-unstapled.dmg`, signed ad hoc. Never
+publish it.
+
 Development bundle (Apple Development identity, development profile, SGQ3):
 
 ```sh
@@ -64,11 +73,12 @@ certificates share a name. macOS development profiles do not grant
 `get-task-allow`, and the script does not ask them to: the development lists
 claim it, and macOS does not restrict it to a profile.
 
-Release (Developer ID identity, Developer ID profile, notarised and stapled):
+Release (Developer ID identity, Developer ID profile; the DMG is notarised
+once and stapled):
 
 ```sh
 git status --short   # must print nothing
-tools/release/asura-bundle --release --out .build/bundles/release-0.1.0 \
+tools/release/asura-bundle --release --out .build/bundles/release-0.0.1 \
   --identity "Developer ID Application: <Name> (<TEAMID>)" \
   --team-id <TEAMID> \
   --profile .build/signing/<developer-id>.provisionprofile \
@@ -81,14 +91,15 @@ script stores none of them in a tracked file and prints only the identity
 name, the team ID and the certificate chain names. The ad hoc mode ignores
 these variables and refuses the arguments.
 
-`notarytool submit --wait` has no time bound. Ctrl-C cancels the wait; the
-submission continues at Apple. Query it later with
+The release submits only the DMG, once. `notarytool submit --wait` has no
+time bound. Ctrl-C cancels the wait; the submission continues at Apple. Query
+it later with
 `xcrun notarytool info <submission-id> --keychain-profile <notary-profile>`.
-Do not submit the same build again. Stapling retries at 1, 2, 4 … 60 s until it
-succeeds or you press Ctrl-C.
+Do not submit the same DMG again. Stapling the DMG retries at 1, 2, 4 … 60 s
+until it succeeds or you press Ctrl-C.
 
 A successful run ends with the line `asura-bundle: step=done`. A run that
-stops earlier wrote no archive.
+stops earlier wrote no `.sha256` file; treat any DMG it left as incomplete.
 
 ## Build-host paths (SG4-O1)
 
@@ -106,8 +117,9 @@ to fixed names for its own two builds
   to `/swiftpm`; `-Xlinker -S` leaves out the debug map.
 
 After assembly, and before any signature, `host-paths` scans every file of
-`Asura.app`; a hit stops the script at `assembly`. `asura-release check`
-runs the same scanner on the extracted archive. To scan a bundle yourself:
+`Asura.app`; a hit stops the script at `assembly`. It scans the DMG staging
+folder again before `hdiutil create` (a hit stops at `dmg`). `asura-release
+check` runs the same scanner on the mounted DMG volume. To scan a bundle yourself:
 
 ```sh
 /usr/bin/python3 -I tools/release/host-paths --repository "$PWD" .build/bundles/dry-run-1/Asura.app
@@ -119,8 +131,8 @@ runs the same scanner on the extracted archive. To scan a bundle yourself:
 | --- | --- |
 | `Asura.app` | The signed bundle |
 | `package/` | The signed helper, `mlx.metallib`, the Hub bundle and `model-package.json`, in the development package layout |
-| `asura-<version>-macos-arm64.tar.gz` and `.sha256` | Release archive (`Asura.app` and `LICENSE`). The ad hoc run names it `…-adhoc-unstapled.tar.gz`. A development run writes none |
-| `notary-submit.plist`, `notary-log.json` | Release only: the notary reply, and its log when not accepted |
+| `Asura-<version>.dmg` and `.sha256` | The release DMG: volume `Asura` (APFS, UDZO) holding `Asura.app`, `LICENSE`, `README.txt` and an `Applications` link. Signed with the identifier `org.pidster.asura.dmg`; release: notarised and stapled. The ad hoc run names it `Asura-<version>-adhoc-unstapled.dmg`. A development run writes none |
+| `notary-submit.plist`, `notary-log.json` | Release only: the notary reply for the DMG, and its log when not accepted |
 
 The script also rewrites the ignored generated Swift sources and
 `.build/model-tools/package-identity.txt`. Later Cargo builds embed this
@@ -199,23 +211,23 @@ ASURA_PROTOC="$PWD/.build/dev-tools/protoc" \
 tools/release/secret-store-qualification --ad-hoc --out .build/bundles/kc-qual-adhoc-1
 ```
 
-## Release promotion and publication (SG4)
+## Release promotion and publication (SG4, SG6)
 
-The [SG4 design](../../docs/designs/release-signing.md#sg4-release-promotion-and-formula)
-governs these steps. `asura-release` only checks; every command that creates a
+The [SG4](../../docs/designs/release-signing.md#sg4-release-promotion-and-formula)
+and [SG6](../../docs/designs/release-signing.md#sg6-dmg-and-cask) designs
+govern these steps. `asura-release` only checks; every command that creates a
 tag, a release or a tap commit below is the owner's (SGQ9). Each mode prints
 `PASS`, `FAIL`, `NOTE` and `RECORD` lines and exits 1 on any `FAIL`. No step
 has a time bound; Ctrl-C cancels. Keep the output of each step with the
 release evidence.
 
-Owner prerequisites, once:
+Owner prerequisite, once: immutable releases for `pidster/asura` (repository
+Settings > General > Releases). They are enabled (2026-11-01); `preflight`
+refuses unless `gh api repos/pidster/asura/immutable-releases` reports
+`"enabled": true`.
 
-- Enable immutable releases for `pidster/asura` (repository Settings >
-  General > Releases). `preflight` refuses until
-  `gh api repos/pidster/asura/immutable-releases` reports `"enabled": true`.
-
-Below, `V` is the `asura-cli` version, `T` the team ID and `R` the released
-commit. Use a clean worktree of `main` at `R`, as for NT-P1.
+Below, `V` is the `asura-cli` version (the first release is `0.0.1`), `T` the
+team ID and `R` the released commit. Use a clean worktree of `main` at `R`.
 
 1. Preflight (read only):
 
@@ -223,7 +235,8 @@ commit. Use a clean worktree of `main` at `R`, as for NT-P1.
    tools/release/asura-release preflight --version V
    ```
 
-2. Build, notarise and staple; the last line must be `asura-bundle: step=done`:
+2. Build, sign, pack, notarise the DMG once and staple it; the last line must
+   be `asura-bundle: step=done`:
 
    ```sh
    tools/release/asura-bundle --release --out .build/bundles/release-V \
@@ -231,29 +244,32 @@ commit. Use a clean worktree of `main` at `R`, as for NT-P1.
      --profile .build/signing/<developer-id>.provisionprofile --notary-profile <notary-profile>
    ```
 
-3. Check the archive and keep the `RECORD` lines:
+3. Check the DMG and keep the `RECORD` lines. `check` attaches the DMG
+   read-only under a temporary directory and ejects it at the end:
 
    ```sh
-   A=.build/bundles/release-V/asura-V-macos-arm64.tar.gz
-   tools/release/asura-release check --release --team-id T --version V --archive "$A" | tee .build/bundles/release-V/check.txt
+   D=.build/bundles/release-V/Asura-V.dmg
+   tools/release/asura-release check --release --team-id T --version V --dmg "$D" | tee .build/bundles/release-V/check.txt
    ```
 
-4. Generate the formula and test it from a local tap (`file://` URL). The
-   mode refuses if `$(brew --prefix)/bin/asura` exists or `asura` is installed,
-   sets `HOMEBREW_NO_AUTO_UPDATE=1`, uses only the tap `asura-release/local`,
-   and uninstalls and untaps at the end:
+4. Generate the cask and test it from a local tap (`file://` URL). The mode
+   refuses if `/Applications/Asura.app` or `$(brew --prefix)/bin/asura`
+   exists, or a cask or formula named `asura` is installed. It sets
+   `HOMEBREW_NO_AUTO_UPDATE=1`, uses only the tap `asura-release/local`,
+   installs into `/Applications`, runs only `asura --version`, and
+   uninstalls, untrusts and untaps at the end:
 
    ```sh
-   tools/release/asura-release formula --version V --archive "$A" --out .build/bundles/release-V/asura.rb
-   tools/release/asura-release tap-test --version V --formula .build/bundles/release-V/asura.rb \
-     --archive "$A" --release --team-id T
+   tools/release/asura-release cask --version V --dmg "$D" --out .build/bundles/release-V/asura.rb
+   tools/release/asura-release tap-test --version V --cask .build/bundles/release-V/asura.rb \
+     --dmg "$D" --release --team-id T
    ```
 
 5. Publish (owner). Upload exactly the two assets as a draft, then publish:
 
    ```sh
    gh release create vV --repo pidster/asura --draft --target R --title "Asura V" \
-     --notes "Asura V for Apple silicon, macOS 27 or later." "$A" "$A.sha256"
+     --notes "Asura V for Apple silicon, macOS 27 or later. Install: brew install --cask pidster/tap/asura" "$D" "$D.sha256"
    gh release edit vV --repo pidster/asura --draft=false
    ```
 
@@ -263,44 +279,49 @@ commit. Use a clean worktree of `main` at `R`, as for NT-P1.
    stays, the tap is not changed, and a fix needs a new version:
 
    ```sh
-   tools/release/asura-release verify-release --version V --archive "$A" --revision R --team-id T
+   tools/release/asura-release verify-release --version V --dmg "$D" --revision R --team-id T
    ```
 
-7. Test the unchanged formula against the HTTPS asset (also `brew audit
-   --online`; records the HTTPS quarantine state, open point 6):
+7. Test the unchanged cask against the HTTPS asset (also
+   `brew audit --cask --strict --online`):
 
    ```sh
-   tools/release/asura-release tap-test --version V --formula .build/bundles/release-V/asura.rb --release --team-id T
+   tools/release/asura-release tap-test --version V --cask .build/bundles/release-V/asura.rb --release --team-id T
    ```
 
-8. Tap (owner). In a clone of `pidster/homebrew-tap`, copy the formula to
-   `Formula/asura.rb`, add this row to the `README.md` table, commit and push
+8. Tap (owner). In a clone of `pidster/homebrew-tap`, copy the cask to
+   `Casks/asura.rb`, add this row to the `README.md` table, commit and push
    with a normal fast-forward push:
 
    ```text
-   | [asura](Formula/asura.rb) | Coding AI harness for macOS with on-device models. Apple silicon, macOS 27 or later. Source and docs: [pidster/asura](https://github.com/pidster/asura). |
+   | [asura](Casks/asura.rb) | Coding AI harness for macOS with on-device models. Apple silicon, macOS 27 or later. Install with `brew install --cask pidster/tap/asura`. Source and docs: [pidster/asura](https://github.com/pidster/asura). |
    ```
 
-9. Clean host (HD1): with no `asura` installed,
+9. Clean host (HD1): with no Asura installed,
 
    ```sh
-   HOMEBREW_NO_AUTO_UPDATE=1 brew install pidster/tap/asura
-   brew test pidster/tap/asura
-   K="$(brew --prefix pidster/tap/asura)/libexec/Asura.app"
-   codesign --verify --deep --strict "$K" && xcrun stapler validate "$K" && spctl --assess --type execute --verbose=2 "$K"
+   HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask pidster/tap/asura
+   A=/Applications/Asura.app
+   codesign --verify --deep --strict "$A" && spctl --assess --type execute --verbose=2 "$A"
    asura --version
    ```
 
    On a failure, revert the tap commit with a new commit and fix in a new
    version.
 
+`brew uninstall --cask asura` removes `/Applications/Asura.app` and the
+`asura` link only. The cask has no `zap` stanza, so no Homebrew command
+removes `~/.asura` (open owner question; default keep).
+
 ## What the dry run does not prove
 
 - The restricted entitlements (`keychain-access-groups`, application and team
   identifiers). An ad hoc process that claims them is killed at launch, so the
   ad hoc lists omit them. Probes KC-P1 and KC-P2 need a signed bundle.
-- Notarisation and stapling. Probe NT-P1 proved them on 2026-10-27, with the
-  helper's temporary exceptions accepted; each release proves them again in
-  step 3 above.
+- Notarisation and stapling. The ad hoc DMG is never submitted. Probe NT-P1
+  (2026-10-27) notarised a zip of the app; SG6 notarises the DMG; each
+  release proves it again in step 2 above.
+- Gatekeeper on an installed app. Gatekeeper rejects the ad hoc app, which
+  `check` and `tap-test` record as a `NOTE`.
 - The helper App Sandbox under a real signature. The ad hoc helper claims the
   same list, and `--sandbox` proves it with a test variant.

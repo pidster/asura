@@ -327,15 +327,15 @@ Keep orchestration rules in their canonical owner. Pass accessibility and usabil
 
 ### I9: Release qualification
 
-**Deliver:** Signed distribution artifacts and an `asura` formula in the existing
-`pidster/homebrew-tap`, plus installation, upgrade and recovery guidance and
+**Deliver:** One signed, notarised DMG per release and an `asura` cask in the
+existing `pidster/homebrew-tap`, plus installation, upgrade and recovery guidance and
 compatibility and performance evidence. Follow the
 [release distribution design](../designs/release-distribution.md).
 
 **Exit checks:** Verify each of the following against its design:
 
 - Fresh installation on a supported host.
-- Formula audit and installation from the exact qualified prebuilt release asset.
+- Cask audit and installation from the exact qualified DMG release asset.
 - Recovery during upgrade and migration, and upgrade with a live per-user
   service. These are deferred until the first release (owner, 2026-10-17);
   before then no compatibility with older builds or data is required.

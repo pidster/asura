@@ -8,7 +8,7 @@ fn hello() -> pb::Envelope {
         attachment_id: None,
         request_counter: None,
         body: Some(Body::Hello(pb::Hello {
-            client_build: Some("asura/0.1.0".into()),
+            client_build: Some("asura/0.0.1".into()),
         })),
     }
 }
@@ -163,7 +163,7 @@ fn service_projection_capabilities_and_stop_epoch_are_exact() {
     let mut value = inspect();
     value.request_counter = None;
     value.body = Some(Body::HelloReply(pb::HelloReply {
-        service_build: Some("asura/0.1.0".into()),
+        service_build: Some("asura/0.0.1".into()),
         capabilities: vec![1, 2, 3, 4],
         max_frame_bytes: Some(MAX_FRAME_BYTES as u32),
     }));

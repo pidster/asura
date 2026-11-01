@@ -1391,7 +1391,7 @@ mod tests {
     }
     #[test]
     fn service_build_label_uses_control_validation() {
-        assert!(Dispatcher::new("asura/0.1.0").is_ok());
+        assert!(Dispatcher::new("asura/0.0.1").is_ok());
         assert!(Dispatcher::new("").is_err());
         assert!(Dispatcher::new("a\nb").is_err());
     }

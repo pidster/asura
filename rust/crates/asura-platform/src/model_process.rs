@@ -1168,8 +1168,8 @@ mod tests {
         // SG-V9 unit: one resource directory per layout, decided by the path.
         for (helper, expected) in [
             (
-                "/opt/homebrew/Cellar/asura/0.1.0/libexec/Asura.app/Contents/MacOS/asura-model",
-                "/opt/homebrew/Cellar/asura/0.1.0/libexec/Asura.app/Contents/Resources",
+                "/Applications/Asura.app/Contents/MacOS/asura-model",
+                "/Applications/Asura.app/Contents/Resources",
             ),
             (
                 "/private/tmp/out/Asura.app/Contents/MacOS/asura-model",

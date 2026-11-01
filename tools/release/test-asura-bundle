@@ -283,44 +283,55 @@ host_paths_static_checks() {
     refuses_scan 'a relative repository' scan --repository asura "$h/hits"
     refuses_scan 'a missing path' scan --repository "$root" "$h/none"
     refuses_scan 'no path' scan --repository "$root"
-    # asura-release check runs the scanner over the extracted archive: a
+    # asura-release check runs the scanner over the mounted DMG volume: a
     # planted LICENSE fails it; a clean one passes it.
     for kind in planted clean; do
-        a=$h/$kind/asura-9.9.9-macos-arm64-adhoc-unstapled.tar.gz
+        a=$h/$kind/Asura-9.9.9-adhoc-unstapled.dmg
         mkdir -p "$h/$kind/tree/Asura.app/Contents"
         printf 'x\n' > "$h/$kind/tree/Asura.app/Contents/Info.plist"
+        ln -s /Applications "$h/$kind/tree/Applications"
+        printf 'Asura 9.9.9 read-me\n' > "$h/$kind/tree/README.txt"
         if [ "$kind" = planted ]; then printf 'built in %s/src\n' "$HOME" > "$h/$kind/tree/LICENSE"; else printf 'MIT\n' > "$h/$kind/tree/LICENSE"; fi
-        tar -czf "$a" -C "$h/$kind/tree" Asura.app LICENSE
+        hdiutil create -quiet -volname Asura -srcfolder "$h/$kind/tree" -fs APFS -format UDZO "$a" > "$h/create.txt" 2>&1 ||
+            bad "hdiutil create of the $kind DMG: $(tr '\n' ' ' < "$h/create.txt")"
+        codesign --sign - --timestamp=none --identifier org.pidster.asura.dmg "$a" 2>/dev/null || bad "ad hoc signature of the $kind DMG"
         (cd "$h/$kind" && shasum -a 256 "$(basename "$a")" > "$(basename "$a").sha256")
-        "$release/asura-release" check --ad-hoc --version 9.9.9 --archive "$a" > "$h/$kind/check.txt" 2>&1 || :
+        "$release/asura-release" check --ad-hoc --version 9.9.9 --dmg "$a" > "$h/$kind/check.txt" 2>&1 || :
     done
     rule='no file holds the account home, the repository path or the user name (SG4-O1)'
-    check 'check FAILs an archive whose LICENSE holds the home' grep -Fqx "FAIL $rule" "$h/planted/check.txt"
+    check 'check FAILs a DMG whose LICENSE holds the home' grep -Fqx "FAIL $rule" "$h/planted/check.txt"
     check 'check names the planted file and its counts' grep -Fqx '  LICENSE: home 1, repository 0, user 1' "$h/planted/check.txt"
-    check 'check PASSes the path rule on a clean archive' grep -Fqx "PASS $rule" "$h/clean/check.txt"
+    check 'check PASSes the path rule on a clean DMG (the /Applications link is not a hit)' grep -Fqx "PASS $rule" "$h/clean/check.txt"
     check 'check prints no build-host NOTE any more' sh -c '! grep -q "^NOTE .*SG4-O1" "$1" "$2"' sh "$h/planted/check.txt" "$h/clean/check.txt"
+    check 'check ejects the volume of each DMG' sh -c '! mount | grep -Fq "$1"' sh "$h/"
 }
 
-# SG4 (release-signing.md#sg4-release-promotion-and-formula): the formula
-# template, the absence of publishing commands (HD10) and the refusals of
-# asura-release. Uses $scratch from static_checks.
+# SG4 and SG6 (release-signing.md#sg6-dmg-and-cask): the cask and read-me
+# templates, the absence of the archive and formula, the absence of
+# publishing commands (HD10) and the refusals of asura-release. Uses $scratch
+# from static_checks.
 sg4_static_checks() {
     template=$release/asura.rb.in
-    for line in 'class Asura < Formula' '  homepage "https://github.com/pidster/asura"' \
-        '  url "https://github.com/pidster/asura/releases/download/v@VERSION@/asura-@VERSION@-macos-arm64.tar.gz"' \
-        '  sha256 "@SHA256@"' '  license "MIT"' '  depends_on arch: :arm64' '  depends_on macos: :golden_gate' \
-        '    libexec.install "Asura.app"' '    bin.install_symlink libexec/"Asura.app/Contents/MacOS/asura"' \
-        '    assert_equal "@VERSION@", shell_output("#{bin}/asura --version").strip' \
-        '    system "/usr/bin/codesign", "--verify", "--deep", "--strict", app'; do
-        check "formula template line: ${line#"${line%%[! ]*}"}" grep -Fqx -- "$line" "$template"
+    for line in 'cask "asura" do' '  version "@VERSION@"' '  sha256 "@SHA256@"' \
+        '  url "https://github.com/pidster/asura/releases/download/v#{version}/Asura-#{version}.dmg"' \
+        '  name "Asura"' '  desc "Coding AI harness with on-device models"' '  homepage "https://github.com/pidster/asura"' \
+        '  depends_on arch: :arm64' '  depends_on macos: :golden_gate' \
+        '  app "Asura.app"' '  binary "#{appdir}/Asura.app/Contents/MacOS/asura"'; do
+        check "cask template line: ${line#"${line%%[! ]*}"}" grep -Fqx -- "$line" "$template"
     done
-    for digest in helper_sha256 metallib_sha256 hub_bundle_sha256; do
-        check "formula test checks $digest" grep -Fq "manifest[\"$digest\"]" "$template"
-    done
-    check 'formula has no post_install, service, caveats or uninstall hook' sh -c '! grep -Eq "def (post_install|caveats)|^ *service do|uninstall" "$1"' sh "$template"
-    check 'formula never runs the helper' sh -c '! grep -Eq "shell_output\\(.*asura-model|system .*asura-model" "$1"' sh "$template"
-    check 'formula placeholders are only @VERSION@ and @SHA256@' \
+    check 'cask has no zap, uninstall, preflight, postflight or caveats stanza (keeps ~/.asura)' sh -c \
+        '! grep -Eq "^ *(zap|uninstall|preflight|postflight|caveats|installer|pkg|script)\b" "$1"' sh "$template"
+    check 'cask never names ~/.asura in a stanza' sh -c '! grep -v "^ *#" "$1" | grep -Fq ".asura"' sh "$template"
+    check 'cask never runs the helper' sh -c '! grep -q "asura-model" "$1"' sh "$template"
+    check 'cask placeholders are only @VERSION@ and @SHA256@' \
         [ "$(grep -o '@[A-Z0-9_]*@' "$template" | LC_ALL=C sort -u | tr '\n' ' ')" = '@SHA256@ @VERSION@ ' ]
+    readme=$release/dmg-readme.txt.in
+    check 'DMG read-me placeholder is only @VERSION@' [ "$(grep -o '@[A-Z0-9_]*@' "$readme" | LC_ALL=C sort -u | tr '\n' ' ')" = '@VERSION@ ' ]
+    check 'DMG read-me names the cask install command' grep -Fq 'brew install --cask pidster/tap/asura' "$readme"
+    check 'DMG read-me holds no GitHub URL (SG4-O1 user-name rule)' sh -c '! grep -Fq "github.com" "$1"' sh "$readme"
+    check 'no archive or formula code is left in the release scripts' sh -c \
+        '! grep -En "tar\.gz|tar -c|tar -x|class Asura < Formula|--archive|--formula F|formula --|brew test|install_symlink" "$@"' sh \
+        "$release/asura-bundle" "$release/asura-release" "$template"
     for script in asura-release asura-bundle; do
         check "HD10: $script holds no publishing command" sh -c \
             '! grep -En "gh +release +(create|upload|edit|delete)|gi[t]( -C [^ ]+)? +(push|tag)|gh +api .*(-X|--method)|gh +repo +(create|edit)" "$1"' sh "$release/$script"
@@ -328,8 +339,8 @@ sg4_static_checks() {
     tool=$release/asura-release
     fake=$scratch/sg4
     mkdir -p "$fake"
-    printf 'archive' > "$fake/asura-9.9.9-macos-arm64.tar.gz"
-    (cd "$fake" && shasum -a 256 asura-9.9.9-macos-arm64.tar.gz > asura-9.9.9-macos-arm64.tar.gz.sha256)
+    printf 'dmg' > "$fake/Asura-9.9.9.dmg"
+    (cd "$fake" && shasum -a 256 Asura-9.9.9.dmg > Asura-9.9.9.dmg.sha256)
     refuses_tool() { # LABEL EXPECTED ARGS... (no output file may appear)
         label=$1 expected=$2; shift 2
         set +e
@@ -342,28 +353,42 @@ sg4_static_checks() {
             bad "asura-release refuses: $label (status $status: $message)"
         fi
     }
-    a9=$fake/asura-9.9.9-macos-arm64.tar.gz
+    d9=$fake/Asura-9.9.9.dmg
     refuses_tool 'unknown argument' 'unknown argument' check --bogus
+    refuses_tool 'the removed --archive argument' 'unknown argument: --archive' check --ad-hoc --version 9.9.9 --archive "$d9"
     refuses_tool 'malformed version' 'MAJOR.MINOR.PATCH' preflight --version 1.0
-    refuses_tool 'check without a kind' 'choose --release or --ad-hoc' check --version 9.9.9 --archive "$a9"
-    refuses_tool 'release check without a team' 'team-id' check --release --version 9.9.9 --archive "$a9"
-    refuses_tool 'ad hoc check with a team' 'takes no team ID' check --ad-hoc --team-id ABCDE12345 --version 9.9.9 --archive "$a9"
-    refuses_tool 'missing archive' 'regular file' formula --version 9.9.9 --archive "$fake/none.tar.gz" --out "$fake/out.rb"
-    refuses_tool 'formula for another version' 'does not match version' formula --version 9.9.8 --archive "$a9" --out "$fake/out.rb"
+    refuses_tool 'check without a kind' 'choose --release or --ad-hoc' check --version 9.9.9 --dmg "$d9"
+    refuses_tool 'release check without a team' 'team-id' check --release --version 9.9.9 --dmg "$d9"
+    refuses_tool 'ad hoc check with a team' 'takes no team ID' check --ad-hoc --team-id ABCDE12345 --version 9.9.9 --dmg "$d9"
+    refuses_tool 'missing DMG' 'regular file' cask --version 9.9.9 --dmg "$fake/none.dmg" --out "$fake/out.rb"
+    refuses_tool 'cask for another version' 'does not match version' cask --version 9.9.8 --dmg "$d9" --out "$fake/out.rb"
     : > "$fake/exists.rb"
-    refuses_tool 'formula over an existing file' 'must not exist' formula --version 9.9.9 --archive "$a9" --out "$fake/exists.rb"
-    cp "$a9.sha256" "$fake/keep"
-    printf '%064d  asura-9.9.9-macos-arm64.tar.gz\n' 0 > "$a9.sha256"
-    refuses_tool 'formula from an archive that fails its .sha256 (HD5)' 'does not match its .sha256' formula --version 9.9.9 --archive "$a9" --out "$fake/out.rb"
-    mv "$fake/keep" "$a9.sha256"
-    refuses_tool 'tap test of a formula for another version' 'is not the v9.9.8 release asset' tap-test --version 9.9.8 --formula "$template"
-    refuses_tool 'verify-release without a revision' '--revision R is required' verify-release --version 9.9.9 --team-id ABCDE12345 --archive "$a9"
-    if "$tool" formula --version 9.9.9 --archive "$a9" --out "$fake/asura.rb" >/dev/null; then
-        digest=$(cut -d ' ' -f 1 < "$a9.sha256")
-        check 'formula equals the template with the version and digest' \
+    refuses_tool 'cask over an existing file' 'must not exist' cask --version 9.9.9 --dmg "$d9" --out "$fake/exists.rb"
+    cp "$d9.sha256" "$fake/keep"
+    printf '%064d  Asura-9.9.9.dmg\n' 0 > "$d9.sha256"
+    refuses_tool 'cask from a DMG that fails its .sha256 (HD5)' 'does not match its .sha256' cask --version 9.9.9 --dmg "$d9" --out "$fake/out.rb"
+    mv "$fake/keep" "$d9.sha256"
+    set +e
+    message=$("$tool" formula --version 9.9.9 2>&1 >/dev/null); status=$?
+    set -e
+    check 'the removed formula mode prints the usage and exits 2' [ "$status" -eq 2 ]
+    refuses_tool 'tap test of a cask for another version' 'the cask version is not 9.9.8' tap-test --version 9.9.8 --cask "$template"
+    refuses_tool 'verify-release without a revision' '--revision R is required' verify-release --version 9.9.9 --team-id ABCDE12345 --dmg "$d9"
+    if "$tool" cask --version 9.9.9 --dmg "$d9" --out "$fake/asura.rb" >/dev/null; then
+        digest=$(cut -d ' ' -f 1 < "$d9.sha256")
+        check 'cask equals the template with the version and digest' \
             [ "$(cat "$fake/asura.rb")" = "$(sed -e 's/@VERSION@/9.9.9/g' -e "s/@SHA256@/$digest/g" "$template")" ]
+        # The tap test refuses before any brew change when the app exists;
+        # the test directory stands in for /Applications.
+        mkdir -p "$fake/apps/Asura.app"
+        tool=env; refuses_tool 'tap test with an existing Asura.app' 'Asura.app exists; remove it first' \
+            "ASURA_RELEASE_TEST_APPDIR=$fake/apps" "$release/asura-release" tap-test --version 9.9.9 --cask "$fake/asura.rb"
+        rmdir "$fake/apps/Asura.app"
+        refuses_tool 'tap test with the test application folder never installs' 'for refusal tests only' \
+            "ASURA_RELEASE_TEST_APPDIR=$fake/apps" "$release/asura-release" tap-test --version 9.9.9 --cask "$fake/asura.rb"
+        tool=$release/asura-release
     else
-        bad 'formula writes the formula for a matching archive'
+        bad 'cask writes the cask for a matching DMG'
     fi
 }
 
@@ -439,38 +464,51 @@ sys.exit(1 if found else 0)' "$app" "$HOME" /Users/ "$root" "/$(id -un)/"
         'LC_ALL=C grep -aqE "/(asura/\.build/[^/]+|swiftpm)/checkouts/" "$1"' sh "$contents/MacOS/asura-model"
     check 'SG4-O1: helper carries no debug map (no N_SO or N_OSO stab)' sh -c \
         '! nm -ap "$1" | grep -Eq "^[0-9a-f]+ - [0-9a-f]+ [0-9a-f]+ +(SO|OSO|SOL) "' sh "$contents/MacOS/asura-model"
-    # SG4: the dry-run archive beside the bundle passes the ad hoc archive check
-    # (manifest, signatures, digests, asura --version) and yields a formula.
+    # SG6: the dry-run DMG beside the bundle passes the ad hoc DMG check
+    # (format, volume, manifest, signatures, digests, asura --version) and
+    # yields a cask.
     version=$(value CFBundleShortVersionString "$contents/Info.plist")
-    archive=$(dirname -- "$app")/asura-$version-macos-arm64-adhoc-unstapled.tar.gz
-    if [ -f "$archive" ]; then
+    dmg=$(dirname -- "$app")/Asura-$version-adhoc-unstapled.dmg
+    if [ -f "$dmg" ]; then
         log=$(mktemp -d "${TMPDIR:-/tmp}/asura-bundle-test.XXXXXXXX")
-        if "$release/asura-release" check --ad-hoc --version "$version" --archive "$archive" > "$log/check.txt" 2>&1; then
+        if "$release/asura-release" check --ad-hoc --version "$version" --dmg "$dmg" > "$log/check.txt" 2>&1; then
             pass "asura-release check --ad-hoc ($(tail -n 1 "$log/check.txt"))"
         else
             bad "asura-release check --ad-hoc"; grep '^FAIL' "$log/check.txt" | sed 's/^/  /'
         fi
-        check 'asura-release formula from the dry-run archive' \
-            "$release/asura-release" formula --version "$version" --archive "$archive" --out "$log/asura.rb"
+        for line in 'PASS image format UDZO' 'PASS one APFS volume named Asura' 'PASS DMG signing identifier org.pidster.asura.dmg' \
+            'PASS volume holds exactly Applications, Asura.app, LICENSE and README.txt' \
+            'PASS Applications is a link to /Applications' 'PASS DMG: ad hoc signature, no team'; do
+            check "check: ${line#PASS }" grep -Fqx "$line" "$log/check.txt"
+        done
+        check 'check ejected the volume' sh -c '! mount | grep -Fq "/asura-release."' sh
+        check 'asura-release cask from the dry-run DMG' \
+            "$release/asura-release" cask --version "$version" --dmg "$dmg" --out "$log/asura.rb"
         check 'check records the pinned rustc of rust-toolchain.toml' grep -Fq \
             "RECORD rustc rustc $(sed -n 's/^channel = "\(.*\)"$/\1/p' "$root/rust-toolchain.toml") " "$log/check.txt"
         check 'SG4-O1: check passes the build-host path rule' \
             grep -Fqx 'PASS no file holds the account home, the repository path or the user name (SG4-O1)' "$log/check.txt"
-        # SG4-O1: the same archive with the home planted in LICENSE (outside
-        # the signed bundle) fails exactly one check, the build-host path rule.
+        # SG4-O1: the same volume repacked with the home planted in LICENSE
+        # (outside the signed bundle) fails exactly one check, the rule.
         mkdir "$log/tree" "$log/planted"
-        tar -xzf "$archive" -C "$log/tree"
-        printf 'built in %s\n' "$HOME" >> "$log/tree/LICENSE"
-        COPYFILE_DISABLE=1 tar --no-mac-metadata -czf "$log/planted/$(basename "$archive")" -C "$log/tree" Asura.app LICENSE
-        (cd "$log/planted" && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
-        "$release/asura-release" check --ad-hoc --version "$version" --archive "$log/planted/$(basename "$archive")" \
-            > "$log/planted.txt" 2>&1 || :
+        ditto --norsrc --noextattr --noqtn "$app" "$log/tree/Asura.app"
+        ln -s /Applications "$log/tree/Applications"
+        sed "s/@VERSION@/$version/g" "$release/dmg-readme.txt.in" > "$log/tree/README.txt"
+        { cat "$root/LICENSE"; printf 'built in %s\n' "$HOME"; } > "$log/tree/LICENSE"
+        planted=$log/planted/$(basename "$dmg")
+        # A failure here is reported, never a silent exit (set -e).
+        hdiutil create -quiet -volname Asura -srcfolder "$log/tree" -fs APFS -format UDZO "$planted" > "$log/create.txt" 2>&1 ||
+            { bad "hdiutil create of the planted DMG: $(tr '\n' ' ' < "$log/create.txt")"; rm -rf "$log"; return; }
+        codesign --sign - --timestamp=none --identifier org.pidster.asura.dmg "$planted" 2>/dev/null ||
+            { bad 'ad hoc signature of the planted DMG'; rm -rf "$log"; return; }
+        (cd "$log/planted" && shasum -a 256 "$(basename "$planted")" > "$(basename "$planted").sha256")
+        "$release/asura-release" check --ad-hoc --version "$version" --dmg "$planted" > "$log/planted.txt" 2>&1 || :
         check 'SG4-O1: a planted home path fails only the build-host path rule' \
             [ "$(grep '^FAIL' "$log/planted.txt")" = 'FAIL no file holds the account home, the repository path or the user name (SG4-O1)' ]
         check 'SG4-O1: the report names LICENSE' grep -Fqx '  LICENSE: home 1, repository 0, user 1' "$log/planted.txt"
         rm -rf "$log"
     else
-        bad "no dry-run archive beside the bundle: $archive"
+        bad "no dry-run DMG beside the bundle: $dmg"
     fi
 }
 

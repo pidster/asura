@@ -20,7 +20,7 @@ explains project terms.
 | [ADR-0005: Default Ratatui chat](0005-default-ratatui-chat.md) | Launch Ratatui chat by default, with its Rust backend in the shared user service. |
 | [ADR-0006: Asynchronous event pipelines](0006-async-event-pipelines.md) | Use asynchronous, event-driven coordination with explicit input and signal pipelines. |
 | [ADR-0007: Multi-project control interface](0007-multi-project-control-interface.md) | Navigate authorized projects and concurrent activities within one interactive client. |
-| [ADR-0008: Homebrew tap distribution](0008-homebrew-tap-distribution.md) | Distribute prebuilt Asura releases through the existing `pidster/homebrew-tap`. |
+| [ADR-0008: Signed DMG through a Homebrew cask](0008-homebrew-tap-distribution.md) | Release one signed, notarised `Asura-<version>.dmg`; the `asura` cask in `pidster/homebrew-tap` installs `Asura.app` into `/Applications` and links `asura` (amended 2026-11-01; the archive and formula are removed). |
 | [ADR-0009: Supervised local-model helper](0009-supervised-local-model-helper.md) | Run the first macOS Foundation Models implementation in a supervised Swift process. |
 | [ADR-0010: Protobuf model and control channels](0010-protobuf-model-channel.md) | Shared pinned generation with separate contracts; model channel uses chunk frames, bounded credit and an exact helper match. |
 | [ADR-0011: Decouple tool output from model input](0011-tool-job-controller.md) | Run long-running tools as conversation-scoped jobs; the model reads retained output on request. |

@@ -1,0 +1,20 @@
+Asura @VERSION@ for Apple silicon, macOS 27 or later
+
+Install with Homebrew (recommended):
+
+    brew install --cask pidster/tap/asura
+
+Homebrew puts Asura.app in /Applications and links the asura command.
+
+Install by hand:
+
+1. Drag Asura.app onto Applications.
+2. Link the command into a folder on your PATH, for example:
+
+     ln -s /Applications/Asura.app/Contents/MacOS/asura /opt/homebrew/bin/asura
+
+3. In a new terminal, run: asura --version
+
+Keep Asura.app whole in /Applications: do not copy the asura executable out
+of the app. Asura keeps its state in ~/.asura. Removing Asura.app does not
+remove ~/.asura.

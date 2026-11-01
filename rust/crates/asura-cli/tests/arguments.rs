@@ -69,7 +69,7 @@ fn unsafe_log_setup_preserves_json_and_fails_before_service_access() {
     std::fs::remove_dir(path).unwrap();
 }
 
-/// HD8 (release-signing.md SG4): the formula test runs `asura --version`.
+/// HD8 (release-signing.md SG4, SG6): the cask install check runs `asura --version`.
 /// It must print only the package version and need no file write and no
 /// network, so it runs here under a Seatbelt profile that denies both.
 #[test]
