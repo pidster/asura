@@ -258,6 +258,11 @@ fn settle(fixture: &mut Fixture, outcome: Case) -> Case {
 
 pub(super) fn run(provider: &str) -> Result<()> {
     let mut fixture = Fixture::new()?;
+    // The sandboxed helper reads only its exceptions; MLX and Core AI assets
+    // in the scratch home need the SG-V5 test variant's bundle.
+    if let Some(bundle) = std::env::var_os("ASURA_TEST_BUNDLE").filter(|value| !value.is_empty()) {
+        fixture.use_bundle(&PathBuf::from(bundle).canonicalize()?)?;
+    }
     fixture.start()?;
     wait_ready(&fixture, None)?;
     select_native_tool_provider(&fixture, provider)?;

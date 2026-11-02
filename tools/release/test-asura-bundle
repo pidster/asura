@@ -12,13 +12,20 @@
 #                                      an ad hoc Asura.app: a test-only signed
 #                                      variant, the HS-P7 negative fixture and the
 #                                      conversation_flow --bundle-sandbox journey
+#   test-asura-bundle --sandbox-journeys APP FLAG...
+#                                      the same variant, then each native
+#                                      conversation_flow journey FLAG (such as
+#                                      --native-mlx-exec-cmd-tools) with the
+#                                      service in the variant's bundle layout
 #
 # --static needs ASURA_PROTOC and ASURA_PROTOC_GEN_SWIFT for the refusal cases
 # that pass the generator preflight. --sandbox needs ASURA_PROTOC to build the
 # journey; it runs MLX when ASURA_TEST_MLX_ASSET names a model directory and
 # Ollama when a local Ollama already serves ASURA_TEST_OLLAMA_MODEL (default
 # granite4.1:8b). No case signs with an identity, reads a keychain or builds
-# the bundle; --sandbox signs ad hoc only, under probe identifiers.
+# the bundle; --sandbox and --sandbox-journeys sign ad hoc only, under probe
+# identifiers. --sandbox-journeys needs ASURA_PROTOC and the asset variables
+# its journeys name.
 set -eu
 PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
@@ -533,10 +540,15 @@ sys.exit(1 if found else 0)' "$app" "$HOME" /Users/ "$root" "/$(id -un)/"
 # carries that exception (--static).
 probe_id=org.pidster.asura.probe.model
 harness_root=/private/tmp/
-sandbox_checks() {
+# Builds the SG-V5 variant of APP and a conversation_flow that embeds its
+# identity. Sets variant, helper, contents, container, work and journey;
+# variant_ready is 1 only when every step produced its output. The EXIT
+# trap restores package-identity.txt and removes the work tree.
+sandbox_variant() {
+    variant_ready=0
     app=$1
     contents=$app/Contents
-    [ -n "${ASURA_PROTOC:-}" ] || { bad 'the journey build needs ASURA_PROTOC'; return; }
+    [ -n "${ASURA_PROTOC:-}" ] || { bad 'the journey build needs ASURA_PROTOC'; return 0; }
     account_home=$(/usr/bin/python3 -I -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
     container=$account_home/Library/Containers/$probe_id
     work=$(mktemp -d /private/tmp/asura-sg-v5.XXXXXXXX)
@@ -545,8 +557,10 @@ sandbox_checks() {
     finish() {
         # Restore the bundle's package identity; remove the work tree and the
         # removable contents of the probe container, then list what remains.
+        # A new modification time makes the next Cargo build embed the
+        # restored identity again instead of keeping the variant's.
         if [ -f "$work/package-identity.txt.saved" ]; then
-            cp -p "$work/package-identity.txt.saved" "$identity"
+            cp "$work/package-identity.txt.saved" "$identity"
         fi
         rm -rf "$work"
         if [ -d "$container" ]; then
@@ -567,7 +581,7 @@ sandbox_checks() {
     key=com.apple.security.temporary-exception.files.absolute-path.read-only
     plutil -convert xml1 -o "$test_list" "$shipped" &&
         /usr/libexec/PlistBuddy -c "Add :$key array" -c "Add :$key:0 string $harness_root" "$test_list" >/dev/null ||
-        { bad 'cannot write the test entitlement list'; return; }
+        { bad 'cannot write the test entitlement list'; return 0; }
     check 'test list is the shipped list plus only the harness exception' sh -c \
         '[ "$(plutil -convert json -o - "$1" | /usr/bin/python3 -I -c "import json,sys; d=json.load(sys.stdin); d.pop(sys.argv[1]); print(json.dumps(d, sort_keys=True))" "$3")" = "$(plutil -convert json -o - "$2" | /usr/bin/python3 -I -c "import json,sys; print(json.dumps(json.load(sys.stdin), sort_keys=True))")" ]' \
         sh "$test_list" "$shipped" "$key"
@@ -575,7 +589,7 @@ sandbox_checks() {
     # The variant: the bundle copied, its helper's embedded Info.plist set to
     # the probe identifier (same section size), re-signed ad hoc and hardened.
     variant=$work/Asura.app
-    ditto --norsrc --noextattr --noqtn "$app" "$variant" || { bad 'cannot copy the bundle'; return; }
+    ditto --norsrc --noextattr --noqtn "$app" "$variant" || { bad 'cannot copy the bundle'; return 0; }
     helper=$variant/Contents/MacOS/asura-model
     check 'variant Info.plist names the probe identifier' /usr/bin/python3 -I - "$helper" "$probe_id" <<'PY'
 import plistlib, subprocess, sys
@@ -606,7 +620,7 @@ PY
         --entitlements "$test_list" "$helper" 2>/dev/null &&
         codesign --force --sign - --timestamp=none --options runtime \
             --entitlements "$release/entitlements/asura.ad-hoc.plist" "$variant" 2>/dev/null ||
-        { bad 'cannot sign the test variant'; return; }
+        { bad 'cannot sign the test variant'; return 0; }
     check 'variant deep strict verification' codesign --verify --deep --strict "$variant"
     info=$(codesign -d --verbose=2 "$helper" 2>&1)
     check 'variant helper identifier is the probe identifier' sh -c 'printf "%s\n" "$1" | grep -qx "Identifier=$2"' sh "$info" "$probe_id"
@@ -623,6 +637,30 @@ PY
          "$3/version-copy" --version | grep -Fq " build=$(plutil -extract build_id raw -o - "$2") "' \
         sh "$helper" "$contents/Resources/model-package.json" "$work"
 
+    # The journey build embeds the variant's identity.
+    field() { plutil -extract "$1" raw -o - "$contents/Resources/model-package.json"; }
+    printf '%s\n' "$(field build_id)" "$(field schema_sha256)" \
+        "$(shasum -a 256 "$helper" | cut -d ' ' -f 1)" "$(field metallib_sha256)" "$(field hub_bundle_sha256)" \
+        > "$work/package-identity.txt"
+    mkdir -p "$(dirname -- "$identity")"
+    cp "$work/package-identity.txt" "$identity"
+    journey=$(cargo test --manifest-path "$root/Cargo.toml" -p asura-service --test conversation_flow --locked \
+        --no-run --message-format=json 2>"$work/build.log" | /usr/bin/python3 -I -c '
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("reason") == "compiler-artifact" and message["target"]["name"] == "conversation_flow" and message.get("executable"):
+        print(message["executable"])') || :
+    if [ -z "$journey" ] || [ ! -x "$journey" ]; then
+        bad "cannot build conversation_flow: $(tail -n 5 "$work/build.log")"
+        return
+    fi
+    variant_ready=1
+}
+
+sandbox_checks() {
+    sandbox_variant "$1"
+    [ "$variant_ready" -eq 1 ] || return 0
     # HS-P7: the negative fixture shares the variant's identifier, container
     # and entitlement list. The control has no entitlements.
     probe_info=$work/probe-Info.plist
@@ -674,24 +712,6 @@ PY
     check 'HS-P7: write inside the container allowed' [ "$(result "$sandboxed" write-container)" = allowed ]
     check 'HS-P1: the probe container exists' [ -d "$container/Data" ]
 
-    # HS-P1 to HS-P6 end to end: the journey embeds the variant's identity.
-    field() { plutil -extract "$1" raw -o - "$contents/Resources/model-package.json"; }
-    printf '%s\n' "$(field build_id)" "$(field schema_sha256)" \
-        "$(shasum -a 256 "$helper" | cut -d ' ' -f 1)" "$(field metallib_sha256)" "$(field hub_bundle_sha256)" \
-        > "$work/package-identity.txt"
-    mkdir -p "$(dirname -- "$identity")"
-    cp "$work/package-identity.txt" "$identity"
-    journey=$(cargo test --manifest-path "$root/Cargo.toml" -p asura-service --test conversation_flow --locked \
-        --no-run --message-format=json 2>"$work/build.log" | /usr/bin/python3 -I -c '
-import json, sys
-for line in sys.stdin:
-    message = json.loads(line)
-    if message.get("reason") == "compiler-artifact" and message["target"]["name"] == "conversation_flow" and message.get("executable"):
-        print(message["executable"])') || :
-    if [ -z "$journey" ] || [ ! -x "$journey" ]; then
-        bad "cannot build conversation_flow: $(tail -n 5 "$work/build.log")"
-        return
-    fi
     ollama=${ASURA_TEST_OLLAMA_MODEL:-granite4.1:8b}
     if tags=$(curl -sf http://127.0.0.1:11434/api/tags 2>/dev/null) &&
         printf '%s' "$tags" | /usr/bin/python3 -I -c 'import json, sys; sys.exit(0 if sys.argv[1] in [m.get("name") for m in json.load(sys.stdin).get("models", [])] else 1)' "$ollama"; then
@@ -722,11 +742,37 @@ for line in sys.stdin:
     check 'HS-P1: the probe container exists after the journey' [ -d "$container/Data" ]
 }
 
+# SG-V5 native journeys: each named conversation_flow journey runs once with
+# ASURA_TEST_BUNDLE set to the variant, so its service runs from the variant's
+# Asura.app layout in a scratch home under /private/tmp/ and its sandboxed
+# helper reads MLX and Core AI assets copied there.
+sandbox_journeys() {
+    sandbox_variant "$1"
+    [ "$variant_ready" -eq 1 ] || return 0
+    shift
+    for flag in "$@"; do
+        log=$work/journey${flag}.log
+        set +e
+        ASURA_TEST_BUNDLE=$variant "$journey" "$flag" > "$log" 2>&1
+        status=$?
+        set -e
+        sed 's/^/  journey: /' "$log"
+        check "journey $flag exits 0 with the sandboxed variant" [ "$status" -eq 0 ]
+    done
+}
+
 case "${1:-}" in
     --static) [ "$#" -eq 1 ] || { echo "$0 --static" >&2; exit 2; }; static_checks ;;
     --bundle) [ "$#" -eq 2 ] && [ -d "$2" ] || { echo "$0 --bundle PATH/Asura.app" >&2; exit 2; }; bundle_checks "$2" ;;
     --sandbox) [ "$#" -eq 2 ] && [ -d "$2" ] || { echo "$0 --sandbox PATH/Asura.app" >&2; exit 2; }; sandbox_checks "$2" ;;
-    *) sed -n '2,21p' "$0" >&2; exit 2 ;;
+    --sandbox-journeys)
+        usage="$0 --sandbox-journeys PATH/Asura.app --native-...-exec-cmd-tools..."
+        [ "$#" -ge 3 ] && [ -d "$2" ] || { echo "$usage" >&2; exit 2; }
+        for flag in "$@"; do
+            case "$flag" in --sandbox-journeys|"$2") ;; --native-*) ;; *) echo "$usage" >&2; exit 2 ;; esac
+        done
+        shift; sandbox_journeys "$@" ;;
+    *) sed -n '2,28p' "$0" >&2; exit 2 ;;
 esac
 printf '%s passed, %s failed, %s skipped\n' "$passed" "$failed" "$skipped"
 [ "$failed" -eq 0 ]
