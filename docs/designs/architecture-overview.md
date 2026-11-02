@@ -67,8 +67,8 @@ flowchart TB
     Person(["Person"]):::outside
     subgraph Release["Release path"]
         Notary["Apple notary service"]:::built
-        Brew["Homebrew tap"]:::designed
-        DMG["DMG download, unconfirmed"]:::proposed
+        DMG["Signed, notarised DMG"]:::built
+        Brew["Homebrew cask in pidster/tap"]:::designed
     end
     subgraph Clients["Control clients"]
         TUI["TUI chat, Ratatui"]:::built
@@ -93,13 +93,14 @@ flowchart TB
     CLI -->|"control API on control.sock"| Asura
     Asura -->|"jobs under Seatbelt profiles"| Tools
     Asura -->|"local inference"| Ollama
-    Notary -->|"notarised, stapled Asura.app"| Brew
+    Notary -->|"notarised, stapled DMG"| DMG
+    DMG -->|"cask installs from the DMG"| Brew
     Brew -->|"install signed Asura.app"| Asura
     Asura -->|"context the egress policy allows, AD-25"| Prov
     Person -->|"same control contract"| GUI
     GUI -->|"control API"| Asura
     Asura <-->|"authenticated control and evidence"| RHost
-    DMG -->|"install"| Asura
+    DMG -->|"download and drag to Applications"| Asura
     Asura -->|"question to Apple"| PCC
     subgraph Legend["Legend"]
         direction LR
@@ -111,9 +112,9 @@ flowchart TB
     classDef designed stroke-width:2px,stroke-dasharray:8 4
     classDef proposed stroke-width:2px,stroke-dasharray:2 3
     classDef outside stroke-width:1px
-    linkStyle 0,1,2,3,4,5 stroke-width:2px
-    linkStyle 6,7,8 stroke-width:2px,stroke-dasharray:8 4
-    linkStyle 9,10,11,12,13 stroke-width:2px,stroke-dasharray:2 3
+    linkStyle 0,1,2,3,4,5,6,13 stroke-width:2px
+    linkStyle 7,8,9 stroke-width:2px,stroke-dasharray:8 4
+    linkStyle 10,11,12,14 stroke-width:2px,stroke-dasharray:2 3
 ```
 
 - The TUI and the CLI are built. They are clients of one per-user service
@@ -122,10 +123,11 @@ flowchart TB
   requirement with no design.
 - `Asura.app`, Developer ID signing and notarisation are built
   ([release signing](release-signing.md); probe NT-P1 passed 2026-10-27).
-- The Homebrew tap is selected ([ADR-0008](../decisions/0008-homebrew-tap-distribution.md),
-  [release distribution](release-distribution.md)). The formula template exists
-  (SG4), but no public release exists. No document on `main` names a DMG, so the
-  DMG is unconfirmed.
+- The signed, notarised DMG is the primary distribution and is built (SG6,
+  notarised and stapled 2026-11-01). Homebrew installs it with the `asura` cask in
+  `pidster/tap` ([ADR-0008](../decisions/0008-homebrew-tap-distribution.md),
+  [release distribution](release-distribution.md)). The cask template and the
+  local tap test exist, but no public release exists, so the cask is designed.
 - Local models, including Ollama on loopback, are built
   ([model providers](model-provider-integration.md)). Remote providers are
   refused until the EX13 grant and EX14 credentials exist
@@ -565,8 +567,8 @@ flowchart TB
 | GUI client | Proposed | [Architecture baseline](../architecture.md#control-and-execution-boundaries) (requirement only) | 1 |
 | Remote Asura hosts | Proposed | [Architecture baseline](../architecture.md#control-and-execution-boundaries) (requirement only) | 1 |
 | `Asura.app`, Developer ID, Hardened Runtime, notarisation | Built | [Release signing](release-signing.md) | 1, 2 |
-| Homebrew tap | Designed | [ADR-0008](../decisions/0008-homebrew-tap-distribution.md), [release distribution](release-distribution.md) | 1 |
-| DMG | Proposed, unconfirmed | No document on `main` | 1 |
+| Homebrew cask | Designed | [ADR-0008](../decisions/0008-homebrew-tap-distribution.md), [release distribution](release-distribution.md) | 1 |
+| DMG | Built (SG6) | [release distribution](release-distribution.md), [release signing](release-signing.md) | 1 |
 | Developer ID only for first releases | Proposed (AD-19) | Distribution research, not on `main` | 1 |
 | PCC Foundation Models for Developer ID | Proposed (AD-22) | Distribution research, not on `main` | 1 |
 | Per-user service and control API | Built | [System architecture](system-architecture.md), [user service and configuration](user-service-configuration.md) | 1, 2 |
