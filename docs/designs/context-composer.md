@@ -2141,7 +2141,7 @@ an ad hoc `asura-bundle` package copied beside the test binaries.
 | CC-N4 | `nativeOllamaStageBTwoRequests`, `granite4.1:8b`, Ollama 0.40.11 | Pass |
 | CC-N5 | `nativeCoreAIStageBTwoRequests`, `qwen3_4b_4bit_dynamic` (`main.hash` `14c5d258`, 40,960 tokens), hard-linked asset root; 263 s including the first compile | Pass |
 | CC-N6 | `--native-exec-cmd-tools` (system) and `--native-ollama-exec-cmd-tools`: EQ-1 to EQ-4b through stage B | Pass: system 6/6 and Ollama `granite4.1:8b` 6/6 (EQ-1 to EQ-4b); one earlier Ollama run had EQ-4 fail as a model result (the model changed the command) |
-| CC-N6, MLX and Core AI | `--native-mlx-exec-cmd-tools`, `--native-coreai-exec-cmd-tools` | Unverified: the development helper is App-Sandboxed and reads models only under `~/.asura/data/models/` (SG2a); the journeys' asset roots under `/private/tmp` return `model_unavailable` at Hello. Not a CC4 change; the engine-level cases CC-N3 and CC-N5 stand in. See the 2026-11-02 measurement below |
+| CC-N6, MLX and Core AI | `test-asura-bundle --sandbox-journeys APP --native-mlx-exec-cmd-tools`, then the same with `--native-coreai-exec-cmd-tools` (SG-V5 variant, see the measurement below) | Sandbox access works: the sandboxed helper loads both assets from the scratch home, and EQ-3b and EQ-4b pass in every run (MLX 3 of 3, Core AI 1 of 1). Qualification fails as a model result: MLX `Qwen3-1.7B-4bit` passed 0, 2 and 0 of 4 cases in 3 runs; Core AI `qwen3_4b_4bit_dynamic` passed 0 of 4 in 1 run. Failure classes: the model called `job`, made no call, or changed the escaped command (`\n` became a newline, `$$` became `$`); one Core AI EQ-1 ended `generated_content_empty` and one MLX EQ-4 ended `backend_failure` (provider). Unverified: a passing run for either provider |
 | CC-U29, CC-U30 | `context::request` tests | Pass |
 | CC-U31 | `tools::tests::cc_u31_results_render_as_before_the_service_owned_loop` | Pass |
 | CC-U32 | `model_owner` `cc_u32_*` | Pass |
@@ -2180,11 +2180,13 @@ The journey runs match. `--native-mlx`, `--native-mlx-exec-cmd-tools` and
 logged `deny(1) file-read-data` for
 `<harness home>/.asura/data/models/{mlx,coreai}/native-fixture` at each
 helper Hello. No link type in an isolated harness home reaches the
-helper with the shipped entitlements. These journeys need either the
-[SG-V5 test variant](release-signing.md#probes) (an
-absolute-path read-only exception for the harness root, signed at test
-time) or assets under the real `~/.asura/data/models/`. That choice is open
-for the owner.
+helper with the shipped entitlements. Tests never use the real
+`~/.asura`. These journeys therefore run with the SG-V5 test variant
+through `test-asura-bundle --sandbox-journeys`
+([SG-F14](release-signing.md#sg-f14-native-journeys-with-the-sg-v5-variant)).
+The variant is a test-time ad hoc re-signature of the bundle helper. It
+carries the shipped list plus one read-only absolute-path exception for
+`/private/tmp/`. The shipped and development lists do not change.
 
 Finding during implementation (2026-11-02): the composer's `W` for a system
 model tool turn was 772 bytes (tool schemas at one token per byte, 1-byte

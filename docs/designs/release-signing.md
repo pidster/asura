@@ -2562,6 +2562,83 @@ notarisation of the sandboxed helper remain with SG0-K, NT-P1 and SG4. The
 identifier, so native tests beside it would read only the account home;
 native tests use an unsandboxed development helper or the SG-V5 variant.
 
+#### SG-F14: native journeys with the SG-V5 variant
+
+Selected (test change, engineering, 2026-11-02). The native MLX and Core AI
+`conversation_flow` journeys copy their asset into the scratch home under
+`/private/tmp/`. The `<out>/package/` helper copied beside the test binaries
+denies that path (measured in
+[context composer CC4 evidence](context-composer.md#cc4-implementation-evidence-2026-11-02)).
+These journeys therefore run with the SG-V5 variant. Tests never write
+assets to the account home's `~/.asura`.
+
+- `test-asura-bundle --sandbox-journeys APP FLAG...` builds the variant and
+  the journey binary through the same function as `--sandbox`
+  (`sandbox_variant`). It then runs each `--native-*` journey flag once with
+  `ASURA_TEST_BUNDLE` naming the variant. A flag that does not start with
+  `--native-` is refused (exit 2). A journey that exits non-zero is a FAIL.
+- `conversation_flow` has one bundle-layout owner, `Fixture::use_bundle`.
+  `--bundle-sandbox` uses it. `exec_cmd_journey::run` uses it when
+  `ASURA_TEST_BUNDLE` is set and not empty. Without that variable, the
+  journeys keep the helper beside the test binary.
+- The variant claims the shipped list plus the one read-only absolute-path
+  exception `/private/tmp/`, under the probe identifier. The tracked
+  entitlement lists do not change, and `--static` still refuses an
+  absolute-path key in them.
+- The journey binary embeds the variant's digest, and `package-identity.txt`
+  is restored at exit. The restore now writes a new modification time
+  (`cp`, not `cp -p`). Otherwise Cargo keeps the variant digest in the next
+  build, and the helper beside the test binaries then fails the identity
+  check.
+- The probe container's `Data` directory is removed at exit, as for
+  `--sandbox`. Any Core AI cache that the sandboxed helper creates inside the
+  container is removed with it.
+
+```mermaid
+flowchart TD
+    A["test-asura-bundle --sandbox-journeys APP FLAG..."] --> F{"Each FLAG starts with --native-?"}
+    F -->|"No"| U["Usage, exit 2"]
+    F -->|Yes| V["sandbox_variant: test list, variant copy, probe identifier, ad hoc signature, variant checks"]
+    V -->|"Copy, signing or build fails: record FAIL"| R
+    V --> I["Write the variant digest to package-identity.txt; build conversation_flow"]
+    I --> J["For each FLAG: ASURA_TEST_BUNDLE=variant conversation_flow FLAG"]
+    J --> L["Fixture::use_bundle: Asura.app layout in the scratch home under /private/tmp/"]
+    L --> S["Service copies the variant helper to .asura/run/model-hex and spawns it in the App Sandbox"]
+    S --> M["Helper reads .asura/data/models/{mlx,coreai}/native-fixture through the /private/tmp/ exception"]
+    M --> E{"Journey exit 0?"}
+    E -->|"No: record FAIL"| N["Next FLAG"]
+    E -->|Yes| N
+    N --> R["Exit trap: restore package-identity.txt with a new mtime; remove work tree and probe container Data"]
+    R --> X{"Any FAIL?"}
+    X -->|Yes| Bad["Exit 1"]
+    X -->|No| Good["Exit 0"]
+```
+
+| Case | Layer | Check |
+| --- | --- | --- |
+| SG-F14 refusal | Unit | `--sandbox-journeys` with fewer than three arguments, a missing bundle or a flag outside `--native-*` exits 2 |
+| SG-F14, CC-N6 MLX | End to end | `--sandbox-journeys APP --native-mlx-exec-cmd-tools` with `ASURA_TEST_MLX_ASSET`: EQ-1 to EQ-4 pass |
+| SG-F14, CC-N6 Core AI | End to end | `--sandbox-journeys APP --native-coreai-exec-cmd-tools` with `ASURA_TEST_COREAI_ASSET`: EQ-1 to EQ-4 pass |
+| SG-V5 regression | End to end | `--sandbox APP` still passes after the split into `sandbox_variant` |
+
+Evidence (2026-11-02, macOS 27 build 26A428, ad hoc bundle from
+`asura-bundle --ad-hoc`):
+
+- Refusal: exit 2 in each refusal case.
+- `--sandbox`: 31 passed, 1 skipped (Ollama not selected), including the
+  sandboxed MLX turn.
+- `--static`: 147 passed.
+- The sandboxed helper now loads both assets from the scratch home. The
+  escape-free variants EQ-3b and EQ-4b pass in every run.
+- EQ-1 to EQ-4 did not all pass, as a model result. MLX passed 0, 2 and 0 of
+  4 in 3 runs; Core AI passed 0 of 4 in 1 run. The details are in the
+  [CC4 evidence](context-composer.md#cc4-implementation-evidence-2026-11-02).
+- Core AI cache: the probe container grew from 36 KiB to 2,212,344 KiB
+  (about 2.1 GiB) during the Core AI run. The exit trap then removed it.
+  `~/Library/Caches/coreai-cache` stayed at 34,029,796 KiB, so the sandboxed
+  helper's compiled cache lives in its container. Each Core AI run compiles
+  again (EQ-1 took about 20 minutes, including the compile).
+
 ### SG3 delivery
 
 Delivered 2026-10-27 on the SG3 worktree branch. No named identity,
