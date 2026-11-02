@@ -1253,6 +1253,7 @@ apps. A custom Seatbelt profile would have to list them and keep them current.
 | Read its own executable, `mlx.metallib` and the Hub bundle in `~/.asura/run/model-<hex>/` | Outside the container | `temporary-exception.files.home-relative-path.read-only: /.asura/run/` | HS-P3 |
 | Read assets in `~/.asura/data/models/{coreai,mlx}/` | Outside the container | `temporary-exception.files.home-relative-path.read-only: /.asura/data/models/` | HS-P6 |
 | Ollama on loopback, later remote providers (EX13) | Outgoing network | `com.apple.security.network.client` | HS-P5 |
+| llama.cpp on loopback, directly or through the service relay ([llama.cpp backend](llamacpp-backend.md#the-helper-sandbox)) | Outgoing network only; the helper reads no GGUF file and never holds the key | `com.apple.security.network.client`, already claimed | Native LC-N1 runs unsandboxed; the signed run is the owner's |
 | Metal and MLX GPU kernels | Sandboxed apps can use Metal; no entitlement is documented | None | HS-P3 |
 | Foundation Models | No entitlement is documented | None | HS-P2 |
 | Core AI (`CoreAI.framework`) | Not documented | Unknown | HS-P4 |

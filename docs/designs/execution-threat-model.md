@@ -768,6 +768,39 @@ display text only. This supersedes SO2's loss rule.
 | PX-V18 | With a scratch keychain: a queued `!` command with a secret and a queued `!!` command survive a restart and run with their values; raw-byte sweeps of journal, payloads, audit and logs find no value; no item remains after settlement |
 | PX-V19 | An item read under another input or installation is rejected; an orphan item is deleted at startup; a locked keychain refuses the submit without a journal record or disk fallback |
 
+## llama.cpp server
+
+Status: selected 2026-11-02 with the [llama.cpp backend design](llamacpp-backend.md),
+under the owner decision "Yes, with Asura's own server". This section lists what
+the backend, the relay and the server Asura starts add to this model.
+
+What changes:
+
+- A program Asura did not build, `llama-server`, runs outside every sandbox as
+  the person, kept alive by a LaunchAgent, and parses GGUF files the person adds.
+- A loopback port (8934 by default) serves inference to anyone with the key.
+  Each loaded model runs in its own `llama-server` process on an ephemeral
+  loopback port **without** a key (probe P2, 2026-11-02).
+- A key: 32 random bytes in one team Keychain item, passed to the router through
+  a pipe, and added to requests by a relay in the service.
+- The helper (class B) talks to the relay with a per-helper token, not the key.
+
+| ID | Threat | Mitigation | Gap or accepted exposure |
+| --- | --- | --- | --- |
+| LT1 | A changed or planted `llama-server` runs at every login | Only the approved path starts, and only while its real path, size and SHA-256 match the record written by `asura llamacpp approve`. A mismatch refuses to start and names both digests | The libraries `llama-server` loads from its Cellar are not checked. A same-user process can rewrite the approval record or the agent file. Same-UID is one principal under D1. Accepted |
+| LT2 | The key leaks | Team Keychain item; pipe to the router (`/dev/fd/<n>`), never a file, argument, environment variable or log; the relay holds it in zeroizing memory; no class B or C process receives it | Any team-signed Asura build with the group can read the item (as SG-T1). The router holds it in memory. Accepted under D1 |
+| LT3 | A same-user process uses the model processes behind the router without the key | Loopback only; model jobs have no network ([exec_cmd](exec-cmd-tool.md)) | Model processes listen without a key on ephemeral ports (P2); any same-user process can use them. The key protects the router port only. Accepted under D1; recorded so no claim says otherwise |
+| LT4 | A web page in the person's browser uses the server | The router needs the key; `--no-ui` | The router reflects any `Origin` with credentials (P12). A page that finds a model process's ephemeral port can use it without a key. Gap, shared with Llama.app's server; llama.cpp offers no setting that closes CORS in 0.7.0 |
+| LT5 | A GGUF file exploits `llama-server`'s parser | Files are added only by the person (`asura llamacpp add`); the name rule and the `GGUF` magic are checked; Asura never downloads one | `llama-server` parses the file unsandboxed as the person. A malicious file runs with the person's rights. Accepted as the person's choice, as for any program they run |
+| LT6 | The relay becomes an open door to the router | It listens on `127.0.0.1` only, for the life of one helper; each request must carry the 32-byte token (constant-time compare); four methods and paths only; 4 connections; the token is random, not derived from the key (F2) | A same-user process that reads the helper's memory can use the relay while it lives. Accepted under D1 |
+| LT7 | Another process takes the port first and impersonates the server | The relay sends the key only to `127.0.0.1:<port>`; `asura` mode is the only mode with tools | A same-user squatter on the port receives the key and the conversation. Accepted under D1. `llama-app` and `url` are endpoint-dependent and get no project tools (LCQ1) |
+| LT8 | The LaunchAgent persists after the person stops using it | `asura llamacpp stop` boots it out and removes its file; a refusal to start exits 0 and launchd does not loop | Uninstalling `Asura.app` leaves the file in `~/Library/LaunchAgents`, which then names a missing program. The person runs `stop` first; the cask `zap` does not cover it yet |
+| LT9 | A model changes the server | The model has no tool that runs `asura llamacpp` or sets configuration; model jobs cannot write `~/.asura` or `~/Library/LaunchAgents` and have no network | `!` and `!!` are the person's commands and may run them |
+
+Validation: LC-U7, LC-U10, LC-I4, LC-I5 and LC-I6 in the
+[backend design](llamacpp-backend.md#validation) cover LT1, LT2 and LT6. LT3, LT4
+and LT7 are stated exposures, not tested claims.
+
 ## Design verification
 
 Recorded on 2026-10-13: the facts were gathered from the code by a read-only
@@ -858,3 +891,7 @@ follow-up design table and the helper App Sandbox update under EXD-3. EX-H1 is
 not recorded; PT-H1 and SG-T3 are unchanged. No diagram changed.
 
 Return to the [design index](README.md).
+
+Recorded on 2026-11-02: the [llama.cpp server](#llamacpp-server) section was
+added with the llama.cpp backend design, from the probes recorded there. No
+diagram in this document changed.

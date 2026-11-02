@@ -41,6 +41,10 @@ and inventory waits have no time limit. See
 That section supersedes the time limits stated in earlier sections. Implemented
 2026-10-16.
 
+llama.cpp update (owner, 2026-11-02): a fifth provider, `llamacpp`, and the
+server Asura starts for it are designed in [llama.cpp backend](llamacpp-backend.md).
+It follows the Ollama transport and loopback rules below.
+
 ## Scope and evidence
 
 Read-only Wisp inspection used revision
