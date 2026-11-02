@@ -161,7 +161,7 @@ mechanism this design applies for it. The sections below give the detail.
 | D1 | A new `context` module in `asura-service`, called by the conversation owner, replaces the current builder. Its core is pure. Storage keeps no selection policy. | [Ownership](#ownership). The writer's `Prepare` returns candidates and no longer applies the 32-turn and 64 KiB rule. |
 | D2 | Bytes per token are learned per model from measured input tokens (context telemetry), with a safety margin. An unmeasured model uses 1 token per byte. | [Token conversion](#token-conversion) |
 | D3 | The output reservation is the per-request output space in the context window, not a turn budget. It is a per-model value in the capacity record, defaulting to `min(maximum output, window ÷ 4)`. Refined 2026-10-19 under the owner's removal of output caps: Asura has no maximum output, so `R = ⌊E ÷ 4⌋` now; see [output reservation](#output-reservation-r). | `R` in the [budget](#per-request-budget-algorithm) |
-| D4 | Stage B (the service owns the request loop and recomposes per request) is the target; stage A (view sizing at the tool callback) comes first. | [Recomposition during tool loops](#recomposition-during-tool-loops). Stage B implies loop closure decision 6, which remains formally open. |
+| D4 | Stage B (the service owns the request loop and recomposes per request) is the target; stage A (view sizing at the tool callback) comes first. | [Recomposition during tool loops](#recomposition-during-tool-loops). Stage B implies loop closure decision 6, which remains formally open. The owner chose on 2026-11-02 to probe Foundation Models, MLX, Core AI and Ollama for a service-run tool loop before deciding it. |
 | D5 | The manifest is a payload object with its digest in the journal. Before J1, `TurnAccepted` carries the manifest digest and the composer revision, and, under N1, the budget inputs. | [Composition manifest](#composition-manifest) |
 | D6 | History is reduced by mechanical fidelity levels (full, reference, omitted), newest first. Model-written summaries need a separate design. | [Segments and fidelity](#segments-and-fidelity) |
 | D7 | "Match the window to the size the model can handle." The input limit is the model's window from its capacity record, converted to bytes by D2. Input streams across fixed 64 KiB frames (tool output views rule 4). The schema and helper change stays within protocol `0.1`. Built in CC1. | `W` in the [budget](#per-request-budget-algorithm); [streamed input transfer](#streamed-input-transfer) |
@@ -642,6 +642,9 @@ A comes first. Today the helper owns the request loop and its transcript
 (`BoundedToolModel.swift`, `Backend.swift:260`). Stage B implies
 [loop closure decision 6](loop-closure.md#decisions) (the service owns the turn
 request loop). That decision remains formally open, so stage B is not ready.
+The owner chose on 2026-11-02 to probe first: Foundation Models, MLX, Core AI
+and Ollama are probed for a tool loop that the service runs, and decision 6
+follows that evidence. Separate work runs the probes; this design does not.
 
 **Stage A, view sizing at the callback (CC2).** The helper keeps its loop. When a
 tool call settles, the conversation owner asks the composer for that result's

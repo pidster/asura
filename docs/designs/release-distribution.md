@@ -59,15 +59,59 @@ The `asura` cask (`Casks/asura.rb` in `pidster/homebrew-tap`) must:
 - install `Asura.app` into `/Applications` (`app "Asura.app"`) and link the
   command with `binary "#{appdir}/Asura.app/Contents/MacOS/asura"`, so that
   `$(brew --prefix)/bin/asura` resolves to the bundle executable;
-- have no `preflight`, `postflight`, `uninstall` or `zap` stanza. The cask
-  must not launch the service, initialize `.asura`, migrate authority, or
-  delete user data in install, upgrade or uninstall.
+- have no `preflight`, `postflight` or `uninstall` stanza. The cask must not
+  launch the service, initialize `.asura`, migrate authority, or delete user
+  data in install, upgrade or a plain uninstall;
+- have exactly one `zap` stanza, `zap trash: "~/.asura"`, as its last stanza
+  ([zap](#zap-and-asura)).
 
-`zap` and `~/.asura` (open owner decision, default "keep"). `brew uninstall
---cask asura` removes only `/Applications/Asura.app` and the `bin/asura` link.
-Without a `zap` stanza, `brew uninstall --zap` removes nothing more. Until the
-owner decides otherwise, no cask stanza removes `~/.asura` or any file in the
-account home.
+### Zap and `~/.asura`
+
+Owner decision (2026-11-02): `brew uninstall --zap --cask asura` removes all of
+`~/.asura`. This replaces the earlier open item, whose default was "keep" and
+under which the cask had no `zap` stanza.
+
+| Command | Removes | Keeps |
+| --- | --- | --- |
+| `brew uninstall --cask asura` | `/Applications/Asura.app` and the `bin/asura` link | `~/.asura`, the Keychain items, the helper's sandbox container and the Core AI cache |
+| `brew uninstall --zap --cask asura` | The above, then all of `~/.asura`, moved to the Trash | The Keychain items, the helper's sandbox container and the Core AI cache |
+
+Selected stanza (engineering, 2026-11-02): `zap trash: "~/.asura"`. The
+Homebrew Cask Cookbook (Homebrew 7.0.11, `docs/Cask-Cookbook.md`, "Stanza:
+`zap`") says that "the `trash:` key is preferred over `delete:`", and that
+`delete:` "should only be used as a last resort". `trash:` follows the same
+path rules as `delete:`: a leading `~` expands to the home directory and the
+path must be absolute. Homebrew's
+`Cask::Artifact::AbstractUninstall#each_resolved_path` performs that expansion
+and skips a path whose parent is not writable. `trash:` moves the folder to the
+person's Trash, so the person can still recover the journal, the memory graph
+and the configuration until they empty it. Nothing in Homebrew's rules makes
+`delete:` the only correct form.
+
+Rules and limits:
+
+- The Cookbook says that `zap` should not remove "files created by the user
+  directly". `~/.asura` holds Asura's state, which the person's work created.
+  The owner's decision overrides that guidance for this cask; `trash:` keeps
+  the removal recoverable.
+- `zap` does not remove the named secrets and other items in the Keychain. The
+  person removes named secrets with `/secrets remove NAME` before the zap.
+  Whether a later stanza or command removes Keychain items, the helper's
+  sandbox container (`~/Library/Containers/org.pidster.asura.model`) or the
+  Core AI cache (`~/Library/Caches/coreai-cache/<macOS build>/org.pidster.asura.model`)
+  is not decided.
+- A running service keeps its open files after the folder moves to the Trash.
+  The person stops the service with `asura service stop` before the zap. The cask has
+  no stanza that stops the service (no `uninstall quit:` or `launchctl:`),
+  because the service is not a launchd job or an app with a bundle identifier
+  to quit.
+- No test runs `--zap`: the tap test would remove the real `~/.asura`. The
+  stanza is checked statically by `test-asura-bundle --static`, by
+  `asura-release cask` and `tap-test` on the generated cask, by
+  `brew audit --cask --strict`, and by Homebrew's own parse of the installed
+  cask (`brew info --json=v2`), which `tap-test` compares with
+  `{"trash": "~/.asura"}` without running it
+  ([SG6 tap test](release-signing.md#local-tap-test)).
 
 A cask has no `test` block. The offline package and resource check that a
 formula test gave therefore moves into the release scripts
@@ -198,7 +242,9 @@ remain the rollback reference; a cask upgrade may already have replaced the
 local `/Applications/Asura.app`. An older executable must reject an authority
 schema it cannot read; a binary downgrade cannot silently restore older
 authority files. `brew uninstall --cask asura` removes `/Applications/Asura.app` and the
-`bin/asura` link, not `.asura`, the runtime guard or external SurrealDB. After uninstall, a running service may
+`bin/asura` link, not `.asura`, the runtime guard or external SurrealDB;
+`brew uninstall --zap --cask asura` also moves `~/.asura` to the Trash
+([zap](#zap-and-asura)). After uninstall, a running service may
 still exist; D2/I9 must select and validate the user-facing shutdown and
 reinstall behavior before release.
 
@@ -256,6 +302,7 @@ stateDiagram-v2
 | HD4 | Service crash during handover | Deferred until the first release (owner, 2026-10-17). Sole-owner recovery replays original requests and tasks before new admission. |
 | HD5 | Cask or download digest failure | `brew install --cask` fails with a checksum error; no `/Applications/Asura.app`, no `bin/asura` link and no installed cask remain; `.asura` and the bound graph are unchanged. |
 | HD6 | Uninstall then reinstall | `brew uninstall --cask asura` removes the app and the link only; user data in `~/.asura` persists; a compatible reinstall reopens the original installation only after binding verification. |
+| HD15 | `brew uninstall --zap --cask asura` | The app and the link go; all of `~/.asura` moves to the Trash; Keychain items stay. Statically checked only: the template stanza, the generated cask, `brew audit --cask --strict` and Homebrew's parse of the installed cask. No test runs `--zap` on an account home. |
 | HD7 | Older binary after authority schema migration | Deferred until the first release (owner, 2026-10-17). It rejects the unknown schema and does not write or roll back state. |
 | HD8 | The cask install check runs on an account with existing Asura state | `bin/asura --version` creates no socket, service or authority write. |
 | HD9 | The DMG holds several executables and runtime resources | The DMG manifest, the exact shared build and private-protocol identities, the signatures, and executable resource lookup from `/Applications/Asura.app/Contents/Resources` pass without build-tree paths. |

@@ -185,6 +185,11 @@ ran. A store never overwrites a secret of the same name: Asura says that it
 exists, and you replace it or keep it. A command that is already queued keeps
 the value it was submitted with.
 
+Limit: Asura keeps the output of such a command private, but it does not track
+the files the command writes. If the command writes the value to a file, a
+model that reads that file later can see the value. Write secret values only
+where no model reads them, or remove the file afterwards.
+
 ## Job limits
 
 The `jobs` settings limit how many command jobs the service runs and queues.

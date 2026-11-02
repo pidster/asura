@@ -437,6 +437,10 @@ Open decisions for the per-loop mapping:
    [ADR-0003](../decisions/0003-aggregate-budget-admission.md), and whether
    unknown model capacity refuses admission or uses a verified configured value.
 6. Whether the service takes ownership of the turn request loop from the helper.
+   Owner direction (2026-11-02): probe first. Before deciding, Asura probes
+   Foundation Models, MLX, Core AI and Ollama for a tool loop that the service
+   runs. The probes and their design belong to separate work; until their
+   evidence exists, this decision stays open and the helper keeps the loop.
 
 Owner direction (2026-10-13): the closure that guarantees a turn's tool loop
 ends is derived from evidence. Asura logs tool-loop traces and builds a

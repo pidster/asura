@@ -9,6 +9,11 @@ also records the resolution of the secrets study's question OD-10 (AD-10) for
 named references in person commands. Protocol numbering remains `0.1`;
 journal format remains `1`.
 
+Revision of 2026-11-02 ([owner decisions](#owner-decisions-2026-11-02)): the
+file limit of a tainted command is stated (AD-11), and a model command that
+names `$ASURA_SECRET_` is refused with a reason instead of running with the
+reference as text ([model commands](#model-commands)).
+
 Revision of 2026-11-01, replace in place (selected, engineering): a replace
 changes the stored item's data with one `SecItemUpdate` call instead of a
 delete then an add, so a failed replace keeps the old value. The reply
@@ -22,6 +27,13 @@ replace of a name that is not stored is `absent`. See
 | --- | --- | --- |
 | ENV-O1 | The offer to store a flagged variable creates a **durable named secret**. The person stores a flagged terminal variable, such as `GITHUB_TOKEN`, in the team Keychain store under its name. Later `!` and `!!` commands use it by explicit reference: raw delivery, so the job is tainted under T1. Binding a secret to a host is broker work (AD-4) and is not part of this design | This document; [person command environment](person-command-environment.md#env-o1-the-offer-to-store-a-variable-as-a-secret) |
 | AD-10 (named references) | Resolved here as the engineering choice the owner asked for: study option R2, `$ASURA_SECRET_<NAME>`, in `!` and `!!` commands only ([references](#references-in-commands)) | [Secret detection](secret-detection.md#command-rewrite) |
+
+## Owner decisions (2026-11-02)
+
+| ID | Decision | Applied in |
+| --- | --- | --- |
+| AD-11 | **Accept and state the limit.** The output of a command that used a raw secret, including a named secret, is private (T1), but the files that command writes are not tracked. A model can read such a file later. The limit is stated in the "zero model access" claim (AD-23) and in the user documentation | [Security](#security); [commands](../user/commands.md#named-secret-commands); [the claim](assurance-and-differentiation.md#what-zero-model-access-can-honestly-claim) |
+| Model references | **Refuse with a reason.** A model `exec_cmd` command whose text contains `$ASURA_SECRET_` or `${ASURA_SECRET_` is refused before it runs. The model gets a clear reason: model commands cannot use stored secrets, and the person can run the command as a `!` command. Nothing runs. Brokered use (later) is separate. This replaces the earlier rule that a named reference in a model command stays text | [Model commands](#model-commands) |
 
 ## Scope
 
@@ -763,7 +775,9 @@ values 14 `SECRET_NOT_FOUND`, 15 `SECRET_REFERENCE_INVALID` and 16
   holds a reference; only a person command that the person types runs it,
   and that is the person's choice (PX3).
 - **Residuals.** The tainted job can write the value to a file or send it on
-  the network (study 9.4, PT3). Copies inside prost, the kernel and the
+  the network (study 9.4, PT3). Asura does not track the files it writes, so a
+  model can read such a file later; the owner accepted this stated limit on
+  2026-11-02 (AD-11). Copies inside prost, the kernel and the
   Security framework (SS-T8). Same-user readers of the job's process
   environment (PT-H1).
 
