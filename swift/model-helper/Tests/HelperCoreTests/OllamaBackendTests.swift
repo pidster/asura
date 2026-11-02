@@ -391,6 +391,7 @@ private func ollamaTurn(_ server: OllamaFixtureServer, input: ModelInput)
     let greeting = try await channel.next().hello
     let data = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "ollama:fixture"; begin.inputBytes = UInt64(data.count)
+    begin.requestOrdinal = 1
     try await channel.send(.begin(begin)); _ = try await channel.next()
     var offset = 0
     var ordinal: UInt64 = 0
@@ -408,7 +409,8 @@ private func ollamaTurn(_ server: OllamaFixtureServer, input: ModelInput)
     credit.acceptedBytes = 0; credit.grantedBytes = 65_536
     try await channel.send(.start(.init()))
     try await channel.send(.credit(credit))
-    return (greeting, try await channel.terminal())
+    channel.credited = 2
+    return (greeting, try await channel.collect().terminal)
 }
 
 private let fullWindowShow = #"{"capabilities":["completion"],"model_info":{"granite.context_length":131072}}"#

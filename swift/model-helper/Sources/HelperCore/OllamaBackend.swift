@@ -34,10 +34,10 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
     public var thinkingControls: ThinkingControls = []
     var inputObserver: OllamaInputObserver? = nil
     var usageObserver: InferenceUsageObserver? = nil
-    /// Session tool handler for a call whose name is not registered: the SDK
-    /// cannot dispatch it, so the adapter sends it for its record and then
-    /// fails the turn with protocolFault (TCR-D17).
-    var unregisteredToolHandler: ToolHandler? = nil
+    /// Reporter for a call whose name is not registered: the SDK cannot
+    /// dispatch it, so the adapter reports it for its record and then fails
+    /// the request with protocolFault (TCR-D17, revised by CC4).
+    var unregisteredToolHandler: UnregisteredToolReporter? = nil
     public var capabilities: LanguageModelCapabilities {
         .init((supportsTools ? [.toolCalling] : []) + (supportsReasoning ? [.reasoning] : []))
     }
@@ -411,10 +411,10 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                             guard model.supportsTools else { throw Failure.unsupported }
                             let arguments = String(decoding: try JSONEncoder().encode(call.function.arguments), as: UTF8.self)
                             guard registered.contains(call.function.name) else {
-                                // The SDK cannot return a result for this name. Send it
-                                // for its record, await the result, then fail the turn.
-                                if let handler = model.unregisteredToolHandler {
-                                    _ = try await handler(ToolProposal(name: call.function.name,
+                                // The SDK cannot dispatch this name. Report it for its
+                                // record, then fail the request.
+                                if let report = model.unregisteredToolHandler {
+                                    await report(ToolProposal(name: call.function.name,
                                         arguments: arguments, source: .providerJson))
                                 }
                                 throw BackendFailure(.protocolFault)

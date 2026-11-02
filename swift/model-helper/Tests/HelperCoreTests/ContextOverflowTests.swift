@@ -135,10 +135,7 @@ private struct ListTool: Tool {
         modelName: "system", supportsTools: true)
     var input = ModelInput(); input.instructions = "test"; input.prompt = "test"
     do {
-        try await engine.generateWithTools(input, handler: { _ in
-            Issue.record("an overflowing request reached a tool")
-            return ToolResult(status: .unavailable, text: "")
-        }, snapshot: { _ in })
+        _ = try await engine.generateWithTools(input, thinking: .none, request: 2, snapshot: { _ in })
         Issue.record("an oversized mid-turn request completed")
     } catch let failure as BackendFailure {
         #expect(failure.reason == .contextLimit)

@@ -93,6 +93,10 @@ pub(crate) enum ModelEvent {
         usage_tokens: Option<u64>,
     },
     ToolCall(pb::ToolCall),
+    /// The request ended with calls (`Terminal` outcome 4); the helper
+    /// waits for the next `Begin` (context-composer.md, CC4). The model
+    /// owner checked the count against the calls received.
+    ToolCallsProposed,
     Failed(&'static str),
 }
 /// Kept wind-down (owner, 2026-10-16): cooperative cancel grace, then the
@@ -168,7 +172,12 @@ pub(crate) struct ModelOwner {
     terminal_seen: bool,
     faulted: bool,
     tools_enabled: bool,
-    pending_tool: Option<u32>,
+    /// The request ordinal of the current request; 0 before the first Begin.
+    request: u32,
+    /// `ToolCall` positions received in the current request.
+    proposals: u32,
+    /// The first Begin's thinking form, repeated by later requests.
+    thinking: asura_control::thinking::Request,
     measured_context: bool,
     usage_reports: u32,
     effective_context: Option<u32>,
@@ -311,7 +320,9 @@ impl ModelOwner {
             terminal_seen: false,
             faulted: false,
             tools_enabled: false,
-            pending_tool: None,
+            request: 0,
+            proposals: 0,
+            thinking: asura_control::thinking::Request::None,
             measured_context: false,
             usage_reports: 0,
             effective_context: None,
@@ -347,15 +358,37 @@ impl ModelOwner {
         self.tools_enabled = enable_tools;
         self.operation = operation;
         self.generation = generation;
+        self.thinking = thinking;
+        self.send_begin(1, input)
+    }
+    /// Request `request + 1` of the same operation after a request ended with
+    /// tool calls (context-composer.md, CC4). It repeats the first request's
+    /// model, tools and thinking form.
+    pub(crate) fn begin_next(&mut self, input: Vec<u8>) -> Result<(), &'static str> {
+        if self.phase != Phase::Available || self.request == 0 || !self.tools_enabled {
+            return Err("model_not_ready");
+        }
+        model::decode_input(&input).map_err(|_| "model_input_invalid")?;
+        if (input.len() as u64) > u64::from(self.effective_context.unwrap_or(0)).saturating_mul(8) {
+            return Err("model_input_invalid");
+        }
+        let next = self.request.checked_add(1).ok_or("model_protocol_fault")?;
+        self.send_begin(next, input)
+    }
+    fn send_begin(&mut self, request: u32, input: Vec<u8>) -> Result<(), &'static str> {
         self.queue(Body::Begin(pb::Begin {
             model: Some(self.selection.model.clone()),
             input_bytes: Some(input.len() as u64),
             // No output cap: the model writes until it stops or its window is
             // full (owner, 2026-10-19; turn-usage-helper.md, request admission).
-            enable_project_tools: enable_tools.then_some(true),
-            thinking: (thinking != asura_control::thinking::Request::None)
-                .then_some(thinking as i32),
+            enable_project_tools: self.tools_enabled.then_some(true),
+            thinking: (self.thinking != asura_control::thinking::Request::None)
+                .then_some(self.thinking as i32),
+            request_ordinal: Some(request),
         }))?;
+        self.request = request;
+        self.proposals = 0;
+        self.measured_context = false;
         self.input = Some(input);
         self.input_sent = 0;
         self.input_accepted = 0;
@@ -363,24 +396,22 @@ impl ModelOwner {
         self.phase = Phase::Input;
         Ok(())
     }
-    pub(crate) fn tool_result(&mut self, result: pb::ToolResult) -> Result<(), &'static str> {
-        if self.phase != Phase::Running
-            || !self.tools_enabled
-            || self.pending_tool != result.ordinal
-        {
-            return Err("model_not_ready");
-        }
-        self.queue(Body::ToolResult(result))?;
-        self.pending_tool = None;
-        Ok(())
+    /// The request ordinal of the current request (CC4).
+    pub(crate) fn request(&self) -> u32 {
+        self.request
     }
     pub(crate) fn start(&mut self) -> Result<(), &'static str> {
         if self.phase != Phase::Ready {
             return Err("model_not_ready");
         }
         self.queue(Body::Start(pb::Start {}))?;
-        self.credit(2)?;
-        self.credited = 2;
+        // The current output transfer may already hold its credit from the
+        // previous request's last revision (CC4).
+        let next = self.revision + 2;
+        if self.credited < next {
+            self.credit(next)?;
+            self.credited = next;
+        }
         self.phase = Phase::Running;
         Ok(())
     }
@@ -826,10 +857,12 @@ impl ModelOwner {
                 events.push(ModelEvent::Ready);
             }
             Body::ToolCall(call) if self.phase == Phase::Running && self.tools_enabled => {
-                if self.pending_tool.is_some() && self.pending_tool != call.ordinal {
+                // Each call's position in the request's response, in order
+                // (CC4); the conversation owner assigns the turn ordinal.
+                if call.ordinal != self.proposals.checked_add(1) {
                     return Err("model_protocol_fault");
                 }
-                self.pending_tool = call.ordinal;
+                self.proposals += 1;
                 events.push(ModelEvent::ToolCall(call));
             }
             Body::InferenceUsage(value)
@@ -935,11 +968,6 @@ impl ModelOwner {
                     bytes = ?terminal.total_bytes,
                     "model_helper_diagnostic"
                 );
-                // A successful response cannot precede the service's durable tool result.
-                // Failure/cancellation may end a suspended callback; its host worker still settles.
-                if terminal.outcome == Some(1) && self.pending_tool.is_some() {
-                    return Err("model_protocol_fault");
-                }
                 let expected_revision = self.revision + u64::from(self.chunks > 0);
                 if terminal.count != Some(self.total_chunks)
                     || terminal.total_bytes != Some(self.total_bytes)
@@ -965,6 +993,22 @@ impl ModelOwner {
                         "model_helper_diagnostic"
                     );
                     return Err("model_protocol_fault");
+                }
+                if terminal.outcome == Some(4) {
+                    // CC4: the request ended with its calls, after its last
+                    // revision; the helper session continues.
+                    if self.phase != Phase::Running
+                        || !self.tools_enabled
+                        || self.proposals == 0
+                        || terminal.tool_calls != Some(self.proposals)
+                        || self.chunks > 0
+                        || terminal.last_revision != Some(self.revision)
+                    {
+                        return Err("model_protocol_fault");
+                    }
+                    self.phase = Phase::Available;
+                    events.push(ModelEvent::ToolCallsProposed);
+                    return Ok(());
                 }
                 self.terminal_seen = true;
                 events.push(ModelEvent::Terminal {
@@ -1024,7 +1068,7 @@ impl ModelOwner {
     pub(crate) fn tool_test_fixture() -> Self {
         let mut value = tests::owner(Phase::Running);
         value.tools_enabled = true;
-        value.pending_tool = Some(1);
+        value.request = 1;
         value
     }
     /// An owner whose helper has settled (no child, no cleanup).
@@ -1039,12 +1083,8 @@ impl ModelOwner {
     pub(crate) fn response_test_credits(&mut self) -> Vec<u64> {
         tests::output_credits(self)
     }
-    /// As if the helper had just sent the `ToolCall` at `ordinal`.
-    pub(crate) fn tool_test_pending(&mut self, ordinal: u32) {
-        self.pending_tool = Some(ordinal);
-    }
-    /// Every ToolResult queued for the helper, in order.
-    pub(crate) fn tool_test_results(&self) -> Vec<pb::ToolResult> {
+    /// The Begin frames queued for the helper, in order.
+    pub(crate) fn begin_test_frames(&self) -> Vec<pb::Begin> {
         self.outgoing
             .iter()
             .filter_map(|frame| {
@@ -1052,29 +1092,15 @@ impl ModelOwner {
                     .ok()?
                     .body
                 {
-                    Some(Body::ToolResult(result)) => Some(result),
+                    Some(Body::Begin(begin)) => Some(begin),
                     _ => None,
                 }
             })
             .collect()
     }
-    /// Takes every queued ToolResult, as the transport would write them.
-    pub(crate) fn tool_test_drain_results(&mut self) -> Vec<pb::ToolResult> {
-        let results = self.tool_test_results();
-        self.outgoing.clear();
-        results
-    }
-    pub(crate) fn tool_test_has_delivery(&self, result: pb::ToolResult) -> bool {
-        let frame = model::encode_frame(
-            &pb::Envelope {
-                operation_id: Some(self.operation.to_vec()),
-                generation: Some(self.generation),
-                body: Some(Body::ToolResult(result)),
-            },
-            Direction::ServiceToHelper,
-        )
-        .unwrap();
-        self.outgoing.contains(&frame)
+    /// As if the helper's request ended with `count` calls (CC4).
+    pub(crate) fn tool_test_proposed(&mut self) {
+        self.phase = Phase::Available;
     }
 }
 
@@ -1222,7 +1248,9 @@ mod tests {
             terminal_seen: false,
             faulted: false,
             tools_enabled: false,
-            pending_tool: None,
+            request: 0,
+            proposals: 0,
+            thinking: asura_control::thinking::Request::None,
             measured_context: false,
             usage_reports: 0,
             effective_context: (phase != Phase::Hello).then_some(4096),
@@ -1327,6 +1355,7 @@ mod tests {
                     usage_known: Some(false),
                     usage_tokens: None,
                     reason: Some(0),
+                    tool_calls: None,
                 })),
                 &mut events,
             )
@@ -1389,6 +1418,7 @@ mod tests {
             instructions: Some("i".into()),
             history: Vec::new(),
             prompt: Some("p".into()),
+            continuation: Vec::new(),
         })
         .unwrap();
         let begin = |controls: u32, request: Request| {
@@ -1531,6 +1561,7 @@ mod tests {
                     instructions: Some(String::new()),
                     history: vec![],
                     prompt: Some("hello".into()),
+                    continuation: Vec::new(),
                 })
                 .unwrap();
                 owner
@@ -1640,6 +1671,7 @@ mod tests {
             instructions: Some(String::new()),
             history: vec![],
             prompt: Some("hello".into()),
+            continuation: Vec::new(),
         })
         .unwrap();
         owner
@@ -1671,6 +1703,7 @@ mod tests {
             instructions: Some(String::new()),
             history: vec![],
             prompt: Some("hello".into()),
+            continuation: Vec::new(),
         })
         .unwrap();
         owner
@@ -1701,6 +1734,7 @@ mod tests {
                 input_bytes: Some(begin.input_bytes.unwrap()),
                 enable_project_tools: None,
                 thinking: None,
+                request_ordinal: Some(1),
             }
         );
         assert!(begin.model.is_some());
@@ -1730,6 +1764,7 @@ mod tests {
             usage_known: Some(true),
             usage_tokens: Some(3),
             reason: Some(0),
+            tool_calls: None,
         };
         owner
             .receive(message(Body::Terminal(terminal)), &mut events)
@@ -1763,50 +1798,156 @@ mod tests {
         );
         assert!(events.is_empty());
     }
+    fn tool_call(position: u32) -> Body {
+        Body::ToolCall(pb::ToolCall {
+            ordinal: Some(position),
+            name: Some("project".into()),
+            arguments: Some(r#"{"command":"list_directory"}"#.into()),
+            arguments_bytes: None,
+            name_bytes: None,
+            source: Some(1),
+        })
+    }
+    fn proposed(calls: u32, revision: u64, chunks: u64, bytes: u64) -> Body {
+        Body::Terminal(pb::Terminal {
+            outcome: Some(4),
+            last_revision: Some(revision),
+            count: Some(chunks),
+            total_bytes: Some(bytes),
+            usage_known: Some(false),
+            usage_tokens: None,
+            reason: Some(0),
+            tool_calls: Some(calls),
+        })
+    }
+    fn small_input() -> Vec<u8> {
+        model::encode_input(&pb::ModelInput {
+            instructions: Some("i".into()),
+            history: Vec::new(),
+            prompt: Some("p".into()),
+            continuation: Vec::new(),
+        })
+        .unwrap()
+    }
+    /// CC-U32: a request's calls arrive in position order, then outcome 4
+    /// returns the owner to available without a terminal; the next request's
+    /// Begin carries ordinal 2, resets the input ledger, and Start credits
+    /// the current output transfer only once.
     #[test]
-    fn cancelled_tool_result_never_enters_output_queue() {
+    fn cc_u32_request_ends_with_calls_and_the_next_request_begins() {
         let mut owner = owner(Phase::Running);
         owner.tools_enabled = true;
-        owner.pending_tool = Some(1);
-        owner.cancel(1, Instant::now());
+        owner.request = 1;
+        let mut events = Vec::new();
+        owner
+            .receive(message(chunk("look", 1, 0)), &mut events)
+            .unwrap();
+        owner
+            .receive(message(end("look", 1, 1)), &mut events)
+            .unwrap();
+        // The conversation owner releases the next transfer's credit.
+        owner.set_output_paused(false);
+        assert_eq!(output_credits(&mut owner), vec![3]);
+        owner.receive(message(tool_call(1)), &mut events).unwrap();
+        owner.receive(message(tool_call(2)), &mut events).unwrap();
+        owner
+            .receive(message(proposed(2, 1, 1, 4)), &mut events)
+            .unwrap();
+        assert!(matches!(events.last(), Some(ModelEvent::ToolCallsProposed)));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ModelEvent::ToolCall(_)))
+                .count(),
+            2
+        );
+        assert_eq!(owner.phase, Phase::Available);
+        assert!(!owner.terminal_seen);
+        owner.input_sent = 99;
+        owner.begin_next(small_input()).unwrap();
+        let begins = owner.begin_test_frames();
+        assert_eq!(begins.len(), 1);
+        assert_eq!(begins[0].request_ordinal, Some(2));
+        assert_eq!(begins[0].enable_project_tools, Some(true));
+        assert_eq!(
+            (owner.phase, owner.input_sent, owner.proposals),
+            (Phase::Input, 0, 0)
+        );
         owner.outgoing.clear();
+        owner.phase = Phase::Ready;
+        owner.start().unwrap();
+        assert!(
+            output_credits(&mut owner).is_empty(),
+            "transfer 3 was credited before"
+        );
+        assert_eq!(owner.request(), 2);
+        // A second call of request 2 starts again at position 1.
+        owner.receive(message(tool_call(1)), &mut events).unwrap();
+    }
+    /// CC-U32: a position out of order, a count that differs, outcome 4 with
+    /// tools disabled, with no calls or with a partial revision is a fault.
+    #[test]
+    fn cc_u32_request_end_faults() {
+        let mut events = Vec::new();
+        let running = || {
+            let mut value = owner(Phase::Running);
+            value.tools_enabled = true;
+            value.request = 1;
+            value
+        };
+        let mut owner = running();
+        assert!(owner.receive(message(tool_call(2)), &mut events).is_err());
+        let mut owner = running();
+        owner.receive(message(tool_call(1)), &mut events).unwrap();
         assert!(
             owner
-                .tool_result(pb::ToolResult {
-                    ordinal: Some(1),
-                    status: Some(1),
-                    text: Some("secret".into()),
-                    next_offset: None,
-                    truncated: Some(false)
-                })
+                .receive(message(proposed(2, 0, 0, 0)), &mut events)
                 .is_err()
         );
-        assert!(owner.outgoing.is_empty());
-        assert_eq!(owner.pending_tool, Some(1));
-    }
-    #[test]
-    fn cancellation_discards_unstarted_result_and_abandons_partial_frame() {
-        for partial in [false, true] {
-            let mut owner = owner(Phase::Running);
-            owner.tools_enabled = true;
-            owner.pending_tool = Some(1);
+        let mut owner = running();
+        assert!(
             owner
-                .tool_result(pb::ToolResult {
-                    ordinal: Some(1),
-                    status: Some(1),
-                    text: Some("secret".into()),
-                    next_offset: None,
-                    truncated: Some(false),
-                })
-                .unwrap();
-            let result_frame = owner.outgoing.front().unwrap().clone();
-            owner.written = usize::from(partial);
-            owner.cancel(1, Instant::now());
-            assert_eq!(owner.written, 0);
-            assert!(!owner.outgoing.iter().any(|frame| frame == &result_frame));
-            assert_eq!(owner.outgoing.len(), usize::from(!partial));
-            assert_eq!(owner.phase, Phase::Draining);
-        }
+                .receive(message(proposed(1, 0, 0, 0)), &mut events)
+                .is_err()
+        );
+        let mut owner = running();
+        owner.tools_enabled = false;
+        assert!(owner.receive(message(tool_call(1)), &mut events).is_err());
+        let mut owner = running();
+        owner
+            .receive(message(chunk("look", 1, 0)), &mut events)
+            .unwrap();
+        owner.receive(message(tool_call(1)), &mut events).unwrap();
+        assert!(
+            owner
+                .receive(message(proposed(1, 1, 1, 4)), &mut events)
+                .is_err()
+        );
+        // begin_next only between requests of a tool turn.
+        let mut owner = running();
+        assert_eq!(owner.begin_next(small_input()), Err("model_not_ready"));
+    }
+    /// CC-U32: a cancel between requests reaches the helper.
+    #[test]
+    fn cc_u32_cancel_between_requests_is_sent() {
+        let mut owner = owner(Phase::Available);
+        owner.tools_enabled = true;
+        owner.request = 1;
+        owner.cancel(1, Instant::now());
+        assert_eq!(owner.phase, Phase::Draining);
+        let cancels = owner
+            .outgoing
+            .iter()
+            .filter(|frame| {
+                matches!(
+                    model::decode_body(&frame[4..], Direction::ServiceToHelper)
+                        .unwrap()
+                        .body,
+                    Some(Body::Cancel(_))
+                )
+            })
+            .count();
+        assert_eq!(cancels, 1);
     }
     #[test]
     fn cancellation_prevents_start_and_retains_generation() {
@@ -1825,6 +1966,7 @@ mod tests {
             instructions: Some(String::new()),
             history: vec![],
             prompt: Some("hello".into()),
+            continuation: Vec::new(),
         })
         .unwrap();
         owner
@@ -1864,6 +2006,7 @@ mod tests {
             instructions: Some("x".repeat(200_000)),
             history: vec![],
             prompt: Some("hello".into()),
+            continuation: Vec::new(),
         })
         .unwrap();
         let total = input.len() as u64;
@@ -1923,6 +2066,7 @@ mod tests {
             instructions: Some("x".repeat(801)),
             history: vec![],
             prompt: Some("hello".into()),
+            continuation: Vec::new(),
         })
         .unwrap();
         assert!(
@@ -1945,6 +2089,7 @@ mod tests {
             instructions: Some("x".repeat(200_000)),
             history: vec![],
             prompt: Some("hello".into()),
+            continuation: Vec::new(),
         })
         .unwrap();
         owner
@@ -2115,6 +2260,7 @@ mod tests {
                     usage_tokens: Some(1),
                     usage_known: Some(true),
                     reason: Some(0),
+                    tool_calls: None,
                 })),
                 &mut events,
             )
@@ -2125,58 +2271,6 @@ mod tests {
             ModelEvent::Failed("model_protocol_fault")
         ));
         assert!(!owner.terminal_seen);
-    }
-    #[test]
-    fn completion_cannot_overtake_a_pending_durable_tool_result() {
-        let mut owner = owner(Phase::Running);
-        owner.tools_enabled = true;
-        let mut events = Vec::new();
-        owner
-            .receive(message(chunk("answer", 1, 0)), &mut events)
-            .unwrap();
-        owner
-            .receive(message(end("answer", 1, 1)), &mut events)
-            .unwrap();
-        owner
-            .receive(
-                message(Body::ToolCall(pb::ToolCall {
-                    ordinal: Some(1),
-                    name: Some("project".into()),
-                    arguments: Some(r#"{"command":"list_directory"}"#.into()),
-                    arguments_bytes: None,
-                    name_bytes: None,
-                    source: Some(1),
-                })),
-                &mut events,
-            )
-            .unwrap();
-        let terminal = pb::Terminal {
-            outcome: Some(1),
-            last_revision: Some(1),
-            count: Some(1),
-            total_bytes: Some(6),
-            usage_known: Some(false),
-            usage_tokens: None,
-            reason: Some(0),
-        };
-        assert_eq!(
-            owner.receive(message(Body::Terminal(terminal)), &mut events),
-            Err("model_protocol_fault")
-        );
-        assert!(!owner.terminal_seen);
-        owner
-            .tool_result(pb::ToolResult {
-                ordinal: Some(1),
-                status: Some(1),
-                text: Some("file".into()),
-                next_offset: None,
-                truncated: Some(false),
-            })
-            .unwrap();
-        owner
-            .receive(message(Body::Terminal(terminal)), &mut events)
-            .unwrap();
-        assert!(owner.terminal_seen);
     }
     #[test]
     fn measured_input_context_is_once_before_output_and_generation_fenced() {
@@ -2268,6 +2362,7 @@ mod tests {
                     usage_tokens: None,
                     usage_known: Some(false),
                     reason: Some(0),
+                    tool_calls: None,
                 })),
                 Direction::HelperToService,
             )

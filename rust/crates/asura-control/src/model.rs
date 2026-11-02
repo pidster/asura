@@ -30,6 +30,11 @@ pub const MAX_TOOL_ORDINAL: u32 = MAX_RECORDED_TOOL_CALLS + 1;
 /// usage). Not an output cap: no request has one (owner, 2026-10-19;
 /// turn-usage-helper.md, request admission).
 pub const MAX_COUNTED_TOKENS: u64 = 1_000_000_000;
+/// Continuation entries of one request (CC4): at most 200 assistant entries
+/// and 200 tool entries, since every request adds at least one recorded call.
+pub const MAX_CONTINUATION_ENTRIES: usize = 400;
+/// Bytes of a service-assigned call ID (`call_<ordinal>`), `[A-Za-z0-9_-]`.
+pub const MAX_CALL_ID_BYTES: usize = 64;
 /// Credit window for one direction; a sliding window for input.
 pub const CREDIT_WINDOW: u64 = 65_536;
 /// Bytes one output revision appends: a per-transfer bound, not a response
@@ -161,11 +166,7 @@ pub fn validate_semantics(
     let service = direction == Direction::ServiceToHelper;
     let allowed = match body {
         Body::Hello(_) | Body::Credit(_) => true,
-        Body::Begin(_)
-        | Body::InputEnd(_)
-        | Body::Start(_)
-        | Body::Cancel(_)
-        | Body::ToolResult(_) => service,
+        Body::Begin(_) | Body::InputEnd(_) | Body::Start(_) | Body::Cancel(_) => service,
         Body::Ready(_)
         | Body::SnapshotEnd(_)
         | Body::Terminal(_)
@@ -369,6 +370,8 @@ pub fn validate_semantics(
                 && positive(v.input_bytes, MAX_INPUT_BYTES)
                 // Absent means send nothing (thinking-level.md).
                 && v.thinking.is_none_or(|n| (1..=5).contains(&n))
+                // The service's request ordinal (CC4).
+                && v.request_ordinal.is_some_and(|n| n >= 1)
         }
         Body::Chunk(v) => {
             transfer(v.transfer_id, v.direction)
@@ -423,17 +426,6 @@ pub fn validate_semantics(
                 }
                 && matches!(v.source, Some(1 | 2))
         }
-        Body::ToolResult(v) => {
-            v.ordinal
-                .is_some_and(|n| (1..=MAX_TOOL_ORDINAL).contains(&n))
-                && v.status.is_some_and(|n| (1..=8).contains(&n))
-                && (v.ordinal != Some(MAX_TOOL_ORDINAL) || v.status == Some(7))
-                // Status 8 `private` (PTS-R5): text only, never truncated.
-                && (v.status != Some(8) || v.truncated == Some(false))
-                && v.text.as_ref().is_some_and(|text| text.len() <= 16_384)
-                && v.truncated.is_some()
-                && (v.status == Some(1) || v.next_offset.is_none())
-        }
         Body::Terminal(v) => {
             let usage = match v.usage_known {
                 Some(false) => v.usage_tokens.is_none(),
@@ -446,8 +438,20 @@ pub fn validate_semantics(
                 && v.last_revision.is_some()
                 && count_bytes(v.count, v.total_bytes, u64::MAX)
                 && match v.outcome {
-                    Some(1) => positive(v.last_revision, u64::MAX) && v.reason == Some(0),
-                    Some(2 | 3) => v.reason.is_some_and(|n| (1..=12).contains(&n)),
+                    Some(1) => {
+                        positive(v.last_revision, u64::MAX)
+                            && v.reason == Some(0)
+                            && v.tool_calls.is_none()
+                    }
+                    Some(2 | 3) => {
+                        v.reason.is_some_and(|n| (1..=12).contains(&n)) && v.tool_calls.is_none()
+                    }
+                    // CC4: the request ended with 1 to 201 tool calls.
+                    Some(4) => {
+                        v.reason == Some(0)
+                            && v.tool_calls
+                                .is_some_and(|n| (1..=MAX_TOOL_ORDINAL).contains(&n))
+                    }
                     _ => false,
                 }
         }
@@ -497,7 +501,12 @@ pub fn validate_input(input: &pb::ModelInput) -> Result<(), ProtocolError> {
         .checked_add(prompt.len())
         .ok_or(ProtocolError::InvalidLength)?;
     for turn in &input.history {
-        if !matches!(turn.role, Some(1 | 2)) {
+        // Earlier turns carry text only (CC4: tool records stay in their turn).
+        if !matches!(turn.role, Some(1 | 2))
+            || !turn.tool_calls.is_empty()
+            || turn.call_id.is_some()
+            || turn.tool_name.is_some()
+        {
             return Err(ProtocolError::InvalidSemantics);
         }
         let text = turn.text.as_ref().ok_or(ProtocolError::InvalidSemantics)?;
@@ -505,11 +514,85 @@ pub fn validate_input(input: &pb::ModelInput) -> Result<(), ProtocolError> {
             .checked_add(text.len())
             .ok_or(ProtocolError::InvalidLength)?;
     }
+    bytes = bytes
+        .checked_add(continuation_bytes(&input.continuation)?)
+        .ok_or(ProtocolError::InvalidLength)?;
     if bytes as u64 > MAX_INPUT_BYTES || input.encoded_len() as u64 > MAX_INPUT_BYTES {
         Err(ProtocolError::InvalidLength)
     } else {
         Ok(())
     }
+}
+fn call_id(value: Option<&str>) -> bool {
+    value.is_some_and(|id| {
+        (1..=MAX_CALL_ID_BYTES).contains(&id.len())
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    })
+}
+fn tool_name(value: Option<&str>) -> bool {
+    value.is_some_and(|name| (1..=MAX_TOOL_NAME_BYTES).contains(&name.len()))
+}
+/// The continuation's structure (CC4): groups of one assistant entry with
+/// 1 to 201 tool calls and empty text, then one tool entry per call, in
+/// call order, with matching call IDs. Returns its text bytes.
+fn continuation_bytes(entries: &[pb::HistoryTurn]) -> Result<usize, ProtocolError> {
+    if entries.len() > MAX_CONTINUATION_ENTRIES {
+        return Err(ProtocolError::InvalidSemantics);
+    }
+    let mut bytes = 0usize;
+    let mut index = 0;
+    while index < entries.len() {
+        let call = &entries[index];
+        let calls = &call.tool_calls;
+        if call.role != Some(2)
+            || call.text.as_deref() != Some("")
+            || call.call_id.is_some()
+            || call.tool_name.is_some()
+            || calls.is_empty()
+            || calls.len() > MAX_TOOL_ORDINAL as usize
+        {
+            return Err(ProtocolError::InvalidSemantics);
+        }
+        for value in calls {
+            if !call_id(value.call_id.as_deref())
+                || !tool_name(value.name.as_deref())
+                || value
+                    .arguments
+                    .as_ref()
+                    .is_none_or(|text| text.len() > MAX_TOOL_ARGUMENT_BYTES)
+            {
+                return Err(ProtocolError::InvalidSemantics);
+            }
+            bytes = bytes
+                .checked_add(value.arguments.as_ref().map_or(0, String::len))
+                .ok_or(ProtocolError::InvalidLength)?;
+        }
+        let outputs = entries
+            .get(index + 1..index + 1 + calls.len())
+            .ok_or(ProtocolError::InvalidSemantics)?;
+        for (output, value) in outputs.iter().zip(calls) {
+            if output.role != Some(3)
+                || !output.tool_calls.is_empty()
+                || output.call_id != value.call_id
+                || !tool_name(output.tool_name.as_deref())
+            {
+                return Err(ProtocolError::InvalidSemantics);
+            }
+            bytes = bytes
+                .checked_add(
+                    output
+                        .text
+                        .as_ref()
+                        .ok_or(ProtocolError::InvalidSemantics)?
+                        .len(),
+                )
+                .ok_or(ProtocolError::InvalidLength)?;
+        }
+        index += 1 + calls.len();
+    }
+    Ok(bytes)
 }
 #[cfg(test)]
 mod tests;

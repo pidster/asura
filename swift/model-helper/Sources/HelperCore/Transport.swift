@@ -16,6 +16,10 @@ public final class Transport: @unchecked Sendable {
     private var decoder = FrameDecoder()
     private var controls: [Data] = []
     private var dataFrames: [Data] = []
+    /// One data frame waiting for queue room (CC4: a response's tool calls
+    /// leave in a burst). It ends when the peer drains the queue, or with the
+    /// channel's failure; no time bound.
+    private var roomWaiter: (frame: Data, done: CheckedContinuation<Void, any Error>)?
     private var current = Data()
     private var offset = 0
 
@@ -71,6 +75,36 @@ public final class Transport: @unchecked Sendable {
         }
     }
 
+    /// Enqueues one data frame, waiting while the ordered data queue is full
+    /// (8 frames or one frame plus 1,024 bytes). One sender may wait at a time.
+    public func sendWhenRoom(_ message: Envelope) async throws {
+        let frame = try Wire.frame(message)
+        try await withCheckedThrowingContinuation { (done: CheckedContinuation<Void, any Error>) in
+            queue.async { [self] in
+                guard !closed, !finishing else { done.resume(throwing: HelperError.closed); return }
+                if hasRoom(for: frame) {
+                    dataFrames.append(frame)
+                    if writerSuspended { writerSuspended = false; writer?.resume() }
+                    done.resume()
+                } else if roomWaiter == nil {
+                    roomWaiter = (frame, done)
+                    if writerSuspended { writerSuspended = false; writer?.resume() }
+                } else {
+                    done.resume(throwing: HelperError.limit)
+                }
+            }
+        }
+    }
+    private func hasRoom(for frame: Data) -> Bool {
+        dataFrames.count < 8 && dataFrames.reduce(0, { $0 + $1.count }) + frame.count <= Limits.frame + 1024
+    }
+    private func admitWaiter() {
+        guard let waiter = roomWaiter, hasRoom(for: waiter.frame) else { return }
+        roomWaiter = nil
+        dataFrames.append(waiter.frame)
+        waiter.done.resume()
+    }
+
     public func close() { queue.async { [self] in fail(nil) } }
     public func finish() {
         queue.async { [self] in
@@ -112,7 +146,7 @@ public final class Transport: @unchecked Sendable {
         for _ in 0..<16 {
             if current.isEmpty {
                 if !controls.isEmpty { current = controls.removeFirst() }
-                else if !dataFrames.isEmpty { current = dataFrames.removeFirst() }
+                else if !dataFrames.isEmpty { current = dataFrames.removeFirst(); admitWaiter() }
                 else {
                     if finishing { fail(nil) }
                     else if !writerSuspended { writerSuspended = true; writer?.suspend() }
@@ -147,6 +181,7 @@ public final class Transport: @unchecked Sendable {
         reader = nil
         writer = nil
         controls.removeAll(); dataFrames.removeAll(); current.removeAll()
+        if let waiter = roomWaiter { roomWaiter = nil; waiter.done.resume(throwing: error ?? HelperError.closed) }
         continuation.finish(throwing: error)
         // All IO callbacks run on this queue and observe `closed` before use.
         Darwin.close(fd)

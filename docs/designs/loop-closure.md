@@ -446,8 +446,8 @@ Open decisions for the per-loop mapping:
    A Core AI run with a real local model comes before the build (composer CC4).
    The implementation-ready design is
    [CC4](context-composer.md#cc4-service-owned-request-loop-stage-b). Under it a
-   full window that stops the next request is a new known-size closure of the
-   turn loop (`context_limit`).
+   full window ends the turn loop through the helper's exact count or the
+   provider's window (`context_limit`), as it did inside the SDK loop.
 
 Owner direction (2026-10-13): the closure that guarantees a turn's tool loop
 ends is derived from evidence. Asura logs tool-loop traces and builds a

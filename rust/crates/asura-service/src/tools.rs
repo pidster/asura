@@ -663,9 +663,108 @@ impl Budget {
     }
 }
 
+/// One settled call's result as the model receives it (CC4): the status
+/// code (1 success to 8 private, the journal's result codes), the service
+/// text and the paging facts. It replaces the removed wire `ToolResult`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reply {
+    pub ordinal: Option<u32>,
+    pub status: Option<i32>,
+    pub text: Option<String>,
+    pub next_offset: Option<u64>,
+    pub truncated: Option<bool>,
+}
+
+/// The status names the model reads, as the helper rendered them before
+/// CC4 (the wire `ToolStatus` case names).
+fn status_name(status: i32) -> &'static str {
+    match status {
+        1 => "success",
+        2 => "denied",
+        3 => "invalidArguments",
+        4 => "unavailable",
+        5 => "timeout",
+        6 => "cancelled",
+        7 => "limit",
+        8 => "private",
+        _ => "unspecified",
+    }
+}
+
+/// The model text of one result (context-composer.md, CC4 requests and
+/// tool calls, rule 8): a private result is its text alone (PTS-R4); a
+/// failure is `Tool failed: <status>` with the service text on the next line
+/// (TCR-D18); a success ends with its paging line. The service is the one
+/// owner of this rendering.
+pub fn render_reply(reply: &Reply) -> String {
+    let status = reply.status.unwrap_or(0);
+    let text = reply.text.as_deref().unwrap_or("");
+    let truncated = reply.truncated.unwrap_or(false);
+    if status == 8 {
+        return text.to_owned();
+    }
+    if status != 1 {
+        let mut value = format!("Tool failed: {}", status_name(status));
+        if !text.is_empty() {
+            value.push('\n');
+            value.push_str(text);
+        }
+        if truncated {
+            value.push_str("\n[truncated: true]");
+        }
+        return value;
+    }
+    match reply.next_offset {
+        Some(next) => format!("{text}\n[next byte offset: {next}, truncated: {truncated}]"),
+        None => format!("{text}\n[truncated: {truncated}]"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn reply(status: i32, text: &str, next_offset: Option<u64>, truncated: bool) -> Reply {
+        Reply {
+            ordinal: Some(1),
+            status: Some(status),
+            text: Some(text.into()),
+            next_offset,
+            truncated: Some(truncated),
+        }
+    }
+    /// CC-U31 (rendering): every status renders as the helper rendered it
+    /// before CC4, so the model's view of a result does not change.
+    #[test]
+    fn cc_u31_results_render_as_before_the_service_owned_loop() {
+        assert_eq!(
+            render_reply(&reply(3, "invalid_arguments: missing_field", None, false)),
+            "Tool failed: invalidArguments\ninvalid_arguments: missing_field"
+        );
+        assert_eq!(
+            render_reply(&reply(7, "", None, false)),
+            "Tool failed: limit"
+        );
+        assert_eq!(
+            render_reply(&reply(5, "stdout: partial", None, true)),
+            "Tool failed: timeout\nstdout: partial\n[truncated: true]"
+        );
+        let private = "private: this job used secrets, so its output is private to the person";
+        assert_eq!(render_reply(&reply(8, private, None, false)), private);
+        assert_eq!(
+            render_reply(&reply(1, "content", Some(7), false)),
+            "content\n[next byte offset: 7, truncated: false]"
+        );
+        assert_eq!(
+            render_reply(&reply(1, "a\nb", None, true)),
+            "a\nb\n[truncated: true]"
+        );
+        for (status, name) in [(2, "denied"), (4, "unavailable"), (6, "cancelled")] {
+            assert_eq!(
+                render_reply(&reply(status, "", None, false)),
+                format!("Tool failed: {name}")
+            );
+        }
+    }
     #[test]
     fn exec_cmd_requires_separate_execution_grant_and_never_remote_disclosure() {
         let mut grant = Grant {

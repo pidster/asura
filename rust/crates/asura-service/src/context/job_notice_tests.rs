@@ -1603,10 +1603,10 @@ fn j5t_11_manifest_segments_and_revision_3() {
     let reference = encoded(COMPOSER_REVISION, &shown, &[Fidelity::Reference], &budget);
     assert_eq!(reference.len(), bytes.len() - segments.len());
     // The revision changes the digest; the composition records it.
-    assert_eq!(COMPOSER_REVISION, 4);
+    assert_eq!(COMPOSER_REVISION, 5);
     let two = encoded(2, &shown, &[Fidelity::Full], &budget);
     assert_ne!(Sha256::digest(&two), Sha256::digest(&bytes));
-    assert_eq!(composed.composition(budget).composer_revision, 4);
+    assert_eq!(composed.composition(budget).composer_revision, 5);
     // A different stored S or live count changes the bound digest.
     let mut moved = notice.clone();
     moved.through += 1;

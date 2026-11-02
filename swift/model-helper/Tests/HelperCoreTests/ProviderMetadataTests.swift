@@ -51,7 +51,7 @@ private struct NamedProvider: ModelBackend {
     #expect(reply.hello.selectedModel == selector)
     #expect(!reply.hello.hasModelName)
     var begin = Asura_Model_V1_Begin()
-    begin.model = selector; begin.inputBytes = 10
+    begin.model = selector; begin.inputBytes = 10; begin.requestOrdinal = 1
     frame = Envelope(); frame.operationID = Data(repeating: 7, count: 16); frame.generation = 1
     frame.body = .begin(begin)
     try await service.send(frame)

@@ -159,6 +159,7 @@ fn active_projection(owner: &Owner) -> Arc<journal::Replay> {
             cancel: None,
             terminal: None,
             tools: vec![],
+            request_starts: Vec::new(),
         },
     );
     Arc::new(replay)

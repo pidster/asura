@@ -103,16 +103,8 @@ final class OllamaFixtureServer: @unchecked Sendable {
     }
 }
 
-/// TCR-I09 helper part: the Ollama adapter receives a name that is not
-/// registered. The helper sends a ToolCall with that name, the argument JSON and
-/// source provider_json; it receives status 3; then the turn fails with
-/// protocolFault. The SDK never dispatches the call (no second chat request).
-@Test func ollamaUnregisteredNameIsSentForItsRecordThenFailsTheTurn() async throws {
-    let server = try OllamaFixtureServer(chats: [
-        #"{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"delete_everything","arguments":{"path":"/"}}}]},"done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":2}"#
-    ])
-    server.start()
-    defer { server.close() }
+/// Opens a helper session over the real Ollama adapter against `server`.
+private func ollamaSession(_ server: OllamaFixtureServer) async throws -> ToolSessionChannel {
     var fds: [Int32] = [-1, -1]
     #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
     let helper = try Transport(fd: fds[0]); let service = try Transport(fd: fds[1])
@@ -122,7 +114,7 @@ final class OllamaFixtureServer: @unchecked Sendable {
     }, buildID: identity, schemaDigest: identity)
     let running = Task { await session.run() }
     let channel = ToolSessionChannel(helper: helper, service: service, running: running)
-    defer { channel.close() }
+    channel.selector = "ollama:fixture"
     var hello = Asura_Model_V1_Hello()
     hello.buildID = identity; hello.schemaDigest = identity; hello.maxFrameBytes = 65_536
     hello.availability = .unknown; hello.reason = .none; hello.selectedModel = "ollama:fixture"
@@ -131,26 +123,67 @@ final class OllamaFixtureServer: @unchecked Sendable {
     try await service.send(helloEnvelope)
     let greeting = try await channel.next()
     #expect(greeting.hello.availability == .available && greeting.hello.supportedCapabilities & 1 != 0)
+    return channel
+}
+
+/// TCR-I09 helper part (revised by CC4): the Ollama adapter receives a name
+/// that is not registered. The helper sends a ToolCall with that name, the
+/// argument JSON and source provider_json, then the request fails with
+/// protocolFault. The SDK never dispatches the call (no second chat request).
+@Test func ollamaUnregisteredNameIsSentForItsRecordThenFailsTheRequest() async throws {
+    let server = try OllamaFixtureServer(chats: [
+        #"{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"delete_everything","arguments":{"path":"/"}}}]},"done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":2}"#
+    ])
+    server.start()
+    defer { server.close() }
+    let channel = try await ollamaSession(server)
+    defer { channel.close() }
     var input = ModelInput(); input.instructions = ""; input.prompt = "tools"
-    let data = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = "ollama:fixture"; begin.inputBytes = UInt64(data.count)
-    begin.enableProjectTools = true
-    try await channel.send(.begin(begin)); _ = try await channel.next()
-    var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
-    chunk.ordinal = 0; chunk.revision = 0; chunk.data = data
-    try await channel.send(.chunk(chunk))
-    var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(data.count)
-    try await channel.send(.inputEnd(end)); _ = try await channel.next()
-    var credit = Asura_Model_V1_Credit(); credit.transferID = 2; credit.direction = .output
-    credit.acceptedBytes = 0; credit.grantedBytes = 65_536
-    try await channel.send(.start(.init()))
-    try await channel.send(.credit(credit))
-    let call = try await channel.nextToolCall()
+    try await channel.request(1, input)
+    let result = try await channel.collect()
+    #expect(result.calls.count == 1)
+    let call = try #require(result.calls.first)
     #expect(call.ordinal == 1 && call.name == "delete_everything" && call.source == .providerJson)
     #expect(call.arguments == #"{"path":"\/"}"# || call.arguments == #"{"path":"/"}"#)
-    try await channel.reply(1, .invalidArguments, "unknown_tool: unregistered_name")
-    let terminal = try await channel.terminal()
-    #expect(terminal.outcome == .failed && terminal.reason == .protocolFault)
-    #expect(channel.unexpectedToolCalls == 0)
+    #expect(result.terminal.outcome == .failed && result.terminal.reason == .protocolFault)
     #expect(server.chatCount == 1)
+}
+
+/// CC4 through the real Ollama adapter: request 1 returns a call; request 2
+/// carries the continuation. Each request is one /api/chat. Request 2's
+/// messages start with request 1's messages unchanged (Q5, prefix reuse),
+/// then the assistant call and the tool output.
+@Test func ollamaTwoRequestsKeepTheEarlierMessagesStable() async throws {
+    let server = try OllamaFixtureServer(chats: [
+        #"{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_x","function":{"name":"exec_cmd","arguments":{"command":"ls"}}}]},"done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":2}"#,
+        #"{"message":{"role":"assistant","content":"two files"},"done":true,"done_reason":"stop","prompt_eval_count":20,"eval_count":2}"#
+    ])
+    server.start()
+    defer { server.close() }
+    let channel = try await ollamaSession(server)
+    defer { channel.close() }
+    var input = ModelInput(); input.instructions = "instructions"; input.prompt = "list files"
+    var user = Asura_Model_V1_HistoryTurn(); user.role = .user; user.text = "earlier"
+    var assistant = Asura_Model_V1_HistoryTurn(); assistant.role = .assistant; assistant.text = "reply"
+    input.history = [user, assistant]
+    try await channel.request(1, input)
+    let first = try await channel.collect()
+    #expect(first.terminal.outcome == .toolCalls && first.calls.map(\.name) == ["exec_cmd"])
+    input.continuation = continuation([(id: "call_1", name: "exec_cmd", arguments: #"{"command":"ls"}"#, output: "a\nb")])
+    try await channel.request(2, input)
+    let second = try await channel.collect()
+    #expect(second.terminal.outcome == .complete && channel.response == "two files")
+    #expect(server.chatCount == 2)
+    let bodies = server.chatBodies
+    func messages(_ body: Data) throws -> [[String: Any]] {
+        let object = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        return try #require(object["messages"] as? [[String: Any]])
+    }
+    let one = try messages(bodies[0]); let two = try messages(bodies[1])
+    #expect(one.count == 4 && two.count == 6)
+    for (a, b) in zip(one, two) { #expect(NSDictionary(dictionary: a) == NSDictionary(dictionary: b)) }
+    #expect(two[4]["role"] as? String == "assistant")
+    #expect((two[4]["tool_calls"] as? [[String: Any]])?.count == 1)
+    #expect(two[5]["role"] as? String == "tool" && two[5]["content"] as? String == "a\nb"
+        && two[5]["tool_name"] as? String == "exec_cmd")
 }

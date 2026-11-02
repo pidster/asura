@@ -10,12 +10,7 @@ import Testing
 /// owner decision 2). It asserts the measured table so an SDK change is seen.
 private actor Q1Probe {
     var passes = 0
-    var proposals: [ToolProposal] = []
     func next() -> Int { passes += 1; return passes }
-    func received(_ proposal: ToolProposal) -> ToolResult {
-        proposals.append(proposal)
-        return ToolResult(status: .invalidArguments, text: "invalid_arguments: recorded")
-    }
 }
 private struct Q1Model: LanguageModel {
     let probe: Q1Probe
@@ -71,14 +66,16 @@ private func measure(_ value: Q1Case) async -> (reached: Bool, outcome: String, 
         contextTokens: 8192, modelName: "q1-fixture", supportsTools: true)
     var input = ModelInput(); input.instructions = "q1"; input.prompt = "q1"
     var outcome = "complete"
+    var proposals: [ToolProposal] = []
     do {
-        try await backend.generateWithTools(input, handler: { await probe.received($0) }, snapshot: { _ in })
+        // CC4: the stop tool ends the request; the calls come back unread.
+        proposals = try await backend.generateWithTools(input, thinking: .none, request: 1, snapshot: { _ in })
     } catch let error as BackendFailure {
         outcome = "backend_failure:\(error.reason)"
     } catch {
         outcome = modelFailureDiagnostic(error).trimmingCharacters(in: .whitespacesAndNewlines)
     }
-    let proposals = await probe.proposals
+    #expect(await probe.passes <= 1, "one inference per request")
     return (!proposals.isEmpty, outcome, proposals.first?.arguments)
 }
 

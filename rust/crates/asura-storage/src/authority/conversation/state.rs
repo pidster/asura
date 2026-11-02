@@ -1413,6 +1413,26 @@ impl Replay {
                         && p.helper != [0; 16],
                 )?;
                 op.helper = Some(p.helper);
+                op.request_starts.push(op.tools.len());
+                self.active_activity(sequence);
+            }
+            Record::RequestStarted(p) => {
+                // CC4: a later request of a started, open turn of this owner
+                // generation, after at least one new call, every call resolved.
+                let owner = self.owner_generation;
+                let op = self.operation_mut(p.operation, p.generation)?;
+                let previous = op.request_starts.last().copied();
+                require(
+                    op.owner_generation == owner
+                        && op.helper.is_some()
+                        && op.cancel.is_none()
+                        && op.terminal.is_none()
+                        && u32::try_from(op.request_starts.len()).ok() == p.request.checked_sub(1)
+                        && p.request >= 2
+                        && previous.is_some_and(|start| op.tools.len() > start)
+                        && op.tools.iter().all(|tool| !tool.unresolved()),
+                )?;
+                op.request_starts.push(op.tools.len());
                 self.active_activity(sequence);
             }
             Record::CancelRequested(p) => {
@@ -1901,6 +1921,7 @@ impl Replay {
                 cancel: None,
                 terminal: None,
                 tools: Vec::new(),
+                request_starts: Vec::new(),
                 response: Response::default(),
                 thinking: Response::default(),
             },

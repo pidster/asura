@@ -190,10 +190,13 @@ public struct SystemBackend: ToolModelBackend {
         capabilities.contains(.reasoning) ? [.low, .medium, .high] : []
     }
 
-    public static func history(_ input: ModelInput) -> [Transcript.Entry] {
+    public static func history(_ input: ModelInput, tools: [any Tool] = []) -> [Transcript.Entry] {
         func segment(_ text: String) -> [Transcript.Segment] { [.text(.init(content: text))] }
+        // The instructions entry declares the tools, as the SDK's own session
+        // writes it; the system model reads the declarations from it.
         var entries: [Transcript.Entry] = [
-            .instructions(.init(segments: segment(input.instructions), toolDefinitions: []))
+            .instructions(.init(segments: segment(input.instructions),
+                toolDefinitions: tools.map { Transcript.ToolDefinition(tool: $0) }))
         ]
         for turn in input.history {
             if turn.role == .user {
@@ -203,6 +206,45 @@ public struct SystemBackend: ToolModelBackend {
             }
         }
         return entries
+    }
+    /// The whole request as transcript entries (CC4): instructions with the
+    /// declared tools, history, the prompt, then the continuation as tool
+    /// calls and tool outputs. A call whose arguments are not JSON is a
+    /// service fault.
+    public static func transcript(_ input: ModelInput, tools: [any Tool]) throws -> [Transcript.Entry] {
+        var entries = history(input, tools: tools)
+        entries.append(.prompt(.init(segments: [.text(.init(content: input.prompt))])))
+        for turn in input.continuation {
+            switch turn.role {
+            case .assistant:
+                let calls = try turn.toolCalls.map { call -> Transcript.ToolCall in
+                    guard let arguments = try? GeneratedContent(json: call.arguments) else {
+                        throw BackendFailure(.protocolFault)
+                    }
+                    return Transcript.ToolCall(id: call.callID, toolName: call.name, arguments: arguments)
+                }
+                entries.append(.toolCalls(.init(calls)))
+            case .tool:
+                entries.append(.toolOutput(.init(id: turn.callID, toolName: turn.toolName,
+                    segments: [.text(.init(content: turn.text))])))
+            default:
+                throw BackendFailure(.protocolFault)
+            }
+        }
+        return entries
+    }
+    /// The calls of the last `toolCalls` entry of a preserved transcript, in
+    /// response order; `nil` when there is none (an SDK regression, CC4).
+    static func proposals(_ transcript: Transcript) -> [ToolProposal]? {
+        for entry in transcript.reversed() {
+            if case .toolCalls(let calls) = entry {
+                let proposals = calls.map {
+                    ToolProposal(name: $0.toolName, arguments: $0.arguments.jsonString, source: .generatedContent)
+                }
+                return proposals.isEmpty ? nil : proposals
+            }
+        }
+        return nil
     }
 
     private func engine() throws -> FoundationBackend<SystemLanguageModel> {
@@ -225,13 +267,9 @@ public struct SystemBackend: ToolModelBackend {
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         try await engine().generate(input, thinking: thinking, snapshot: snapshot)
     }
-    public func generateWithTools(_ input: ModelInput, handler: @escaping ToolHandler,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
-        try await engine().generateWithTools(input, handler: handler, snapshot: snapshot)
-    }
-    public func generateWithTools(_ input: ModelInput, thinking: ThinkingRequest, handler: @escaping ToolHandler,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
-        try await engine().generateWithTools(input, thinking: thinking, handler: handler, snapshot: snapshot)
+    public func generateWithTools(_ input: ModelInput, thinking: ThinkingRequest, request: UInt32,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws -> [ToolProposal] {
+        try await engine().generateWithTools(input, thinking: thinking, request: request, snapshot: snapshot)
     }
 }
 
@@ -239,11 +277,10 @@ public typealias NativeTokenCounter = @Sendable ([Transcript.Entry], [any Tool])
 
 /// One SDK conversation engine shared by all admitted native/custom adapters.
 public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
-    /// Builds the per-generation model with its observers. The tool handler is
-    /// the unguarded session handler, for adapters that must report a call the
-    /// SDK cannot dispatch (TCR-D17); it is nil when tools are disabled.
+    /// Builds the per-request model with its observers. The reporter takes a
+    /// call the SDK cannot dispatch (TCR-D17); it is nil when tools are disabled.
     public typealias InstrumentationFactory = @Sendable (InferenceUsageObserver,
-        @escaping @Sendable (Snapshot) async throws -> Void, ToolHandler?) -> Model
+        @escaping @Sendable (Snapshot) async throws -> Void, UnregisteredToolReporter?) -> Model
     public let model: Model
     public let capabilityProfile: CapabilityProfile
     private let contextTokens: UInt32?
@@ -286,49 +323,44 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
             thinkingControls: thinkingControls)
     }
     public func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
-        try await generateSession(input, thinking: .none, handler: nil, snapshot: snapshot)
+        _ = try await generateSession(input, thinking: .none, request: 1, tools: false, snapshot: snapshot)
     }
     public func generate(_ input: ModelInput, thinking: ThinkingRequest,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
-        try await generateSession(input, thinking: thinking, handler: nil, snapshot: snapshot)
+        _ = try await generateSession(input, thinking: thinking, request: 1, tools: false, snapshot: snapshot)
     }
-    public func generateWithTools(_ input: ModelInput, handler: @escaping ToolHandler,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
-        try await generateWithTools(input, thinking: .none, handler: handler, snapshot: snapshot)
-    }
-    public func generateWithTools(_ input: ModelInput, thinking: ThinkingRequest, handler: @escaping ToolHandler,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+    public func generateWithTools(_ input: ModelInput, thinking: ThinkingRequest, request: UInt32,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws -> [ToolProposal] {
         guard supportsTools else { throw BackendFailure(.modelUnavailable) }
         try capabilityProfile.require([.toolCalling])
-        try await generateSession(input, thinking: thinking, handler: handler, snapshot: snapshot)
+        return try await generateSession(input, thinking: thinking, request: request, tools: true, snapshot: snapshot)
     }
-    private func generateSession(_ input: ModelInput, thinking: ThinkingRequest, handler: ToolHandler?,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+    /// One request: one fresh session, one inference (CC4). The session holds
+    /// only the instructions; the executor wrapper replaces the request
+    /// transcript with the whole input. With tools, every project tool throws
+    /// `StopForCaller`, so a response with calls ends the session; the calls
+    /// are read from the preserved transcript and returned, never run.
+    private func generateSession(_ input: ModelInput, thinking: ThinkingRequest, request: UInt32, tools enabled: Bool,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws -> [ToolProposal] {
         // The service sends only a reported form; anything else is a fault.
         guard thinkingControls.accepts(thinking) else { throw BackendFailure(.protocolFault) }
         try Task.checkCancellation()
-        let entries = SystemBackend.history(input)
-        let current = Transcript.Entry.prompt(.init(segments: [.text(.init(content: input.prompt))]))
-        let requestUsage = InferenceUsageObserver(snapshot: snapshot)
-        let generationModel = instrumentationFactory?(requestUsage, snapshot, handler) ?? model
+        let tools = enabled ? makeProjectTools() : []
+        let entries = try SystemBackend.transcript(input, tools: tools)
+        let requestUsage = InferenceUsageObserver(request: request, snapshot: snapshot)
+        let unregistered = ProposalLog()
+        let reporter: UnregisteredToolReporter? = enabled ? { @Sendable proposal in await unregistered.append(proposal) } : nil
+        let generationModel = instrumentationFactory?(requestUsage, snapshot, reporter) ?? model
         // No Asura output cap (owner, 2026-10-19). Adapters whose nil means a
         // small library default receive the window, which cannot bind first.
         let responseTokens = responseTokensFromWindow ? contextTokens.map { Int($0) } : nil
         let boundedModel = BoundedToolModel(base: generationModel, responseTokens: responseTokens,
-            toolsEnabled: handler != nil, usageObserver: requestUsage)
+            transcript: Transcript(entries: entries), usageObserver: requestUsage)
         do {
-            let guardedHandler: ToolHandler?
-            if let handler {
-                guardedHandler = { @Sendable (call: ToolProposal) async throws -> ToolResult in
-                    try await boundedModel.budget.requireSuccessfulInference()
-                    return try await handler(call)
-                }
-            } else {
-                guardedHandler = nil
-            }
-            let tools = guardedHandler.map { makeProjectTools($0, budget: boundedModel.budget) } ?? []
             if let tokenCounter {
-                let count = try await tokenCounter(entries + [current], tools)
+                // The instructions entry declares the tools, so the entries hold
+                // the schemas once; they are not counted again.
+                let count = try await tokenCounter(entries, [])
                 try Task.checkCancellation()
                 guard let measured = UInt32(exactly: count) else { throw BackendFailure(.contextLimit) }
                 if let capacity = contextTokens {
@@ -339,30 +371,50 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
                 }
             }
             let session = LanguageModelSession(model: boundedModel, tools: tools,
-                transcript: Transcript(entries: entries))
+                transcript: Transcript(entries: Array(entries.prefix(1))))
+            // A throwing stop tool must leave its toolCalls entry in place (CC4).
+            session.transcriptErrorHandlingPolicy = .preserveTranscript
             // The SDK session owns inference; retain it through every async stream exit.
             defer { withExtendedLifetime(session) {} }
             // The thinking form the service sent; none leaves the model's default.
             let contextOptions = ContextOptions(reasoningLevel: ThinkingControls.reasoningLevel(thinking))
             let stream = session.streamResponse(to: input.prompt, options: GenerationOptions(maximumResponseTokens: responseTokens), contextOptions: contextOptions)
-            for try await value in stream {
-                try Task.checkCancellation()
-                // A count above the counter validity bound stays unknown.
-                let total = reportsUsage ? UInt64(exactly: value.usage.output.totalTokenCount)
-                    .flatMap { $0 <= Limits.countedTokens ? $0 : nil } : nil
-                let thought = thinkingText(value.transcriptEntries)
-                try await snapshot(Snapshot(text: value.content, thinking: thought.isEmpty ? nil : thought,
-                    usageTokens: handler == nil ? total : nil))
+            do {
+                for try await value in stream {
+                    try Task.checkCancellation()
+                    // A count above the counter validity bound stays unknown.
+                    let total = reportsUsage ? UInt64(exactly: value.usage.output.totalTokenCount)
+                        .flatMap { $0 <= Limits.countedTokens ? $0 : nil } : nil
+                    let thought = thinkingText(value.transcriptEntries)
+                    try await snapshot(Snapshot(text: value.content, thinking: thought.isEmpty ? nil : thought,
+                        usageTokens: enabled ? nil : total))
+                }
+            } catch let call as LanguageModelSession.ToolCallError where call.underlyingError is StopForCaller {
+                if let failure = await boundedModel.gate.recordedFailure() { throw failure }
+                guard let proposals = SystemBackend.proposals(session.transcript) else {
+                    reportStopToolTranscript()
+                    throw BackendFailure(.internalError)
+                }
+                return proposals
             }
-            if let failure = await boundedModel.budget.recordedFailure() { throw failure }
+            if let failure = await boundedModel.gate.recordedFailure() { throw failure }
+            return []
         } catch {
             try Task.checkCancellation()
-            if let failure = await boundedModel.budget.recordedFailure() { throw failure }
-            if let failure = error as? BackendFailure { throw failure }
-            // A full window inside a turn is a context limit (CC4 prerequisite).
-            if isContextOverflow(error) {
+            var failure: BackendFailure?
+            if let recorded = await boundedModel.gate.recordedFailure() { failure = recorded }
+            else if let typed = error as? BackendFailure { failure = typed }
+            else if isContextOverflow(error) {
+                // A full window inside a turn is a context limit (CC4 prerequisite).
                 reportModelFailure(error)
-                throw BackendFailure(.contextLimit)
+                failure = BackendFailure(.contextLimit)
+            }
+            if let failure {
+                // An unregistered call is sent for its record before the
+                // request fails (TCR-D17, revised by CC4).
+                let reported = await unregistered.all()
+                if !reported.isEmpty { throw ProposedThenFailed(proposals: reported, failure: failure) }
+                throw failure
             }
             guard let error = error as? LanguageModelError else { throw error }
             reportModelFailure(error)
@@ -374,4 +426,27 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
             }
         }
     }
+}
+
+/// Proposals the SDK could not dispatch, sent before the request fails
+/// (TCR-D17). At most `Limits.toolProposals` are kept.
+actor ProposalLog {
+    private var items: [ToolProposal] = []
+    func append(_ proposal: ToolProposal) {
+        if items.count < Int(Limits.toolProposals) { items.append(proposal) }
+    }
+    func all() -> [ToolProposal] { items }
+}
+/// A request that reported proposals and then failed (TCR-D17): the helper
+/// sends the proposals, then `Terminal` failed with `failure`.
+public struct ProposedThenFailed: Error, Sendable {
+    public let proposals: [ToolProposal]
+    public let failure: BackendFailure
+}
+/// The SDK no longer kept the stop tool's `toolCalls` entry (CC4 regression).
+func reportStopToolTranscript() {
+    let bytes = Array("asura_model_failure stop_tool_transcript 0\n".utf8)
+    let flags = fcntl(STDERR_FILENO, F_GETFL)
+    guard flags >= 0, fcntl(STDERR_FILENO, F_SETFL, flags | O_NONBLOCK) == 0 else { return }
+    _ = bytes.withUnsafeBytes { Darwin.write(STDERR_FILENO, $0.baseAddress, $0.count) }
 }

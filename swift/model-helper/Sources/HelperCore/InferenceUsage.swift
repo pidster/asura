@@ -35,7 +35,12 @@ public actor InferenceUsageObserver {
     private var ordinal: UInt32 = 0
     private var active: Active?
     private let snapshot: @Sendable (Snapshot) async throws -> Void
-    public init(snapshot: @escaping @Sendable (Snapshot) async throws -> Void) { self.snapshot = snapshot }
+    /// `request` is the service's request ordinal (CC4): the one inference
+    /// of that request reports it. The default, 1, is a single request.
+    public init(request: UInt32 = 1, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) {
+        self.snapshot = snapshot
+        self.ordinal = request > 0 ? request - 1 : 0
+    }
 
     func begin(_ id: UUID) async throws {
         try Task.checkCancellation()

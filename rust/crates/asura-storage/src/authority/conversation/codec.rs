@@ -2049,6 +2049,15 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.bytes(&p.helper);
             w.bytes(&p.input_digest);
         }
+        Record::RequestStarted(p) => {
+            require(p.request >= 2)?;
+            w.bytes(&p.operation);
+            w.u64(p.generation);
+            w.u32(p.request);
+            w.u32(p.measured_tokens);
+            w.bytes(&p.input_digest);
+            w.bytes(&p.manifest_digest);
+        }
         Record::CancelRequested(p) => {
             w.bytes(&p.operation);
             w.u64(p.generation);
@@ -2314,6 +2323,18 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             helper: r.array()?,
             input_digest: r.array()?,
         }),
+        33 => {
+            let value = RequestStarted {
+                operation: r.array()?,
+                generation: r.u64()?,
+                request: r.u32()?,
+                measured_tokens: r.u32()?,
+                input_digest: r.array()?,
+                manifest_digest: r.array()?,
+            };
+            require(value.request >= 2)?;
+            Record::RequestStarted(value)
+        }
         7 => Record::CancelRequested(CancelRequested {
             operation: r.array()?,
             generation: r.u64()?,

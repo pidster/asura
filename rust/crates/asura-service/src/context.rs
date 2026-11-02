@@ -6,16 +6,19 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 
 mod job_notice;
+mod request;
 pub(crate) mod taint;
 pub(crate) mod view;
 pub(crate) use job_notice::{Notice, NoticeError, NoticeInputs, Settlement};
+pub(crate) use request::{Measured, Pair, TurnBase, compose_request};
 
 /// Versions the composition rules and the manifest encoding. Revision 2
 /// adds the J5 job notice and its segments; revision 3 adds each prior
 /// turn's notice, rebuilt at reference fidelity inside its history entry
 /// (tool-job-controller.md, notices in later turns); revision 4 adds the
-/// CC3 notice views (kind 7 segments) and the T1 excluded fidelity.
-pub(crate) const COMPOSER_REVISION: u32 = 4;
+/// CC3 notice views (kind 7 segments) and the T1 excluded fidelity;
+/// revision 5 adds CC4 request manifests (segment kinds 8 and 9).
+pub(crate) const COMPOSER_REVISION: u32 = 5;
 /// Calibration before enough measurements: one token per byte (D2).
 const FALLBACK_MILLI: u32 = 1000;
 /// Upper bound on the learned bytes per token.
@@ -273,6 +276,7 @@ struct Decision<'a> {
     mandatory: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decide<'a>(
     instructions: &str,
     prompt: &str,
@@ -280,11 +284,17 @@ fn decide<'a>(
     unlisted: u32,
     notice: &Notice,
     budget: Budget,
+    reserved: u64,
 ) -> Result<Decision<'a>, Error> {
-    let limit = budget.bytes().ok_or(Error::ContextLimit {
-        mandatory_bytes: 0,
-        budget_bytes: 0,
-    })?;
+    // `reserved` bytes of `W` belong to a later request's continuation (CC4).
+    let limit = budget
+        .bytes()
+        .and_then(|bytes| bytes.checked_sub(reserved))
+        .filter(|bytes| *bytes > 0)
+        .ok_or(Error::ContextLimit {
+            mandatory_bytes: reserved,
+            budget_bytes: budget.bytes().unwrap_or(0),
+        })?;
     let mut ordered: Vec<&Candidate> = history.iter().collect();
     ordered.sort_by_key(|t| (std::cmp::Reverse(t.generation), t.operation));
     let turns: Vec<&Candidate> = ordered[..ordered.len().min(MAX_COMPOSED_PRIOR)].to_vec();
@@ -413,7 +423,7 @@ pub(crate) fn plan_turn(
     notice: &Notice,
     budget: Budget,
 ) -> Result<Vec<ViewPlan>, Error> {
-    let decision = decide(instructions, prompt, history, unlisted, notice, budget)?;
+    let decision = decide(instructions, prompt, history, unlisted, notice, budget, 0)?;
     let (eligible, share) = view_shares(&decision, notice);
     let Some(source) = view::view_budget(share, 0) else {
         return Ok(Vec::new());
@@ -460,7 +470,40 @@ pub(crate) fn compose_views(
     budget: Budget,
     views: &[Option<NoticeView>],
 ) -> Result<Composed, Error> {
-    let decision = decide(instructions, prompt, history, unlisted, notice, budget)?;
+    compose_views_reserving(
+        instructions,
+        prompt,
+        history,
+        unlisted,
+        notice,
+        budget,
+        views,
+        0,
+    )
+}
+/// [`compose_views`] within `W` minus `reserved` bytes: the turn start
+/// recomposed for a later request whose continuation needs that room
+/// (CC4, CC-F4 step 4).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compose_views_reserving(
+    instructions: &str,
+    prompt: &str,
+    history: &[Candidate],
+    unlisted: u32,
+    notice: &Notice,
+    budget: Budget,
+    views: &[Option<NoticeView>],
+    reserved: u64,
+) -> Result<Composed, Error> {
+    let decision = decide(
+        instructions,
+        prompt,
+        history,
+        unlisted,
+        notice,
+        budget,
+        reserved,
+    )?;
     let (eligible, share) = view_shares(&decision, notice);
     let Decision {
         limit,
@@ -638,16 +681,23 @@ fn build(
         history.push(pb::HistoryTurn {
             role: Some(1),
             text: Some(user),
+            tool_calls: Vec::new(),
+            call_id: None,
+            tool_name: None,
         });
         history.push(pb::HistoryTurn {
             role: Some(2),
             text: Some(model),
+            tool_calls: Vec::new(),
+            call_id: None,
+            tool_name: None,
         });
     }
     pb::ModelInput {
         instructions: Some(instructions.into()),
         history,
         prompt: Some(format!("{block}{prompt}")),
+        continuation: Vec::new(),
     }
 }
 /// The parts of one composed request that the manifest binds, in

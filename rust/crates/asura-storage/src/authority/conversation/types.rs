@@ -237,6 +237,20 @@ pub struct StartAuthorized {
     pub helper: Id,
     pub input_digest: Hash,
 }
+/// Kind 33 (CC4): request `request` (2 or more) of a turn starts. It binds
+/// that request's input and manifest digests before the helper starts it
+/// (context-composer.md, request manifest and kind 33).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestStarted {
+    pub operation: Id,
+    pub generation: u64,
+    pub request: u32,
+    /// The previous request's measured input tokens; 0 when not measured.
+    /// A composition input that no other record holds (ENV3).
+    pub measured_tokens: u32,
+    pub input_digest: Hash,
+    pub manifest_digest: Hash,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CancelRequested {
     pub operation: Id,
@@ -328,6 +342,8 @@ pub enum Record {
     ProjectRenamed(ProjectRenamed),
     TurnAccepted(Box<TurnAccepted>),
     StartAuthorized(StartAuthorized),
+    /// Kind 33 (CC4): a later request of a turn starts.
+    RequestStarted(RequestStarted),
     CancelRequested(CancelRequested),
     TurnTerminal(TurnTerminal),
     InputQueued(InputQueued),
@@ -368,6 +384,7 @@ impl Record {
             Self::ProjectRegistered(_) => 4,
             Self::TurnAccepted(_) => 21,
             Self::StartAuthorized(_) => 6,
+            Self::RequestStarted(_) => 33,
             Self::CancelRequested(_) => 7,
             Self::TurnTerminal(_) => 8,
             Self::ProjectRequestAlias(_) => 9,
@@ -489,6 +506,10 @@ pub struct Operation {
     pub cancel: Option<Cause>,
     pub terminal: Option<Terminal>,
     pub tools: Vec<ToolRecord>,
+    /// For each started request, in order, the number of kind 14 records
+    /// before it: kind 6 starts request 1 at 0, each kind 33 the next
+    /// (CC4). Calls from index `starts[k]` belong to request `k + 1`.
+    pub request_starts: Vec<usize>,
     /// The journaled response: kind 24 segments, then the kind 8 tail.
     pub response: Response,
     /// The journaled thinking text: kind 25 segments (thinking-level.md).

@@ -54,6 +54,7 @@ fn fixtures() -> Vec<(pb::Envelope, Direction)> {
                 input_bytes: Some(10),
                 enable_project_tools: None,
                 thinking: None,
+                request_ordinal: Some(1),
             })),
             ServiceToHelper,
         ),
@@ -127,14 +128,17 @@ fn fixtures() -> Vec<(pb::Envelope, Direction)> {
             HelperToService,
         ),
         (
-            envelope(Body::ToolResult(pb::ToolResult {
-                ordinal: Some(1),
-                status: Some(1),
-                text: Some("content".into()),
-                next_offset: Some(7),
-                truncated: Some(false),
+            envelope(Body::Terminal(pb::Terminal {
+                outcome: Some(4),
+                last_revision: Some(1),
+                count: Some(1),
+                total_bytes: Some(10),
+                usage_tokens: None,
+                usage_known: Some(false),
+                reason: Some(0),
+                tool_calls: Some(1),
             })),
-            ServiceToHelper,
+            HelperToService,
         ),
         (
             envelope(Body::Terminal(pb::Terminal {
@@ -145,6 +149,7 @@ fn fixtures() -> Vec<(pb::Envelope, Direction)> {
                 usage_tokens: None,
                 usage_known: Some(false),
                 reason: Some(0),
+                tool_calls: None,
             })),
             HelperToService,
         ),
@@ -252,11 +257,15 @@ fn input_unicode_repeated_history_presence_and_byte_bounds() {
         history: vec![
             pb::HistoryTurn {
                 role: Some(1),
-                text: Some("世界".into())
+                text: Some("世界".into()),
+                tool_calls: Vec::new(),
+                call_id: None,
+                tool_name: None,
             };
             MAX_HISTORY_ENTRIES
         ],
         prompt: Some("question".into()),
+        continuation: Vec::new(),
     };
     let bytes = encode_input(&input).unwrap();
     assert_eq!(decode_input(&bytes).unwrap(), input);
@@ -288,6 +297,7 @@ fn input_transfer_bounds_follow_chunk_count_not_a_content_limit() {
         envelope(Body::Begin(pb::Begin {
             model: Some("system".into()),
             input_bytes: Some(bytes),
+            request_ordinal: Some(1),
             ..Default::default()
         }))
     };
@@ -645,19 +655,6 @@ fn export_cross_language_fixtures() {
             );
         }
     }
-    write(
-        "exec_cmd_failed_output.pb",
-        "service",
-        true,
-        envelope(Body::ToolResult(pb::ToolResult {
-            ordinal: Some(1),
-            status: Some(5),
-            text: Some("stdout: partial\nstderr: deadline".into()),
-            next_offset: None,
-            truncated: Some(true),
-        }))
-        .encode_to_vec(),
-    );
     for (message, direction) in fixtures() {
         let name = match message.body.as_ref().unwrap() {
             Body::Hello(_) => "hello",
@@ -672,7 +669,6 @@ fn export_cross_language_fixtures() {
             Body::Terminal(_) => "terminal",
             Body::ToolCall(_) => "tool_call",
             Body::ContextMeasured(_) => "context_measured",
-            Body::ToolResult(_) => "tool_result",
             Body::InferenceUsage(_) => "inference_usage",
         };
         let kind = if direction == Direction::ServiceToHelper {
@@ -698,6 +694,7 @@ fn export_cross_language_fixtures() {
             usage_tokens: Some(usage),
             usage_known: Some(true),
             reason: Some(0),
+            tool_calls: None,
         }));
         write(
             &format!("helper_terminal_usage_{usage}.pb"),
@@ -795,6 +792,7 @@ fn export_cross_language_fixtures() {
             input_bytes: Some(10),
             enable_project_tools: None,
             thinking,
+            request_ordinal: Some(1),
         }));
         write(name, "service", accepted, message.encode_to_vec());
     }
@@ -840,6 +838,7 @@ fn export_cross_language_fixtures() {
         usage_tokens: None,
         usage_known: Some(false),
         reason: Some(12),
+        tool_calls: None,
     }));
     write(
         "helper_terminal_failed_empty.pb",
@@ -870,9 +869,13 @@ fn export_cross_language_fixtures() {
             .map(|n| pb::HistoryTurn {
                 role: Some(if n % 2 == 0 { 1 } else { 2 }),
                 text: Some(format!("turn {n}: 世界 e\u{301} 🙂\n")),
+                tool_calls: Vec::new(),
+                call_id: None,
+                tool_name: None,
             })
             .collect(),
         prompt: Some("Hello 世界".into()),
+        continuation: Vec::new(),
     };
     write(
         "input_unicode_history_32.pb",
@@ -885,8 +888,12 @@ fn export_cross_language_fixtures() {
         history: vec![pb::HistoryTurn {
             role: Some(2),
             text: Some(String::new()),
+            tool_calls: Vec::new(),
+            call_id: None,
+            tool_name: None,
         }],
         prompt: Some("x".repeat(32768)),
+        continuation: Vec::new(),
     };
     write(
         "input_prompt_max_empty_optional.pb",
@@ -916,7 +923,10 @@ fn export_cross_language_fixtures() {
     history.history = vec![
         pb::HistoryTurn {
             role: Some(1),
-            text: Some(String::new())
+            text: Some(String::new()),
+            tool_calls: Vec::new(),
+            call_id: None,
+            tool_name: None,
         };
         MAX_HISTORY_ENTRIES
     ];
@@ -938,8 +948,12 @@ fn export_cross_language_fixtures() {
         history: vec![pb::HistoryTurn {
             role: Some(99),
             text: Some("text".into()),
+            tool_calls: Vec::new(),
+            call_id: None,
+            tool_name: None,
         }],
         prompt: Some("x".into()),
+        continuation: Vec::new(),
     };
     write(
         "invalid_input_role.pb",
@@ -1003,6 +1017,7 @@ fn export_cross_language_fixtures() {
         usage_tokens: Some(MAX_COUNTED_TOKENS + 1),
         usage_known: Some(true),
         reason: Some(0),
+        tool_calls: None,
     }));
     write(
         "invalid_usage_output_overflow.pb",
@@ -1144,97 +1159,6 @@ fn tcr_u14_tool_call_bounds_and_sizes() {
     let len = bytes.len();
     bytes[len - 10] = 9;
     assert!(decode_body(&bytes, Direction::HelperToService).is_ok());
-}
-
-#[test]
-fn tool_results_enforce_direction_bounds_and_over_limit_ordinal() {
-    let result = envelope(Body::ToolResult(pb::ToolResult {
-        ordinal: Some(1),
-        status: Some(1),
-        text: Some("source".into()),
-        next_offset: Some(6),
-        truncated: Some(false),
-    }));
-    assert!(encode_frame(&result, Direction::ServiceToHelper).is_ok());
-    assert_eq!(
-        encode_frame(&result, Direction::HelperToService),
-        Err(ProtocolError::WrongDirection)
-    );
-    let mut bad = result.clone();
-    if let Some(Body::ToolResult(v)) = &mut bad.body {
-        v.text = Some("x".repeat(16_385));
-    }
-    assert_eq!(
-        encode_frame(&bad, Direction::ServiceToHelper),
-        Err(ProtocolError::InvalidSemantics)
-    );
-    if let Some(Body::ToolResult(v)) = &mut bad.body {
-        v.text = Some(String::new());
-        v.status = Some(2);
-    }
-    assert_eq!(
-        encode_frame(&bad, Direction::ServiceToHelper),
-        Err(ProtocolError::InvalidSemantics)
-    );
-    // Ordinals 1..=200 with any status; the over-limit ordinal only with
-    // status 7 (TCR-D6, owner 2026-10-18); never beyond it.
-    for ordinal in [1, MAX_RECORDED_TOOL_CALLS] {
-        let mut recorded = result.clone();
-        if let Some(Body::ToolResult(v)) = &mut recorded.body {
-            v.ordinal = Some(ordinal);
-            v.status = Some(3);
-            v.next_offset = None;
-        }
-        assert!(encode_frame(&recorded, Direction::ServiceToHelper).is_ok());
-    }
-    let over = |status| {
-        envelope(Body::ToolResult(pb::ToolResult {
-            ordinal: Some(MAX_TOOL_ORDINAL),
-            status: Some(status),
-            text: Some("limit".into()),
-            next_offset: None,
-            truncated: Some(false),
-        }))
-    };
-    assert!(encode_frame(&over(7), Direction::ServiceToHelper).is_ok());
-    for status in [1, 3, 6] {
-        assert_eq!(
-            encode_frame(&over(status), Direction::ServiceToHelper),
-            Err(ProtocolError::InvalidSemantics)
-        );
-    }
-    if let Some(Body::ToolResult(v)) = &mut bad.body {
-        v.ordinal = Some(MAX_TOOL_ORDINAL + 1);
-        v.status = Some(7);
-    }
-    assert!(encode_frame(&bad, Direction::ServiceToHelper).is_err());
-}
-
-/// PTS-U3: status 8 `private` is accepted only untruncated and without a
-/// next offset; status 9 is unknown.
-#[test]
-fn private_tool_result_status_rules() {
-    let private = |truncated, next_offset, status| {
-        envelope(Body::ToolResult(pb::ToolResult {
-            ordinal: Some(1),
-            status: Some(status),
-            text: Some("private: this job used secrets".into()),
-            next_offset,
-            truncated: Some(truncated),
-        }))
-    };
-    assert!(encode_frame(&private(false, None, 8), Direction::ServiceToHelper).is_ok());
-    for bad in [private(true, None, 8), private(false, Some(1), 8)] {
-        assert_eq!(
-            encode_frame(&bad, Direction::ServiceToHelper),
-            Err(ProtocolError::InvalidSemantics)
-        );
-    }
-    // An unknown enum value fails the wire scan first.
-    assert_eq!(
-        encode_frame(&private(false, None, 9), Direction::ServiceToHelper),
-        Err(ProtocolError::MalformedWire)
-    );
 }
 
 #[test]
@@ -1399,38 +1323,6 @@ fn locality_and_declared_capabilities_have_strict_direction_and_scope() {
     assert!(encode_frame(&helper, Direction::HelperToService).is_err());
 }
 
-#[test]
-fn failed_exec_cmd_wire_result_preserves_bounded_output_but_never_cursor() {
-    let result = pb::ToolResult {
-        ordinal: Some(1),
-        status: Some(5),
-        text: Some("stdout: partial\nstderr: deadline".into()),
-        next_offset: None,
-        truncated: Some(true),
-    };
-    assert!(
-        encode_frame(
-            &envelope(Body::ToolResult(result.clone())),
-            Direction::ServiceToHelper
-        )
-        .is_ok()
-    );
-    for bad in [
-        pb::ToolResult {
-            next_offset: Some(1),
-            ..result.clone()
-        },
-        pb::ToolResult {
-            text: Some("x".repeat(16385)),
-            ..result
-        },
-    ] {
-        assert!(
-            encode_frame(&envelope(Body::ToolResult(bad)), Direction::ServiceToHelper).is_err()
-        );
-    }
-}
-
 /// A5: Begin has no time field and no output cap; removed
 /// `deadline_remaining_ms` (field 3) and `max_response_tokens` (field 4,
 /// owner, 2026-10-19) are unknown fields and the Begin is rejected.
@@ -1441,6 +1333,7 @@ fn begin_carries_no_deadline_and_removed_field_is_rejected() {
         input_bytes: Some(1),
         enable_project_tools: None,
         thinking: None,
+        request_ordinal: Some(1),
     };
     let message = envelope(Body::Begin(begin.clone()));
     assert!(encode_frame(&message, Direction::ServiceToHelper).is_ok());
@@ -1561,4 +1454,144 @@ fn tool_support_is_stated_only_by_the_capability_mask() {
             "{mask}"
         );
     }
+}
+
+fn continuation(calls: &[(&str, &str)]) -> Vec<pb::HistoryTurn> {
+    let mut entries = vec![pb::HistoryTurn {
+        role: Some(2),
+        text: Some(String::new()),
+        tool_calls: calls
+            .iter()
+            .map(|(id, name)| pb::HistoryToolCall {
+                call_id: Some((*id).into()),
+                name: Some((*name).into()),
+                arguments: Some("{}".into()),
+            })
+            .collect(),
+        ..Default::default()
+    }];
+    for (id, name) in calls {
+        entries.push(pb::HistoryTurn {
+            role: Some(3),
+            text: Some("output".into()),
+            call_id: Some((*id).into()),
+            tool_name: Some((*name).into()),
+            ..Default::default()
+        });
+    }
+    entries
+}
+fn input_with(continuation: Vec<pb::HistoryTurn>) -> pb::ModelInput {
+    pb::ModelInput {
+        instructions: Some("i".into()),
+        history: vec![],
+        prompt: Some("p".into()),
+        continuation,
+    }
+}
+/// CC-U33: `Begin` needs its request ordinal; outcome 4 needs 1 to 201 tool
+/// calls and reason none, and no other outcome carries them; the
+/// continuation is paired assistant and tool entries; history holds no tool
+/// fields; `ToolResult` (field 21) no longer exists.
+#[test]
+fn cc_u33_request_loop_wire_shapes() {
+    let begin = |ordinal| {
+        envelope(Body::Begin(pb::Begin {
+            model: Some("system".into()),
+            input_bytes: Some(1),
+            request_ordinal: ordinal,
+            ..Default::default()
+        }))
+    };
+    assert!(encode_frame(&begin(Some(2)), Direction::ServiceToHelper).is_ok());
+    for bad in [None, Some(0)] {
+        assert!(encode_frame(&begin(bad), Direction::ServiceToHelper).is_err());
+    }
+    let terminal = |outcome, reason, tool_calls| {
+        envelope(Body::Terminal(pb::Terminal {
+            outcome: Some(outcome),
+            last_revision: Some(1),
+            count: Some(0),
+            total_bytes: Some(0),
+            usage_tokens: None,
+            usage_known: Some(false),
+            reason: Some(reason),
+            tool_calls,
+        }))
+    };
+    for calls in [1, MAX_TOOL_ORDINAL] {
+        assert!(encode_frame(&terminal(4, 0, Some(calls)), Direction::HelperToService).is_ok());
+    }
+    for bad in [
+        terminal(4, 0, None),
+        terminal(4, 0, Some(0)),
+        terminal(4, 0, Some(MAX_TOOL_ORDINAL + 1)),
+        terminal(4, 8, Some(1)),
+        terminal(1, 0, Some(1)),
+        terminal(2, 8, Some(1)),
+    ] {
+        assert!(encode_frame(&bad, Direction::HelperToService).is_err());
+    }
+    assert_eq!(
+        encode_frame(&terminal(4, 0, Some(1)), Direction::ServiceToHelper),
+        Err(ProtocolError::WrongDirection)
+    );
+    let good = input_with(
+        [
+            continuation(&[("call_1", "exec_cmd"), ("call_2", "job")]),
+            continuation(&[("call_3", "project")]),
+        ]
+        .concat(),
+    );
+    assert!(decode_input(&encode_input(&good).unwrap()).is_ok());
+    let mut misordered = continuation(&[("call_1", "exec_cmd"), ("call_2", "job")]);
+    misordered.swap(1, 2);
+    let mut no_output = continuation(&[("call_1", "exec_cmd")]);
+    no_output.pop();
+    let mut text = continuation(&[("call_1", "exec_cmd")]);
+    text[0].text = Some("words".into());
+    let mut bad_id = continuation(&[("call 1", "exec_cmd")]);
+    bad_id[1].call_id = Some("call 1".into());
+    let mut no_calls = continuation(&[("call_1", "exec_cmd")]);
+    no_calls[0].tool_calls.clear();
+    for bad in [misordered, no_output, text, bad_id, no_calls] {
+        assert!(encode_input(&input_with(bad)).is_err());
+    }
+    let mut history = input_with(vec![]);
+    history.history = vec![pb::HistoryTurn {
+        role: Some(2),
+        text: Some("a".into()),
+        call_id: Some("call_1".into()),
+        ..Default::default()
+    }];
+    assert!(encode_input(&history).is_err());
+    history.history[0].call_id = None;
+    history.history[0].role = Some(3);
+    assert!(encode_input(&history).is_err());
+    // The largest continuation: 200 requests of one call, and one response
+    // of 201 calls; one more entry is rejected (scan and validator agree).
+    let ids: Vec<String> = (1..=200).map(|n| format!("call_{n}")).collect();
+    let most: Vec<pb::HistoryTurn> = ids
+        .iter()
+        .flat_map(|id| continuation(&[(id.as_str(), "job")]))
+        .collect();
+    assert_eq!(most.len(), MAX_CONTINUATION_ENTRIES);
+    assert!(decode_input(&encode_input(&input_with(most.clone())).unwrap()).is_ok());
+    let mut over = most;
+    over.extend(continuation(&[("call_201", "job")]));
+    assert!(encode_input(&input_with(over)).is_err());
+    let wide: Vec<String> = (1..=MAX_TOOL_ORDINAL)
+        .map(|n| format!("call_{n}"))
+        .collect();
+    let pairs: Vec<(&str, &str)> = wide.iter().map(|id| (id.as_str(), "job")).collect();
+    assert!(decode_input(&encode_input(&input_with(continuation(&pairs))).unwrap()).is_ok());
+    // Envelope field 21 is reserved: the former ToolResult is unknown.
+    let mut bytes = pb::Envelope {
+        operation_id: Some(vec![7; 16]),
+        generation: Some(1),
+        body: None,
+    }
+    .encode_to_vec();
+    bytes.extend_from_slice(&[0xaa, 0x01, 0x02, 0x08, 0x01]);
+    assert!(decode_body(&bytes, Direction::ServiceToHelper).is_err());
 }

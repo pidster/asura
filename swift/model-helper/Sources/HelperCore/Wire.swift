@@ -33,6 +33,10 @@ public enum Limits {
     /// Wire bounds of one forwarded proposal (tool-call-records.md, wire contract).
     public static let toolName = 256
     public static let toolArguments = 64_000
+    /// Continuation entries of one request (CC4): 200 assistant and 200 tool entries.
+    public static let continuationEntries = 400
+    /// Bytes of a service-assigned call ID, `[A-Za-z0-9_-]`.
+    public static let callID = 64
 }
 
 /// Canonical decoding does not grant admission. Unknown fields are explicitly rejected.
@@ -59,7 +63,6 @@ public enum Wire {
         case .snapshotEnd(let v): known = v.unknownFields.data.isEmpty
         case .terminal(let v): known = v.unknownFields.data.isEmpty
         case .toolCall(let v): known = v.unknownFields.data.isEmpty
-        case .toolResult(let v): known = v.unknownFields.data.isEmpty
         }
         guard known, try message.serializedData() == data else { throw HelperError.protocolFault }
         if let peer { try validate(message, from: peer) }
@@ -183,7 +186,9 @@ public enum Wire {
             }
         case .begin(let v):
             try check(service && v.hasModel && selector(v.model) && v.hasInputBytes && (1...Limits.input).contains(v.inputBytes)
-                && (!v.hasThinking || (1...5).contains(v.thinking.rawValue)))
+                && (!v.hasThinking || (1...5).contains(v.thinking.rawValue))
+                // The service's request ordinal (CC4).
+                && v.hasRequestOrdinal && v.requestOrdinal >= 1)
         case .chunk(let v):
             try check(v.hasTransferID && v.hasDirection && transfer(v.transferID, v.direction)
                 && v.direction == (service ? .input : .output) && v.hasData && !v.data.isEmpty && v.data.count <= Limits.chunk
@@ -217,20 +222,18 @@ public enum Wire {
                 && (!v.hasNameBytes || v.nameBytes > UInt32(Limits.toolName))
                 && (!v.hasArguments || v.arguments.utf8.count <= Limits.toolArguments)
                 && (!v.hasArgumentsBytes || v.argumentsBytes > UInt32(Limits.toolArguments)))
-        case .toolResult(let v):
-            try check(service && v.hasOrdinal && (1...Limits.toolProposals).contains(v.ordinal)
-                && (v.ordinal < Limits.toolProposals || v.status == .limit)
-                && v.hasStatus && (1...8).contains(v.status.rawValue)
-                && v.hasText && v.text.utf8.count <= 16_384 && v.hasTruncated)
-            // Status 8 `private` (PTS-R5): text only, never truncated.
-            if v.status == .private { try check(!v.truncated) }
-            if v.status != .success { try check(!v.hasNextOffset) }
         case .terminal(let v):
             try check(!service && v.hasUsageKnown && (v.usageKnown ? v.hasUsageTokens && v.usageTokens <= Limits.countedTokens : !v.hasUsageTokens)
                 && v.hasLastRevision && v.hasCount && v.hasTotalBytes
                 && counts(v.count, v.totalBytes, UInt64.max) && v.hasOutcome && v.hasReason)
-            if v.outcome == .complete { try check(v.lastRevision > 0 && v.reason == .none) }
-            else { try check((v.outcome == .failed || v.outcome == .cancelled) && (1...12).contains(v.reason.rawValue)) }
+            switch v.outcome {
+            case .complete: try check(v.lastRevision > 0 && v.reason == .none && !v.hasToolCalls)
+            // CC4: the request ended with 1 to 201 tool calls.
+            case .toolCalls: try check(v.reason == .none && v.hasToolCalls
+                && (1...Limits.toolProposals).contains(v.toolCalls))
+            case .failed, .cancelled: try check((1...12).contains(v.reason.rawValue) && !v.hasToolCalls)
+            default: throw HelperError.protocolFault
+            }
         }
     }
 
@@ -243,12 +246,52 @@ public enum Wire {
             try value.serializedData() == data else { throw HelperError.protocolFault }
         var bytes = value.instructions.utf8.count + value.prompt.utf8.count
         for turn in value.history {
+            // Earlier turns carry text only (CC4).
             guard turn.unknownFields.data.isEmpty, turn.hasRole, turn.hasText,
-                turn.role == .user || turn.role == .assistant else { throw HelperError.protocolFault }
+                turn.role == .user || turn.role == .assistant, turn.toolCalls.isEmpty,
+                !turn.hasCallID, !turn.hasToolName else { throw HelperError.protocolFault }
             bytes += turn.text.utf8.count
         }
+        bytes += try continuationBytes(value.continuation)
         guard UInt64(bytes) <= Limits.input else { throw HelperError.limit }
         return value
+    }
+
+    /// The continuation's structure (CC4), as the service validates it: one
+    /// assistant entry with 1 to 201 tool calls and empty text, then one tool
+    /// entry per call in call order with the matching call ID.
+    static func continuationBytes(_ entries: [Asura_Model_V1_HistoryTurn]) throws -> Int {
+        func check(_ valid: Bool) throws { if !valid { throw HelperError.protocolFault } }
+        func callID(_ text: String) -> Bool {
+            (1...Limits.callID).contains(text.utf8.count)
+                && text.utf8.allSatisfy { ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122) || $0 == 95 || $0 == 45 }
+        }
+        func toolName(_ text: String) -> Bool { (1...Limits.toolName).contains(text.utf8.count) }
+        try check(entries.count <= Limits.continuationEntries)
+        var bytes = 0
+        var index = 0
+        while index < entries.count {
+            let call = entries[index]
+            try check(call.unknownFields.data.isEmpty && call.role == .assistant && call.hasText
+                && call.text.isEmpty && !call.hasCallID && !call.hasToolName
+                && !call.toolCalls.isEmpty && call.toolCalls.count <= Int(Limits.toolProposals))
+            for value in call.toolCalls {
+                try check(value.unknownFields.data.isEmpty && value.hasCallID && callID(value.callID)
+                    && value.hasName && toolName(value.name) && value.hasArguments
+                    && value.arguments.utf8.count <= Limits.toolArguments)
+                bytes += value.arguments.utf8.count
+            }
+            try check(index + call.toolCalls.count < entries.count)
+            for (offset, value) in call.toolCalls.enumerated() {
+                let output = entries[index + 1 + offset]
+                try check(output.unknownFields.data.isEmpty && output.role == .tool && output.toolCalls.isEmpty
+                    && output.hasCallID && output.callID == value.callID
+                    && output.hasToolName && toolName(output.toolName) && output.hasText)
+                bytes += output.text.utf8.count
+            }
+            index += 1 + call.toolCalls.count
+        }
+        return bytes
     }
 
     public static func frame(_ message: Envelope) throws -> Data {

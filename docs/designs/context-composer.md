@@ -10,7 +10,7 @@ tool job packets that CC2 and CC3 waited for (J1, J3 and J5) are delivered.
 The owner asked on 2026-10-31 to build CC2, then CC3, and approved the
 [taint exclusion hook](#taint-exclusion-hook) (T1) the same day. The owner
 decided [loop closure](loop-closure.md#decisions) decision 6 on 2026-11-02:
-slice **CC4 is selected and ready for implementation** under the
+slice **CC4 is implemented (2026-11-02)** under the
 [CC4 design](#cc4-service-owned-request-loop-stage-b). CC5 waits for a memory
 selection design; see [delivery](#dependencies-and-delivery).
 [CC1 implementation details](#cc1-implementation-details) record what code
@@ -1400,7 +1400,8 @@ One writer owns each packet's paths in order: CC2-S, CC2-C, CC3-S, CC3-C.
 
 ### CC4: service-owned request loop (stage B)
 
-Status: selected design, ready for implementation, 2026-11-02. The owner
+Status: selected design, 2026-11-02; **implemented 2026-11-02**, with the
+evidence and gaps in [CC4 implementation evidence](#cc4-implementation-evidence-2026-11-02). The owner
 decided [loop closure decision 6](loop-closure.md#decisions) on 2026-11-02:
 the service owns the turn tool loop on all four backends (system model, MLX,
 Core AI and Ollama). The Foundation Models path uses the probed workaround,
@@ -1520,16 +1521,16 @@ sequenceDiagram
             X-->>O: Settled result
             O->>W: Kind 15 or kind 29
         end
-        O->>K: Compose request k+1: base, settled pairs, budget
-        alt Fits
+        O->>K: Compose request k+1: base, settled pairs, budget, measured T
+        alt Within the Begin sanity bound
             K-->>O: Input, manifest digest
             O->>H: Begin k+1, input chunks under credit
             H-->>O: Ready
-            O->>W: Kind 33 request k+1 with its digests
+            O->>W: Kind 33 request k+1 with T and its digests
             W-->>O: Durable
             O->>H: Start
-        else Does not fit
-            K-->>O: context_limit
+        else Above the sanity bound
+            K-->>O: model_input_invalid
             O->>H: Cancel
             O->>W: Kind 8 failed
         end
@@ -1580,10 +1581,10 @@ stateDiagram-v2
     Running --> Settling: Terminal tool_calls n, n calls queued
     Settling --> Settling: next queued call recorded and settled
     Settling --> Recomposing: queue empty, every call settled
-    Recomposing --> Transfer: input fits W, Begin k+1
-    Recomposing --> Ending: context_limit
+    Recomposing --> Transfer: input composed, Begin k+1
+    Recomposing --> Ending: above the Begin sanity bound
     Settling --> Ending: over-limit call 201 recorded
-    Running --> Ending: Terminal complete, failed or cancelled
+    Running --> Ending: Terminal complete, failed (context_limit included) or cancelled
     Transfer --> Ending: failure or helper exit
     Settling --> Ending: cancel, steering or shutdown, queued calls recorded cancelled
     Ending --> [*]: helper settled, kind 8 durable
@@ -1641,8 +1642,17 @@ sources that built it (candidates, notice, read views). The conversation owner
 keeps these sources for the turn, at most the 8 MiB `Prepare` bound.
 
 1. Build the continuation with every pair at full fidelity, after the base.
-2. If the encoded input is within `W`, use it. The base and every earlier
-   continuation entry are byte-identical to the previous request's.
+2. If the input fits, use it. The base and every earlier continuation entry
+   are byte-identical to the previous request's. The input fits when its
+   encoded size is within `W`, or, when the previous request's input tokens
+   `T` were measured (`ContextMeasured`), when
+   `T + a + 32 × n ≤ E − R`: `a` is the bytes the request appends and `n`
+   the entries it appends. One token covers at least one byte, and 32 tokens
+   per entry cover the template's role markers, so this bounds the exact
+   count. `W` alone is a conservative estimate: it counts the tool schemas at
+   one token per byte and uses the 1-byte fallback until calibration has three
+   pairs (measured 2026-11-02: `W` was 772 bytes for a system model request
+   whose exact count was 1,716 of 8,192 tokens).
 3. Otherwise reduce older pairs: walk the pairs of requests before the latest
    one, oldest first. Replace each result text with one service-written
    reference line until the input fits:
@@ -1651,10 +1661,16 @@ keeps these sources for the turn, at most the 8 MiB `Prepare` bound.
    stays, so call and result stay paired (rule 2).
 4. Otherwise recompose the base: run CC-F1 for the turn start with `W` reduced
    by the encoded continuation. History turns become references or join the
-   omitted range under the existing rules.
-5. If the base's mandatory segments still do not fit, or the encoded input
-   exceeds `W`, the turn fails with `context_limit`. The latest request's
-   pairs are mandatory: a result the model has not seen is never reduced.
+   omitted range under the existing rules. If the base cannot be recomposed
+   within that room, the base stays as composed.
+5. The request is then sent, even if its estimate still exceeds `W`. The
+   latest request's pairs are mandatory: a result the model has not seen is
+   never reduced. The exact authority on the window is the helper's token
+   count (system model) or the provider's window, as for stage A results: a
+   full window ends the turn with `context_limit` (Q6 included), or, for an
+   Ollama refusal above `num_ctx`, as a provider failure (FW-I2). The only
+   composer failure is an input above the `Begin` sanity bound (capacity × 8
+   bytes), `model_input_invalid`.
 
 Sizes are computed from the protobuf encoding, so each step is exact and the
 pure core needs no trial encodes beyond the final check. Equal inputs give
@@ -1667,17 +1683,23 @@ bounded by the number of pairs (at most 200).
 
 ```mermaid
 flowchart TD
-    In["Request k+1: base, settled pairs, W"] --> Full["Continuation with every pair at full fidelity"]
-    Full --> Fit{"Encoded input within W?"}
+    In["Request k+1: base, settled pairs, W,<br/>measured tokens T of request k if any"] --> Full["Continuation with every pair at full fidelity"]
+    Full --> Fit{"Within W, or T + appended bytes<br/>+ 32 per entry within E - R?"}
     Fit -->|Yes| Stable["Input and manifest; earlier entries byte-stable"]
     Fit -->|No| Older{"A full result of a request<br/>before the latest?"}
-    Older -->|Yes| Ref["Oldest such result becomes a reference line"] --> Fit
+    Older -->|Yes| Ref["Oldest such result becomes a reference line"] --> Within{"Encoded input within W?"}
+    Within -->|Yes| Reduced["Input and manifest; older results reduced"]
+    Within -->|No| Older
     Older -->|No| Base["Recompose the base (CC-F1)<br/>with W minus the continuation"]
-    Base --> Mand{"Base mandatory segments fit?"}
-    Mand -->|No| Limit["context_limit; the turn ends failed"]
-    Mand -->|Yes| Enc{"Encoded input within W?"}
-    Enc -->|Yes| Recomposed["Input and manifest; base recomposed"]
-    Enc -->|No| Limit
+    Base --> Mand{"Base fits that room?"}
+    Mand -->|Yes| Recomposed["Input and manifest; base recomposed"]
+    Mand -->|No| Kept["Input and manifest; base kept"]
+    Recomposed --> Send["Send; the helper's exact count or the<br/>provider window is the backstop"]
+    Kept --> Send
+    Reduced --> Send
+    Stable --> Send
+    Send --> Sane{"Within the Begin sanity bound?"}
+    Sane -->|No| Invalid["model_input_invalid; the turn ends failed"]
 ```
 
 #### Request manifest and kind 33
@@ -1686,7 +1708,8 @@ Composer revision 5 marks CC4. Request 1 keeps the turn-start manifest of
 kind 21 (revision 5 changes only the revision word in its encoding). Each
 request `k > 1` has a request manifest; its digest is SHA-256 over:
 
-- format byte 2, the composer revision, the request ordinal (u32);
+- format byte 2, the composer revision, the request ordinal (u32), the
+  measured tokens `T` of the previous request (u32, 0 when not measured);
 - the base manifest digest: kind 21's, or the recomposed base's;
 - one segment per continuation entry, in input order: kind 8 `tool_call`
   (role 2) or kind 9 `tool_result` (role 3), fidelity (3 full, 2 reference),
@@ -1694,8 +1717,10 @@ request `k > 1` has a request manifest; its digest is SHA-256 over:
   rendered result), and the shown length (u32) and SHA-256 of the shown text.
 
 Kind 33 `RequestStarted` (new, journal format 1): operation (16 bytes),
-generation (u64), request (u32, at least 2), input digest (32), manifest
-digest (32); 92 bytes. Replay accepts it only for an operation of the current
+generation (u64), request (u32, at least 2), measured tokens `T` of the
+previous request (u32, 0 when not measured), input digest (32), manifest
+digest (32); 96 bytes. `T` is a composition input that no other record
+holds, so the record keeps it for recomputation (ENV3). Replay accepts it only for an operation of the current
 owner generation whose kind 6 committed, with no cancel and no terminal,
 whose request count is one less, whose every kind 14 is resolved and which
 recorded at least one kind 14 since its previous request started. Kind 14
@@ -1705,7 +1730,7 @@ ENV3 holds: the manifest is recomputed, never stored. Request `k`'s input is a
 function of kind 21 and its sources, the kind 14 records and their results
 (kind 15 text, kind 29 with its view ranges and the retained pages, and the
 not-run text derived from kind 14 codes), and the request boundaries (kind 6
-and each kind 33). The kind 33 digests verify a recomputation.
+and each kind 33, with its `T`). The kind 33 digests verify a recomputation.
 
 ##### CC-D2: request manifest data view
 
@@ -1803,7 +1828,8 @@ reach the service together, so no busy reply is needed.
 | `Terminal` outcome 4 whose `tool_calls` differs from the calls received, with no calls, with tools disabled, or with a partial revision | Protocol fault |
 | `Begin` with a request ordinal that is not the next one, or a later `Begin` that changes the model, tools or thinking | Helper protocol fault |
 | Preserved transcript holds no `toolCalls` entry (SDK change) | Request fails `internal_error`; turn fails; the native regression test fails first |
-| Next request does not fit `W` after both reductions | Turn fails, cause `input_limit` (`context_limit` to the client) |
+| Next request still exceeds `W` after both reductions | Sent: `W` is an estimate; the helper's exact count or the provider's window decides (step 5) |
+| Next request above the `Begin` sanity bound | Turn fails `model_input_invalid` |
 | Helper preflight or provider reports a full window | Turn fails `context_limit`, as today, including the `GenerativeError` overflow (Q6) |
 | 201st proposal | Recorded `limit`; turn fails `output_limit`; later proposals are not recorded |
 | Cancel, steering or shutdown while calls are queued | Kind 7, then each queued call as kind 14 `cancelled` (TCR-D8), then the terminal; the helper answers `Cancel` with `Terminal` cancelled in any state |
@@ -1833,7 +1859,7 @@ reach the service together, so no busy reply is needed.
 | AE-01 | Composition per request is bounded pure work on the reactor. The helper's request is the existing model task; stop tools return at once. |
 | AE-02 | No new blocking call. Tool runs keep their existing workers; journal appends keep the writer worker. |
 | AE-03 | Queued calls: at most 201 per request in the service and in the helper. Continuation: at most 400 entries; each argument at most 64,000 bytes, each result at most 16,384 bytes before rendering. Kind 33: at most 200 per turn. The kept base sources are at most the 8 MiB `Prepare` bound. |
-| AE-04 | No time bound. A request ends on its `Terminal`, a cancel, steering, shutdown, helper exit or a protocol fault. Between requests the owner waits only for tool settlement, which keeps its own closures. The loop as a whole ends by the 200-call limit, a full window (`context_limit`), cancel or the model's final answer. |
+| AE-04 | No time bound. A request ends on its `Terminal`, a cancel, steering, shutdown, helper exit or a protocol fault. Between requests the owner waits only for tool settlement, which keeps its own closures. The loop as a whole ends by the 200-call limit, a full window (`context_limit` from the helper's count or the provider), cancel or the model's final answer. |
 | AE-05 | Nothing is retried. A request is never resent; a call is recorded once. Restart uses interrupted-turn recovery. |
 | AE-06 | Shutdown cancels the turn: the helper answers `Cancel` in every state; queued calls are recorded `cancelled` before the terminal. |
 | AE-07 | CC-I21 (cancel between requests) and CC-I22 (restart in the loop) exercise the closures. |
@@ -1879,7 +1905,7 @@ turns.** Output from retained streams in the turn's notice
 notice in history stays at reference fidelity. Lifts PC12 for person notices.
 Applies T1 to notices and rebuilt prior notices (composer revision 4).
 
-**CC4, selected 2026-11-02 (loop closure decision 6 decided): per-request
+**CC4, implemented 2026-11-02 (loop closure decision 6 decided): per-request
 recomposition (stage B).** Service-owned request loop, per-request manifests,
 history entries carrying tool calls and results
 ([CC4 design](#cc4-service-owned-request-loop-stage-b)).
@@ -1955,7 +1981,7 @@ Ollama.
 | CC-U27 | CC2 | Kind 29 with 0 to 3 view ranges, and outcome `private` | Encode, decode, validate | Round trip; sizes as the view block table; a view with a non-`ok` outcome, 4 ranges, overlapping ranges or bytes past the total is `Corrupt`; `private` is refused for codes other than 10 and 12 to 14, and with any body |
 | CC-U28 | ENV4 | A tainted model `exec_cmd` call whose job's kind 26 committed; the same before kind 26; the turn ended first | Advance the call | Kind 29 outcome `private`, no body, appended after kind 26 with no yield wait; the rendered text holds the handle and no state, exit status, count, elapsed time or output |
 | CC-U29 | CC4 | A base and pairs of two requests, ample `W` | `compose_request` twice; then for the next request | Equal bytes and digest; history and prompt byte-equal to the base; each continuation is the previous one plus the new entries; call IDs `call_<ordinal>`; one assistant entry per request |
-| CC-U30 | CC4 | Pairs of three requests; `W` that fits only after reductions | `compose_request` | Older results become reference lines oldest first; the latest request's results stay full; the base is recomposed only when references are not enough; `context_limit` when the latest pairs and the mandatory base exceed `W` |
+| CC-U30 | CC4 | Pairs of three requests; `W` that fits only after reductions; a measured previous request | `compose_request` | Older results become references oldest first; the latest request's results stay full; the base is recomposed only when references are not enough; a request still over `W` is sent with the base kept; a measured `T` with room keeps every result full |
 | CC-U31 | CC4 | Kind 14 forms 1 to 4; every result status, private included | Build pairs and render | Forms 1 and 2 with a JSON object are placed; otherwise `{}`; rendering equals the earlier helper rendering for each status; placeholders kept |
 | CC-U32 | CC4 | Model owner after request 1 | `ToolCall` positions 1 and 2, `Terminal` outcome 4; then `Begin` 2 | Calls emitted in order; owner returns to available; request 2 resets the input ledger and credits the next output transfer once; wrong position, count mismatch, outcome 4 without tools or with a partial revision is a fault |
 | CC-U33 | CC4 | Control validator | `Begin` with and without `request_ordinal`; `Terminal` outcome 4 with and without `tool_calls`; continuation entries well formed, unpaired, misordered or with tool fields in history | Valid shapes pass; every other shape is rejected |
@@ -2000,10 +2026,10 @@ outside the lifecycle Cargo gate; the gate records each result per backend.
 | --- | --- | --- | --- |
 | CC-N1 | CC4 | Model-free; real FoundationModels session machinery with a scripted executor; runs in every `swift test` | A stop tool that throws ends the session with `ToolCallError`; the preserved transcript holds the `toolCalls` entry with all calls in order; the executor received the override transcript, continuation included; exactly one dispatch. Fails if the SDK changes either behavior |
 | CC-N2 | CC4 | System model, `ASURA_TEST_NATIVE_SYSTEM=1` | A request that requires a tool returns at least one proposal; a request whose continuation ends with a tool output completes with text; the mid-turn overflow is `context_limit` |
-| CC-N3 | CC4 | MLX, `ASURA_TEST_MLX_ASSET` (`mlx-community/Qwen3-1.7B-4bit`) | As CC-N2, through `FoundationBackend` over MLX |
+| CC-N3 | CC4 | MLX, `ASURA_TEST_MLX_ROOT` (an asset root holding `mlx/fixture`, `mlx-community/Qwen3-1.7B-4bit`) | As CC-N2, through `FoundationBackend` over MLX |
 | CC-N4 | CC4 | Ollama, `ASURA_TEST_OLLAMA_MODEL` (`granite4.1:8b`) | As CC-N2, through the Ollama adapter |
-| CC-N5 | CC4 | Core AI, `ASURA_TEST_COREAI_ASSET` | The `--native-coreai-exec-cmd-tools` journey runs its turns through stage B |
-| CC-N6 | CC4 | System, MLX, Ollama | The `--native-*-exec-cmd-tools` journeys run their multi-request turns through stage B |
+| CC-N5 | CC4 | Core AI, `ASURA_TEST_COREAI_ROOT` (an asset root holding `coreai/fixture`) | As CC-N2, through the Core AI bridge |
+| CC-N6 | CC4 | System, MLX, Core AI, Ollama | The `--native-*-exec-cmd-tools` journeys run their multi-request turns through stage B |
 
 ### End-to-end
 
@@ -2100,5 +2126,40 @@ helper from an ad hoc `asura-bundle` package:
 
 The `--long-conversation` journey needs the native model and takes several
 minutes, so it is not in the lifecycle Cargo gate.
+
+### CC4 implementation evidence, 2026-11-02
+
+macOS 27 (build 26A428), Xcode 27.1, Metal toolchain 32023.921.5; helper from
+an ad hoc `asura-bundle` package copied beside the test binaries.
+
+| Case | Evidence | Result |
+| --- | --- | --- |
+| Q6 prerequisite | Swift `generativeTooManyTokensIsContextLimit`, `otherGenerativeErrorsStayInternal`, `sdkContextSizeExceededStaysContextLimit`; native `nativeSystemMidTurnOverflowIsContextLimit` (system model, 8,192 tokens, real `GenerativeError`) | Pass |
+| CC-N1 | Swift `stopToolPreservesEveryCallOfTheResponseInOrder`, `executorReceivesTheWholeRequestAsItsTranscript`, `tcrQ1MalformedFormsAgainstGeneratedContentTools` (real FoundationModels session, scripted executor; every `swift test`) | Pass |
+| CC-N2 | `nativeSystemStageBTwoRequests`, `nativeSystemJourneyShapedRequests` (1,566 and 1,716 measured input tokens) | Pass |
+| CC-N3 | `nativeMLXStageBTwoRequests`, `Qwen3-1.7B-4bit` (`3b1b1768`), hard-linked asset root; the test runner needs `mlx.metallib` from the bundle beside it | Pass |
+| CC-N4 | `nativeOllamaStageBTwoRequests`, `granite4.1:8b`, Ollama 0.40.11 | Pass |
+| CC-N5 | `nativeCoreAIStageBTwoRequests`, `qwen3_4b_4bit_dynamic` (`main.hash` `14c5d258`, 40,960 tokens), hard-linked asset root; 263 s including the first compile | Pass |
+| CC-N6 | `--native-exec-cmd-tools` (system) and `--native-ollama-exec-cmd-tools`: EQ-1 to EQ-4b through stage B | Pass: system 6/6 and Ollama `granite4.1:8b` 6/6 (EQ-1 to EQ-4b); one earlier Ollama run had EQ-4 fail as a model result (the model changed the command) |
+| CC-N6, MLX and Core AI | `--native-mlx-exec-cmd-tools`, `--native-coreai-exec-cmd-tools` | Unverified: the development helper is App-Sandboxed and reads models only under `~/.asura/data/models/` (SG2a); the journeys' asset roots under `/private/tmp` return `model_unavailable` at Hello. Not a CC4 change; the engine-level cases CC-N3 and CC-N5 stand in |
+| CC-U29, CC-U30 | `context::request` tests | Pass |
+| CC-U31 | `tools::tests::cc_u31_results_render_as_before_the_service_owned_loop` | Pass |
+| CC-U32 | `model_owner` `cc_u32_*` | Pass |
+| CC-U33 | `asura-control` `cc_u33_request_loop_wire_shapes`; Swift `requestLoopWireShapes`, `continuationStructureIsValidated` | Pass |
+| CC-U34 | `asura-storage` `cc_u34_request_started_needs_a_new_resolved_call_and_the_next_ordinal` | Pass |
+| CC-U35 | `conversation::tool_tests::cc_u35_*` | Pass |
+| CC-S2, CC-S3 helper session | Swift `requestLoopRunsOneInferencePerBegin`, `cancelBetweenRequestsEndsTheSession`, `laterBeginMustBeTheNextToolRequest`, `aRequestSendsAtMost201Calls`, `ollamaTwoRequestsKeepTheEarlierMessagesStable` | Pass |
+| CC-I20, CC-I21, CC-I22 | `tool_call_flow requests`, `loop-cancel`, `loop-restart` | Pass |
+| CC-I23 | `person_command_flow` taint journey: five requests of one turn swept | Pass |
+| CC-I24 | `tool_call_flow window` (FW-I3): 21 requests, 9 older results as references, 11 requests byte-stable before the first reduction | Pass |
+| CC-E9 | `tui_pty.py --context-views`, `--job-notices`, `--person-*` | Pass |
+| Journal-level recomputation of a kind 33 input from records and pages | Not built; the pure function is deterministic (CC-U29) and kind 33 binds its digests | Unverified at integration |
+
+Finding during implementation (2026-11-02): the composer's `W` for a system
+model tool turn was 772 bytes (tool schemas at one token per byte, 1-byte
+fallback) while the exact count was 1,716 of 8,192 tokens, so a strict `W`
+failed every second request. The design now uses the previous request's
+measured tokens and keeps the helper's exact count as the backstop (step 2
+and step 5).
 
 Return to the [design index](README.md).

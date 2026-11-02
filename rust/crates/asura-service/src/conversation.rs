@@ -342,8 +342,8 @@ fn tool_result(
     }
     result
 }
-fn tool_wire_result(value: &journal::ToolResult) -> mp::ToolResult {
-    mp::ToolResult {
+fn tool_wire_result(value: &journal::ToolResult) -> tools::Reply {
+    tools::Reply {
         ordinal: Some(value.ordinal),
         status: Some(i32::from(value.status)),
         text: Some(value.text.clone()),
@@ -679,8 +679,31 @@ struct Active {
     tool: Option<LiveTool>,
     tool_budget: tools::Budget,
     tool_executor: tools::Executor,
-    /// Completed calls by ordinal: the received digest and the result sent.
-    tool_cache: Vec<(u32, [u8; 32], mp::ToolResult)>,
+    /// Settled calls of the turn in ordinal order: what later requests show
+    /// (CC4 request composition).
+    tool_cache: Vec<Settled>,
+    /// Calls the current request proposed that are not yet decided, in
+    /// position order (CC4); at most 201.
+    proposals: VecDeque<mp::ToolCall>,
+    /// The helper ended the current request with calls; the next request
+    /// starts when every call has settled (CC4).
+    next_request: bool,
+    /// The current request's start record committed: kind 6 for request 1,
+    /// kind 33 for later requests (CC4).
+    request_started: bool,
+    /// The over-limit call (ordinal 201) was recorded; the turn ends.
+    limit_reached: bool,
+    /// The current request's composed input size, for calibration.
+    request_bytes: usize,
+    /// The current request's measured input (`ContextMeasured`), the exact
+    /// bound for composing the next request (CC4 step 2).
+    measured: Option<crate::context::Measured>,
+    /// The measured tokens the next request was composed with, for kind 33.
+    request_measured: u32,
+    /// Request 1's composition and sources, for later requests (CC4).
+    base: Option<Box<crate::context::TurnBase>>,
+    /// The digests of the request being started (kind 33).
+    request_digests: Option<([u8; 32], [u8; 32])>,
     /// Per-turn key for the received-call digest; dropped at turn end.
     secret_key: zeroize::Zeroizing<[u8; 32]>,
     /// The model's read cursors of this turn (J3-E4), from its kind 29
@@ -695,6 +718,52 @@ impl Active {
         }
     }
 }
+/// One settled call: its kind 14 name and placed arguments, the request
+/// that proposed it, the job its result names and the result delivered.
+#[derive(Debug)]
+struct Settled {
+    request: u32,
+    name: String,
+    arguments: String,
+    job: Option<journal::Id>,
+    reply: tools::Reply,
+}
+impl Settled {
+    fn new(
+        active: &Active,
+        record: &journal::ToolCall,
+        job: Option<journal::Id>,
+        reply: tools::Reply,
+    ) -> Self {
+        Self {
+            request: active.model.request().max(1),
+            name: if record.name.is_empty() {
+                "unnamed_tool".into()
+            } else {
+                record.name.clone()
+            },
+            arguments: placed_arguments(record),
+            job,
+            reply,
+        }
+    }
+}
+/// The kind 14 stored argument text when its form is verbatim or canonical
+/// and it is a JSON object; otherwise `{}` (CC4 rule 7). Placeholders stay.
+fn placed_arguments(record: &journal::ToolCall) -> String {
+    use journal::ArgumentForm as F;
+    if matches!(record.form, F::Verbatim | F::Canonical)
+        && matches!(
+            asura_platform::secrets::json::parse(&record.arguments),
+            Ok(asura_platform::secrets::json::Value::Object(_))
+        )
+    {
+        record.arguments.clone()
+    } else {
+        "{}".into()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum AutomaticInitialization {
     #[default]
@@ -743,6 +812,8 @@ enum Job {
     ReadPrompt(pb::Envelope),
     Accept,
     Start,
+    /// A later request's kind 33 (CC4).
+    RequestStart,
     Cancel,
     Finish,
     ToolIntent,
@@ -2319,6 +2390,15 @@ impl Owner {
             tool_budget: tools::Budget::cancellation_driven(),
             tool_executor,
             tool_cache: Vec::new(),
+            proposals: VecDeque::new(),
+            next_request: false,
+            request_started: false,
+            limit_reached: false,
+            request_bytes: 0,
+            measured: None,
+            request_measured: 0,
+            base: None,
+            request_digests: None,
             secret_key: zeroize::Zeroizing::new({
                 let mut key = [0u8; 32];
                 key[..16].copy_from_slice(&asura_platform::random_id());
@@ -2340,6 +2420,7 @@ impl Owner {
             views,
             ..
         } = composing;
+        let prompt = active.turn.prompt.clone();
         match crate::context::compose_views(
             instructions,
             &active.turn.prompt,
@@ -2365,6 +2446,22 @@ impl Owner {
                 active.turn.input_digest = Sha256::digest(&composed.input).into();
                 active.turn.composition = composed.composition(budget);
                 active.turn.prior_operations = composed.shown;
+                // The base of later requests (CC4): request 1 as composed,
+                // with its sources for a recomposition under pressure.
+                if let Ok(input) = asura_control::model::decode_input(&composed.input) {
+                    active.base = Some(Box::new(crate::context::TurnBase {
+                        instructions,
+                        prompt,
+                        candidates,
+                        unlisted: active.unlisted,
+                        notice,
+                        views,
+                        budget,
+                        input,
+                        manifest_digest: composed.manifest_digest,
+                    }));
+                }
+                active.request_bytes = composed.input.len();
                 active.input = composed.input;
                 active.ready = true;
             }
@@ -3048,10 +3145,22 @@ impl Owner {
             Job::Start => {
                 let active = self.active.as_mut().expect("active permit");
                 active.start_committed = true;
+                active.request_started = true;
                 if active.cancel.is_none() && !self.closing {
                     active.measurements.started = Some(now);
                 }
                 if active.cancel.is_none()
+                    && !self.closing
+                    && let Err(message) = active.model.start()
+                {
+                    Self::failed(active, message, now);
+                }
+            }
+            Job::RequestStart => {
+                let active = self.active.as_mut().expect("active request");
+                active.request_started = true;
+                if active.cancel.is_none()
+                    && active.terminal.is_none()
                     && !self.closing
                     && let Err(message) = active.model.start()
                 {
@@ -3118,26 +3227,33 @@ impl Owner {
                     {
                         let _ = emitter.try_emit(event);
                     }
-                    let wire = mp::ToolResult {
+                    let wire = tools::Reply {
                         ordinal: Some(tool.ordinal),
                         status: Some(i32::from(status)),
                         text: Some(text),
                         next_offset: None,
                         truncated: Some(false),
                     };
-                    active
-                        .tool_cache
-                        .push((tool.ordinal, tool.digest, wire.clone()));
+                    let settled = Settled::new(active, &tool.record, None, wire);
+                    active.tool_cache.push(settled);
                     if self.closing {
                         active.revoke_create();
                         active.cancel.get_or_insert(journal::Cause::ServiceShutdown);
                     }
-                    // Once cancel or turn end is set no result is sent (TCR-D8).
-                    if active.cancel.is_none()
-                        && active.terminal.is_none()
-                        && let Err(message) = active.model.tool_result(wire)
-                    {
-                        Self::failed(active, message, now);
+                    // The over-limit call is recorded; the service ends the
+                    // turn (TCR-D6, revised by CC4). Later proposals of the
+                    // request get no record.
+                    if tool.ordinal > tools::MAX_CALLS {
+                        active.limit_reached = true;
+                        active.proposals.clear();
+                        if active.cancel.is_none() && active.terminal.is_none() {
+                            Self::failed_with(
+                                active,
+                                "output_limit",
+                                journal::Cause::OutputLimit,
+                                now,
+                            );
+                        }
                     }
                 }
             }
@@ -3176,9 +3292,8 @@ impl Owner {
                 if active.tool_budget.settle(sent).is_err() {
                     Self::failed(active, "model_protocol_fault", now);
                 } else {
-                    active
-                        .tool_cache
-                        .push((call.ordinal, tool.digest, wire.clone()));
+                    let settled = Settled::new(active, &tool.record, None, wire.clone());
+                    active.tool_cache.push(settled);
                     active.cursor += 1;
                     if self.closing {
                         // Shutdown ends the turn through its cancel path.
@@ -3196,19 +3311,9 @@ impl Owner {
                     {
                         Self::failed(active, "model_protocol_fault", now);
                     }
-                    if active.cancel.is_none()
-                        && active.terminal.is_none()
-                        && active.tools_enabled
-                        && tools::validate_authority(
-                            &call,
-                            &tool_grant(&active.turn, active.foreground_user),
-                            &tools::Destination::Local,
-                        )
-                        .is_ok()
-                        && let Err(message) = active.model.tool_result(wire)
-                    {
-                        Self::failed(active, message, now);
-                    }
+                    // The result reaches the model in the next request's
+                    // continuation (CC4); `wire` is the delivered form.
+                    let _ = wire;
                 }
             }
             Job::Finish => {
@@ -3393,6 +3498,63 @@ impl Owner {
             }
         }
     }
+    /// Composes the next request from the base and the settled calls and
+    /// sends it (CC4, CC-F4). A request that does not fit ends the turn
+    /// with `context_limit` (cause `input_limit`).
+    fn next_request(active: &mut Active, now: Instant) {
+        let Some(base) = active.base.as_deref() else {
+            Self::failed(active, "model_input_invalid", now);
+            return;
+        };
+        let pairs: Vec<crate::context::Pair> = active
+            .tool_cache
+            .iter()
+            .zip(1u32..)
+            .map(|(settled, ordinal)| crate::context::Pair {
+                ordinal: settled.reply.ordinal.unwrap_or(ordinal),
+                request: settled.request,
+                name: settled.name.clone(),
+                arguments: settled.arguments.clone(),
+                output: tools::render_reply(&settled.reply),
+                job: settled.job,
+            })
+            .collect();
+        let request = active.model.request().saturating_add(1);
+        // The measurement belongs to the request it measured; take it.
+        let measured = active.measured.take();
+        match crate::context::compose_request(base, &pairs, request, measured) {
+            Ok(composed) => {
+                if composed.reduced > 0 || composed.recomposed {
+                    tracing::info!(
+                        request,
+                        reduced = composed.reduced,
+                        recomposed = composed.recomposed,
+                        "request_recomposed"
+                    );
+                }
+                active.request_digests = Some((
+                    Sha256::digest(&composed.input).into(),
+                    composed.manifest_digest,
+                ));
+                active.request_bytes = composed.input.len();
+                active.request_measured = measured.map_or(0, |m| m.tokens);
+                active.ready = false;
+                if let Err(message) = active.model.begin_next(composed.input) {
+                    Self::failed(active, message, now);
+                }
+            }
+            Err(crate::context::Error::ContextLimit {
+                mandatory_bytes,
+                budget_bytes,
+            }) => {
+                tracing::warn!(request, mandatory_bytes, budget_bytes, "context_limit");
+                Self::failed_with(active, "context_limit", journal::Cause::InputLimit, now);
+            }
+            Err(crate::context::Error::Invalid) => {
+                Self::failed(active, "model_input_invalid", now);
+            }
+        }
+    }
     fn helper_terminal(active: &mut Active, outcome: i32, reason: i32, usage_tokens: Option<u64>) {
         active.revoke_create();
         tracing::info!(
@@ -3449,24 +3611,12 @@ impl Owner {
         replay: Option<&journal::Replay>,
         execution: bool,
     ) {
+        // The conversation owner assigned `ordinal` (CC4); calls are taken
+        // one at a time from the request's queue.
         let ordinal = value.ordinal.unwrap_or(0);
         let digest = received_digest(&active.secret_key, &value);
-        // A resend at a used ordinal: equal gets the same result, a different
-        // call is a helper fault.
-        if let Some((_, prior, wire)) = active.tool_cache.iter().find(|(o, _, _)| *o == ordinal) {
-            let resent = *prior == digest
-                && (active.cancel.is_some()
-                    || active.terminal.is_some()
-                    || active.model.tool_result(wire.clone()).is_ok());
-            if !resent {
-                Self::failed(active, "model_protocol_fault", now);
-            }
-            return;
-        }
-        if let Some(pending) = &active.tool {
-            if pending.ordinal != ordinal || pending.digest != digest {
-                Self::failed(active, "model_protocol_fault", now);
-            }
+        if active.tool.is_some() {
+            Self::failed(active, "model_protocol_fault", now);
             return;
         }
         if ordinal != active.tool_budget.next_ordinal() {
@@ -3757,6 +3907,21 @@ impl Owner {
         });
         active.model.cancel(1, now);
     }
+    /// Ends the turn `failed` with `cause` (CC4: the over-limit call ends
+    /// it with `output_limit`, a request that does not fit with `input_limit`).
+    fn failed_with(
+        active: &mut Active,
+        message: &'static str,
+        cause: journal::Cause,
+        now: Instant,
+    ) {
+        Self::failed(active, message, now);
+        if let Some(terminal) = &mut active.terminal
+            && terminal.kind == journal::TerminalKind::Failed
+        {
+            terminal.cause = cause;
+        }
+    }
     #[track_caller]
     fn failed(active: &mut Active, message: &'static str, now: Instant) {
         active.revoke_create();
@@ -3935,11 +4100,6 @@ impl Owner {
             .as_mut()
             .map(|active| active.model.poll(now))
             .unwrap_or_default();
-        // EX11: the effective value of the turn's project at each call.
-        let execution = self
-            .active
-            .as_ref()
-            .is_none_or(|active| self.execution_on(active.turn.project));
         for event in events {
             use crate::model_owner::ModelEvent;
             let active = self.active.as_mut().expect("active model");
@@ -4064,7 +4224,11 @@ impl Owner {
                         active.cursor += 1;
                     }
                     self.calibration
-                        .record(&active.turn.model, active.input.len(), input_tokens);
+                        .record(&active.turn.model, active.request_bytes, input_tokens);
+                    active.measured = Some(crate::context::Measured {
+                        tokens: input_tokens,
+                        bytes: active.request_bytes as u64,
+                    });
                 }
                 ModelEvent::Ready => active.ready = true,
                 ModelEvent::Revision {
@@ -4088,14 +4252,25 @@ impl Owner {
                     }
                 }
                 ModelEvent::ToolCall(call) => {
-                    // Before StartAuthorized commits or with tools disabled a
-                    // call is a helper fault, not a proposal (TCR-D7). After
-                    // cancel or turn end it is still recorded, as `cancelled`.
-                    if !active.tools_enabled || !active.start_committed {
+                    // Before the request's start record commits or with tools
+                    // disabled a call is a helper fault, not a proposal
+                    // (TCR-D7). Calls queue in position order and are decided
+                    // one at a time (CC4); after cancel or turn end each is
+                    // still recorded, as `cancelled`.
+                    if !active.tools_enabled || !active.request_started {
                         Self::failed(active, "model_protocol_fault", now);
+                    } else if active.proposals.len() < journal::MAX_TOOL_CALL_ORDINAL as usize {
+                        active.proposals.push_back(call);
                     } else {
-                        Self::tool_call(active, call, now, self.replay.as_deref(), execution);
+                        Self::failed(active, "model_protocol_fault", now);
                     }
+                }
+                ModelEvent::ToolCallsProposed => {
+                    // The request ended with calls; the next one starts once
+                    // they have settled (CC4).
+                    active.next_request = true;
+                    active.request_started = false;
+                    active.ready = false;
                 }
                 ModelEvent::Terminal {
                     outcome,
@@ -4225,6 +4400,11 @@ impl Owner {
         if self.drive_create_recovery() {
             return;
         }
+        // EX11: the effective execution setting of the turn's project now.
+        let execution = self
+            .active
+            .as_ref()
+            .is_none_or(|active| self.execution_on(active.turn.project));
         if !self.closing && self.unavailable.is_none() {
             if let Some(active) = &mut self.active {
                 if self
@@ -4434,6 +4614,25 @@ impl Owner {
                 self.unavailable = Some(storage_error(e));
             }
             return;
+        }
+        // CC4: decide the next queued call of the request, one at a time.
+        if active.tool.is_none()
+            && !active.limit_reached
+            && let Some(mut call) = active.proposals.pop_front()
+        {
+            call.ordinal = Some(active.tool_budget.next_ordinal());
+            Self::tool_call(active, call, now, self.replay.as_deref(), execution);
+        }
+        // CC4: every call settled; compose and send the next request.
+        if active.next_request
+            && active.tool.is_none()
+            && active.proposals.is_empty()
+            && active.cancel.is_none()
+            && active.terminal.is_none()
+            && !self.closing
+        {
+            active.next_request = false;
+            Self::next_request(active, now);
         }
         if let Some(tool) = &mut active.tool {
             if !tool.intent_committed {
@@ -4690,6 +4889,26 @@ impl Owner {
                 {
                     self.unavailable = Some(storage_error(e));
                 }
+            }
+        } else if active.ready
+            && active.start_committed
+            && !active.request_started
+            && active.cancel.is_none()
+            && active.terminal.is_none()
+            && let Some((input_digest, manifest_digest)) = active.request_digests
+        {
+            // CC4: a later request's start record binds its digests.
+            active.ready = false;
+            let record = journal::Record::RequestStarted(journal::RequestStarted {
+                operation,
+                generation,
+                request: active.model.request(),
+                measured_tokens: active.request_measured,
+                input_digest,
+                manifest_digest,
+            });
+            if let Err(e) = self.append(record, Job::RequestStart, None) {
+                self.unavailable = Some(storage_error(e));
             }
         } else if active.ready && !active.start_committed && active.cancel.is_none() {
             active.ready = false;
@@ -5170,7 +5389,7 @@ impl Owner {
             delivered: active
                 .tool_cache
                 .iter()
-                .map(|(_, _, wire)| wire.text.as_deref().map_or(0, str::len) as u64)
+                .map(|settled| settled.reply.text.as_deref().map_or(0, str::len) as u64)
                 .sum(),
             output_tokens: active.measurements.output.unwrap_or(0),
             milli: budget.bytes_per_token_milli,
@@ -5221,7 +5440,7 @@ impl Owner {
         {
             let _ = emitter.try_emit(event);
         }
-        let wire = mp::ToolResult {
+        let wire = tools::Reply {
             ordinal: Some(tool.ordinal),
             status: Some(i32::from(result.status)),
             text: Some(text),
@@ -5233,19 +5452,13 @@ impl Owner {
             Self::failed(active, "model_protocol_fault", now);
             return;
         }
-        active
-            .tool_cache
-            .push((tool.ordinal, tool.digest, wire.clone()));
+        // The result reaches the model in the next request (CC4).
+        let settled = Settled::new(active, &tool.record, named, wire);
+        active.tool_cache.push(settled);
         active.cursor += 1;
         if self.closing {
             active.revoke_create();
             active.cancel.get_or_insert(journal::Cause::ServiceShutdown);
-        }
-        if active.cancel.is_none()
-            && active.terminal.is_none()
-            && let Err(message) = active.model.tool_result(wire)
-        {
-            Self::failed(active, message, now);
         }
     }
     /// The job control handler's reactor step: page replies, held appends
@@ -5600,6 +5813,7 @@ mod observation_tests {
                     completed: 1,
                 }),
                 tools: Vec::new(),
+                request_starts: Vec::new(),
             },
         );
         owner.replay = Some(Arc::new(replay));

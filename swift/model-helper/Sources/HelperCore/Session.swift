@@ -25,8 +25,12 @@ public actor HelperSession {
     private var inputChunks: UInt64 = 0
     private var decodedInput: ModelInput?
     private var projectToolsEnabled = false
-    private var toolOrdinal: UInt32 = 0
-    private var pendingTool: (UInt32, CheckedContinuation<ToolResult, any Error>)?
+    /// The service's request ordinal of the current request; 0 before the
+    /// first Begin (context-composer.md, CC4). Later Begins repeat the
+    /// model, tools and thinking of the first.
+    private var requestOrdinal: UInt32 = 0
+    /// The current request's calls, sent after its text is committed.
+    private var proposals: [ToolProposal] = []
     private var modelTask: Task<Void, Never>?
     private var timer: Task<Void, Never>?
     private var timerRevision: UInt64 = 0
@@ -37,6 +41,8 @@ public actor HelperSession {
     /// 2026-10-17); nothing else arms a timer.
     private let timerSleep: @Sendable (UInt32) async throws -> Void
     private var measuredContext = false
+    /// A `Start` was received: output credit may arrive in any later phase.
+    private var startedOnce = false
     private var settledInferenceOrdinal: UInt32 = 0
     private var activeInferenceOrdinal: UInt32?
     /// The response text as the service holds it after the last SnapshotEnd.
@@ -96,7 +102,6 @@ public actor HelperSession {
             reportModelFailure(error)
             transport.close()
         }
-        finishTool(.failure(HelperError.closed))
         timer?.cancel()
         modelTask?.cancel()
         phase = .terminal
@@ -213,11 +218,46 @@ public actor HelperSession {
             message.operationID.contains(where: { $0 != 0 }), message.hasGeneration, message.generation > 0 else {
             throw HelperError.protocolFault
         }
+        if phase == .begin, requestOrdinal > 0 {
+            // Between requests (CC4): the next Begin, a cancel or an output
+            // credit of the current transfer.
+            guard message.operationID == operation, message.generation == generation else {
+                throw HelperError.protocolFault
+            }
+            switch body {
+            case .cancel(let cancel):
+                guard cancel.hasReason, (1...4).contains(cancel.reason.rawValue) else { throw HelperError.protocolFault }
+                await fail(cancel.reason == .timeout ? .timeout : .cancelled, cancelled: true)
+                return
+            case .credit(let credit):
+                try applyOutputCredit(credit)
+                return
+            case .begin: break
+            default: throw HelperError.protocolFault
+            }
+        }
         if phase == .begin {
             guard case .begin(let begin) = body, begin.hasModel, begin.model == selectedModel,
                 begin.hasInputBytes, begin.inputBytes > 0, begin.inputBytes <= Limits.input,
                 // A sanity bound on allocation, not a content limit.
-                begin.inputBytes <= UInt64(contextTokens) * 8 else { throw HelperError.protocolFault }
+                begin.inputBytes <= UInt64(contextTokens) * 8,
+                begin.hasRequestOrdinal, requestOrdinal < UInt32.max,
+                begin.requestOrdinal == requestOrdinal + 1 else { throw HelperError.protocolFault }
+            let tools = begin.hasEnableProjectTools && begin.enableProjectTools
+            let requested: ThinkingRequest = begin.hasThinking ? begin.thinking : .none
+            if requestOrdinal > 0 {
+                // A later request repeats the first: tools on, same thinking.
+                guard tools, projectToolsEnabled, requested == thinking else { throw HelperError.protocolFault }
+                requestOrdinal = begin.requestOrdinal
+                expectedInput = begin.inputBytes
+                inputChunks = 0; inputData.removeAll(); measuredContext = false
+                phase = .input
+                var credit = Asura_Model_V1_Credit()
+                credit.transferID = 1; credit.direction = .input; credit.acceptedBytes = 0
+                credit.grantedBytes = Limits.creditWindow
+                try await transport.send(envelope(.credit(credit)))
+                return
+            }
             // Only a form reported in Hello (thinking-level.md); absent is none.
             if begin.hasThinking {
                 guard begin.thinking != .none, thinkingControls.accepts(begin.thinking) else {
@@ -225,9 +265,10 @@ public actor HelperSession {
                 }
                 thinking = begin.thinking
             }
+            requestOrdinal = begin.requestOrdinal
             operation = message.operationID; generation = message.generation
             expectedInput = begin.inputBytes
-            projectToolsEnabled = begin.hasEnableProjectTools && begin.enableProjectTools
+            projectToolsEnabled = tools
             if let capabilities {
                 activation = Dictionary(uniqueKeysWithValues: ModelCapability.allCases.map {
                     ($0, capabilities.activation($0, toolsEnabled: projectToolsEnabled, thinking: thinking))
@@ -273,23 +314,29 @@ public actor HelperSession {
             try await transport.send(envelope(.ready(.init())))
         case .start:
             guard phase == .ready, let input = decodedInput else { throw HelperError.protocolFault }
-            decodedInput = nil; phase = .running
+            decodedInput = nil; phase = .running; startedOnce = true
             guard let backend = self.backend else { throw HelperError.unavailable }
             let owner = self
             let enableTools = projectToolsEnabled
             let thinking = self.thinking
+            let request = requestOrdinal
             modelTask = Task {
                 do {
                     if enableTools, let toolBackend = backend as? any ToolModelBackend {
-                        try await toolBackend.generateWithTools(input, thinking: thinking,
-                            handler: { proposal in try await owner.requestTool(proposal) },
-                            snapshot: { value in try await owner.snapshot(value) })
+                        // One inference; its calls are returned, never run (CC4).
+                        let proposals = try await toolBackend.generateWithTools(input, thinking: thinking,
+                            request: request, snapshot: { value in try await owner.snapshot(value) })
+                        await owner.completed(proposals: proposals)
                     } else {
                         try await backend.generate(input, thinking: thinking) { value in
                             try await owner.snapshot(value)
                         }
+                        await owner.completed(proposals: [])
                     }
-                    await owner.completed()
+                } catch let reported as ProposedThenFailed {
+                    // TCR-D17: the unregistered call goes for its record first.
+                    reportModelFailure(reported.failure)
+                    await owner.failedAfterProposals(reported.proposals, reason: reported.failure.reason)
                 } catch is CancellationError {
                     await owner.backendCancelled(taskCancelled: Task.isCancelled)
                 } catch let error as BackendFailure {
@@ -300,23 +347,14 @@ public actor HelperSession {
                     await owner.backendFailed(.internalError)
                 }
             }
-        case .toolResult(let result):
-            guard phase == .running, projectToolsEnabled,
-                let pending = pendingTool, result.ordinal == pending.0,
-                // No turn result-byte total (owner, 2026-10-18); Wire bounds each result.
-                result.ordinal < Limits.toolProposals || result.status == .limit else { throw HelperError.protocolFault }
-            finishTool(.success(ToolResult(status: result.status, text: result.text,
-                nextOffset: result.hasNextOffset ? result.nextOffset : nil, truncated: result.truncated)))
         case .credit(let credit):
-            guard phase == .running, credit.hasTransferID,
-                var ledger = ledgers[credit.transferID], credit.hasDirection, credit.direction == .output,
-                credit.hasAcceptedBytes, credit.hasGrantedBytes, credit.acceptedBytes >= ledger.accepted,
-                credit.acceptedBytes <= ledger.sent, credit.grantedBytes > ledger.granted,
-                credit.grantedBytes >= ledger.sent, credit.grantedBytes <= credit.acceptedBytes + UInt64(Limits.frame) else {
+            // Output credit for the current transfer may follow a request's
+            // terminal (CC4), so a later request's input phases accept it.
+            guard startedOnce else {
                 throw HelperError.protocolFault
             }
-            ledger.accepted = credit.acceptedBytes; ledger.granted = credit.grantedBytes
-            ledgers[credit.transferID] = ledger
+            try applyOutputCredit(credit)
+            guard phase == .running else { return }
             do { try await pump() }
             catch let error as BackendFailure { await fail(error.reason, cancelled: false) }
             catch { await fail(.protocolFault, cancelled: false) }
@@ -324,26 +362,25 @@ public actor HelperSession {
         }
     }
 
-    private func finishTool(_ result: Result<ToolResult, any Error>, ordinal: UInt32? = nil) {
-        guard let pending = pendingTool, ordinal == nil || pending.0 == ordinal else { return }
-        pendingTool = nil
-        pending.1.resume(with: result)
+    /// One output credit: it may only advance the ledger of a known transfer.
+    private func applyOutputCredit(_ credit: Asura_Model_V1_Credit) throws {
+        guard credit.hasTransferID,
+            var ledger = ledgers[credit.transferID], credit.hasDirection, credit.direction == .output,
+            credit.hasAcceptedBytes, credit.hasGrantedBytes, credit.acceptedBytes >= ledger.accepted,
+            credit.acceptedBytes <= ledger.sent, credit.grantedBytes > ledger.granted,
+            credit.grantedBytes >= ledger.sent, credit.grantedBytes <= credit.acceptedBytes + UInt64(Limits.frame) else {
+            throw HelperError.protocolFault
+        }
+        ledger.accepted = credit.acceptedBytes; ledger.granted = credit.grantedBytes
+        ledgers[credit.transferID] = ledger
     }
 
-    /// Forwards one proposal unread: name and argument text, or their sizes when
-    /// over the wire limits (known-size exhaustion). Ordinals run 1 through
-    /// Limits.toolProposals; after the result of the last, over-limit ordinal the
-    /// turn fails with outputLimit (TCR-D6). The name
-    /// and arguments are never logged.
-    private func requestTool(_ proposal: ToolProposal) async throws -> ToolResult {
-        guard phase == .running, pendingFailure == nil, projectToolsEnabled else { throw CancellationError() }
-        // A concurrent callback gets the busy reply: no frame, no ordinal, no
-        // record; the turn continues (model-tool-execution.md, EXQ-D1).
-        guard pendingTool == nil else { return ToolResult.busy }
-        guard toolOrdinal < Limits.toolProposals else { throw BackendFailure(.outputLimit) }
-        toolOrdinal += 1
+    /// One proposal as a `ToolCall` at `position` in this request's response:
+    /// name and argument text, or their sizes when over the wire limits
+    /// (known-size exhaustion). The name and arguments are never logged.
+    private func toolCall(_ proposal: ToolProposal, position: UInt32) throws -> Envelope {
         var call = Asura_Model_V1_ToolCall()
-        call.ordinal = toolOrdinal
+        call.ordinal = position
         call.source = proposal.source
         let nameBytes = proposal.name.utf8.count
         if nameBytes <= Limits.toolName { call.name = proposal.name }
@@ -351,25 +388,26 @@ public actor HelperSession {
         let argumentBytes = proposal.arguments.utf8.count
         if argumentBytes <= Limits.toolArguments { call.arguments = proposal.arguments }
         else { call.argumentsBytes = UInt32(clamping: argumentBytes) }
-        let requestOrdinal = toolOrdinal
         let message = envelope(.toolCall(call))
         try Wire.validate(message, from: .helper)
-        let result = try await withCheckedThrowingContinuation { continuation in
-            pendingTool = (toolOrdinal, continuation)
-            Task {
-                // A ToolCall can hold 64,000 bytes of argument text, beyond the
-                // 4,096-byte control frame bound, so it travels on the ordered
-                // data queue (bounded at one frame plus 1,024 bytes).
-                do { try await transport.send(message, control: false) }
-                catch { finishTool(.failure(error), ordinal: requestOrdinal) }
-            }
+        return message
+    }
+    /// Sends the request's calls in order. A `ToolCall` can hold 64,000
+    /// bytes of argument text, beyond the 4,096-byte control frame bound,
+    /// so it travels on the ordered data queue.
+    private func sendCalls(_ calls: [ToolProposal]) async throws {
+        for (index, proposal) in calls.enumerated() {
+            try await transport.sendWhenRoom(try toolCall(proposal, position: UInt32(index + 1)))
         }
-        if requestOrdinal == Limits.toolProposals {
-            // The over-limit proposal is recorded; the turn ends here.
-            await backendFailed(.outputLimit)
-            throw BackendFailure(.outputLimit)
-        }
-        return result
+    }
+    /// A request that reported an unregistered call and then failed
+    /// (TCR-D17, revised by CC4): the call goes for its record, then the
+    /// request fails.
+    private func failedAfterProposals(_ calls: [ToolProposal], reason: Reason) async {
+        guard phase == .running, pendingFailure == nil else { return }
+        do { try await sendCalls(Array(calls.prefix(Int(Limits.toolProposals)))) }
+        catch { await fail(.protocolFault, cancelled: false); return }
+        await backendFailed(reason)
     }
 
     private func snapshot(_ value: Snapshot) async throws {
@@ -417,14 +455,16 @@ public actor HelperSession {
         guard phase == .running, pendingFailure == nil else { return }
         pendingFailure = reason
         backendFinished = true
-        finishTool(.failure(CancellationError()))
         do { try await pump() }
         catch { await fail(reason, cancelled: false) }
     }
-    private func completed() async {
+    /// The inference settled. With calls, the request ends after its text is
+    /// committed (CC4); the helper sends at most 201 calls per request.
+    private func completed(proposals: [ToolProposal]) async {
         guard phase == .running else { return }
         backendFinished = true
-        if revision == 0 && target == nil { target = Data() }
+        self.proposals = Array(proposals.prefix(Int(Limits.toolProposals)))
+        if self.proposals.isEmpty && revision == 0 && target == nil { target = Data() }
         do { try await pump() } catch { await fail(.outputLimit, cancelled: false) }
     }
 
@@ -436,8 +476,12 @@ public actor HelperSession {
             if transmitting == nil {
                 if target == nil && targetThinking == nil {
                     if backendFinished {
-                        try await terminal(pendingFailure == nil ? .complete : .failed,
-                            reason: pendingFailure ?? .none)
+                        if pendingFailure == nil && !proposals.isEmpty {
+                            try await requestEnded()
+                        } else {
+                            try await terminal(pendingFailure == nil ? .complete : .failed,
+                                reason: pendingFailure ?? .none)
+                        }
                     }
                     return
                 }
@@ -549,10 +593,34 @@ public actor HelperSession {
         return n
     }
 
+    /// Ends the request with its calls (CC4): `ToolCall` 1 to n, then
+    /// `Terminal` outcome 4. The session waits for the next Begin; the
+    /// committed text, revisions and output transfers continue.
+    private func requestEnded() async throws {
+        let calls = proposals
+        proposals = []
+        if let ordinal = activeInferenceOrdinal {
+            activeInferenceOrdinal = nil; settledInferenceOrdinal = ordinal
+            try await transport.send(envelope(.inferenceUsage(RequestUsage(ordinal: ordinal).wire)))
+        }
+        try await sendCalls(calls)
+        var end = Asura_Model_V1_Terminal()
+        end.outcome = .toolCalls; end.toolCalls = UInt32(calls.count)
+        end.lastRevision = revision
+        end.count = totalChunks; end.totalBytes = totalBytes; end.reason = .none
+        end.usageKnown = false
+        let message = envelope(.terminal(end))
+        try Wire.validate(message, from: .helper)
+        try await transport.sendWhenRoom(message)
+        // Ready for the next request; nothing of this request is kept.
+        backendFinished = false; usage = nil; modelTask = nil
+        target = nil; targetThinking = nil
+        phase = .begin
+    }
+
     private func terminal(_ outcome: Asura_Model_V1_Outcome, reason: Reason) async throws {
         guard phase != .terminal else { return }
         phase = .terminal
-        finishTool(.failure(CancellationError()))
         timer?.cancel(); modelTask?.cancel()
         if let ordinal = activeInferenceOrdinal {
             activeInferenceOrdinal = nil; settledInferenceOrdinal = ordinal

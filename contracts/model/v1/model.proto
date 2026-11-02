@@ -4,12 +4,16 @@ package asura.model.v1;
 enum Availability { AVAILABILITY_UNSPECIFIED = 0; AVAILABILITY_AVAILABLE = 1; AVAILABILITY_UNAVAILABLE = 2; AVAILABILITY_UNKNOWN = 3; }
 enum TransferDirection { TRANSFER_DIRECTION_UNSPECIFIED = 0; TRANSFER_DIRECTION_INPUT = 1; TRANSFER_DIRECTION_OUTPUT = 2; }
 enum CancelReason { CANCEL_REASON_UNSPECIFIED = 0; CANCEL_REASON_USER = 1; CANCEL_REASON_TIMEOUT = 2; CANCEL_REASON_SHUTDOWN = 3; CANCEL_REASON_RESOURCE_LIMIT = 4; }
-enum Outcome { OUTCOME_UNSPECIFIED = 0; OUTCOME_COMPLETE = 1; OUTCOME_FAILED = 2; OUTCOME_CANCELLED = 3; }
+// OUTCOME_TOOL_CALLS (4) ends one request with tool calls, not the helper
+// session; the service starts the next request (context-composer.md, CC4).
+enum Outcome { OUTCOME_UNSPECIFIED = 0; OUTCOME_COMPLETE = 1; OUTCOME_FAILED = 2; OUTCOME_CANCELLED = 3; OUTCOME_TOOL_CALLS = 4; }
 enum Reason { REASON_NONE = 0; REASON_MODEL_UNAVAILABLE = 1; REASON_INPUT_LIMIT = 2; REASON_OUTPUT_LIMIT = 3; REASON_CONTEXT_LIMIT = 4; REASON_TIMEOUT = 5; REASON_REFUSAL = 6; REASON_CANCELLED = 7; REASON_PROTOCOL_FAULT = 8; REASON_HELPER_FAILED = 9; REASON_INTERNAL_ERROR = 10; REASON_INTERRUPTED = 11; REASON_RESULT_EXPIRED = 12; }
-enum Role { ROLE_UNSPECIFIED = 0; ROLE_USER = 1; ROLE_ASSISTANT = 2; }
+// ROLE_TOOL (3): one tool output of the current turn (CC4 continuation).
+enum Role { ROLE_UNSPECIFIED = 0; ROLE_USER = 1; ROLE_ASSISTANT = 2; ROLE_TOOL = 3; }
 // The form of the thinking level sent for one turn (thinking-level.md).
 enum ThinkingRequest { THINKING_REQUEST_NONE = 0; THINKING_REQUEST_OFF = 1; THINKING_REQUEST_ON = 2; THINKING_REQUEST_LOW = 3; THINKING_REQUEST_MEDIUM = 4; THINKING_REQUEST_HIGH = 5; }
 message Envelope {
+  reserved 21;
   optional bytes operation_id = 1;
   optional uint64 generation = 2;
   oneof body {
@@ -24,7 +28,8 @@ message Envelope {
     SnapshotEnd snapshot_end = 18;
     Terminal terminal = 19;
     ToolCall tool_call = 20;
-    ToolResult tool_result = 21;
+    // ToolResult (21) was removed by CC4: results reach the model in the next
+    // request's continuation.
     ContextMeasured context_measured = 22;
     InferenceUsage inference_usage = 23;
   }
@@ -70,6 +75,10 @@ message Begin {
   optional bool enable_project_tools = 5;
   // Absent: send nothing. Present: OFF to HIGH, within the helper's controls.
   optional ThinkingRequest thinking = 6;
+  // The service's request ordinal within the operation: 1 for the first
+  // Begin of a helper session, then each next (CC4). Later Begins repeat
+  // the model, tools and thinking of the first.
+  optional uint32 request_ordinal = 7;
 }
 message Chunk { optional uint64 transfer_id = 1; optional TransferDirection direction = 2; optional uint64 ordinal = 3; optional bytes data = 4; optional uint64 revision = 5; }
 message Credit { optional uint64 transfer_id = 1; optional TransferDirection direction = 2; optional uint64 accepted_bytes = 3; optional uint64 granted_bytes = 4; }
@@ -83,18 +92,25 @@ message Cancel { optional CancelReason reason = 1; }
 // With thinking_offset and thinking_bytes (both or neither), the first
 // thinking_bytes bytes revise the thinking text the same way (thinking-level.md).
 message SnapshotEnd { optional uint64 revision = 1; optional uint64 count = 2; optional uint64 total_bytes = 3; optional uint64 offset = 4; optional uint64 thinking_offset = 5; optional uint64 thinking_bytes = 6; }
-message Terminal { optional Outcome outcome = 1; optional uint64 last_revision = 2; optional uint64 count = 3; optional uint64 total_bytes = 4; optional uint64 usage_tokens = 5; optional bool usage_known = 6; optional Reason reason = 7; }
-message ModelInput { optional string instructions = 1; repeated HistoryTurn history = 2; optional string prompt = 3; }
-message HistoryTurn { optional Role role = 1; optional string text = 2; }
+// tool_calls: the ToolCall frames of this request, 1-201, only with
+// OUTCOME_TOOL_CALLS (CC4).
+message Terminal { optional Outcome outcome = 1; optional uint64 last_revision = 2; optional uint64 count = 3; optional uint64 total_bytes = 4; optional uint64 usage_tokens = 5; optional bool usage_known = 6; optional Reason reason = 7; optional uint32 tool_calls = 8; }
+// continuation: the current turn's entries after the prompt (CC4): for each
+// settled request, one assistant entry with its tool calls and empty text,
+// then one tool entry per call in call order. History holds roles 1 and 2
+// with text only.
+message ModelInput { optional string instructions = 1; repeated HistoryTurn history = 2; optional string prompt = 3; repeated HistoryTurn continuation = 4; }
+message HistoryTurn { optional Role role = 1; optional string text = 2; repeated HistoryToolCall tool_calls = 3; optional string call_id = 4; optional string tool_name = 5; }
+// One tool call of an earlier request of the turn; the call ID is the
+// service's `call_<turn ordinal>`, the arguments a JSON object.
+message HistoryToolCall { optional string call_id = 1; optional string name = 2; optional string arguments = 3; }
 
-// TOOL_STATUS_PRIVATE (8): a tainted job's result, shown to the model as its
-// text alone (tool-job-controller.md, private tool result status).
 // Unparsed proposals. The service is the only argument parser and owns grants,
 // host execution and durable outcomes (tool-call-records.md).
-enum ToolStatus { TOOL_STATUS_UNSPECIFIED = 0; TOOL_STATUS_SUCCESS = 1; TOOL_STATUS_DENIED = 2; TOOL_STATUS_INVALID_ARGUMENTS = 3; TOOL_STATUS_UNAVAILABLE = 4; TOOL_STATUS_TIMEOUT = 5; TOOL_STATUS_CANCELLED = 6; TOOL_STATUS_LIMIT = 7; TOOL_STATUS_PRIVATE = 8; }
 enum ToolCallSource { TOOL_CALL_SOURCE_UNSPECIFIED = 0; TOOL_CALL_SOURCE_GENERATED_CONTENT = 1; TOOL_CALL_SOURCE_PROVIDER_JSON = 2; }
 message ToolCall {
-  // 1-201; 201 only for the over-limit proposal (owner, 2026-10-18).
+  // The call's position in this request's response, 1-201; the service
+  // assigns the turn ordinal (CC4).
   optional uint32 ordinal = 1;
   // 1-256 bytes; absent when longer, then name_bytes is set.
   optional string name = 2;
@@ -108,7 +124,6 @@ message ToolCall {
   // Typed argument messages were removed (owner, 2026-10-17).
   reserved 10 to 19;
 }
-message ToolResult { optional uint32 ordinal = 1; optional ToolStatus status = 2; optional string text = 3; optional uint64 next_offset = 4; optional bool truncated = 5; }
 
 message ContextMeasured { optional uint32 input_tokens = 1; optional uint32 capacity_tokens = 2; }
 
@@ -122,4 +137,5 @@ message ModelInventoryEntry {
 message ModelInventoryIssue { optional string provider = 1; optional string reason = 2; }
 
 // One settled executor request; observed counters are independent of context occupancy.
+// request_ordinal equals the request's Begin.request_ordinal (CC4).
 message InferenceUsage { optional uint32 request_ordinal = 1; optional uint64 input_tokens = 2; optional uint64 output_tokens = 3; optional uint64 cached_input_tokens = 4; optional bool complete = 5; }

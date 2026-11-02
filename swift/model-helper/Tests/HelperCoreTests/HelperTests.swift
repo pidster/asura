@@ -149,7 +149,7 @@ private func revise(_ response: inout Data, _ end: Asura_Model_V1_SnapshotEnd, _
     #expect(reply.hello.contextSource == ContextCapacitySource.system.rawValue)
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let data = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"
     begin.inputBytes = UInt64(data.count)
     try await service.send(scoped(.begin(begin)))
     #expect(try Wire.decode(#require(try await replies.next())).credit.transferID == 1)
@@ -208,7 +208,7 @@ private func revise(_ response: inout Data, _ end: Asura_Model_V1_SnapshotEnd, _
     #expect(!reply.hello.hasToolSchemaBytes)
     var input = ModelInput(); input.instructions = String(repeating: "x", count: 200_000); input.prompt = "fixture"
     let data = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"
     begin.inputBytes = UInt64(data.count)
     try await service.send(scoped(.begin(begin)))
     let first = try Wire.decode(#require(try await replies.next())).credit
@@ -248,7 +248,7 @@ private func revise(_ response: inout Data, _ end: Asura_Model_V1_SnapshotEnd, _
     var replies = service.frames.makeAsyncIterator()
     try await service.send(hello(identity))
     _ = try Wire.decode(#require(try await replies.next()))
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"
     begin.inputBytes = 8_001
     try await service.send(scoped(.begin(begin)))
     var credited = false
@@ -309,7 +309,7 @@ private func revise(_ response: inout Data, _ end: Asura_Model_V1_SnapshotEnd, _
     var replies = service.frames.makeAsyncIterator()
     try await service.send(hello(identity))
     _ = try await replies.next()
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = 20
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"; begin.inputBytes = 20
     try await service.send(scoped(.begin(begin)))
     _ = try await replies.next()
     var cancel = Asura_Model_V1_Cancel(); cancel.reason = .user
@@ -344,7 +344,7 @@ private actor Burst: ModelBackend {
     try await service.send(hello(identity)); _ = try await replies.next()
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
@@ -394,7 +394,7 @@ private actor Burst: ModelBackend {
     try await service.send(hello(identity)); _ = try await replies.next()
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
@@ -442,7 +442,7 @@ private struct UnsolicitedCancellationBackend: ModelBackend {
     try await service.send(hello(identity)); _ = try await replies.next()
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
@@ -480,7 +480,7 @@ func backendFailureDrainsBoundedSnapshotsOrStopsAtExistingBoundary(_ action: Str
     try await service.send(hello(identity)); _ = try await replies.next()
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
     let clock = ContinuousClock(); let started = clock.now
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
@@ -577,7 +577,7 @@ private actor CancellableGeneration: ModelBackend {
     try await service.send(hello(identity)); _ = try await replies.next()
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"
     begin.inputBytes = UInt64(bytes.count)
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
@@ -609,19 +609,10 @@ private actor CancellableGeneration: ModelBackend {
 
 /// PTS-R5: status 8 `private` is valid from the service only untruncated;
 /// status 9 is unknown.
-@Test func privateToolResultStatusRules() throws {
-    var result = Asura_Model_V1_ToolResult()
-    result.ordinal = 1; result.status = .private; result.text = "private: x"; result.truncated = false
-    try Wire.validate(scoped(.toolResult(result)), from: .service)
-    result.truncated = true
-    #expect(throws: HelperError.self) { try Wire.validate(scoped(.toolResult(result)), from: .service) }
-    result.truncated = false; result.status = .UNRECOGNIZED(9)
-    #expect(throws: HelperError.self) { try Wire.validate(scoped(.toolResult(result)), from: .service) }
-}
 
 /// Begin has no deadline field; the removed field 3 is an unknown field.
 @Test func beginCarriesNoDeadlineAndRemovedFieldIsRejected() throws {
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"
     begin.inputBytes = 10
     try Wire.validate(scoped(.begin(begin)), from: .service)
     var raw = try begin.serializedData(); raw.append(contentsOf: [0x18, 0xd0, 0x0f])
@@ -668,7 +659,7 @@ func stalledTransferAndReadyHandoffWaitUntilCancel(ready: Bool) async throws {
     try await service.send(hello(identity)); _ = try await replies.next()
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"
     begin.inputBytes = UInt64(bytes.count)
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     if ready {
@@ -720,7 +711,7 @@ func lateInputMeasurementPreservesOutputAndRejectsDuplicate(_ duplicate: Bool) a
     #expect(reply.hello.contextSource == ContextCapacitySource.system.rawValue)
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let data = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"
     begin.inputBytes = UInt64(data.count)
     try await service.send(scoped(.begin(begin)))
     #expect(try Wire.decode(#require(try await replies.next())).credit.transferID == 1)
@@ -805,7 +796,7 @@ func usageReportsPreserveTextAndCancellationHasOneReportBeforeTerminal(mode: Str
     try await service.send(hello(identity)); _ = try await replies.next()
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"
     begin.inputBytes = UInt64(bytes.count)
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
@@ -862,7 +853,7 @@ func usageReportsPreserveTextAndCancellationHasOneReportBeforeTerminal(mode: Str
 /// CC-I13 (helper side): the reported tool overhead covers every declared tool.
 @Test func toolSchemaBytesCoverDeclaredTools() {
     let bytes = projectToolSchemaBytes()
-    let names = makeProjectTools({ _ in throw BackendFailure(.internalError) })
+    let names = makeProjectTools()
         .reduce(0) { $0 + $1.name.utf8.count + $1.description.utf8.count }
     #expect(Int(bytes) > names)
     #expect(bytes <= Limits.toolSchemaBytes)
@@ -905,7 +896,7 @@ private func runRevisions(_ backend: RevisionBackend) async throws
     try await service.send(hello(identity)); _ = try await replies.next()
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
@@ -1044,7 +1035,7 @@ private func runThinking(_ backend: ThinkingBackend, request: ThinkingRequest) a
     let available = try Wire.decode(#require(try await replies.next())).hello
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
+    var begin = Asura_Model_V1_Begin(); begin.requestOrdinal = 1; begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
     if request != .none { begin.thinking = request }
     try await service.send(scoped(.begin(begin)))
     guard let credit = try await replies.next() else {

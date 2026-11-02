@@ -1,3 +1,4 @@
+use super::tool_tests::delivered_any;
 use super::*;
 use crate::conversation::tool_tests::{Fixture, decided, encodes, wire};
 use asura_storage::authority::writer::test_support::controlled_ticket;
@@ -206,12 +207,12 @@ fn acknowledged_committed_create_after_cancel_stays_success_but_is_not_delivered
         now,
     );
     let active = fixture.owner.active.as_ref().unwrap();
-    assert_eq!(active.tool_cache[0].2.status, Some(1));
+    assert_eq!(active.tool_cache[0].reply.status, Some(1));
     assert_eq!(
-        active.tool_cache[0].2.text.as_deref(),
+        active.tool_cache[0].reply.text.as_deref(),
         Some(rendered.as_str())
     );
-    assert!(active.model.tool_test_results().is_empty());
+    assert!(!delivered_any(active));
 }
 
 fn pending_projection() -> Arc<journal::Replay> {
@@ -253,6 +254,7 @@ fn pending_projection() -> Arc<journal::Replay> {
             helper: Some([8; 16]),
             cancel: None,
             terminal: None,
+            request_starts: vec![0],
             tools: vec![journal::ToolRecord {
                 name: "memory".into(),
                 tool: Some(journal::RegisteredTool::Memory),

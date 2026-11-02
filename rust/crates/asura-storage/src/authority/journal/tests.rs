@@ -2500,3 +2500,86 @@ fn epg_u3_kind_32_entries_survive_rolls_and_checkpoints() {
     };
     assert_eq!(check(&replayed, &mut index), live);
 }
+
+// ----- CC4 kind 33 (context-composer.md, CC-U34). -----
+
+fn request(operation: Id, generation: u64, request: u32) -> Record {
+    Record::RequestStarted(RequestStarted {
+        operation,
+        generation,
+        request,
+        measured_tokens: 1_716,
+        input_digest: [request as u8; 32],
+        manifest_digest: [0x33; 32],
+    })
+}
+/// CC-U34: kind 33 round trips; replay accepts it only after a new,
+/// resolved call of a started open turn, with the next request ordinal,
+/// and reopening the journal keeps the request starts.
+#[test]
+fn cc_u34_request_started_needs_a_new_resolved_call_and_the_next_ordinal() {
+    let record = request(id(7), 3, 2);
+    let frame = encode_frame(
+        &FrameContext {
+            installation_id: id(1),
+            transition_id: id(2),
+            sequence: 9,
+            prior_digest: [0; 32],
+            expected_revision: 0,
+            owner_generation: 1,
+        },
+        &record,
+    )
+    .unwrap();
+    let payload = &frame[144..frame.len() - 40];
+    assert_eq!(payload.len(), 96);
+    assert_eq!(decode_record(33, payload).unwrap(), record);
+    let mut low = payload.to_vec();
+    low[24..28].copy_from_slice(&1u32.to_be_bytes());
+    assert!(decode_record(33, &low).is_err(), "request 1 is kind 6");
+
+    let mut h = Harness::new();
+    let project = h.register(1);
+    let (conversation, operation, generation) = h.start(project, None);
+    // No call since request 1 started.
+    assert_eq!(
+        h.append(request(operation, generation, 2)),
+        Err(Failure::Invalid)
+    );
+    h.job(operation, generation, 1);
+    // A skipped ordinal.
+    assert_eq!(
+        h.append(request(operation, generation, 3)),
+        Err(Failure::Invalid)
+    );
+    h.append(request(operation, generation, 2)).unwrap();
+    // No new call since request 2 started.
+    assert_eq!(
+        h.append(request(operation, generation, 3)),
+        Err(Failure::Invalid)
+    );
+    // An unresolved call.
+    h.append(exec_call(operation, generation, 2)).unwrap();
+    assert_eq!(
+        h.append(request(operation, generation, 3)),
+        Err(Failure::Invalid)
+    );
+    h.append(intent(operation, generation, 2)).unwrap();
+    h.append(handle(operation, generation, 2)).unwrap();
+    h.append(request(operation, generation, 3)).unwrap();
+    assert_eq!(
+        h.state().operations[&operation].request_starts,
+        vec![0, 1, 2]
+    );
+    let reopened = open(h.files(), false).unwrap();
+    assert_eq!(
+        reopened.state().operations[&operation].request_starts,
+        vec![0, 1, 2]
+    );
+    // After the terminal no request starts.
+    h.finish(conversation, operation, generation, 0);
+    assert_eq!(
+        h.append(request(operation, generation, 4)),
+        Err(Failure::Invalid)
+    );
+}

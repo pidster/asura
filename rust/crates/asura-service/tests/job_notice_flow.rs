@@ -392,9 +392,13 @@ fn input_digest(chat: &Value) -> Result<[u8; 32]> {
             .map(|(role, text)| mp::HistoryTurn {
                 role: Some(if role == "user" { 1 } else { 2 }),
                 text: Some(text.clone()),
+                tool_calls: Vec::new(),
+                call_id: None,
+                tool_name: None,
             })
             .collect(),
         prompt: Some(prompt.1.clone()),
+        continuation: Vec::new(),
     };
     let bytes = wire::encode_input(&input).map_err(|e| format!("encode: {e:?}"))?;
     Ok(Sha256::digest(&bytes).into())
@@ -487,7 +491,7 @@ fn idle() -> Result<()> {
     );
     assert_eq!(input_digest(&chat)?, turn.input_digest);
     assert_eq!(composition.notice_views, 0b1, "the view is recorded");
-    assert_eq!(composition.composer_revision, 4);
+    assert_eq!(composition.composer_revision, 5);
     // J5T-07: the entry text holds no output and no payload state; output
     // reaches the model only inside the view, on a continuation line (CC3).
     let entry = &text[..text.find("[Output excerpt follows.").ok_or("view")?];
@@ -767,7 +771,7 @@ fn later() -> Result<()> {
     assert_eq!(history_entry(&chat, "Two jobs.")?, "Two jobs.");
     let (_, third_turn) = accepted(&fixture, third)?;
     assert_eq!(input_digest(&chat)?, third_turn.input_digest);
-    assert_eq!(third_turn.composition.composer_revision, 4);
+    assert_eq!(third_turn.composition.composer_revision, 5);
     // Crash and restart; the fourth turn rebuilds both notices from the
     // journal and has none of its own.
     fixture.crash()?;

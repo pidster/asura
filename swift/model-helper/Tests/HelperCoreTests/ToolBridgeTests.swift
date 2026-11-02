@@ -3,8 +3,28 @@ import Foundation
 import Testing
 @testable import HelperCore
 
-private struct ToolScript: ToolModelBackend {
-    let proposals: [ToolProposal]
+// CC4 helper session cases (context-composer.md, CC-S3 and CC4 wire changes):
+// one inference per Begin; a response's calls go out as ToolCall frames
+// after its text, then Terminal outcome 4; the session waits for the next
+// Begin. No ToolResult exists.
+
+/// Each request's scripted reply, by request ordinal; records what it received.
+actor RequestScript {
+    var replies: [ScriptedStep]
+    var inputs: [ModelInput] = []
+    var requests: [UInt32] = []
+    init(_ replies: [ScriptedStep]) { self.replies = replies }
+    func next(_ input: ModelInput, request: UInt32) -> ScriptedStep {
+        inputs.append(input); requests.append(request)
+        return replies.isEmpty ? .answer("done") : replies.removeFirst()
+    }
+}
+enum ScriptedStep: Sendable {
+    case answer(String)
+    case calls(String, [ToolProposal])
+}
+struct ToolScript: ToolModelBackend {
+    let script: RequestScript
     let source: ContextCapacitySource
     func status() async -> BackendStatus { BackendStatus(contextTokens: 4096,
         reportedContextTokens: 4096, contextSource: source, supportsTools: true,
@@ -12,156 +32,314 @@ private struct ToolScript: ToolModelBackend {
     func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         throw HelperError.unavailable
     }
-    func generateWithTools(_ input: ModelInput, handler: @escaping ToolHandler,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+    func generateWithTools(_ input: ModelInput, thinking: ThinkingRequest, request: UInt32,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws -> [ToolProposal] {
         try await snapshot(Snapshot(text: "", inputContext: (123, 4096)))
-        var text = ""
-        for proposal in proposals { text = try await handler(proposal).text }
-        try await snapshot(Snapshot(text: text, usageTokens: 1))
-    }
-}
-
-/// TCR-U15 (transport part): every provider path forwards the name and the
-/// exact argument text with its source; the result text returns unchanged.
-@Test(arguments: [false, true], ["system", "coreai:fixture", "mlx:fixture", "ollama:fixture"])
-func toolCallbackWaitsForServiceResultOrCancellation(cancel: Bool, selector: String) async throws {
-    try await toolCallbackJourney(cancel: cancel, selector: selector,
-        proposal: ToolProposal(name: "project", arguments: #"{"command":"read_file","path":"README.md"}"#,
-            source: .generatedContent))
-}
-
-@Test(arguments: ["system", "coreai:fixture", "mlx:fixture", "ollama:fixture"])
-func everyToolNameAndMalformedTextUseTheSameServiceBridge(selector: String) async throws {
-    for cancel in [false, true] {
-        for proposal in [
-            ToolProposal(name: "memory", arguments: #"{"command":"create_note","body":" exact\nbody "}"#, source: .generatedContent),
-            ToolProposal(name: "memory", arguments: #"{"command":"get_note"}"#, source: .generatedContent),
-            ToolProposal(name: "service", arguments: #"{"command":"audit","limit":99}"#, source: .generatedContent),
-            ToolProposal(name: "exec_cmd", arguments: #"{"command":"printf fixture","cwd":"."}"#, source: .generatedContent),
-            ToolProposal(name: "project", arguments: "not json {", source: .providerJson),
-            ToolProposal(name: "unregistered_tool", arguments: "", source: .providerJson)
-        ] {
-            try await toolCallbackJourney(cancel: cancel, selector: selector, proposal: proposal)
+        switch await script.next(input, request: request) {
+        case .answer(let text):
+            try await snapshot(Snapshot(text: text, usageTokens: 1))
+            return []
+        case .calls(let text, let proposals):
+            if !text.isEmpty { try await snapshot(Snapshot(text: text)) }
+            return proposals
         }
     }
 }
 
-/// TCR-U15 (owner, 2026-10-18): 200 proposals run with 4,000-byte results
-/// (800,000 bytes, far above the removed 65,536-byte turn total; the test's
-/// service transport sends results on its 4,096-byte control queue); the 201st is sent with ordinal 201 and, after its
-/// LIMIT result, the turn fails with outputLimit; no further proposal is sent.
-@Test func overLimitProposalIsSentThenTheTurnFailsWithOutputLimit() async throws {
-    #expect(Limits.recordedToolCalls == 200 && Limits.toolProposals == 201)
-    let proposals = (1...(Limits.toolProposals + 1)).map { _ in
-        ToolProposal(name: "service", arguments: #"{"command":"status"}"#, source: .generatedContent)
+/// The service side of one helper session over a socket pair.
+final class ToolSessionChannel: @unchecked Sendable {
+    let helper: Transport
+    let service: Transport
+    var replies: AsyncThrowingStream<Data, any Error>.AsyncIterator
+    let running: Task<Void, Never>
+    var selector = "system"
+    /// Revisions received; the current output transfer is `revision + 2`.
+    var revision: UInt64 = 0
+    /// The newest output transfer credited.
+    var credited: UInt64 = 0
+    var text = Data()
+    private var pending = Data()
+    init(helper: Transport, service: Transport, running: Task<Void, Never>) {
+        self.helper = helper; self.service = service; self.running = running
+        replies = service.frames.makeAsyncIterator()
     }
-    let channel = try await openToolSession(selector: "system", proposals: proposals)
-    defer { channel.close() }
-    let full = String(repeating: "x", count: 4_000)
-    for ordinal in UInt32(1)...Limits.toolProposals {
-        let call = try await channel.nextToolCall()
-        #expect(call.ordinal == ordinal && call.name == "service" && call.source == .generatedContent)
-        let over = ordinal == Limits.toolProposals
-        var result = Asura_Model_V1_ToolResult(); result.ordinal = ordinal
-        result.status = over ? .limit : .success; result.text = over ? "limit" : full
-        result.truncated = false
-        try await channel.send(.toolResult(result))
+    func scoped(_ body: Envelope.OneOf_Body) -> Envelope {
+        var value = Envelope(); value.operationID = Data(repeating: 7, count: 16)
+        value.generation = 1; value.body = body; return value
     }
-    let terminal = try await channel.terminal()
-    #expect(terminal.outcome == .failed && terminal.reason == .outputLimit)
-    #expect(channel.unexpectedToolCalls == 0)
+    func send(_ body: Envelope.OneOf_Body) async throws { try await service.send(scoped(body)) }
+    func next() async throws -> Envelope { try Wire.decode(#require(try await replies.next()), from: .helper) }
+    /// Begin, input, Ready and Start of request `ordinal`; credits the
+    /// current output transfer once.
+    func request(_ ordinal: UInt32, _ input: ModelInput, tools: Bool = true,
+        thinking: ThinkingRequest? = nil) async throws {
+        let data = try input.serializedData()
+        var begin = Asura_Model_V1_Begin(); begin.model = selector; begin.inputBytes = UInt64(data.count)
+        begin.requestOrdinal = ordinal
+        if tools { begin.enableProjectTools = true }
+        if let thinking { begin.thinking = thinking }
+        try await send(.begin(begin)); _ = try await next()
+        var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
+        chunk.ordinal = 0; chunk.revision = 0; chunk.data = data
+        try await send(.chunk(chunk))
+        var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(data.count)
+        try await send(.inputEnd(end))
+        let ready = try await next()
+        guard case .ready = ready.body else { throw HelperError.protocolFault }
+        try await send(.start(.init()))
+        try await credit()
+    }
+    /// Credits the current output transfer once, as the service does.
+    func credit() async throws {
+        let transfer = revision + 2
+        guard credited < transfer else { return }
+        var credit = Asura_Model_V1_Credit(); credit.transferID = transfer; credit.direction = .output
+        credit.acceptedBytes = 0; credit.grantedBytes = 65_536
+        credited = transfer
+        try await send(.credit(credit))
+    }
+    /// Frames until the request's Terminal: its calls, the terminal and the
+    /// response text as the service holds it. Each revision gets the next credit.
+    func collect() async throws -> (calls: [Asura_Model_V1_ToolCall], terminal: Asura_Model_V1_Terminal) {
+        var calls: [Asura_Model_V1_ToolCall] = []
+        while true {
+            let message = try await next()
+            switch message.body {
+            case .chunk(let value): pending.append(value.data)
+            case .snapshotEnd(let value):
+                text.removeSubrange(Int(value.offset)..<text.count)
+                text.append(pending); pending.removeAll()
+                revision = value.revision
+                try? await credit()
+            case .toolCall(let call): calls.append(call)
+            case .terminal(let value): return (calls, value)
+            default: break
+            }
+        }
+    }
+    var response: String { String(decoding: text, as: UTF8.self) }
+    func close() { service.close(); helper.close(); running.cancel() }
 }
 
-/// One model response with two tool calls: the second callback starts only
-/// after the service has seen the first call, so it arrives while the first is
-/// pending. After the first settles, the next request repeats the second.
-private struct ConcurrentToolScript: ToolModelBackend {
-    let first: ToolProposal
-    let second: ToolProposal
-    let firstSent: AsyncStream<Void>
-    let busyReturned: AsyncStream<ToolResult>.Continuation
-    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096,
-        reportedContextTokens: 4096, contextSource: .system, supportsTools: true,
-        capabilityProfile: try! CapabilityProfile(mask: 1, provenance: .runtime)) }
-    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
-        throw HelperError.unavailable
-    }
-    func generateWithTools(_ input: ModelInput, handler: @escaping ToolHandler,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
-        try await snapshot(Snapshot(text: "", inputContext: (123, 4096)))
-        async let pending = handler(first)
-        // Declared after the async let, so it runs first: a thrown busy
-        // callback finishes the stream and the test fails instead of waiting.
-        defer { busyReturned.finish() }
-        var gate = firstSent.makeAsyncIterator()
-        _ = await gate.next()
-        let busy = try await handler(second)
-        busyReturned.yield(busy)
-        let settled = try await pending
-        let repeated = try await handler(second)
-        try await snapshot(Snapshot(text: [busy.rendered, settled.text, repeated.text].joined(separator: "|"),
-            usageTokens: 1))
-    }
-}
-
-/// EXQ-D1 (model-tool-execution.md, concurrent callback busy reply): a callback
-/// that arrives while another is pending gets the busy reply at once. It sends
-/// no ToolCall and takes no ordinal; the pending call still completes, the
-/// repeated call gets ordinal 2, and the turn completes.
-@Test func concurrentCallbackGetsBusyReplyAndTurnContinues() async throws {
-    let (firstSent, signal) = AsyncStream<Void>.makeStream()
-    let (busyReplies, busyReturned) = AsyncStream<ToolResult>.makeStream()
-    let first = ToolProposal(name: "exec_cmd", arguments: #"{"command":"printf one"}"#, source: .providerJson)
-    let second = ToolProposal(name: "exec_cmd", arguments: #"{"command":"printf two"}"#, source: .providerJson)
-    let channel = try await openToolSession(selector: "system", proposals: [],
-        backend: ConcurrentToolScript(first: first, second: second, firstSent: firstSent,
-            busyReturned: busyReturned))
-    defer { channel.close() }
-    let call = try await channel.nextToolCall()
-    #expect(call.ordinal == 1 && call.arguments == first.arguments)
-    signal.yield()
-    // The busy reply returns while ordinal 1 is still pending, before any
-    // service result; the busy callback sends no frame.
-    var busyIterator = busyReplies.makeAsyncIterator()
-    let busy = try #require(await busyIterator.next())
-    #expect(busy.status == .unavailable && busy.nextOffset == nil && !busy.truncated)
-    try await channel.reply(1, .success, "one")
-    let repeated = try await channel.nextToolCall()
-    #expect(repeated.ordinal == 2 && repeated.name == "exec_cmd" && repeated.arguments == second.arguments)
-    try await channel.reply(2, .success, "two")
-    var observed = Data(); var terminal: Asura_Model_V1_Terminal?
-    while terminal == nil {
-        let message = try await channel.next()
-        switch message.body {
-        case .chunk(let value): observed.append(value.data)
-        case .terminal(let value): terminal = value
-        case .toolCall: channel.unexpectedToolCalls += 1
+/// Opens a session whose backend follows `script`, after the Hello exchange.
+func openSession(selector: String = "system", backend: any ModelBackend) async throws -> ToolSessionChannel {
+    var selector = selector
+    if let script = backend as? ToolScript, selector == "system" {
+        switch script.source {
+        case .coreai: selector = "coreai:fixture"
+        case .mlx: selector = "mlx:fixture"
+        case .ollama: selector = "ollama:fixture"
         default: break
         }
     }
-    #expect(terminal?.outcome == .complete)
-    #expect(channel.unexpectedToolCalls == 0)
-    #expect(String(data: observed, encoding: .utf8) == "Tool failed: unavailable\n"
-        + "tool_busy: call_pending; repeat this call after the pending result|one|two")
+    var fds: [Int32] = [-1, -1]
+    #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
+    let helper = try Transport(fd: fds[0]); let service = try Transport(fd: fds[1])
+    let identity = Data(repeating: 1, count: 32)
+    let session = HelperSession(transport: helper, factory: { _, _, _, _ in backend },
+        buildID: identity, schemaDigest: identity)
+    let running = Task { await session.run() }
+    let channel = ToolSessionChannel(helper: helper, service: service, running: running)
+    channel.selector = selector
+    var hello = Asura_Model_V1_Hello()
+    hello.buildID = identity; hello.schemaDigest = identity; hello.maxFrameBytes = 65_536
+    hello.availability = .unknown; hello.reason = .none; hello.selectedModel = selector
+    var helloEnvelope = Envelope(); helloEnvelope.body = .hello(hello)
+    try await service.send(helloEnvelope)
+    _ = try await channel.next()
+    return channel
 }
 
-/// The helper rejects a non-LIMIT result for the over-limit ordinal as a
-/// protocol fault; recorded ordinals accept any status.
-@Test func overLimitResultMustBeLimit() throws {
-    var recorded = Asura_Model_V1_ToolResult(); recorded.ordinal = Limits.recordedToolCalls
-    recorded.status = .success; recorded.text = ""; recorded.truncated = false
-    var accepted = Envelope(); accepted.operationID = Data(repeating: 7, count: 16); accepted.generation = 1
-    accepted.body = .toolResult(recorded)
-    try Wire.validate(accepted, from: .service)
-    var result = Asura_Model_V1_ToolResult(); result.ordinal = Limits.toolProposals; result.status = .success
-    result.text = ""; result.truncated = false
-    var message = Envelope(); message.operationID = Data(repeating: 7, count: 16); message.generation = 1
-    message.body = .toolResult(result)
-    #expect(throws: HelperError.self) { try Wire.validate(message, from: .service) }
-    result.status = .limit; message.body = .toolResult(result)
-    try Wire.validate(message, from: .service)
-    result.ordinal = Limits.toolProposals + 1; message.body = .toolResult(result)
-    #expect(throws: HelperError.self) { try Wire.validate(message, from: .service) }
+private func prompt(_ text: String) -> ModelInput {
+    var input = ModelInput(); input.instructions = ""; input.prompt = text; return input
+}
+private func proposal(_ name: String, _ arguments: String, _ source: Asura_Model_V1_ToolCallSource = .generatedContent) -> ToolProposal {
+    ToolProposal(name: name, arguments: arguments, source: source)
+}
+
+/// CC-S2: request 1 proposes two calls: ToolCall positions 1 and 2 after the
+/// text, then Terminal outcome 4 with 2 calls. Request 2 carries the
+/// continuation to the backend and completes. One inference per Begin; the
+/// backend sees the service's request ordinals.
+@Test func requestLoopRunsOneInferencePerBegin() async throws {
+    let script = RequestScript([
+        .calls("checking", [proposal("exec_cmd", #"{"command":"ls"}"#), proposal("job", #"{"command":"list"}"#)]),
+        .answer("final answer")
+    ])
+    let channel = try await openSession(backend: ToolScript(script: script, source: .system))
+    defer { channel.close() }
+    try await channel.request(1, prompt("list files"))
+    let first = try await channel.collect()
+    #expect(first.calls.map(\.ordinal) == [1, 2])
+    #expect(first.calls.map(\.name) == ["exec_cmd", "job"])
+    #expect(first.calls.map(\.arguments) == [#"{"command":"ls"}"#, #"{"command":"list"}"#])
+    #expect(first.terminal.outcome == .toolCalls && first.terminal.toolCalls == 2 && first.terminal.reason == .none)
+    #expect(channel.response == "checking")
+    var next = prompt("list files")
+    next.continuation = continuation([
+        (id: "call_1", name: "exec_cmd", arguments: #"{"command":"ls"}"#, output: "job: 1"),
+        (id: "call_2", name: "job", arguments: #"{"command":"list"}"#, output: "- none")])
+    try await channel.request(2, next)
+    let second = try await channel.collect()
+    #expect(second.calls.isEmpty)
+    #expect(second.terminal.outcome == .complete && !second.terminal.hasToolCalls)
+    #expect(channel.response == "final answer")
+    #expect(await script.requests == [1, 2])
+    #expect(await script.inputs.last?.continuation == next.continuation)
+}
+
+/// CC-S2: a cancel between requests ends the session with Terminal cancelled.
+@Test func cancelBetweenRequestsEndsTheSession() async throws {
+    let script = RequestScript([.calls("", [proposal("job", #"{"command":"list"}"#)])])
+    let channel = try await openSession(backend: ToolScript(script: script, source: .ollama))
+    defer { channel.close() }
+    try await channel.request(1, prompt("go"))
+    #expect(try await channel.collect().terminal.outcome == .toolCalls)
+    var cancel = Asura_Model_V1_Cancel(); cancel.reason = .user
+    try await channel.send(.cancel(cancel))
+    let terminal = try await channel.collect().terminal
+    #expect(terminal.outcome == .cancelled && terminal.reason == .cancelled)
+    #expect(await script.requests == [1])
+}
+
+/// CC-S2: a later Begin must carry the next ordinal and repeat the first
+/// request's tools; otherwise the helper faults and closes the channel.
+@Test(arguments: [(UInt32(3), true), (UInt32(1), true), (UInt32(2), false)])
+func laterBeginMustBeTheNextToolRequest(ordinal: UInt32, tools: Bool) async throws {
+    let script = RequestScript([.calls("", [proposal("job", #"{"command":"list"}"#)])])
+    let channel = try await openSession(backend: ToolScript(script: script, source: .mlx))
+    defer { channel.close() }
+    try await channel.request(1, prompt("go"))
+    #expect(try await channel.collect().terminal.outcome == .toolCalls)
+    let data = try prompt("go").serializedData()
+    var begin = Asura_Model_V1_Begin(); begin.model = channel.selector; begin.inputBytes = UInt64(data.count)
+    begin.requestOrdinal = ordinal
+    if tools { begin.enableProjectTools = true }
+    try await channel.send(.begin(begin))
+    var frames: [Envelope] = []
+    while let raw = try await channel.replies.next() { frames.append(try Wire.decode(raw, from: .helper)) }
+    #expect(!frames.contains { if case .credit = $0.body { true } else { false } })
+    #expect(await script.requests == [1])
+}
+
+/// Every provider source sends the name and exact argument text unread,
+/// malformed and unregistered ones included (TCR-U15, transport part).
+@Test(arguments: [ContextCapacitySource.system, .coreai, .mlx, .ollama])
+func everyProposalIsSentUnread(source: ContextCapacitySource) async throws {
+    let proposals = [
+        proposal("memory", #"{"command":"create_note","body":" exact\nbody "}"#),
+        proposal("service", #"{"command":"audit","limit":99}"#),
+        proposal("project", "not json {", .providerJson),
+        proposal("unregistered_tool", "", .providerJson)
+    ]
+    let script = RequestScript([.calls("", proposals)])
+    let channel = try await openSession(backend: ToolScript(script: script, source: source))
+    defer { channel.close() }
+    try await channel.request(1, prompt("go"))
+    let result = try await channel.collect()
+    #expect(result.calls.count == proposals.count)
+    for (call, expected) in zip(result.calls, proposals) {
+        #expect(call.name == expected.name && call.arguments == expected.arguments && call.source == expected.source)
+        #expect(!call.hasNameBytes && !call.hasArgumentsBytes && call.unknownFields.data.isEmpty)
+    }
+    #expect(result.terminal.toolCalls == UInt32(proposals.count))
+}
+
+/// A response with more than 201 calls sends the first 201; the service then
+/// records the 201st as the over-limit call and ends the turn (CC4).
+@Test func aRequestSendsAtMost201Calls() async throws {
+    #expect(Limits.recordedToolCalls == 200 && Limits.toolProposals == 201)
+    let proposals = (1...(Limits.toolProposals + 5)).map { _ in proposal("service", #"{"command":"status"}"#) }
+    var fds: [Int32] = [-1, -1]
+    #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
+    let helper = try Transport(fd: fds[0])
+    let raw = RawServiceSide(fd: fds[1])
+    defer { helper.close(); raw.close() }
+    let identity = Data(repeating: 1, count: 32)
+    let script = RequestScript([.calls("", proposals)])
+    let session = HelperSession(transport: helper, factory: { _, _, _, _ in ToolScript(script: script, source: .system) },
+        buildID: identity, schemaDigest: identity)
+    let running = Task { await session.run() }
+    defer { running.cancel() }
+    var hello = Asura_Model_V1_Hello()
+    hello.buildID = identity; hello.schemaDigest = identity; hello.maxFrameBytes = 65_536
+    hello.availability = .unknown; hello.reason = .none; hello.selectedModel = "system"
+    var helloEnvelope = Envelope(); helloEnvelope.body = .hello(hello)
+    try raw.send(helloEnvelope)
+    _ = try await raw.wait { if case .hello = $0.body { true } else { false } }
+    let data = try prompt("go").serializedData()
+    var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(data.count)
+    begin.requestOrdinal = 1; begin.enableProjectTools = true
+    try raw.send(raw.scoped(.begin(begin)))
+    _ = try await raw.wait { if case .credit = $0.body { true } else { false } }
+    var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
+    chunk.ordinal = 0; chunk.revision = 0; chunk.data = data
+    try raw.send(raw.scoped(.chunk(chunk)))
+    var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(data.count)
+    try raw.send(raw.scoped(.inputEnd(end)))
+    _ = try await raw.wait { if case .ready = $0.body { true } else { false } }
+    try raw.send(raw.scoped(.start(.init())))
+    let terminal = try await raw.wait { if case .terminal = $0.body { true } else { false } }.terminal
+    let calls = raw.received.compactMap { frame -> Asura_Model_V1_ToolCall? in
+        if case .toolCall(let call) = frame.body { return call } else { return nil }
+    }
+    #expect(calls.count == Int(Limits.toolProposals))
+    #expect(calls.map(\.ordinal) == Array(1...Limits.toolProposals))
+    #expect(terminal.outcome == .toolCalls && terminal.toolCalls == Limits.toolProposals)
+}
+
+/// The service side of a socket pair with blocking writes and a reader thread
+/// that feeds the frame decoder 256 bytes at a time, so a burst of frames
+/// never exceeds the decoder's per-feed bound (test harness only).
+final class RawServiceSide: @unchecked Sendable {
+    private let fd: Int32
+    private let lock = NSLock()
+    private var frames: [Envelope] = []
+    private var ended = false
+    init(fd: Int32) {
+        self.fd = fd
+        let thread = Thread { [self] in
+            var decoder = FrameDecoder()
+            var buffer = [UInt8](repeating: 0, count: 256)
+            while true {
+                let count = Darwin.read(fd, &buffer, buffer.count)
+                guard count > 0, let decoded = try? decoder.feed(Data(buffer.prefix(count))) else {
+                    lock.withLock { ended = true }; return
+                }
+                for frame in decoded {
+                    guard let message = try? Wire.decode(frame, from: .helper) else { lock.withLock { ended = true }; return }
+                    lock.withLock { frames.append(message) }
+                }
+            }
+        }
+        thread.start()
+    }
+    var received: [Envelope] { lock.withLock { frames } }
+    func scoped(_ body: Envelope.OneOf_Body) -> Envelope {
+        var value = Envelope(); value.operationID = Data(repeating: 7, count: 16)
+        value.generation = 1; value.body = body; return value
+    }
+    func send(_ message: Envelope) throws {
+        let frame = try Wire.frame(message)
+        try frame.withUnsafeBytes { raw in
+            var offset = 0
+            while offset < raw.count {
+                let count = Darwin.write(fd, raw.baseAddress! + offset, raw.count - offset)
+                guard count > 0 else { throw HelperError.closed }
+                offset += count
+            }
+        }
+    }
+    /// The first received frame matching `match`; test-only polling with a bound.
+    func wait(_ match: (Envelope) -> Bool) async throws -> Envelope {
+        for _ in 0..<5_000 {
+            if let found = received.first(where: match) { return found }
+            if lock.withLock({ ended }) { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        throw HelperError.closed
+    }
+    func close() { Darwin.shutdown(fd, SHUT_RDWR); Darwin.close(fd) }
 }
 
 /// TCR-U15: a name over 256 bytes and argument text over 64,000 bytes are sent
@@ -169,100 +347,16 @@ private struct ConcurrentToolScript: ToolModelBackend {
 @Test func oversizedNameAndArgumentsSendSizesOnly() async throws {
     let longName = String(repeating: "n", count: 257)
     let longArguments = #"{"command":"create_note","body":""# + String(repeating: "é", count: 32_000) + #""}"#
-    let channel = try await openToolSession(selector: "system", proposals: [
-        ToolProposal(name: longName, arguments: #"{}"#, source: .generatedContent),
-        ToolProposal(name: "memory", arguments: longArguments, source: .generatedContent),
-        ToolProposal(name: String(repeating: "m", count: 256),
-            arguments: String(repeating: "x", count: 64_000), source: .generatedContent)])
+    let script = RequestScript([.calls("", [
+        proposal(longName, #"{}"#), proposal("memory", longArguments),
+        proposal(String(repeating: "m", count: 256), String(repeating: "x", count: 64_000))])])
+    let channel = try await openSession(backend: ToolScript(script: script, source: .system))
     defer { channel.close() }
-    let first = try await channel.nextToolCall()
-    #expect(!first.hasName && first.nameBytes == 257 && first.arguments == "{}" && !first.hasArgumentsBytes)
-    try await channel.reply(1, .invalidArguments, "invalid_arguments: name_over_limit")
-    let second = try await channel.nextToolCall()
-    #expect(second.name == "memory" && !second.hasArguments
-        && second.argumentsBytes == UInt32(longArguments.utf8.count))
-    try await channel.reply(2, .invalidArguments, "invalid_arguments: arguments_over_limit")
-    let third = try await channel.nextToolCall()
-    #expect(third.name.utf8.count == 256 && third.arguments.utf8.count == 64_000)
-    try await channel.reply(3, .success, "ok")
-    let terminal = try await channel.terminal()
-    #expect(terminal.outcome == .complete)
-}
-
-private func toolCallbackJourney(cancel: Bool, selector: String, proposal: ToolProposal) async throws {
-    var fds: [Int32] = [-1, -1]
-    #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
-    let helper = try Transport(fd: fds[0]); let service = try Transport(fd: fds[1])
-    defer { helper.close(); service.close() }
-    let identity = Data(repeating: 1, count: 32)
-    let session = HelperSession(transport: helper, factory: { selected, assets, endpoint, capabilities in
-        #expect(selected == selector && assets == "/tmp/model-fixture" && endpoint == nil && capabilities == nil)
-        let source: ContextCapacitySource
-        if selected.hasPrefix("coreai:") { source = .coreai }
-        else if selected.hasPrefix("mlx:") { source = .mlx }
-        else if selected.hasPrefix("ollama:") { source = .ollama }
-        else { source = .system }
-        return ToolScript(proposals: [proposal], source: source)
-    }, buildID: identity, schemaDigest: identity)
-    let running = Task { await session.run() }
-    defer { running.cancel() }
-    func scoped(_ body: Envelope.OneOf_Body) -> Envelope {
-        var value = Envelope(); value.operationID = Data(repeating: 7, count: 16)
-        value.generation = 1; value.body = body; return value
-    }
-    var replies = service.frames.makeAsyncIterator()
-    var hello = Asura_Model_V1_Hello()
-    hello.buildID = identity; hello.schemaDigest = identity; hello.maxFrameBytes = 65_536
-    hello.availability = .unknown; hello.reason = .none
-    hello.selectedModel = selector; hello.assetRoot = "/tmp/model-fixture"
-    var helloEnvelope = Envelope(); helloEnvelope.body = .hello(hello)
-    try await service.send(helloEnvelope)
-    let greeting = try Wire.decode(#require(try await replies.next()), from: .helper)
-    #expect(greeting.hello.selectedModel == selector && greeting.hello.supportedCapabilities & 1 != 0)
-    var input = ModelInput(); input.instructions = ""; input.prompt = "read file"
-    let data = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = selector; begin.inputBytes = UInt64(data.count)
-    begin.enableProjectTools = true
-    try await service.send(scoped(.begin(begin))); _ = try await replies.next()
-    var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
-    chunk.ordinal = 0; chunk.revision = 0; chunk.data = data
-    try await service.send(scoped(.chunk(chunk)))
-    var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(data.count)
-    try await service.send(scoped(.inputEnd(end))); _ = try await replies.next()
-    var credit = Asura_Model_V1_Credit(); credit.transferID = 2; credit.direction = .output
-    credit.acceptedBytes = 0; credit.grantedBytes = 65_536
-    try await service.send(scoped(.start(.init())))
-    try await service.send(scoped(.credit(credit)))
-    let measurement = try Wire.decode(#require(try await replies.next()), from: .helper)
-    #expect(measurement.contextMeasured.inputTokens == 123)
-    #expect(measurement.contextMeasured.capacityTokens == 4096)
-    let call = try Wire.decode(#require(try await replies.next()), from: .helper)
-    #expect(call.toolCall.ordinal == 1)
-    #expect(call.toolCall.name == proposal.name && call.toolCall.arguments == proposal.arguments)
-    #expect(call.toolCall.source == proposal.source)
-    #expect(!call.toolCall.hasNameBytes && !call.toolCall.hasArgumentsBytes)
-    #expect(call.toolCall.unknownFields.data.isEmpty)
-    if cancel {
-        var message = Asura_Model_V1_Cancel(); message.reason = .user
-        try await service.send(scoped(.cancel(message)))
-    } else {
-        var result = Asura_Model_V1_ToolResult(); result.ordinal = 1; result.status = .success
-        result.text = "observed file content"; result.nextOffset = 21; result.truncated = false
-        try await service.send(scoped(.toolResult(result)))
-    }
-    var observed = Data(); var terminal: Asura_Model_V1_Terminal?
-    while let frame = try await replies.next() {
-        let message = try Wire.decode(frame, from: .helper)
-        switch message.body {
-        case .chunk(let value): observed.append(value.data)
-        case .terminal(let value): terminal = value
-        default: break
-        }
-        if terminal != nil { break }
-    }
-    #expect(terminal?.outcome == (cancel ? .cancelled : .complete))
-    #expect(cancel ? observed.isEmpty : String(data: observed, encoding: .utf8) == "observed file content")
-    service.close(); helper.close(); await running.value
+    try await channel.request(1, prompt("go"))
+    let calls = try await channel.collect().calls
+    #expect(!calls[0].hasName && calls[0].nameBytes == 257 && calls[0].arguments == "{}" && !calls[0].hasArgumentsBytes)
+    #expect(calls[1].name == "memory" && !calls[1].hasArguments && calls[1].argumentsBytes == UInt32(longArguments.utf8.count))
+    #expect(calls[2].name.utf8.count == 256 && calls[2].arguments.utf8.count == 64_000)
 }
 
 @Test func toolWireRejectsWrongDirectionsBoundsAndUnknownFields() throws {
@@ -301,86 +395,55 @@ private func toolCallbackJourney(cancel: Bool, selector: String, proposal: ToolP
     rejected { $0.clearSource() }
     rejected { $0.source = .unspecified }
     // Removed typed argument field 10 (read_file) is now unknown and rejected.
-    envelope.body = .toolCall(call)
     var raw = try call.serializedData(); raw.append(contentsOf: [0x52, 0x00])
     let stale = try Asura_Model_V1_ToolCall(serializedBytes: raw)
     envelope.body = .toolCall(stale)
     #expect(throws: (any Error).self) { _ = try Wire.decode(envelope.serializedData(), from: .helper) }
 }
 
-/// A scripted session over a socket pair: the service side of one turn.
-final class ToolSessionChannel: @unchecked Sendable {
-    let helper: Transport
-    let service: Transport
-    var replies: AsyncThrowingStream<Data, any Error>.AsyncIterator
-    let running: Task<Void, Never>
-    var unexpectedToolCalls = 0
-    init(helper: Transport, service: Transport, running: Task<Void, Never>) {
-        self.helper = helper; self.service = service; self.running = running
-        replies = service.frames.makeAsyncIterator()
+/// CC4 wire: Begin needs its request ordinal; outcome 4 needs 1 to 201 calls
+/// and reason none; no other outcome carries calls; envelope field 21 (the
+/// removed ToolResult) is unknown.
+@Test func requestLoopWireShapes() throws {
+    var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = 1
+    var envelope = Envelope(); envelope.operationID = Data(repeating: 1, count: 16); envelope.generation = 1
+    envelope.body = .begin(begin)
+    #expect(throws: HelperError.self) { try Wire.validate(envelope, from: .service) }
+    begin.requestOrdinal = 2; envelope.body = .begin(begin)
+    try Wire.validate(envelope, from: .service)
+    func terminal(_ outcome: Asura_Model_V1_Outcome, _ reason: Reason, _ calls: UInt32?) -> Envelope {
+        var end = Asura_Model_V1_Terminal(); end.outcome = outcome; end.reason = reason
+        end.lastRevision = 1; end.count = 0; end.totalBytes = 0; end.usageKnown = false
+        if let calls { end.toolCalls = calls }
+        var value = envelope; value.body = .terminal(end); return value
     }
-    func scoped(_ body: Envelope.OneOf_Body) -> Envelope {
-        var value = Envelope(); value.operationID = Data(repeating: 7, count: 16)
-        value.generation = 1; value.body = body; return value
+    try Wire.validate(terminal(.toolCalls, .none, 1), from: .helper)
+    try Wire.validate(terminal(.toolCalls, .none, Limits.toolProposals), from: .helper)
+    for bad in [terminal(.toolCalls, .none, nil), terminal(.toolCalls, .none, 0),
+        terminal(.toolCalls, .none, Limits.toolProposals + 1), terminal(.toolCalls, .protocolFault, 1),
+        terminal(.complete, .none, 1), terminal(.failed, .protocolFault, 1)] {
+        #expect(throws: HelperError.self) { try Wire.validate(bad, from: .helper) }
     }
-    func send(_ body: Envelope.OneOf_Body) async throws { try await service.send(scoped(body)) }
-    func next() async throws -> Envelope { try Wire.decode(#require(try await replies.next()), from: .helper) }
-    func nextToolCall() async throws -> Asura_Model_V1_ToolCall {
-        while true {
-            let message = try await next()
-            if case .toolCall(let call) = message.body { return call }
-            if case .terminal = message.body { throw HelperError.closed }
-        }
-    }
-    func reply(_ ordinal: UInt32, _ status: Asura_Model_V1_ToolStatus, _ text: String) async throws {
-        var result = Asura_Model_V1_ToolResult(); result.ordinal = ordinal; result.status = status
-        result.text = text; result.truncated = false
-        try await send(.toolResult(result))
-    }
-    func terminal() async throws -> Asura_Model_V1_Terminal {
-        while true {
-            let message = try await next()
-            switch message.body {
-            case .terminal(let value): return value
-            case .toolCall: unexpectedToolCalls += 1
-            default: break
-            }
-        }
-    }
-    func close() { service.close(); helper.close(); running.cancel() }
+    var bytes = try Envelope.with { $0.operationID = Data(repeating: 7, count: 16); $0.generation = 1 }.serializedData()
+    bytes.append(contentsOf: [0xaa, 0x01, 0x02, 0x08, 0x01])
+    #expect(throws: (any Error).self) { _ = try Wire.decode(bytes, from: .service) }
 }
 
-/// Opens a turn with tools enabled whose backend proposes `proposals` in order.
-func openToolSession(selector: String, proposals: [ToolProposal],
-    backend: (any ModelBackend)? = nil) async throws -> ToolSessionChannel {
-    var fds: [Int32] = [-1, -1]
-    #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
-    let helper = try Transport(fd: fds[0]); let service = try Transport(fd: fds[1])
-    let identity = Data(repeating: 1, count: 32)
-    let session = HelperSession(transport: helper, factory: { _, _, _, _ in
-        backend ?? ToolScript(proposals: proposals, source: .system)
-    }, buildID: identity, schemaDigest: identity)
-    let running = Task { await session.run() }
-    let channel = ToolSessionChannel(helper: helper, service: service, running: running)
-    var hello = Asura_Model_V1_Hello()
-    hello.buildID = identity; hello.schemaDigest = identity; hello.maxFrameBytes = 65_536
-    hello.availability = .unknown; hello.reason = .none; hello.selectedModel = selector
-    var helloEnvelope = Envelope(); helloEnvelope.body = .hello(hello)
-    try await service.send(helloEnvelope)
-    _ = try await channel.next()
-    var input = ModelInput(); input.instructions = ""; input.prompt = "tools"
-    let data = try input.serializedData()
-    var begin = Asura_Model_V1_Begin(); begin.model = selector; begin.inputBytes = UInt64(data.count)
-    begin.enableProjectTools = true
-    try await channel.send(.begin(begin)); _ = try await channel.next()
-    var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
-    chunk.ordinal = 0; chunk.revision = 0; chunk.data = data
-    try await channel.send(.chunk(chunk))
-    var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(data.count)
-    try await channel.send(.inputEnd(end)); _ = try await channel.next()
-    var credit = Asura_Model_V1_Credit(); credit.transferID = 2; credit.direction = .output
-    credit.acceptedBytes = 0; credit.grantedBytes = 65_536
-    try await channel.send(.start(.init()))
-    try await channel.send(.credit(credit))
-    return channel
+/// CC4 input: the continuation is paired assistant and tool entries with
+/// matching call IDs; history holds no tool fields.
+@Test func continuationStructureIsValidated() throws {
+    var input = ModelInput(); input.instructions = "i"; input.prompt = "p"
+    input.continuation = continuation([(id: "call_1", name: "exec_cmd", arguments: "{}", output: "x"),
+        (id: "call_2", name: "job", arguments: "{}", output: "y")])
+    #expect(try Wire.input(input.serializedData()) == input)
+    var swapped = input; swapped.continuation.swapAt(1, 2)
+    var missing = input; missing.continuation.removeLast()
+    var spoken = input; spoken.continuation[0].text = "words"
+    var badID = input; badID.continuation[0].toolCalls[0].callID = "call 1"; badID.continuation[1].callID = "call 1"
+    var history = input; history.continuation = []
+    var turn = Asura_Model_V1_HistoryTurn(); turn.role = .assistant; turn.text = "a"; turn.callID = "call_1"
+    history.history = [turn]
+    for bad in [swapped, missing, spoken, badID, history] {
+        #expect(throws: (any Error).self) { _ = try Wire.input(bad.serializedData()) }
+    }
 }

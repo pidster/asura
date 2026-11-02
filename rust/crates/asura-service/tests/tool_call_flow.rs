@@ -195,6 +195,8 @@ fn id(value: Option<Vec<u8>>) -> Result<[u8; 16]> {
 enum Step {
     /// One tool call with any name and any argument JSON value.
     Call(String, Value),
+    /// Several tool calls in one response (CC4).
+    Calls(Vec<(String, Value)>),
     /// The final answer.
     Final,
     /// An HTTP 400 reply with this JSON body, as the daemon refuses a prompt
@@ -409,11 +411,21 @@ fn serve(
                 "done": true, "done_reason": "stop", "prompt_eval_count": 48, "eval_count": 3});
             return socket.write_all(format!("{done}\n").as_bytes());
         }
+        // The request body's size bounds its tokens (one token covers at
+        // least one byte), so the measured input the service sees is an
+        // honest upper bound (CC4 step 2).
+        let prompt_tokens = length;
         let response = match step {
             Step::Call(name, arguments) => json!({
                 "message": {"role": "assistant", "content": "", "tool_calls": [
                     {"function": {"name": name, "arguments": arguments}}]},
-                "done": true, "done_reason": "stop", "prompt_eval_count": 32, "eval_count": 2}),
+                "done": true, "done_reason": "stop", "prompt_eval_count": prompt_tokens, "eval_count": 2}),
+            Step::Calls(calls) => json!({
+                "message": {"role": "assistant", "content": "", "tool_calls": calls
+                    .into_iter()
+                    .map(|(name, arguments)| json!({"function": {"name": name, "arguments": arguments}}))
+                    .collect::<Vec<_>>()},
+                "done": true, "done_reason": "stop", "prompt_eval_count": prompt_tokens, "eval_count": 2}),
             _ => json!({
                 "message": {"role": "assistant", "content": "COMPLETE"},
                 "done": true, "done_reason": "stop", "prompt_eval_count": 48, "eval_count": 3}),
@@ -425,6 +437,210 @@ fn serve(
 }
 
 // ----------------------------------------------------------------- turns
+
+/// The kind 6 and kind 33 records of `operation`, in journal order.
+fn request_starts(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<(u32, [u8; 32])>> {
+    let (bytes, _) = fixture.journal()?;
+    Ok(frames(&bytes)?
+        .into_iter()
+        .filter_map(|(_, record)| match record {
+            journal::Record::StartAuthorized(p) if p.operation == operation => {
+                Some((1, p.input_digest))
+            }
+            journal::Record::RequestStarted(p) if p.operation == operation => {
+                Some((p.request, p.input_digest))
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// CC-I20 (CC4): one response with two calls, then one call, then the
+/// answer: three chat requests through the real service and helper. Each
+/// later request's messages start with the earlier request's messages
+/// byte for byte, then the assistant calls and the tool outputs. Kind 6
+/// starts request 1 and kind 33 requests 2 and 3, with distinct input
+/// digests; the calls carry turn ordinals 1 to 3; the journal replays.
+fn request_loop() -> Result<()> {
+    let (fixture, model, project, directory) = setup("requests")?;
+    std::fs::write(directory.join("a.txt"), "alpha\n")?;
+    std::fs::write(directory.join("b.txt"), "beta\n")?;
+    model.script(&[
+        Step::Calls(vec![
+            (
+                "project".into(),
+                json!({"command": "read_file", "path": "a.txt"}),
+            ),
+            (
+                "project".into(),
+                json!({"command": "read_file", "path": "b.txt"}),
+            ),
+        ]),
+        call("project", json!({"command": "list_directory"})),
+        Step::Final,
+    ]);
+    let operation = submit(&fixture, project, "CC-I20")?;
+    let event = finish(&fixture, operation, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    let requests = model.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3, "one chat request per model request");
+    let messages: Vec<&Vec<Value>> = requests
+        .iter()
+        .map(|r| r["messages"].as_array().unwrap())
+        .collect();
+    for (index, pair) in messages.windows(2).enumerate() {
+        assert_eq!(
+            &pair[1][..pair[0].len()],
+            &pair[0][..],
+            "request {} prefix",
+            index + 1
+        );
+    }
+    // Request 2 ends with one assistant entry holding both calls and their
+    // outputs in call order; request 3 adds the third pair.
+    let two = messages[1];
+    let calls = two[two.len() - 3]["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(two[two.len() - 2]["role"], "tool");
+    assert!(
+        two[two.len() - 2]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("alpha")
+    );
+    assert!(
+        two[two.len() - 1]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("beta")
+    );
+    assert_eq!(messages[2].len(), two.len() + 2);
+    let recorded = calls_of(&fixture, operation)?;
+    assert_eq!(recorded, vec![1, 2, 3]);
+    let starts = request_starts(&fixture, operation)?;
+    assert_eq!(
+        starts.iter().map(|s| s.0).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert!(starts[0].1 != starts[1].1 && starts[1].1 != starts[2].1);
+    let (_, replay) = fixture.journal()?;
+    assert_eq!(replay.operations[&operation].request_starts, vec![0, 2, 3]);
+    sweep(&fixture.home, &[])?;
+    println!(
+        "PASS CC-I20 request loop: 3 chat requests, each a byte-for-byte extension of the last; kind 6 and two kind 33 with distinct input digests; ordinals 1-3"
+    );
+    Ok(())
+}
+/// CC-I21 (CC4): one response proposes a long exec_cmd and a second call;
+/// the person cancels while the first runs. Kind 7 commits, the queued call
+/// is recorded `cancelled`, then the terminal; the helper, waiting between
+/// requests, takes the cancel; no further chat request; controls stay
+/// responsive.
+fn request_loop_cancel() -> Result<()> {
+    let (fixture, model, project, _) = setup("loop-cancel")?;
+    model.script(&[
+        Step::Calls(vec![
+            (
+                "exec_cmd".into(),
+                json!({"command": "sleep 30", "yield_seconds": 30}),
+            ),
+            ("project".into(), json!({"command": "list_directory"})),
+        ]),
+        Step::Final,
+    ]);
+    let operation = submit(&fixture, project, "CC-I21")?;
+    let end = Instant::now() + Duration::from_secs(60);
+    while !calls_of(&fixture, operation)
+        .unwrap_or_default()
+        .contains(&1)
+    {
+        if Instant::now() >= end {
+            return Err("the first call was never recorded".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut client = fixture.attach()?;
+    within_100ms("Inspect while the call runs", || Ok(client.inspect()?))?;
+    fixture
+        .attach()?
+        .cancel_conversation(operation, 1, &|| false)?;
+    let event = finish(&fixture, operation, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(5), "cancelled: {event:?}");
+    let recorded = calls(&fixture, operation)?;
+    assert_eq!(
+        recorded.iter().map(|r| r.call.ordinal).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(recorded[1].call.decision, ToolDecision::Cancelled);
+    assert_eq!(model.chat_requests(), 1, "no request after the cancel");
+    let (bytes, _) = fixture.journal()?;
+    let kinds: Vec<u16> = frames(&bytes)?
+        .into_iter()
+        .filter_map(|(kind, record)| match &record {
+            journal::Record::CancelRequested(p) if p.operation == operation => Some(kind),
+            journal::Record::ToolCall(p) if p.operation == operation && p.ordinal == 2 => {
+                Some(kind)
+            }
+            journal::Record::TurnTerminal(p) if p.operation == operation => Some(kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![7, 14, 8],
+        "kind 7, the queued call cancelled, terminal"
+    );
+    println!(
+        "PASS CC-I21 cancel between requests: kind 7, queued call cancelled, terminal; one chat request"
+    );
+    Ok(())
+}
+fn calls_of(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<u32>> {
+    Ok(calls(fixture, operation)?
+        .iter()
+        .map(|r| r.call.ordinal)
+        .collect())
+}
+
+/// CC-I22 (CC4): the service stops after request 2's kind 33 while the
+/// model's answer is held; the restart marks the turn interrupted, replay
+/// accepts the kind 33 sequence and no chat request is resent.
+fn request_loop_restart() -> Result<()> {
+    let (mut fixture, model, project, directory) = setup("loop-restart")?;
+    std::fs::write(directory.join("a.txt"), "alpha\n")?;
+    let release = fixture.home.join("cc-i22-release");
+    let seen = fixture.home.join("cc-i22-seen");
+    std::fs::write(&release, b"")?;
+    model.script(&[
+        call("project", json!({"command": "read_file", "path": "a.txt"})),
+        Step::Held {
+            create: Some(seen.clone()),
+            release: release.clone(),
+            then: Box::new(Step::Final),
+        },
+    ]);
+    let operation = submit(&fixture, project, "CC-I22")?;
+    let end = Instant::now() + Duration::from_secs(60);
+    while !seen.exists() {
+        if Instant::now() >= end {
+            return Err("request 2 never reached the model".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    fixture.crash()?;
+    std::fs::remove_file(&release)?;
+    fixture.start()?;
+    fixture.wait_ready()?;
+    let event = finish(&fixture, operation, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(6), "interrupted: {event:?}");
+    let starts = request_starts(&fixture, operation)?;
+    assert_eq!(starts.iter().map(|s| s.0).collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(model.chat_requests(), 2, "no request was resent");
+    println!(
+        "PASS CC-I22 restart in the request loop: interrupted, kind 33 replayed, nothing resent"
+    );
+    Ok(())
+}
 
 fn submit(fixture: &Fixture, project: [u8; 16], prompt: &str) -> Result<[u8; 16]> {
     let accepted = queue_submit::submit_queued(&|| fixture.attach(), project, None, 0, prompt)?;
@@ -1139,14 +1355,15 @@ fn unregistered_name() -> Result<()> {
     assert_eq!(event.kind, Some(4), "the helper ends the turn: {event:?}");
     let recorded = calls(&fixture, operation)?;
     assert_eq!(recorded.len(), 1);
+    // CC4 (TCR-D17 revised): the helper sends the call, then fails the
+    // request; the turn has ended, so the call is recorded `cancelled`
+    // (TCR-D8) with its received name and source.
     let record = &recorded[0].call;
-    assert_eq!(record.decision, ToolDecision::UnknownTool);
-    assert_eq!(record.fault, Some(ToolFault::UnregisteredName));
+    assert_eq!(record.decision, ToolDecision::Cancelled);
     assert_eq!(record.source, journal::ToolCallSource::ProviderJson);
     assert_eq!(record.name, "delete_everything");
-    assert_eq!(record.tool_operation, None);
     assert!(recorded[0].result.is_none());
-    assert_eq!(event.tools[0].status, Some(3));
+    assert_eq!(event.tools[0].status, Some(6));
     assert_eq!(
         model.chat_requests(),
         1,
@@ -1154,7 +1371,7 @@ fn unregistered_name() -> Result<()> {
     );
     sweep(&fixture.home, &[])?;
     println!(
-        "PASS TCR-I09 service part: unknown_tool/unregistered_name from provider_json; status 3; the turn failed"
+        "PASS TCR-I09 service part: unregistered name from provider_json recorded cancelled; the turn failed"
     );
     Ok(())
 }
@@ -1663,11 +1880,53 @@ fn full_window() -> Result<()> {
     assert_eq!(sizes.len(), 21);
     assert!(windows.iter().all(|w| *w == Some(WINDOW)), "{windows:?}");
     let last = *sizes.last().unwrap();
-    assert!(last > 262_144, "last request body {last} bytes");
+    assert!(last > 131_072, "last request body {last} bytes");
     let messages = model.tool_messages();
     assert_eq!(messages.len(), 20);
-    assert!(messages.iter().all(|m| m.contains("line 00999 body")));
-    println!("PASS FW-I3 full window: num_ctx {WINDOW} on 21 requests, last body {last} bytes");
+    // CC-I24 (CC4, Q5): the composer's input budget is below 20 results of
+    // 16,000 bytes, so later requests show older results as reference
+    // lines, oldest first; the latest result stays full.
+    assert!(messages.last().unwrap().contains("line 00999 body"));
+    let references: Vec<bool> = messages
+        .iter()
+        .map(|m| m.starts_with("[Asura: tool result "))
+        .collect();
+    let reduced = references.iter().filter(|r| **r).count();
+    assert!(reduced > 0 && reduced < 20, "{reduced} references");
+    assert!(
+        references.windows(2).all(|w| w[0] || !w[1]),
+        "references come first: {references:?}"
+    );
+    // Until the first reduction each request extends the previous one
+    // byte for byte (prefix stability for the provider's cache).
+    let requests = model.requests.lock().unwrap().clone();
+    let mut stable = 0;
+    for pair in requests.windows(2) {
+        let (a, b) = (
+            pair[0]["messages"].as_array().unwrap(),
+            pair[1]["messages"].as_array().unwrap(),
+        );
+        let reduced_here = b.iter().any(|m| {
+            m["role"] == "tool"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("[Asura: tool result "))
+        });
+        if reduced_here {
+            break;
+        }
+        assert_eq!(
+            &b[..a.len()],
+            &a[..],
+            "request {} is not a prefix",
+            stable + 1
+        );
+        stable += 1;
+    }
+    assert!(stable >= 2, "{stable} stable requests");
+    println!(
+        "PASS FW-I3/CC-I24 full window: num_ctx {WINDOW} on 21 requests, last body {last} bytes, {reduced} older results as references, {stable} requests byte-stable before the first reduction"
+    );
     model.script(&[Step::Refused(
         json!({"error": "request (300000 tokens) exceeds the available context size (262144 tokens), try increasing it"})
             .to_string(),
@@ -1738,7 +1997,10 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 11] = [
+    let cases: [Case; 14] = [
+        ("requests", request_loop),
+        ("loop-cancel", request_loop_cancel),
+        ("loop-restart", request_loop_restart),
         ("malformed", malformed_then_valid),
         ("secret", exec_cmd_secret),
         ("create", create_note_body),

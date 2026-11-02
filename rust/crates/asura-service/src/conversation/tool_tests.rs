@@ -80,6 +80,15 @@ impl Fixture {
             tool_budget: tools::Budget::cancellation_driven(),
             tool_executor: tools::Executor::default(),
             tool_cache: vec![],
+            proposals: VecDeque::new(),
+            next_request: false,
+            request_started: true,
+            limit_reached: false,
+            request_bytes: 0,
+            measured: None,
+            request_measured: 0,
+            base: None,
+            request_digests: None,
             secret_key: zeroize::Zeroizing::new([3; 32]),
             cursors: Default::default(),
         };
@@ -253,7 +262,6 @@ fn propose(fixture: &mut Fixture, value: mp::ToolCall) {
     let owner = &mut fixture.owner;
     let replay = owner.replay.clone();
     let active = owner.active.as_mut().unwrap();
-    active.model.tool_test_pending(value.ordinal.unwrap());
     Owner::tool_call(active, value, Instant::now(), replay.as_deref(), true);
 }
 fn fresh_turn(fixture: &mut Fixture) {
@@ -276,11 +284,7 @@ fn cancellation_after_intent_produces_failed_result_without_capture_or_delivery(
     assert_eq!(result.status, 6);
     assert!(result.text.is_empty());
     assert!(fixture.owner.sensor_owner.is_none());
-    assert!(
-        !active
-            .model
-            .tool_test_has_delivery(tool_wire_result(result))
-    );
+    assert!(!delivered(active, tool_wire_result(result)));
     assert!(active.tool_cache.is_empty());
 }
 
@@ -293,11 +297,7 @@ fn result_acknowledgement_after_cancel_never_delivers() {
         active.cancel = Some(cause);
         fixture.acknowledge(Job::ToolResult);
         let active = fixture.owner.active.as_ref().unwrap();
-        assert!(
-            !active
-                .model
-                .tool_test_has_delivery(tool_wire_result(&result))
-        );
+        assert!(!delivered(active, tool_wire_result(&result)));
         assert_eq!(
             active.tool_cache.len(),
             1,
@@ -335,11 +335,7 @@ fn unconfirmed_intent_or_result_never_authorizes_delivery_or_cache() {
             active.tool_budget.result_capacity(),
             tools::MAX_RESULT_BYTES
         );
-        assert!(
-            !active
-                .model
-                .tool_test_has_delivery(tool_wire_result(&result))
-        );
+        assert!(!delivered(active, tool_wire_result(&result)));
     }
 }
 
@@ -347,19 +343,10 @@ fn unconfirmed_intent_or_result_never_authorizes_delivery_or_cache() {
 fn successful_result_requires_acknowledgement_before_delivery() {
     let mut fixture = Fixture::new();
     let result = fixture.stage_result();
-    assert!(
-        !fixture
-            .active()
-            .model
-            .tool_test_has_delivery(tool_wire_result(&result))
-    );
+    assert!(!delivered(fixture.active(), tool_wire_result(&result)));
     fixture.acknowledge(Job::ToolResult);
     let active = fixture.owner.active.as_ref().unwrap();
-    assert!(
-        active
-            .model
-            .tool_test_has_delivery(tool_wire_result(&result))
-    );
+    assert!(delivered(active, tool_wire_result(&result)));
     assert!(active.tool.is_none());
 }
 #[test]
@@ -499,15 +486,10 @@ fn status_capture_does_not_return_before_sensor_commit() {
     assert_eq!(result.status, 1);
     assert!(result.text.contains("observation_id"));
     assert!(result.text.contains("expires_ms"));
-    assert!(
-        !fixture
-            .owner
-            .active
-            .as_ref()
-            .unwrap()
-            .model
-            .tool_test_has_delivery(tool_wire_result(result))
-    );
+    assert!(!delivered(
+        fixture.owner.active.as_ref().unwrap(),
+        tool_wire_result(result)
+    ));
 }
 
 #[test]
@@ -546,12 +528,31 @@ fn helper_settlement_preserves_explicit_cancellation_cause() {
     assert_eq!(active.terminal.as_ref(), Some(&original));
 }
 
-/// The results queued for the helper so far.
-fn sent(fixture: &mut Fixture) -> Vec<mp::ToolResult> {
-    fixture.active().model.tool_test_results()
+/// The results settled so far: what the next request shows (CC4).
+fn sent(fixture: &mut Fixture) -> Vec<tools::Reply> {
+    fixture
+        .active()
+        .tool_cache
+        .iter()
+        .map(|settled| settled.reply.clone())
+        .collect()
 }
-fn sent_result(ordinal: u32, status: i32, text: &str) -> mp::ToolResult {
-    mp::ToolResult {
+/// A settled result reaches the model: it is in the turn's results and the
+/// turn continues to a next request (CC4). After cancel or turn end no
+/// later request is composed, so nothing is delivered.
+pub(super) fn delivered(active: &Active, reply: impl std::borrow::Borrow<tools::Reply>) -> bool {
+    active.cancel.is_none()
+        && active.terminal.is_none()
+        && active
+            .tool_cache
+            .iter()
+            .any(|settled| &settled.reply == reply.borrow())
+}
+pub(super) fn delivered_any(active: &Active) -> bool {
+    active.cancel.is_none() && active.terminal.is_none() && !active.tool_cache.is_empty()
+}
+fn sent_result(ordinal: u32, status: i32, text: &str) -> tools::Reply {
+    tools::Reply {
         ordinal: Some(ordinal),
         status: Some(status),
         text: Some(text.into()),
@@ -651,7 +652,7 @@ fn invalid_semantic_path_is_durable_rejection_not_host_dispatch() {
         let active = fixture.active();
         assert!(active.tool_executor.is_settled());
         assert!(active.tool.is_none());
-        assert_eq!(active.tool_cache[0].2.status, Some(3));
+        assert_eq!(active.tool_cache[0].reply.status, Some(3));
     }
 }
 
@@ -898,42 +899,22 @@ fn run_calls_dispatch_only_after_the_record_commits() {
     }
 }
 
-/// TCR-I10: a resend at a used ordinal with the same text gets the same
-/// result again; different text is a protocol fault with one record only.
+/// TCR-I10, revised by CC4: calls are taken one at a time from the
+/// request's queue, so no resend exists; a call while one is pending is a
+/// fault with one record only.
 #[test]
-fn tcr_i10_resend_is_compared_by_keyed_digest() {
+fn tcr_i10_a_call_while_one_is_pending_is_a_fault() {
     let mut fixture = Fixture::new();
     fresh_turn(&mut fixture);
     let first = wire(1, "project", r#"{"command":"read_file"}"#);
     propose(&mut fixture, first.clone());
-    // An equal resend while pending is not a second call.
-    propose(&mut fixture, first.clone());
     assert!(fixture.active().failure_reason.is_none());
-    fixture.acknowledge(Job::ToolIntent);
-    propose(&mut fixture, first.clone());
-    let results = sent(&mut fixture);
-    assert_eq!(results.len(), 2);
-    assert_eq!(results[0], results[1]);
-    assert!(fixture.active().failure_reason.is_none());
-    assert!(fixture.active().tool.is_none(), "no second record");
-    let mut changed = first;
-    changed.arguments = Some(r#"{"command":"read_file","path":"a"}"#.into());
-    propose(&mut fixture, changed);
+    propose(&mut fixture, first);
     let active = fixture.active();
     assert_eq!(active.failure_reason, Some("model_protocol_fault"));
-    assert!(active.tool.is_none());
-    assert_eq!(active.tool_cache.len(), 1);
-    // A different source or size is also a different call.
-    let mut fixture = Fixture::new();
-    fresh_turn(&mut fixture);
-    let call = wire(1, "service", r#"{"command":"status"}"#);
-    propose(&mut fixture, call.clone());
-    let mut other = call;
-    other.source = Some(2);
-    propose(&mut fixture, other);
-    assert_eq!(
-        fixture.active().failure_reason,
-        Some("model_protocol_fault")
+    assert!(
+        active.tool.is_some(),
+        "the pending call keeps its one record"
     );
 }
 
@@ -1201,11 +1182,10 @@ fn memory_response_does_not_release_slot_before_worker_settles() {
     assert!(!tool.memory_ticket.as_ref().unwrap().is_settled());
     assert!(fixture.owner.pending.is_none());
     assert!(fixture.owner.unavailable.is_none());
-    assert!(
-        !active
-            .model
-            .tool_test_has_delivery(tool_wire_result(tool.result.as_ref().unwrap()))
-    );
+    assert!(!delivered(
+        active,
+        tool_wire_result(tool.result.as_ref().unwrap())
+    ));
     controller.finish();
     assert!(
         fixture
@@ -1226,11 +1206,7 @@ fn memory_response_does_not_release_slot_before_worker_settles() {
     let active = fixture.owner.active.as_ref().unwrap();
     assert!(active.tool.is_none());
     assert_eq!(active.tool_cache.len(), 1);
-    assert!(
-        active
-            .model
-            .tool_test_has_delivery(active.tool_cache[0].2.clone())
-    );
+    assert!(delivered(active, active.tool_cache[0].reply.clone()));
 }
 #[test]
 fn unsettled_memory_cancel_or_steering_never_delivers_late_body() {
@@ -1261,11 +1237,7 @@ fn unsettled_memory_cancel_or_steering_never_delivers_late_body() {
         assert!(!tool.memory_ticket.as_ref().unwrap().is_settled());
         assert!(fixture.owner.pending.is_none());
         assert!(fixture.owner.unavailable.is_none());
-        assert!(
-            !active
-                .model
-                .tool_test_has_delivery(tool_wire_result(result))
-        );
+        assert!(!delivered(active, tool_wire_result(result)));
         assert!(active.tool_cache.is_empty());
         controller.finish();
         assert!(
@@ -1323,6 +1295,7 @@ fn install_recorded_memory_cancel(fixture: &mut Fixture) {
             cancel: active.cancel,
             terminal: None,
             tools: vec![],
+            request_starts: Vec::new(),
         },
     );
     fixture.owner.replay = Some(Arc::new(replay));
@@ -1362,19 +1335,11 @@ fn inventory_requires_durable_intent_and_result_without_host_or_database_executi
     assert!(active.tool_executor.is_settled());
     assert!(tool.memory_ticket.is_none());
     assert!(active.tool_cache.is_empty());
-    assert!(
-        !active
-            .model
-            .tool_test_has_delivery(tool_wire_result(&result))
-    );
+    assert!(!delivered(active, tool_wire_result(&result)));
     fixture.acknowledge(Job::ToolResult);
     let active = fixture.owner.active.as_ref().unwrap();
     assert_eq!(active.tool_cache.len(), 1);
-    assert!(
-        active
-            .model
-            .tool_test_has_delivery(tool_wire_result(&result))
-    );
+    assert!(delivered(active, tool_wire_result(&result)));
 }
 #[test]
 fn inventory_obeys_cancellation_and_disabled_tool_fences() {
@@ -1611,20 +1576,8 @@ fn j1t_04_live_tool_and_cache_hold_no_raw_command() {
     assert!(tool.exec.is_some(), "the start waits for its submit");
     assert!(!format!("{:?}", tool.record).contains(&token));
     fixture.acknowledge(Job::ToolIntent);
-    // A `run` call is cached only with its kind 29 result; an equal
-    // resend of the pending call matches it.
+    // A `run` call is cached only with its kind 29 result.
     assert!(fixture.active().tool_cache.is_empty());
-    propose(&mut fixture, first);
-    assert!(fixture.active().failure_reason.is_none());
-    let other = ["ghp_", &"qQ2".repeat(12)].concat();
-    propose(
-        &mut fixture,
-        exec_cmd_wire(1, &format!("printf '%s' \"{other}\" | wc -c")),
-    );
-    assert_eq!(
-        fixture.active().failure_reason,
-        Some("model_protocol_fault")
-    );
 }
 
 /// J1T-05 unit (J1-Q3): no tool call has a time bound, so a result
@@ -1861,7 +1814,7 @@ fn tcr_i07_cancel_before_commit_records_cancelled_then_terminal() {
     journaled.owner.drive(Instant::now());
     assert!(journaled.settle() == "tool_call");
     assert!(journaled.active().tool.is_none());
-    assert!(journaled.active().model.tool_test_results().is_empty());
+    assert!(!delivered_any(journaled.active()));
     // The helper settles; the terminal follows.
     journaled.active().model = ModelOwner::settled_test_fixture();
     journaled.owner.drive(Instant::now());
@@ -1955,7 +1908,12 @@ fn tcr_i11_two_hundred_calls_run_and_the_next_is_limit() {
         assert!(journaled.settle() == "tool_result");
         journaled.owner.drive(Instant::now());
         // The transport writes each result; the bounded queue never fills.
-        let delivered = journaled.active().model.tool_test_drain_results();
+        let delivered: Vec<tools::Reply> = journaled
+            .active()
+            .tool_cache
+            .iter()
+            .map(|settled| settled.reply.clone())
+            .collect();
         let failure = journaled.active().failure_reason;
         let last = delivered
             .last()
@@ -2396,4 +2354,143 @@ fn execution_change_before_the_start_time_read_compares_against_the_persisted_va
     let mut fixture = Fixture::new();
     fixture.owner.execution_read(on.clone());
     assert_eq!(current(&fixture), Some(on));
+}
+
+// ------------------------------------------------- CC4 request loop (CC-U35)
+
+/// Request 1's base for the fixture turn (a small, roomy composition).
+fn install_base(fixture: &mut Fixture) {
+    let budget = crate::context::Budget {
+        window_tokens: 32_768,
+        output_reservation: 0,
+        overhead_tokens: 0,
+        bytes_per_token_milli: 1000,
+    };
+    let notice = crate::context::Notice::none([5; 16], 0);
+    let composed =
+        crate::context::compose_views("rules", "observe status", &[], 0, &notice, budget, &[])
+            .unwrap();
+    fixture.active().base = Some(Box::new(crate::context::TurnBase {
+        instructions: "rules",
+        prompt: "observe status".into(),
+        candidates: Vec::new(),
+        unlisted: 0,
+        notice,
+        views: Vec::new(),
+        budget,
+        input: asura_control::model::decode_input(&composed.input).unwrap(),
+        manifest_digest: composed.manifest_digest,
+    }));
+}
+/// One owner pass that appends the next kind 14, acknowledged as committed.
+fn record_next(fixture: &mut Fixture) {
+    fixture.owner.drive(Instant::now());
+    fixture.owner.unavailable = None;
+    assert!(fixture.active().tool.is_some(), "a call was decided");
+    fixture.acknowledge(Job::ToolIntent);
+}
+
+/// CC-U35: a request's two calls are recorded in order with the next turn
+/// ordinals; the next request is composed only after both settle, with the
+/// calls and results in its continuation and request ordinal 2.
+#[test]
+fn cc_u35_calls_settle_in_order_before_the_next_request() {
+    let mut fixture = Fixture::new();
+    fresh_turn(&mut fixture);
+    install_base(&mut fixture);
+    let active = fixture.active();
+    active
+        .proposals
+        .push_back(wire(1, "unregistered_tool", "{}"));
+    active
+        .proposals
+        .push_back(wire(2, "other_tool", r#"{"x":1}"#));
+    active.next_request = true;
+    active.model.tool_test_proposed();
+    record_next(&mut fixture);
+    assert_eq!(fixture.active().tool_cache.len(), 1);
+    assert!(
+        fixture.active().model.begin_test_frames().is_empty(),
+        "one call is still queued"
+    );
+    record_next(&mut fixture);
+    assert_eq!(
+        sent(&mut fixture)
+            .iter()
+            .map(|r| r.ordinal)
+            .collect::<Vec<_>>(),
+        vec![Some(1), Some(2)]
+    );
+    fixture.owner.drive(Instant::now());
+    let active = fixture.active();
+    let begins = active.model.begin_test_frames();
+    assert_eq!(begins.len(), 1);
+    assert_eq!(begins[0].request_ordinal, Some(2));
+    assert!(active.request_digests.is_some() && !active.next_request);
+    let (input_digest, _) = active.request_digests.unwrap();
+    assert!(active.request_bytes > 0);
+    // The kind 33 waits for Ready; its digests are the composed request's.
+    active.ready = true;
+    active.request_started = false;
+    let _ = input_digest;
+}
+
+/// CC-U35: the 201st call is recorded with decision `limit` and ends the
+/// turn `failed` with `output_limit`; later proposals get no record.
+#[test]
+fn cc_u35_over_limit_call_ends_the_turn() {
+    let mut fixture = Fixture::new();
+    fresh_turn(&mut fixture);
+    let active = fixture.active();
+    for ordinal in 1..=tools::MAX_CALLS {
+        active.tool_budget.record(ordinal).unwrap();
+    }
+    active
+        .proposals
+        .push_back(wire(1, "service", r#"{"command":"status"}"#));
+    active
+        .proposals
+        .push_back(wire(2, "service", r#"{"command":"status"}"#));
+    active.next_request = true;
+    fixture.owner.drive(Instant::now());
+    fixture.owner.unavailable = None;
+    assert_eq!(
+        fixture
+            .active()
+            .tool
+            .as_ref()
+            .map(|t| (t.ordinal, t.record.decision)),
+        Some((journal::MAX_TOOL_CALL_ORDINAL, journal::ToolDecision::Limit))
+    );
+    fixture.acknowledge(Job::ToolIntent);
+    let active = fixture.active();
+    assert!(active.limit_reached && active.proposals.is_empty());
+    let terminal = active.terminal.as_ref().unwrap();
+    assert_eq!(
+        (terminal.kind, terminal.cause),
+        (journal::TerminalKind::Failed, journal::Cause::OutputLimit)
+    );
+    assert!(active.model.begin_test_frames().is_empty());
+}
+
+/// CC-U35: a turn that ends with calls queued (the helper failed, or a
+/// cancel after its kind 7) records each queued call as `cancelled`
+/// (TCR-D8); no next request is composed.
+#[test]
+fn cc_u35_turn_end_records_queued_calls_cancelled() {
+    let mut fixture = Fixture::new();
+    fresh_turn(&mut fixture);
+    install_base(&mut fixture);
+    let active = fixture.active();
+    active
+        .proposals
+        .push_back(wire(1, "service", r#"{"command":"status"}"#));
+    active.next_request = true;
+    Owner::failed(active, "model_helper_failed", Instant::now());
+    fixture.owner.drive(Instant::now());
+    fixture.owner.unavailable = None;
+    let active = fixture.active();
+    let tool = active.tool.as_ref().expect("the queued call was decided");
+    assert_eq!(tool.record.decision, journal::ToolDecision::Cancelled);
+    assert!(active.model.begin_test_frames().is_empty());
 }

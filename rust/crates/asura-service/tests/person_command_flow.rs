@@ -3166,6 +3166,12 @@ fn views_taint() -> Result<()> {
             );
         }
     }
+    // CC-I23 (CC4): the turn ran as five model requests; the sweep above
+    // covered every one of them.
+    println!(
+        "PASS CC-I23 taint across a multi-request turn: {} requests swept clean",
+        chats.len()
+    );
     // Kind 29 records the exclusion: outcome `private`, no page read.
     let all = records(&env)?;
     let (_, replay) = env.fixture.journal()?;
@@ -3185,7 +3191,7 @@ fn views_taint() -> Result<()> {
             _ => None,
         })
         .ok_or("kind 21")?;
-    assert_eq!(accepted.composer_revision, 4);
+    assert_eq!(accepted.composer_revision, 5);
     assert_ne!(accepted.notice_views, 0, "the untainted view is recorded");
     assert_eq!(operation.conversation, conversation);
     // CC-I17: after a restart the later turn's history rebuilds the notice

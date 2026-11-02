@@ -165,6 +165,9 @@ fn tables(
                 (".asura.control.v1.JobDetail", "path_warnings") => 16,
                 // Two entries per shown turn; the context composer bounds segments.
                 (".asura.model.v1.ModelInput", "history") => 2048,
+                // CC4: 200 assistant and 200 tool entries; one response's calls.
+                (".asura.model.v1.ModelInput", "continuation") => 400,
+                (".asura.model.v1.HistoryTurn", "tool_calls") => 201,
                 _ => 32,
             };
             result.push_str(&format!(

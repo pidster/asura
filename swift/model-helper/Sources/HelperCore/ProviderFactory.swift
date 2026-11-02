@@ -39,11 +39,11 @@ public enum ProviderFactory {
                 reportedContextTokens: model.reportedContextTokens, contextSource: .ollama,
                 modelName: "ollama:\(name)", supportsTools: model.supportsTools,
                 localToolDestination: model.localToolModel != nil,
-                instrumentationFactory: { usage, callback, handler in
+                instrumentationFactory: { usage, callback, reporter in
                     var instrumented = model
                     instrumented.inputObserver = OllamaInputObserver(snapshot: callback)
                     instrumented.usageObserver = usage
-                    instrumented.unregisteredToolHandler = handler
+                    instrumented.unregisteredToolHandler = reporter
                     return instrumented
                 }, thinkingControls: model.thinkingControls)
         default: throw Failure.unsupportedProvider

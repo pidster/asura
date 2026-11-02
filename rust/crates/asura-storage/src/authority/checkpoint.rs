@@ -195,6 +195,11 @@ pub fn encode(state: &Replay, census: &Census, runs: &[RunRef]) -> Result<Vec<u8
                 option_locator(&mut w, tool.follow_frame().as_ref());
                 option_locator(&mut w, tool.result_frame.as_ref());
             }
+            // The request starts (CC4): kind 14 counts before each request.
+            w.u32(op.request_starts.len() as u32);
+            for start in &op.request_starts {
+                w.u32(*start as u32);
+            }
             // The response, then the thinking text (thinking-level.md).
             for text in [&op.response, &op.thinking] {
                 w.u64(text.len);
@@ -487,6 +492,15 @@ pub fn decode(bytes: &[u8], index: &mut dyn Index) -> Result<Checkpoint> {
                 read_option_locator(&mut r)?,
             ));
         }
+        let starts = r.u32()? as usize;
+        require(starts <= MAX_TOOL_CALL_ORDINAL as usize + 1)?;
+        let mut request_starts = Vec::with_capacity(starts);
+        for _ in 0..starts {
+            let start = r.u32()? as usize;
+            require(start <= frames.len() && request_starts.last().is_none_or(|p| *p < start))?;
+            request_starts.push(start);
+        }
+        require(request_starts.is_empty() == helper.is_none())?;
         let mut texts = [Response::default(), Response::default()];
         for text in &mut texts {
             text.len = r.u64()?;
@@ -537,6 +551,7 @@ pub fn decode(bytes: &[u8], index: &mut dyn Index) -> Result<Checkpoint> {
                 cancel,
                 terminal: None,
                 tools,
+                request_starts,
                 response,
                 thinking,
             },

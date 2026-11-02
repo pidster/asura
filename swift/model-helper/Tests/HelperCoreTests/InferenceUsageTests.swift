@@ -60,18 +60,18 @@ private actor UsageSnapshots {
     #expect(await snapshots.reports.count == 1)
 }
 
-/// UH10, UH12 (owner, 2026-10-18 and 2026-10-19): no output cap, request
-/// count or token total refuses a request, and a failure stops admission.
-@Test func requestsAdmitWithoutCapCountOrTurnTotal() async throws {
-    let budget = ToolRoundBudget()
+/// UH10, UH12 (owner, 2026-10-18 and 2026-10-19), revised by CC4: no output
+/// cap, request count or token total exists; each helper request admits one
+/// inference, and a recorded failure stops admission.
+@Test func requestsAdmitOneInferenceWithoutCapCountOrTurnTotal() async throws {
     for _ in 1...100 {
-        try await budget.reserve(); await budget.finishInference()
+        let gate = RequestGate()
+        try await gate.admit()
+        #expect(await gate.recordedFailure() == nil)
     }
-    #expect(await budget.recordedFailure() == nil)
-    let failed = ToolRoundBudget()
-    try await failed.reserve()
-    await failed.finishInference(BackendFailure(.cancelled))
-    await #expect(throws: BackendFailure.self) { try await failed.reserve() }
+    let failed = RequestGate()
+    await failed.record(BackendFailure(.cancelled))
+    await #expect(throws: BackendFailure.self) { try await failed.admit() }
 }
 
 private actor FourPassProbe {
@@ -105,7 +105,10 @@ private struct FourPassModel: LanguageModel {
     }
 }
 
-@Test func threeMeasuredToolPassesAllowFourthFinalResponse() async throws {
+/// CC4: four requests of one turn, one inference each; three return a call
+/// and the fourth answers. Each usage report carries the service's request
+/// ordinal; no request has an Asura output cap (UH13).
+@Test func fourMeasuredRequestsReportTheirServiceOrdinals() async throws {
     let probe = FourPassProbe()
     let snapshots = UsageSnapshots()
     let base = FourPassModel(probe: probe)
@@ -113,14 +116,15 @@ private struct FourPassModel: LanguageModel {
         modelName: "measured-fixture", supportsTools: true,
         instrumentationFactory: { usage, _, _ in var model = base; model.usage = usage; return model })
     var input = ModelInput(); input.instructions = "fixture"; input.prompt = "fixture"
-    try await engine.generateWithTools(input, handler: { proposal in
-        guard proposal.name == "service", proposal.arguments.contains("tools") else { throw HelperError.protocolFault }
-        await probe.hostCalled()
-        return ToolResult(status: .success, text: "fixture tools")
-    }, snapshot: { await snapshots.record($0) })
+    var calls: [[ToolProposal]] = []
+    for request in UInt32(1)...4 {
+        calls.append(try await engine.generateWithTools(input, thinking: .none, request: request,
+            snapshot: { await snapshots.record($0) }))
+    }
+    #expect(calls.map(\.count) == [1, 1, 1, 0])
+    #expect(calls.prefix(3).allSatisfy { $0.first?.name == "service" })
     #expect(await probe.passes == 4)
-    #expect(await probe.hostCalls == 3)
-    // UH13: no Asura output cap on any pass (owner, 2026-10-19).
+    #expect(await probe.hostCalls == 0)
     #expect(await probe.caps == [nil, nil, nil, nil])
     #expect(await snapshots.starts == [1, 2, 3, 4])
     let reports = await snapshots.reports
@@ -149,7 +153,7 @@ private struct FourPassModel: LanguageModel {
 /// counter validity bound, not by a request cap.
 @Test func wireCarriesNoOutputCapAndAcceptsLargeUsage() throws {
     var begin = Asura_Model_V1_Begin()
-    begin.model = "system"; begin.inputBytes = 10
+    begin.model = "system"; begin.inputBytes = 10; begin.requestOrdinal = 1
     var message = Envelope(); message.operationID = Data(repeating: 1, count: 16); message.generation = 1
     message.body = .begin(begin)
     try Wire.validate(message, from: .service)
