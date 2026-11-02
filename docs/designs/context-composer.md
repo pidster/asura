@@ -8,8 +8,10 @@ owner resolved decisions D1–D10 and N1; they are recorded in
 [owner decisions](#owner-decisions) with the mechanism each one selects. The
 tool job packets that CC2 and CC3 waited for (J1, J3 and J5) are delivered.
 The owner asked on 2026-10-31 to build CC2, then CC3, and approved the
-[taint exclusion hook](#taint-exclusion-hook) (T1) the same day. CC4 waits for
-[loop closure](loop-closure.md#decisions) decision 6, and CC5 for a memory
+[taint exclusion hook](#taint-exclusion-hook) (T1) the same day. The owner
+decided [loop closure](loop-closure.md#decisions) decision 6 on 2026-11-02:
+slice **CC4 is selected and ready for implementation** under the
+[CC4 design](#cc4-service-owned-request-loop-stage-b). CC5 waits for a memory
 selection design; see [delivery](#dependencies-and-delivery).
 [CC1 implementation details](#cc1-implementation-details) record what code
 inspection added. The owner answered O1, O2 and O3 on 2026-10-31
@@ -161,7 +163,7 @@ mechanism this design applies for it. The sections below give the detail.
 | D1 | A new `context` module in `asura-service`, called by the conversation owner, replaces the current builder. Its core is pure. Storage keeps no selection policy. | [Ownership](#ownership). The writer's `Prepare` returns candidates and no longer applies the 32-turn and 64 KiB rule. |
 | D2 | Bytes per token are learned per model from measured input tokens (context telemetry), with a safety margin. An unmeasured model uses 1 token per byte. | [Token conversion](#token-conversion) |
 | D3 | The output reservation is the per-request output space in the context window, not a turn budget. It is a per-model value in the capacity record, defaulting to `min(maximum output, window ÷ 4)`. Refined 2026-10-19 under the owner's removal of output caps: Asura has no maximum output, so `R = ⌊E ÷ 4⌋` now; see [output reservation](#output-reservation-r). | `R` in the [budget](#per-request-budget-algorithm) |
-| D4 | Stage B (the service owns the request loop and recomposes per request) is the target; stage A (view sizing at the tool callback) comes first. | [Recomposition during tool loops](#recomposition-during-tool-loops). Stage B implies loop closure decision 6, which remains formally open. The owner chose on 2026-11-02 to probe Foundation Models, MLX, Core AI and Ollama for a service-run tool loop before deciding it. |
+| D4 | Stage B (the service owns the request loop and recomposes per request) is the target; stage A (view sizing at the tool callback) comes first. | [Recomposition during tool loops](#recomposition-during-tool-loops). Stage B implies loop closure decision 6. The owner probed first and then decided it on 2026-11-02: stage B on all four backends ([CC4](#cc4-service-owned-request-loop-stage-b)). |
 | D5 | The manifest is a payload object with its digest in the journal. Before J1, `TurnAccepted` carries the manifest digest and the composer revision, and, under N1, the budget inputs. | [Composition manifest](#composition-manifest) |
 | D6 | History is reduced by mechanical fidelity levels (full, reference, omitted), newest first. Model-written summaries need a separate design. | [Segments and fidelity](#segments-and-fidelity) |
 | D7 | "Match the window to the size the model can handle." The input limit is the model's window from its capacity record, converted to bytes by D2. Input streams across fixed 64 KiB frames (tool output views rule 4). The schema and helper change stays within protocol `0.1`. Built in CC1. | `W` in the [budget](#per-request-budget-algorithm); [streamed input transfer](#streamed-input-transfer) |
@@ -183,6 +185,12 @@ Owner decisions of 2026-10-31 that resolve the CC2 and CC3 questions
 | ENV3 | The single-source-of-truth rule wins over D5: manifests are recomputed from the journal and the retained streams, not stored as separate payload objects. Build nothing for it. Resolves O1 | [Composition manifest](#composition-manifest) |
 | ENV4 | A model `exec_cmd` that receives SL3 or SL7 secret variables is tainted under T1, exactly like a person command. Interim: the later broker work (AD-4) forbids raw delivery to model jobs. Resolves O2 | [Taint exclusion hook](#taint-exclusion-hook), source 2 |
 | ENV1 | Asura builds the environment of `!` and `!!` commands from an allow-list; the `!!` launch environment is removed. Resolves O3 | [Person command environment](person-command-environment.md) |
+
+Owner decision of 2026-11-02 ([loop closure](loop-closure.md#decisions) decision 6):
+
+| ID | Decision | Applied mechanism |
+| --- | --- | --- |
+| LC6 | Stage B on all four backends: Foundation Models (system), MLX, Core AI and Ollama. The Foundation Models path relies on the probed workaround (executor transcript override, a tool that throws a stop error, `.preserveTranscript`), backed by a native regression test that fails if the SDK stops behaving this way. | [CC4](#cc4-service-owned-request-loop-stage-b), with the engineering choices Q2 to Q6 |
 
 ## Selected mechanism
 
@@ -645,8 +653,10 @@ request loop). The owner chose on 2026-11-02 to probe first; the
 [probes](loop-closure-probes.md) showed all four backends can take full history
 per request and return tool calls to the caller. The owner then decided on
 2026-11-02 that the service owns the loop (stage B) on all four backends, with a
-regression test for the Foundation Models workaround. Stage B (CC4) still needs
-its implementation-ready design before code.
+regression test for the Foundation Models workaround. The
+[CC4 design](#cc4-service-owned-request-loop-stage-b) is the implementation-ready
+design. Under stage B the helper never holds a transcript across requests, so
+CCR10's rule against mutating a running SDK transcript holds by construction.
 
 **Stage A, view sizing at the callback (CC2).** The helper keeps its loop. When a
 tool call settles, the conversation owner asks the composer for that result's
@@ -662,11 +672,12 @@ view.
 
 **Stage B, full recomposition per request (CC4).** The service owns the request
 loop. At each settled inference boundary it composes a new `ModelInput` with
-the current turn's call and result pairs as segments. Older pairs can degrade
-to references. Each request gets its own manifest and request ordinal. The
-helper runs each request as a fresh stateless session (CCR21). This needs a
-model schema change within protocol `0.1`: history entries that carry tool
-calls and results.
+the current turn's call and result pairs as segments. Older pairs degrade to
+references only under budget pressure (Q5). Each request gets its own manifest
+and request ordinal. The helper runs each request as a fresh stateless session
+(CCR21). The model schema changes within protocol `0.1`: history entries carry
+tool calls and results ([CC4 wire changes](#cc4-wire-changes)). Stage A view
+sizing stays in force for each result.
 
 #### CC-Q2: tool loop, stage A
 
@@ -1073,7 +1084,7 @@ same day:
 | J3: job tool, reference-only results | Disclosures with handles; reference results | Delivered; used by CC2 |
 | J5: job notices (J5a) | Notice entries in the context block | Delivered (composer revision 3); used by CC3 |
 | Person commands P2, P3 and SL5 (kind 31 secret variables) | The T1 taint source | Delivered; used by the taint hook |
-| Loop closure decision 6 | Stage B | Needed by CC4; formally open |
+| Loop closure decision 6 | Stage B | Decided by the owner, 2026-11-02; used by CC4 |
 | Memory selection design | Evidence and memory segments | Needed by CC5 |
 
 ### CC1 implementation details
@@ -1387,6 +1398,457 @@ One writer owns each packet's paths in order: CC2-S, CC2-C, CC3-S, CC3-C.
 | AE-06 | Shutdown closes the pool; waiting tickets end with `cancelled` and the turn takes its shutdown path. |
 | AE-07 | CC-I3, CC-I4, CC-I15 and CC-I16 exercise stalled and saturated page workers and cancellation during the page phase. |
 
+### CC4: service-owned request loop (stage B)
+
+Status: selected design, ready for implementation, 2026-11-02. The owner
+decided [loop closure decision 6](loop-closure.md#decisions) on 2026-11-02:
+the service owns the turn tool loop on all four backends (system model, MLX,
+Core AI and Ollama). The Foundation Models path uses the probed workaround,
+backed by a native regression test. The [probes](loop-closure-probes.md) give
+the evidence. Protocol numbering remains `0.1`; journal format remains `1`.
+
+Scope: the request loop of one turn, the wire changes it needs, per-request
+composition and manifests, and the removal of the helper's tool loop.
+Non-goals: tool calls of earlier turns in later input (they stay out, as
+today), model summaries (D6), memory (CC5), remote providers, and loop
+closures beyond the 200-call limit (owner, 2026-10-13). Because tool records
+stay within their own turn, the job controller's
+[notice selection](tool-job-controller.md#notice-selection) rule needs no
+change. The notice is bound once, at turn start; a job that settles between
+requests appears in the next turn's notice, not in a later request.
+
+#### CC4 decisions
+
+| ID | Decision | Source |
+| --- | --- | --- |
+| LC6 | The service owns the turn tool loop (stage B) on all four backends. The Foundation Models path uses an executor transcript override and a tool that throws a stop error, with `.preserveTranscript`. A native regression test must fail if the SDK stops behaving this way. | Owner, 2026-11-02 |
+| Q2 | Ollama stays behind the same SDK session interface as the other backends. One helper code path serves all four. | Engineering, 2026-11-02 |
+| Q3 | Reasoning entries are dropped between requests for every backend. The service never sends thinking text (owner, 2026-10-19), so the system model loses only its in-turn reasoning entries, as MLX, Core AI and Ollama already do. | Engineering, 2026-11-02 |
+| Q4 | One turn operation and generation for all requests. The service assigns each request an ordinal in `Begin`; the helper's usage reports carry the same ordinal. | Engineering, 2026-11-02 |
+| Q5 | Recompose only under budget pressure. Otherwise every earlier entry of the input stays byte-stable, so the Ollama and Core AI prefix caches survive. | Engineering, 2026-11-02 |
+| Q6 | The system model's mid-turn overflow (`GenerativeError`) maps to `context_limit`. | Prerequisite, below |
+
+#### CC4 prerequisites
+
+1. **Core AI asset.** The export
+   `~/.local/share/daimon-eval/coreai-export-2026-09-20/exports/qwen3_4b_4bit_dynamic`
+   (2.1 GB, `max_context_length` 40,960, `main.hash` prefix `14c5d258`) is on
+   this Mac. It was the qualification asset of 2026-10-20 (exec_cmd
+   qualification, CoreAI row). Core AI keeps its compiled model in
+   `~/Library/Caches/coreai-cache/<macOS build>/org.pidster.asura.model`
+   (about 2.1 GB); the native journey creates that cache on its first run.
+   No download is needed.
+2. **Mid-turn overflow.** Measured 2026-11-02 (macOS 27, build 26A428, Xcode
+   27.1): a system model request whose transcript holds tool calls and tool
+   outputs above the 8,192-token window fails with the private
+   `GenerativeError`: bridged domain
+   `com.apple.GenerativeFunctionsFoundation.GenerativeError`, code 4,050,000,
+   case `prompt(tooManyTokens)`. A plain prompt above the window still fails
+   with `LanguageModelError.contextSizeExceeded`. The helper's
+   `isContextOverflow` maps both to `context_limit`: the SDK case by type, the
+   private error by its bridged domain and its code or its case label. It never
+   reads error text. Tests: `generativeTooManyTokensIsContextLimit`,
+   `otherGenerativeErrorsStayInternal` and the native
+   `nativeSystemMidTurnOverflowIsContextLimit`.
+
+#### CC4 ownership
+
+| Responsibility | Owner after CC4 | Change |
+| --- | --- | --- |
+| Request loop: when a request starts, which calls run, when the turn ends | Conversation owner (`conversation.rs`) | New: it was the SDK session inside the helper |
+| Request ordinals and turn tool ordinals | Conversation owner | New: the helper numbered both |
+| Composition of each request | Context composer (`context.rs`, `context/request.rs`) | New pure function `compose_request` |
+| Rendering of a tool result as model text | Conversation owner through `tools::render_reply` | Moved from the helper's `ToolResult.rendered` |
+| One inference per request; tool proposals from the response | Swift helper (`Backend.swift`, `Session.swift`) | The helper no longer runs or continues a tool loop |
+| Request start record (kind 33) | Journal writer and replay (`asura-storage`) | New record kind |
+
+The helper keeps provider adaptation, the transcript mapping, the token-count
+preflight, streaming, usage reports and cancellation. It never runs a tool and
+never holds a callback.
+
+#### CC4 wire changes
+
+All changes are schema changes in place within protocol `0.1` (CCR25); no
+compatibility with the earlier schema exists.
+
+| Message | Change |
+| --- | --- |
+| `Role` | Adds `ROLE_TOOL = 3`. |
+| `HistoryToolCall` (new) | `call_id` 1 (1–64 bytes of `[A-Za-z0-9_-]`), `name` 2 (1–256 bytes), `arguments` 3 (a JSON object, at most 64,000 bytes). |
+| `HistoryTurn` | Adds `repeated HistoryToolCall tool_calls = 3`, `call_id = 4` and `tool_name = 5`. A user entry has text only. An assistant entry has text and, only in the continuation, 1–201 tool calls with empty text. A tool entry (continuation only) has `call_id`, `tool_name` (1–256 bytes) and the output text. |
+| `ModelInput` | Adds `repeated HistoryTurn continuation = 4`: the current turn's entries after the prompt. For each settled request in order: one assistant entry with that request's calls, then one tool entry per call in call order, with matching call IDs. Empty for request 1. At most 400 entries. `history` keeps roles 1 and 2 with no tool fields. |
+| `Begin` | Adds `request_ordinal = 7`, required, at least 1. A helper session's first `Begin` carries 1; each later one the next. Later `Begin`s repeat the model, `enable_project_tools` (true) and `thinking` of the first. |
+| `Outcome` | Adds `OUTCOME_TOOL_CALLS = 4`: the request ended with tool calls. |
+| `Terminal` | Adds `tool_calls = 8`, 1–201, present only with outcome 4 and reason none. Outcome 4 ends the request, not the helper session. |
+| `ToolCall` | `ordinal` (1–201) is now the call's position in this request's response. The service assigns the turn ordinal. |
+| `ToolResult`, `ToolStatus` | Removed; envelope field 21 is reserved. Results reach the model in the next request's continuation. |
+| `InferenceUsage` | `request_ordinal` equals the request's `Begin.request_ordinal`; one report per request. |
+| `ContextMeasured` | Once per request (was once per helper session). |
+
+The call ID in the continuation is service-assigned: `call_<turn ordinal>`.
+The provider's own call ID never crosses the wire. Every input is therefore
+recomputable from the journal (ENV3), and the provider's ID format cannot
+change a later prefix.
+
+#### CC-Q4: service-owned request loop
+
+Selected design. Solid arrows are requests and messages; dashed arrows are
+replies. It shows one turn with one tool round. Request 1 follows CC-Q1 and
+CC-Q3 unchanged.
+
+```mermaid
+sequenceDiagram
+    participant O as Conversation owner
+    participant K as Context composer
+    participant W as Journal writer
+    participant H as Model helper
+    participant X as Tool owners
+    Note over O,H: Request 1: CC-Q1 and CC-Q3, kind 21, Begin 1, kind 6, Start
+    H-->>O: Revisions while text streams
+    alt Final answer
+        H-->>O: Terminal complete
+        O->>W: Kind 8 terminal
+    else Tool calls proposed
+        H-->>O: ToolCall positions 1 to n, after the last revision
+        H-->>O: Terminal tool_calls n
+        loop Each queued call, in order, one at a time
+            O->>O: Assign the turn ordinal, decide by the tool call records
+            O->>W: Kind 14
+            O->>X: Run under policy with stage A view sizing
+            X-->>O: Settled result
+            O->>W: Kind 15 or kind 29
+        end
+        O->>K: Compose request k+1: base, settled pairs, budget
+        alt Fits
+            K-->>O: Input, manifest digest
+            O->>H: Begin k+1, input chunks under credit
+            H-->>O: Ready
+            O->>W: Kind 33 request k+1 with its digests
+            W-->>O: Durable
+            O->>H: Start
+        else Does not fit
+            K-->>O: context_limit
+            O->>H: Cancel
+            O->>W: Kind 8 failed
+        end
+    end
+    opt Cancel, steering or shutdown at any point
+        O->>H: Cancel
+        H-->>O: Terminal cancelled
+    end
+```
+
+#### CC-S3: helper session per request
+
+Selected design. Arrows are messages received or events in the helper. Every
+state ends on its next message, a cancel, channel close or a protocol fault;
+none has a time bound.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Hello
+    Hello --> Begin: Hello sent, model available
+    Hello --> [*]: model unavailable
+    Begin --> Input: Begin k, k is last plus 1
+    Input --> Ready: InputEnd, input valid
+    Ready --> Running: Start
+    Running --> Begin: text committed, ToolCall 1 to n, Terminal tool_calls n
+    Running --> Terminal: Terminal complete or failed
+    Begin --> Terminal: Cancel after request 1
+    Input --> Terminal: Cancel
+    Ready --> Terminal: Cancel
+    Running --> Terminal: Cancel
+    Terminal --> [*]: final drain, channel closed
+```
+
+The helper accepts output `Credit` for its current transfer in every state
+after the first `Start`; a credit can arrive after the request's terminal.
+
+#### CC-S4: service request loop states
+
+Selected design. Arrows are events in the conversation owner. Each state ends
+through a closure: a helper message, a durable reply, a tool settlement, a
+cancel, steering, shutdown or helper exit.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Composing: helper Hello, window known
+    Composing --> Transfer: kind 21 durable, Begin 1
+    Transfer --> Running: Ready, kind 6 or kind 33 durable, Start
+    Running --> Settling: Terminal tool_calls n, n calls queued
+    Settling --> Settling: next queued call recorded and settled
+    Settling --> Recomposing: queue empty, every call settled
+    Recomposing --> Transfer: input fits W, Begin k+1
+    Recomposing --> Ending: context_limit
+    Settling --> Ending: over-limit call 201 recorded
+    Running --> Ending: Terminal complete, failed or cancelled
+    Transfer --> Ending: failure or helper exit
+    Settling --> Ending: cancel, steering or shutdown, queued calls recorded cancelled
+    Ending --> [*]: helper settled, kind 8 durable
+```
+
+#### Requests and tool calls
+
+1. **Request ordinals.** Request 1 starts with kind 6 (`StartAuthorized`), as
+   today. Request `k > 1` starts with kind 33 (`RequestStarted`) after the
+   helper's `Ready`. Kind 33 binds the request's input digest and manifest
+   digest before the helper starts it.
+2. **Proposals.** The helper sends a request's calls only after the inference
+   has settled and its text revisions are committed, then `Terminal` with
+   outcome 4. The model owner checks that each `ToolCall` position is the next
+   one and that `tool_calls` equals the count received. The conversation owner
+   queues the calls (at most 201) and records them one at a time, in position
+   order, through the existing decision path ([tool call
+   records](tool-call-records.md#call-flow)). Each gets the next turn ordinal.
+3. **Running.** Calls run one at a time, as today. Stage A view sizing (CC2)
+   still sizes each job-mode result: the next request's input is the earlier
+   input plus the delivered results, so the stage A remaining budget is
+   unchanged.
+4. **The 200-call limit** stays (owner, 2026-10-13 and 2026-10-18). The 201st
+   proposal of the turn is recorded with decision `limit`, and the turn ends
+   `failed` with cause `output_limit`, as before. Proposals after it in the
+   same request get no record; the stage A helper never forwarded them either.
+   A request can hold at most 201 calls; the helper sends the first 201.
+5. **Next request.** When the queue is empty and every call has settled, the
+   owner composes request `k+1` and sends it. Each request has at least one
+   new call, so a turn has at most 201 requests.
+6. **Response text.** Each request's text revises the turn's response, as the
+   SDK's own loop did: the first revision of a later request cuts the response
+   to the common prefix. Text of a request that proposed calls is not carried
+   into later input; only its calls are. Thinking text revises the same way
+   and is never input (Q3).
+7. **Arguments in the continuation.** The arguments are the kind 14 stored
+   text when its form is verbatim (1) or canonical (2) and it is a JSON
+   object; otherwise `{}`, and the tool entry holds the refusal text. Stored
+   text keeps its `$ASURA_SECRET_<n>` placeholders; the composer never
+   restores a value. The model therefore sees placeholders where the stage A
+   SDK transcript kept its raw arguments.
+8. **Result text.** `tools::render_reply` renders each settled result as the
+   helper rendered it before CC4: a private result (status 8) is its text
+   alone; a failure is `Tool failed: <status>` with the text on the next line;
+   a success ends with the `[truncated: …]` or `[next byte offset: …]` line.
+   Status names are the earlier wire names (`invalidArguments`, `denied`,
+   `unavailable`, `timeout`, `cancelled`, `limit`).
+
+#### Request composition (Q5)
+
+The pure function `context::compose_request` takes the turn's base, the
+settled pairs and the kind 21 budget. The base is request 1's composition:
+instructions, shown history, the context block and the prompt, with the
+sources that built it (candidates, notice, read views). The conversation owner
+keeps these sources for the turn, at most the 8 MiB `Prepare` bound.
+
+1. Build the continuation with every pair at full fidelity, after the base.
+2. If the encoded input is within `W`, use it. The base and every earlier
+   continuation entry are byte-identical to the previous request's.
+3. Otherwise reduce older pairs: walk the pairs of requests before the latest
+   one, oldest first. Replace each result text with one service-written
+   reference line until the input fits:
+   `[Asura: tool result <ordinal> (<name>) not shown for space; <n> bytes]`
+   followed by `job: <handle>` when the result names a job. The call entry
+   stays, so call and result stay paired (rule 2).
+4. Otherwise recompose the base: run CC-F1 for the turn start with `W` reduced
+   by the encoded continuation. History turns become references or join the
+   omitted range under the existing rules.
+5. If the base's mandatory segments still do not fit, or the encoded input
+   exceeds `W`, the turn fails with `context_limit`. The latest request's
+   pairs are mandatory: a result the model has not seen is never reduced.
+
+Sizes are computed from the protobuf encoding, so each step is exact and the
+pure core needs no trial encodes beyond the final check. Equal inputs give
+equal bytes.
+
+##### CC-F4: request composition
+
+Selected design. Arrows are the order of evaluation. The reduction loop is
+bounded by the number of pairs (at most 200).
+
+```mermaid
+flowchart TD
+    In["Request k+1: base, settled pairs, W"] --> Full["Continuation with every pair at full fidelity"]
+    Full --> Fit{"Encoded input within W?"}
+    Fit -->|Yes| Stable["Input and manifest; earlier entries byte-stable"]
+    Fit -->|No| Older{"A full result of a request<br/>before the latest?"}
+    Older -->|Yes| Ref["Oldest such result becomes a reference line"] --> Fit
+    Older -->|No| Base["Recompose the base (CC-F1)<br/>with W minus the continuation"]
+    Base --> Mand{"Base mandatory segments fit?"}
+    Mand -->|No| Limit["context_limit; the turn ends failed"]
+    Mand -->|Yes| Enc{"Encoded input within W?"}
+    Enc -->|Yes| Recomposed["Input and manifest; base recomposed"]
+    Enc -->|No| Limit
+```
+
+#### Request manifest and kind 33
+
+Composer revision 5 marks CC4. Request 1 keeps the turn-start manifest of
+kind 21 (revision 5 changes only the revision word in its encoding). Each
+request `k > 1` has a request manifest; its digest is SHA-256 over:
+
+- format byte 2, the composer revision, the request ordinal (u32);
+- the base manifest digest: kind 21's, or the recomposed base's;
+- one segment per continuation entry, in input order: kind 8 `tool_call`
+  (role 2) or kind 9 `tool_result` (role 3), fidelity (3 full, 2 reference),
+  the turn ordinal (u32), the SHA-256 of the source text (arguments, or the
+  rendered result), and the shown length (u32) and SHA-256 of the shown text.
+
+Kind 33 `RequestStarted` (new, journal format 1): operation (16 bytes),
+generation (u64), request (u32, at least 2), input digest (32), manifest
+digest (32); 92 bytes. Replay accepts it only for an operation of the current
+owner generation whose kind 6 committed, with no cancel and no terminal,
+whose request count is one less, whose every kind 14 is resolved and which
+recorded at least one kind 14 since its previous request started. Kind 14
+records after a kind 33 belong to that request.
+
+ENV3 holds: the manifest is recomputed, never stored. Request `k`'s input is a
+function of kind 21 and its sources, the kind 14 records and their results
+(kind 15 text, kind 29 with its view ranges and the retained pages, and the
+not-run text derived from kind 14 codes), and the request boundaries (kind 6
+and each kind 33). The kind 33 digests verify a recomputation.
+
+##### CC-D2: request manifest data view
+
+Selected logical view. Lines are identity references with cardinalities; they
+are not storage tables.
+
+```mermaid
+erDiagram
+    TURN ||--|{ REQUEST : issues
+    REQUEST ||--|| START_RECORD : "kind 6 or kind 33"
+    REQUEST ||--|| REQUEST_MANIFEST : records
+    REQUEST_MANIFEST ||--|| MANIFEST : "base: kind 21 or recomposed"
+    REQUEST_MANIFEST ||--o{ PAIR_SEGMENT : orders
+    PAIR_SEGMENT }o--|| TOOL_CALL : "kind 14"
+    PAIR_SEGMENT }o--o| TOOL_RESULT : "kind 15 or kind 29"
+    START_RECORD {
+        bytes operation
+        u64 generation
+        u32 request
+        hash input_digest
+        hash manifest_digest
+    }
+    PAIR_SEGMENT {
+        u8 kind
+        u8 role
+        u8 fidelity
+        u32 ordinal
+        hash source_digest
+        u32 shown_length
+        hash shown_digest
+    }
+```
+
+#### Helper request handling
+
+Each request is one stateless SDK session (CCR21). The helper:
+
+1. Maps `ModelInput` to transcript entries: instructions (with the declared
+   tool definitions), history, the prompt, then the continuation as
+   `toolCalls` and `toolOutput` entries. A call's arguments must parse as
+   `GeneratedContent`; otherwise the request fails with `protocol_fault`.
+2. Runs the token-count preflight when a counter exists (system model).
+3. Creates a new `LanguageModelSession` with stop tools: one per declared
+   project tool, with the same name, description and schema, whose `call`
+   throws `StopForCaller`. It sets `.preserveTranscript`.
+4. Calls `streamResponse(to: prompt)`. The `BoundedToolModel` executor wrapper
+   replaces the request transcript with the mapped entries and admits exactly
+   one inference per session; a second dispatch is a protocol fault.
+5. On a normal end, sends the text and `Terminal` complete. On
+   `ToolCallError` whose underlying error is `StopForCaller`, reads the last
+   `toolCalls` entry of the preserved transcript and sends its calls in
+   order (name, `arguments.jsonString`, source `generated_content`). No
+   `toolCalls` entry is an SDK regression: `Terminal` failed,
+   `internal_error`, diagnostic `stop_tool_transcript`.
+6. Classifies failures as before, with Q6: a full window is `context_limit`.
+
+The Ollama adapter keeps its unregistered-name path (TCR-D17, revised): it
+reports the call, which the helper sends as a `ToolCall` with source
+`provider_json`, and then fails the request with `protocol_fault`. The
+service records that call `cancelled`, because the turn has ended (TCR-D8).
+
+##### CC-F5: helper request handling
+
+Selected design. Arrows are decisions in order for one request.
+
+```mermaid
+flowchart TD
+    B["Begin k and input received"] --> M["Map ModelInput: instructions, history,<br/>prompt, continuation"]
+    M --> C{"Token counter present?"}
+    C -->|"Count leaves no output room"| CL["Terminal failed: context_limit"]
+    C -->|"Fits, or no counter"| S["New session with stop tools;<br/>preserveTranscript"]
+    S --> R["streamResponse; wrapper replaces<br/>the transcript; one inference"]
+    R --> Q{"Outcome"}
+    Q -->|"Text completes"| F["Revisions; Terminal complete"]
+    Q -->|"Stop tool throws"| P{"Preserved transcript has<br/>a toolCalls entry?"}
+    P -->|No| IE["Terminal failed: internal_error"]
+    P -->|Yes| TC["Revisions committed; ToolCall 1 to n;<br/>Terminal tool_calls n; wait for Begin k+1"]
+    Q -->|"Window full"| CL
+    Q -->|"Unregistered name (Ollama)"| UR["ToolCall for it;<br/>Terminal failed: protocol_fault"]
+    Q -->|"Other failure"| E["Terminal failed with its reason"]
+    Q -->|"Cancel"| X["Terminal cancelled"]
+```
+
+Removed from the helper: the tool loop, `ToolRoundBudget` request admission
+and inference waiters, `BoundedNativeTool`, the busy reply for concurrent
+callbacks ([model tool execution](model-tool-execution.md#concurrent-callback-busy-reply)),
+the pending-callback slot and `ToolResult` handling. All calls of one response
+reach the service together, so no busy reply is needed.
+
+#### CC4 failure handling
+
+| Case | Result |
+| --- | --- |
+| `ToolCall` with a position that is not the next one, above 201, with tools disabled, or before the request's start record commits | Protocol fault; the turn fails `protocol_failure`; no record for that call |
+| `Terminal` outcome 4 whose `tool_calls` differs from the calls received, with no calls, with tools disabled, or with a partial revision | Protocol fault |
+| `Begin` with a request ordinal that is not the next one, or a later `Begin` that changes the model, tools or thinking | Helper protocol fault |
+| Preserved transcript holds no `toolCalls` entry (SDK change) | Request fails `internal_error`; turn fails; the native regression test fails first |
+| Next request does not fit `W` after both reductions | Turn fails, cause `input_limit` (`context_limit` to the client) |
+| Helper preflight or provider reports a full window | Turn fails `context_limit`, as today, including the `GenerativeError` overflow (Q6) |
+| 201st proposal | Recorded `limit`; turn fails `output_limit`; later proposals are not recorded |
+| Cancel, steering or shutdown while calls are queued | Kind 7, then each queued call as kind 14 `cancelled` (TCR-D8), then the terminal; the helper answers `Cancel` with `Terminal` cancelled in any state |
+| Helper exit between requests | `model_helper_failed`; queued calls recorded `cancelled`; turn fails |
+| Restart during the loop | Existing interrupted-turn recovery; replay accepts the kind 33 sequence; nothing reruns |
+| Unregistered tool name (Ollama) | Its `ToolCall`, then `Terminal` failed `protocol_fault`; the call is recorded `cancelled` |
+
+#### CC4 security
+
+- **Taint on every request (T1).** Every request is composed from the base
+  (T1 applied by CC3) and the settled pairs. A pair's result text is the
+  rendered kind 15 or kind 29 text, and a tainted job's kind 29 is `private`
+  with no output, counts or status. No request can therefore hold tainted
+  output. CC-I23 sweeps every request of a multi-request turn.
+- **Secrets in arguments.** The continuation carries the kind 14 stored text,
+  which holds placeholders and never a value.
+- **Isolation (CCR21).** Each request is a fresh SDK session with no retained
+  transcript. The Ollama and Core AI prefix caches hold only tokens the request
+  itself supplied.
+- **Authority.** The helper still runs no tool; every call enters normal
+  admission in the service (SB-06).
+
+#### CC4 asynchronous execution
+
+| Rule | Application |
+| --- | --- |
+| AE-01 | Composition per request is bounded pure work on the reactor. The helper's request is the existing model task; stop tools return at once. |
+| AE-02 | No new blocking call. Tool runs keep their existing workers; journal appends keep the writer worker. |
+| AE-03 | Queued calls: at most 201 per request in the service and in the helper. Continuation: at most 400 entries; each argument at most 64,000 bytes, each result at most 16,384 bytes before rendering. Kind 33: at most 200 per turn. The kept base sources are at most the 8 MiB `Prepare` bound. |
+| AE-04 | No time bound. A request ends on its `Terminal`, a cancel, steering, shutdown, helper exit or a protocol fault. Between requests the owner waits only for tool settlement, which keeps its own closures. The loop as a whole ends by the 200-call limit, a full window (`context_limit`), cancel or the model's final answer. |
+| AE-05 | Nothing is retried. A request is never resent; a call is recorded once. Restart uses interrupted-turn recovery. |
+| AE-06 | Shutdown cancels the turn: the helper answers `Cancel` in every state; queued calls are recorded `cancelled` before the terminal. |
+| AE-07 | CC-I21 (cancel between requests) and CC-I22 (restart in the loop) exercise the closures. |
+
+#### CC4 packets
+
+| Packet | Owned paths | Delivers |
+| --- | --- | --- |
+| CC4-P prerequisites | `swift/model-helper/Sources/HelperCore/{Backend,BoundedToolModel}.swift`, `ContextOverflowTests.swift` | Q6 overflow mapping and its tests |
+| CC4-W wire | `contracts/model/v1/model.proto`, `asura-control/src/model.rs` and tests | The wire changes and both validators' Rust side |
+| CC4-H helper | `swift/model-helper/Sources/HelperCore/*`, `Tests/HelperCoreTests/*` | One inference per request, stop tools, override, proposals, multi-request session |
+| CC4-S storage | `asura-storage/src/authority/conversation/{types,codec,state}.rs` | Kind 33 and its replay rules |
+| CC4-C composer and owner | `asura-service/src/context.rs`, `context/request.rs`, `model_owner.rs`, `conversation.rs`, `tools.rs` | `compose_request`, the request loop, `render_reply` |
+| CC4-V validation | `asura-service/tests/*`, `rust/crates/asura-cli/tests/tui_pty.py` | CC-I20 to CC-I24 and the journeys |
+
+One writer owns each packet's paths, in the order above.
+
 ### Slices
 
 **CC1, implemented 2026-10-15: turn-start composition and window-sized input.**
@@ -1415,9 +1877,10 @@ turns.** Output from retained streams in the turn's notice
 notice in history stays at reference fidelity. Lifts PC12 for person notices.
 Applies T1 to notices and rebuilt prior notices (composer revision 4).
 
-**CC4, waits for loop closure decision 6: per-request recomposition (stage B).**
-Service-owned request loop, per-request manifests, history entries carrying tool
-calls and results.
+**CC4, selected 2026-11-02 (loop closure decision 6 decided): per-request
+recomposition (stage B).** Service-owned request loop, per-request manifests,
+history entries carrying tool calls and results
+([CC4 design](#cc4-service-owned-request-loop-stage-b)).
 
 **CC5, waits for a memory selection design: memory and evidence.**
 
@@ -1439,7 +1902,8 @@ flowchart TD
     CC2 --> CC3["CC3: notice views,<br/>tainted notices, model holds"]
     J5["Job J5: notices (J5a)<br/>(delivered)"] --> CC3
     CC3 --> CC4["CC4: per-request<br/>recomposition (stage B)"]
-    LC6["Loop closure decision 6<br/>(open)"] --> CC4
+    LC6["Loop closure decision 6<br/>(owner, 2026-11-02)"] --> CC4
+    Pre["CC4 prerequisites: Core AI asset,<br/>overflow mapping (Q6)"] --> CC4
     CC4 --> CC5["CC5: memory and evidence"]
     Sel["Memory selection design"] --> CC5
     CapRec["Capacity record<br/>(provider design)"] -.->|"replaces Hello stub;<br/>R = window ÷ 4 until then"| CC2
@@ -1488,6 +1952,13 @@ Ollama.
 | CC-U26 | CC2 | Payload pages with newlines | Read with "end at a line" and "start at a line" at, inside and past line ends | Cuts at newline bytes only; no cut when the page reaches the stream end or holds no newline; UTF-8 stays valid |
 | CC-U27 | CC2 | Kind 29 with 0 to 3 view ranges, and outcome `private` | Encode, decode, validate | Round trip; sizes as the view block table; a view with a non-`ok` outcome, 4 ranges, overlapping ranges or bytes past the total is `Corrupt`; `private` is refused for codes other than 10 and 12 to 14, and with any body |
 | CC-U28 | ENV4 | A tainted model `exec_cmd` call whose job's kind 26 committed; the same before kind 26; the turn ended first | Advance the call | Kind 29 outcome `private`, no body, appended after kind 26 with no yield wait; the rendered text holds the handle and no state, exit status, count, elapsed time or output |
+| CC-U29 | CC4 | A base and pairs of two requests, ample `W` | `compose_request` twice; then for the next request | Equal bytes and digest; history and prompt byte-equal to the base; each continuation is the previous one plus the new entries; call IDs `call_<ordinal>`; one assistant entry per request |
+| CC-U30 | CC4 | Pairs of three requests; `W` that fits only after reductions | `compose_request` | Older results become reference lines oldest first; the latest request's results stay full; the base is recomposed only when references are not enough; `context_limit` when the latest pairs and the mandatory base exceed `W` |
+| CC-U31 | CC4 | Kind 14 forms 1 to 4; every result status, private included | Build pairs and render | Forms 1 and 2 with a JSON object are placed; otherwise `{}`; rendering equals the earlier helper rendering for each status; placeholders kept |
+| CC-U32 | CC4 | Model owner after request 1 | `ToolCall` positions 1 and 2, `Terminal` outcome 4; then `Begin` 2 | Calls emitted in order; owner returns to available; request 2 resets the input ledger and credits the next output transfer once; wrong position, count mismatch, outcome 4 without tools or with a partial revision is a fault |
+| CC-U33 | CC4 | Control validator | `Begin` with and without `request_ordinal`; `Terminal` outcome 4 with and without `tool_calls`; continuation entries well formed, unpaired, misordered or with tool fields in history | Valid shapes pass; every other shape is rejected |
+| CC-U34 | CC4 | Journal with an accepted, started operation | Kind 33 after a resolved call; a second kind 33 with no new call; kind 33 with an unresolved call, after cancel, after the terminal, with a skipped ordinal | Round trip; only the first is accepted; the others are `Corrupt` |
+| CC-U35 | CC4 | Conversation owner fixture with tools enabled | Two calls proposed; one settles; the 201st proposal; cancel with calls queued | Calls recorded in order with the next turn ordinals; the next request composes only after both settle; the 201st ends the turn `output_limit`; queued calls are recorded `cancelled` before the terminal |
 
 ### Integration
 
@@ -1512,6 +1983,25 @@ Ollama.
 | CC-I17 | CC3 | CC-I16's journal | Restart and recompose the turn | Same input digest from the budget inputs, `notice_views` and the streams; the taint is recomputed from kind 31 |
 | CC-I18 | ENV4 | Real service, scripted loopback model; the model runs `exec_cmd` with a synthetic token in its command, and the command prints a canary and the token; a later turn | The handle delivery, then `job status`, `job read`, `job wait` and `job list` of that job, then the next turn's notice | Delivery and the three calls record outcome `private`; the list row is the private form; the notice entry is private; a raw-byte sweep of every chat request the model received and every kind 21 and kind 29 frame finds no token, no SHA-256 hex digest of the token, no canary, no exit status line and no line or byte count of the job |
 | CC-I19 | ENV4 | CC-I18's journal | Restart and recompose the later turn | The rebuilt notice reference line is private; the taint is recomputed from kind 14 |
+| CC-I20 | CC4 | Real service and helper, scripted loopback model: two calls in one response, then one call, then an answer | The turn | Three chat requests; each later request's messages start with the earlier request's messages byte for byte, then the assistant calls and the tool outputs; kind 6, then kind 33 for requests 2 and 3 with distinct input digests; the journal replays |
+| CC-I21 | CC4 | As CC-I20 with the first call's job held | Cancel while the call runs | Kind 7, the queued call recorded `cancelled`, the terminal; no further chat request; controls stay responsive |
+| CC-I22 | CC4 | As CC-I20 | Kill the service after kind 33 | Restart marks the turn interrupted; replay accepts kind 33; no request is resent |
+| CC-I23 | CC4 | A tainted person job and a tainted model `exec_cmd` with canaries; scripted model calls `job status`, `job read`, `job wait` and `job list` across several requests of one turn | The turn | A raw-byte sweep of every chat request of the turn, every kind 21, kind 29 and kind 33 frame finds no canary, token, exit status or count of a tainted job |
+| CC-I24 | CC4 | Scripted model with a small window; three tool rounds with large results | The turn | A later request shows reference lines for older results; the latest results are full; the turn completes |
+
+### Native
+
+Native cases run real models on the development host. They are opt-in and
+outside the lifecycle Cargo gate; the gate records each result per backend.
+
+| ID | Slice | Environment | Required result |
+| --- | --- | --- | --- |
+| CC-N1 | CC4 | Model-free; real FoundationModels session machinery with a scripted executor; runs in every `swift test` | A stop tool that throws ends the session with `ToolCallError`; the preserved transcript holds the `toolCalls` entry with all calls in order; the executor received the override transcript, continuation included; exactly one dispatch. Fails if the SDK changes either behavior |
+| CC-N2 | CC4 | System model, `ASURA_TEST_NATIVE_SYSTEM=1` | A request that requires a tool returns at least one proposal; a request whose continuation ends with a tool output completes with text; the mid-turn overflow is `context_limit` |
+| CC-N3 | CC4 | MLX, `ASURA_TEST_MLX_ASSET` (`mlx-community/Qwen3-1.7B-4bit`) | As CC-N2, through `FoundationBackend` over MLX |
+| CC-N4 | CC4 | Ollama, `ASURA_TEST_OLLAMA_MODEL` (`granite4.1:8b`) | As CC-N2, through the Ollama adapter |
+| CC-N5 | CC4 | Core AI, `ASURA_TEST_COREAI_ASSET` | The `--native-coreai-exec-cmd-tools` journey runs its turns through stage B |
+| CC-N6 | CC4 | System, MLX, Ollama | The `--native-*-exec-cmd-tools` journeys run their multi-request turns through stage B |
 
 ### End-to-end
 
@@ -1525,6 +2015,7 @@ Ollama.
 | CC-E6 | CC1 | Model whose window exceeds 64 KiB of text | Paste a long document, then ask about its start | Input above 64 KiB is accepted and answered; manifest shows the full document |
 | CC-E7 | CC3 | TUI with the scripted model; person `!` command with a stored secret variable | Next turn, then the model asks `job read` | The person sees the output in the job viewer; the model's notice and `job read` result are private; the answer reaches the TUI; no model request holds the output |
 | CC-E8 | ENV4 | TUI with the scripted model; the model runs `exec_cmd` with a synthetic token in its command that prints a canary | The turn, then the model asks `job read` | The person sees the output in the job viewer; the model's handle delivery and `job read` are private; the answer reaches the TUI; no model request holds the token, its digest, the canary, the exit status or the counts |
+| CC-E9 | CC4 | TUI journeys `--context-views`, `--job-notices` and `--person-*` | Their tool turns | Each tool turn runs as several requests through the real TUI, service and helper; the journeys' assertions hold unchanged |
 
 The end-to-end cases CC-E3, CC-E4 and CC-E7 use the PTY harness with the
 scripted loopback model (`--context-views`), which drives the real TUI,
@@ -1566,6 +2057,9 @@ visually inspected on 2026-10-14; CC-F1 was re-rendered and inspected on
 CC-Q1, CC-Q2, CC-D1 and CC-P1 and the new CC-F2 and CC-F3 were rendered with
 the local Mermaid CLI at scale 2 into a temporary directory outside the
 repository and inspected. Rendering does not validate the semantics.
+On 2026-11-02 the new CC-Q4, CC-S3, CC-S4, CC-F4, CC-D2 and CC-F5 and the
+revised CC-P1 were rendered the same way (Mermaid CLI, scale 2, PNG) and
+inspected for labels, branches and layout. The diagrams set no colours.
 
 CC1 implementation evidence, 2026-10-15, macOS 27 development host:
 

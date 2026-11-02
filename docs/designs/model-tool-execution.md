@@ -273,6 +273,12 @@ exactly once with failure. Late or mismatched results fault the private channel.
 
 ### Concurrent callback busy reply
 
+Superseded on 2026-11-02 by [CC4](context-composer.md#cc4-service-owned-request-loop-stage-b):
+the service owns the turn's request loop, the helper runs one inference per
+request and sends every call of a response together, and `ToolResult` is
+removed. The helper has no callback slot, so no busy reply exists. The text
+below records the earlier design.
+
 Required behavior (2026-10-21, fixes defect EXQ-D1 in
 [exec_cmd qualification](exec-cmd-tool.md#qualification-decisions)). A model
 response can hold several tool calls. The SDK can then run their callbacks at the
@@ -478,6 +484,12 @@ all spawned service/helper children remain owned by the test fixture and settle
 on every exit path. The primary agent schedules all builds and live tests.
 
 ### Shared Foundation Models engine
+
+Revised 2026-11-02 by [CC4](context-composer.md#helper-request-handling): the
+engine runs one inference per request in a fresh session with stop tools, and
+returns the response's tool calls to the service. The SDK no longer runs the
+loop shown in the flowchart below; the service does
+([CC-Q4](context-composer.md#cc-q4-service-owned-request-loop)).
 
 System, custom-local and network providers use one generic FoundationBackend over
 the SDK LanguageModel abstraction. ProviderFactory supplies the selected model,

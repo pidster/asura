@@ -444,6 +444,10 @@ Open decisions for the per-loop mapping:
    undocumented workaround (executor transcript override and a throwing stop
    tool), backed by a regression test that fails if a macOS update breaks it.
    A Core AI run with a real local model comes before the build (composer CC4).
+   The implementation-ready design is
+   [CC4](context-composer.md#cc4-service-owned-request-loop-stage-b). Under it a
+   full window that stops the next request is a new known-size closure of the
+   turn loop (`context_limit`).
 
 Owner direction (2026-10-13): the closure that guarantees a turn's tool loop
 ends is derived from evidence. Asura logs tool-loop traces and builds a

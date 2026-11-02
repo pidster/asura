@@ -54,6 +54,28 @@ stops, the 201st proposal is recorded, the person cancels or steers, the model's
 context window fills, the provider fails, the helper exits, the journal is full,
 or the service shuts down or restarts. No time bound is added.
 
+### Revision for the service-owned loop (CC4, 2026-11-02)
+
+Selected design under [CC4](context-composer.md#cc4-service-owned-request-loop-stage-b).
+The records, decisions and limits above are unchanged. These rules change:
+
+- **Ordinals (TCR-D6).** The wire `ToolCall` ordinal is the call's position in
+  one request's response, 1–201. The conversation owner assigns the turn
+  ordinal (1–201) when it records the call. The `ToolResult` message is
+  removed; a result reaches the model in the next request's input. After the
+  201st record the service, not the helper, ends the turn with `output_limit`.
+- **Helper faults (TCR-D7).** A position that is not the next one in the
+  request, or a `Terminal` whose call count differs, is a helper fault. Resends
+  cannot occur: each call arrives once, so the keyed digest and the resend rule
+  are removed.
+- **Unregistered names (TCR-D17).** The Ollama adapter still sends the call and
+  fails the request with `protocolFault`. The turn has then ended, so the call
+  is recorded `cancelled` (TCR-D8).
+- **Composer use.** Calls and results of the current turn enter later requests
+  of the same turn as tool-call and tool entries
+  ([request composition](context-composer.md#request-composition-q5)). Calls
+  of earlier turns still never enter later input.
+
 ## Purpose and scope
 
 Objectives:

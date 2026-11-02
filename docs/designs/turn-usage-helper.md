@@ -114,8 +114,12 @@ value can stop the model before its context window is full:
 | Ollama | The adapter ignores the option and sends `num_predict: -1` | Ollama documents −1 as “infinite generation” and as the default. Asura sends it explicitly so that a Modelfile `PARAMETER num_predict` cannot add a cap. |
 | CoreAI and MLX | The model's effective context window `E`, from Hello | With `nil`, the pinned adapters substitute their own defaults: CoreAI 512 tokens (2,048 for reasoning models) and MLX 4,096. A value of `E` cannot stop output before the window is full, because the input also occupies the window. |
 
-- **Tool-enabled generation:** every request is admitted while no earlier
-  failure is recorded and no other request is active.
+- **Tool-enabled generation:** revised 2026-11-02 by
+  [CC4](context-composer.md#helper-request-handling). Each helper request
+  (`Begin`) is one SDK session that admits exactly one inference; its tool
+  calls end the session, and the service starts the next request. Before CC4,
+  every request was admitted while no earlier failure was recorded and no
+  other request was active.
 - **Plain text:** one request is admitted. A plain-text turn has no tool
   continuation, so a second dispatch can only be an SDK retry that repeats the
   answer. The second dispatch fails with the output-limit result before provider

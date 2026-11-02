@@ -810,6 +810,14 @@ Prompt is nonempty and at most 32 KiB UTF-8. The encoded ModelInput and all deco
 text together are each limited to 64 KiB. The helper validates these bounds after
 assembling the input transfer and before requesting the start permit.
 
+Revised by the [context composer](context-composer.md) (CC1 removed the 32-turn,
+32 KiB and 64 KiB bounds) and by
+[CC4](context-composer.md#cc4-wire-changes) on 2026-11-02: `ModelInput` gains
+`continuation` (field 4), the current turn's tool-call and tool entries after
+the prompt; `HistoryTurn` gains tool calls (field 3), `call_id` (4) and
+`tool_name` (5); role 3 is a tool output. One helper still serves one admitted
+operation, now as one inference per `Begin`, several `Begin`s per operation.
+
 Use the SDK's structured transcript/prompt representation to preserve roles;
 never concatenate history with invented role delimiters. Token counting and
 context preparation occur after the serialized start permit, inside the admitted

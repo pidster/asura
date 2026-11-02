@@ -1,6 +1,10 @@
 # Loop closure decision 6 probes
 
-Status: probe record, 2026-11-02; the owner adopted stage B on 2026-11-02 on this evidence. It records evidence for
+Status: probe record, 2026-11-02; the owner adopted stage B on 2026-11-02 on this
+evidence. The open questions are resolved in the
+[CC4 design](context-composer.md#cc4-decisions): Q1 by the owner (accept the
+workaround with a native regression test), Q2 to Q5 as engineering choices and
+Q6 as a CC4 prerequisite. It records evidence for
 [loop closure decision 6](loop-closure.md#decisions): whether the service can own
 the turn request loop (context composer stage B, slice CC4). It selects nothing
 and authorizes no code. The owner decides. Protocol numbering remains `0.1`;
