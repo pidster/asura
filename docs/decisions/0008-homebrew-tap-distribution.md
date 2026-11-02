@@ -87,9 +87,11 @@ flowchart TD
   from another build. The recoverable handover path is deferred until the
   first release (owner, 2026-10-17).
 - `brew uninstall --cask asura` removes the app and the link only. It must
-  leave the per-user authority files and graph data in `~/.asura` intact. The
-  cask has no `zap` stanza; whether `zap` may ever remove `~/.asura` is an
-  open owner question, with "keep" as the default.
+  leave the per-user authority files and graph data in `~/.asura` intact.
+  Amended 2026-11-02 (owner): `brew uninstall --zap --cask asura` removes all
+  of `~/.asura` through `zap trash: "~/.asura"`, which moves it to the Trash.
+  Keychain items stay. Until then the cask had no `zap` stanza
+  ([zap and `~/.asura`](../designs/release-distribution.md#zap-and-asura)).
 - Homebrew quarantines a cask download, so Gatekeeper assesses the installed
   app. The notarised, stapled DMG and the notarised app satisfy it.
 - The existing tap is a distribution precedent. It does not establish Asura's

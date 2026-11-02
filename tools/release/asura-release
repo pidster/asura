@@ -320,6 +320,21 @@ tap_test() {
     target=$tap_dir/Casks/asura.rb
     # Audit the cask exactly as it would be published.
     cp "$cask" "$target"
+    # Zap (owner, 2026-11-02): Homebrew's own parse of the cask must hold one zap artifact that moves
+    # ~/.asura to the Trash. Checked from brew info only; no step runs an uninstall with zap, so the real
+    # ~/.asura is never touched (release-distribution.md, zap and ~/.asura).
+    if brew info --json=v2 --cask "$tap/asura" > "$x/info.json" 2> "$x/info.log"; then
+        check 'Homebrew parses the zap stanza as trash ~/.asura only' /usr/bin/python3 -I -c '
+import json, sys
+cask = json.load(open(sys.argv[1]))["casks"][0]
+zaps = [a["zap"] for a in cask["artifacts"] if "zap" in a]
+def paths(v):
+    return [v] if isinstance(v, str) else list(v)
+ok = len(zaps) == 1 and len(zaps[0]) == 1 and set(zaps[0][0]) == {"trash"} and paths(zaps[0][0]["trash"]) == ["~/.asura"]
+sys.exit(0 if ok else 1)' "$x/info.json"
+    else
+        bad 'brew info --json=v2 --cask reads the tap cask'; sed 's/^/  /' "$x/info.log"
+    fi
     online=; [ -n "$dmg" ] || online=--online
     if brew audit --cask --strict $online "$tap/asura" > "$x/audit.log" 2>&1; then
         pass "brew audit --cask --strict${online:+ $online}"
@@ -408,6 +423,10 @@ case "$mode" in
         esac
         sed -e "s/@VERSION@/$version/g" -e "s/@SHA256@/$digest/g" "$release/asura.rb.in" > "$out"
         if grep -q '@[A-Z0-9_]*@' "$out"; then rm -f "$out"; refuse 'a template placeholder is left'; fi
+        # Zap (owner, 2026-11-02): the one zap stanza moves ~/.asura to the Trash; nothing deletes it.
+        if [ "$(grep -E '^ *zap\b' "$out")" != '  zap trash: "~/.asura"' ] || grep -Eq 'delete:|rmdir:' "$out"; then
+            rm -f "$out"; refuse 'the cask zap stanza must be exactly: zap trash: "~/.asura"'
+        fi
         pass "cask written: $out (version $version, sha256 $digest)"
         finish ;;
     tap-test)
@@ -416,6 +435,8 @@ case "$mode" in
         grep -Fqx "  version \"$version\"" "$cask" || refuse "the cask version is not $version"
         grep -Fqx '  url "https://github.com/pidster/asura/releases/download/v#{version}/Asura-#{version}.dmg"' "$cask" ||
             refuse 'the cask url is not the release asset'
+        [ "$(grep -E '^ *zap\b' "$cask")" = '  zap trash: "~/.asura"' ] ||
+            refuse 'the cask zap stanza must be exactly: zap trash: "~/.asura"'
         if [ -n "$dmg" ]; then need_dmg; fi
         if [ "$kind" = release ]; then need_team; elif [ -n "$kind" ]; then refuse 'tap-test takes --release or nothing'; fi
         x=$(scratch)

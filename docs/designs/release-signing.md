@@ -71,8 +71,8 @@ What is open:
   which the owner runs ([NT-P1 results](#nt-p1-results-2026-10-27));
 - the owner decisions that SG4 and SG6 record in
   [SG4 open items](#sg4-open-items) and [SG6 open items](#sg6-open-items):
-  the first publication, and whether a cask `zap` may ever remove `~/.asura`
-  (default: keep). SG4-O1, embedded build-host paths, is resolved
+  the first publication. SG6-O1, the cask `zap`, was decided by the owner on
+  2026-11-02: `zap trash: "~/.asura"`. SG4-O1, embedded build-host paths, is resolved
   ([build-host paths](#build-host-paths-sg4-o1)); SG4-O2 is resolved
   (immutable releases enabled, 2026-11-01).
 
@@ -788,12 +788,18 @@ install (NT-P1 anomaly: Homebrew updated itself during the probe install):
   checks that `/Applications/Asura.app`, `bin/asura`, the installed cask and
   the tap are gone.
 - No step starts the Asura service or reads or writes `~/.asura`: the only
-  Asura process is `asura --version` (HD8).
+  Asura process is `asura --version` (HD8). Cleanup never passes `--zap`, and
+  no step runs the zap stanza (HD15).
+- Before any `brew` call, the mode refuses a cask whose `zap` line is not
+  exactly `zap trash: "~/.asura"`.
 
 Steps:
 
 1. Audit the cask exactly as it would be published:
-   `brew audit --cask --strict` (and `--online` without `--dmg`).
+   `brew audit --cask --strict` (and `--online` without `--dmg`). Then read
+   Homebrew's own parse of the tap cask with `brew info --json=v2 --cask` and
+   require exactly one `zap` artifact, `{"trash": "~/.asura"}`. This checks
+   the stanza without running it.
 2. Write the tap cask. With `--dmg`, the tap copy replaces only the `url` line
    with a `file://` URL to the DMG, and the mode checks that no other line
    differs. Without `--dmg`, the tap copy equals the cask, so the install
@@ -828,12 +834,14 @@ fills `@VERSION@` and `@SHA256@`. The generated file is `Casks/asura.rb` in
   `depends_on macos: :golden_gate` (macOS 27 or later; `>=` is the default
   comparator), `app "Asura.app"` and
   `binary "#{appdir}/Asura.app/Contents/MacOS/asura"`.
-- No `preflight`, `postflight`, `uninstall`, `zap` or `caveats` stanza. The
-  cask never starts the service, creates `.asura`, migrates data or deletes
-  user data (release-distribution). `brew uninstall --cask` removes the app
-  and the link; `brew uninstall --zap` removes nothing more. Whether a `zap`
-  may remove `~/.asura` is open with the owner, default keep
-  ([SG6 open items](#sg6-open-items)).
+- No `preflight`, `postflight`, `uninstall` or `caveats` stanza. The cask
+  never starts the service, creates `.asura` or migrates data, and a plain
+  `brew uninstall --cask` removes only the app and the link.
+- One `zap` stanza, the last: `zap trash: "~/.asura"` (owner, 2026-11-02;
+  revises the earlier "no `zap`, keep" default). `brew uninstall --zap --cask
+  asura` moves all of `~/.asura` to the Trash; Keychain items stay. `trash:` is
+  chosen over `delete:` because the Homebrew Cask Cookbook prefers it and the
+  person can recover the folder ([zap and `~/.asura`](release-distribution.md#zap-and-asura)).
 - No `livecheck` block: Homebrew detects GitHub release URLs, and the audit
   requires one only for new casks in official taps.
 - A cask has no `test` block; the install checks above replace the formula
@@ -1058,7 +1066,7 @@ hold with the owner.
 | Checksum rule | One `shasum -a 256` line: 64 lower-case hex digits, two spaces, the DMG name | Unchanged from SG4. `hdiutil` leaves a `com.apple.FinderInfo` attribute on the DMG; extended attributes are not part of the file bytes or the upload |
 | Cask stanzas | See [cask](#cask) | `brew audit --cask --strict` passed on the generated cask ([SG6 delivery](#sg6-delivery)); the cask `desc` audit refuses "macOS"; `depends_on macos:` defaults to `>=` (Homebrew `Cask::DSL::DependsOn`) |
 | Quarantine | Homebrew always quarantines a cask download | `Cask::Download#quarantine` calls `Quarantine.cask!` for every download, and installation propagates the attribute to the installed app; Homebrew 7.0.11 has no `--no-quarantine` option. Gatekeeper therefore assesses `/Applications/Asura.app`. Measured: both test installs carried `com.apple.quarantine` flag `0181`; Gatekeeper accepted the notarised app as `Notarized Developer ID` and rejected the ad hoc app ([SG6 delivery](#sg6-delivery)) |
-| `zap` | None; `~/.asura` is kept | Open owner question, default keep ([SG6 open items](#sg6-open-items)) |
+| `zap` | `zap trash: "~/.asura"` | Owner, 2026-11-02 (SG6-O1). The Cask Cookbook prefers `trash:` over `delete:`; `~` expands to the home directory. Earlier: no stanza, `~/.asura` kept ([zap and `~/.asura`](release-distribution.md#zap-and-asura)) |
 
 #### DMG build
 
@@ -1180,9 +1188,11 @@ flowchart TD
 
 #### SG6 open items
 
-- **SG6-O1, `zap` and `~/.asura` (owner).** The cask has no `zap` stanza, so
-  no Homebrew command removes `~/.asura`. Default: keep. A later `zap` that
-  removes any Asura data needs an explicit owner decision.
+- **SG6-O1, `zap` and `~/.asura` (owner). Decided 2026-11-02:**
+  `brew uninstall --zap --cask asura` removes all of `~/.asura`; the cask
+  carries `zap trash: "~/.asura"`. Until then the cask had no `zap` stanza and
+  no Homebrew command removed `~/.asura`. Keychain items are not removed
+  ([zap and `~/.asura`](release-distribution.md#zap-and-asura)).
 - **SG6-O2, offline first launch (owner).** The app inside the DMG carries no
   stapled ticket. The first Gatekeeper assessment of a quarantined
   `/Applications/Asura.app` on a Mac without network is not proven. If it
@@ -2345,7 +2355,7 @@ Gate map:
 | SG-V7 | RS5 | Test-support seam: production cannot select `Scratch`; platform unit tests refuse `Target::Default` when a group is found | After each qualification run, the test group lists empty; `cargo test` makes no data-protection add and no login keychain search | — | — |
 | SG-V8 | PC-I38 | — | PC-I38 unsigned (existing) | PC-I38-S signed; HR-P2 recorded. **Pass** (SG5 S1, S4, 2026-10-29) | macOS 27 |
 | SG-V9 | Bundle lookup | Resource path resolution from `Contents/MacOS` | Copy step finds `Resources/mlx.metallib` and the Hub bundle | `--native-mlx` from the installed keg. SG5 S6 (2026-10-29): MLX turn from the notarised keg's bytes with the SG-V5 helper variant and `conversation_flow` as the service, pass; the keg's own `asura` as the service is not run | Clean host |
-| SG-V11 | SG4, SG6: HD1, HD5, HD8, HD9, HD10, HD12, HD13 | `test-asura-bundle --static`: cask template stanzas, no `zap`, `uninstall`, `preflight`, `postflight` or `caveats` stanza, placeholders only `@VERSION@` and `@SHA256@`; the DMG read-me template; no tarball or formula code is left; `asura-release` and `asura-bundle` hold no publishing command (HD10); refusal cases of every mode, including `tap-test` with an existing `/Applications/Asura.app` (a scratch stand-in) and the removed `formula` mode; the generated cask equals the template with the values; `--version` and the `get-task-allow` profile cases. Cargo: `--version` parses before any runtime access and refuses `--logs`; SG-V9 resource path from `/Applications/Asura.app` | `asura --version` exits 0 with the version under a Seatbelt profile that denies file writes and network (HD8). `test-asura-bundle --bundle`: `asura-release check --ad-hoc` on the dry-run DMG (format, volume, manifest, link, signatures, digests, `--version`, eject); `cask`. `tap-test --dmg` with the ad hoc DMG: `brew audit --cask --strict`, the wrong-digest install fails with no app, no link and no cask (HD5), then install into `/Applications`, the link, signature, digests and `bin/asura --version` (HD1, HD9 locally), quarantine and Gatekeeper recorded, cleanup | Release DMG: `check --release` (DMG and app signatures, stapled DMG, Gatekeeper `open` and `execute`) and `tap-test --dmg --release` on the owner's Mac. Owner: publication, `verify-release` (HD12, HD13), HTTPS `tap-test` with `--online`, clean-host install (HD1) | macOS 27, Homebrew 7.0.11, owner's Mac |
+| SG-V11 | SG4, SG6: HD1, HD5, HD8, HD9, HD10, HD12, HD13 | `test-asura-bundle --static`: cask template stanzas, no `uninstall`, `preflight`, `postflight` or `caveats` stanza, exactly one last `zap trash: "~/.asura"` and no `delete:` (2026-11-02), no `--zap` in the release scripts, `tap-test` refusals of a cask without that stanza or with `delete:`, placeholders only `@VERSION@` and `@SHA256@`; the DMG read-me template; no tarball or formula code is left; `asura-release` and `asura-bundle` hold no publishing command (HD10); refusal cases of every mode, including `tap-test` with an existing `/Applications/Asura.app` (a scratch stand-in) and the removed `formula` mode; the generated cask equals the template with the values; `--version` and the `get-task-allow` profile cases. Cargo: `--version` parses before any runtime access and refuses `--logs`; SG-V9 resource path from `/Applications/Asura.app` | `asura --version` exits 0 with the version under a Seatbelt profile that denies file writes and network (HD8). `test-asura-bundle --bundle`: `asura-release check --ad-hoc` on the dry-run DMG (format, volume, manifest, link, signatures, digests, `--version`, eject); `cask`. `tap-test --dmg` with the ad hoc DMG: `brew audit --cask --strict`, Homebrew's parse of the zap stanza (`brew info --json=v2`), the wrong-digest install fails with no app, no link and no cask (HD5), then install into `/Applications`, the link, signature, digests and `bin/asura --version` (HD1, HD9 locally), quarantine and Gatekeeper recorded, cleanup | Release DMG: `check --release` (DMG and app signatures, stapled DMG, Gatekeeper `open` and `execute`) and `tap-test --dmg --release` on the owner's Mac. Owner: publication, `verify-release` (HD12, HD13), HTTPS `tap-test` with `--online`, clean-host install (HD1) | macOS 27, Homebrew 7.0.11, owner's Mac |
 | SG-V12 | RS11, SG4-O1, SG6 | `test-asura-bundle --static`: `host-paths` reports the home inside a string and alone, the repository, `/<user>` under another prefix and a link target; it ignores near misses (another account's home, a longer user name, `org.<user>.asura`, the user name alone, `/cargo/…`, a longer repository name, the `/Applications` link); it prints counts only; it refuses `HOME` empty or `/`, a relative repository, a missing path and no path (exit 2). `asura-release check` fails a small DMG whose `LICENSE` holds the home and passes the rule on a clean one; no `NOTE` remains | `test-asura-bundle --bundle` on a new dry run: an independent raw scan of every bundle file finds no `$HOME`, `/Users/`, repository path or `/<user>/`; `asura` holds `/cargo/registry/src/` and `/rustc/<commit>/library/` locations; the helper holds `/asura/…/checkouts/` (or `/swiftpm/checkouts/`) locations and no debug-map stab; `check --ad-hoc` passes the rule on the DMG; the same volume repacked with the home planted in `LICENSE` fails only the rule. `--sandbox` (SG-V5) on the remapped helper | A release build: notarised, stapled, `check --release` passes every check including the rule | macOS 27, Apple silicon, owner's Mac |
 | SG-V10 | BN1 | Digest over sorted (path, SHA-256) pairs, pinned to the `shasum` form; limit checks (17 files, 17 directories, depth 5, 1 MiB + 1 byte file, 1 MiB + 1 byte total rejected; the limits themselves accepted); empty file accepted; symlink, group-writable and control-character names rejected | Copy into a scratch run root and read by the copied helper; mismatch and absence fail before spawn; Core AI copies, system does not; cleanup leaves unknown entries; cancel during copy cleans owned copies; the service reports an MLX selection unavailable before spawn when the package bundle does not match its embedded digest | `conversation_flow --native-mlx` with a fixture model that has `model_type` and no `tokenizer_class` completes | macOS 27, real MLX model (BN-P1 fixture) |
 

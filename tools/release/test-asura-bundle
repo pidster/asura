@@ -319,9 +319,16 @@ sg4_static_checks() {
         '  app "Asura.app"' '  binary "#{appdir}/Asura.app/Contents/MacOS/asura"'; do
         check "cask template line: ${line#"${line%%[! ]*}"}" grep -Fqx -- "$line" "$template"
     done
-    check 'cask has no zap, uninstall, preflight, postflight or caveats stanza (keeps ~/.asura)' sh -c \
-        '! grep -Eq "^ *(zap|uninstall|preflight|postflight|caveats|installer|pkg|script)\b" "$1"' sh "$template"
-    check 'cask never names ~/.asura in a stanza' sh -c '! grep -v "^ *#" "$1" | grep -Fq ".asura"' sh "$template"
+    check 'cask has no uninstall, preflight, postflight or caveats stanza (a plain uninstall keeps ~/.asura)' sh -c \
+        '! grep -Eq "^ *(uninstall|preflight|postflight|caveats|installer|pkg|script)\b" "$1"' sh "$template"
+    # Zap (owner, 2026-11-02): exactly one zap stanza, the last, moving ~/.asura to the Trash. Nothing runs it.
+    check 'cask zap stanza is exactly: zap trash: "~/.asura"' sh -c \
+        '[ "$(grep -E "^ *zap\b" "$1")" = "  zap trash: \"~/.asura\"" ]' sh "$template"
+    check 'cask zap is the last stanza' sh -c \
+        '[ "$(grep -v "^ *#" "$1" | grep -v "^ *\$" | tail -n 2 | head -n 1)" = "  zap trash: \"~/.asura\"" ]' sh "$template"
+    check 'cask names ~/.asura only in the zap stanza and never with delete' sh -c \
+        '[ "$(grep -v "^ *#" "$1" | grep -F ".asura")" = "  zap trash: \"~/.asura\"" ] && ! grep -Eq "delete:|rmdir:" "$1"' sh "$template"
+    check 'no release script runs brew uninstall --zap' sh -c '! grep -En -- "--zap" "$@"' sh "$release/asura-release" "$release/asura-bundle"
     check 'cask never runs the helper' sh -c '! grep -q "asura-model" "$1"' sh "$template"
     check 'cask placeholders are only @VERSION@ and @SHA256@' \
         [ "$(grep -o '@[A-Z0-9_]*@' "$template" | LC_ALL=C sort -u | tr '\n' ' ')" = '@SHA256@ @VERSION@ ' ]
@@ -378,6 +385,12 @@ sg4_static_checks() {
         digest=$(cut -d ' ' -f 1 < "$d9.sha256")
         check 'cask equals the template with the version and digest' \
             [ "$(cat "$fake/asura.rb")" = "$(sed -e 's/@VERSION@/9.9.9/g' -e "s/@SHA256@/$digest/g" "$template")" ]
+        # A cask without the zap stanza, or with a delete, is refused before any brew call.
+        grep -v '^ *zap ' "$fake/asura.rb" > "$fake/nozap.rb"
+        refuses_tool 'tap test of a cask without the zap stanza' 'zap stanza must be exactly' tap-test --version 9.9.9 --cask "$fake/nozap.rb"
+        sed 's|^  zap trash: "~/.asura"$|  zap delete: "~/.asura"|' "$fake/asura.rb" > "$fake/delete.rb"
+        refuses_tool 'tap test of a cask whose zap deletes ~/.asura' 'zap stanza must be exactly' tap-test --version 9.9.9 --cask "$fake/delete.rb"
+        check 'the generated cask holds the zap stanza' grep -Fqx '  zap trash: "~/.asura"' "$fake/asura.rb"
         # The tap test refuses before any brew change when the app exists;
         # the test directory stands in for /Applications.
         mkdir -p "$fake/apps/Asura.app"

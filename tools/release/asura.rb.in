@@ -15,5 +15,7 @@ cask "asura" do
   app "Asura.app"
   binary "#{appdir}/Asura.app/Contents/MacOS/asura"
 
-  # No zap or uninstall stanza: removing the cask keeps ~/.asura (open owner question, default keep).
+  # A plain uninstall keeps ~/.asura. --zap moves all of it to the Trash (owner, 2026-11-02); Keychain items stay
+  # (release-distribution.md, zap and ~/.asura).
+  zap trash: "~/.asura"
 end
