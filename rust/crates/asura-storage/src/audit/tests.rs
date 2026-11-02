@@ -2268,3 +2268,53 @@ fn ns_u13_named_secret_events() {
     );
     assert!(named.is_err(), "a name field is refused");
 }
+
+/// NS-U17 (named-secrets.md, model commands; 2026-11-02): the refusal event
+/// of a model command that names `$ASURA_SECRET_`. It cites the call only;
+/// a name or command field is refused, and the IDs, generation and ordinal
+/// are checked.
+#[test]
+fn ns_u17_secret_reference_refused_event() {
+    let event = |project, operation, generation, ordinal| Event::ExecCmdSecretReferenceRefused {
+        project,
+        operation,
+        generation,
+        ordinal,
+    };
+    event([1; 16], [2; 16], 3, 1).validate().unwrap();
+    assert_eq!(event([1; 16], [2; 16], 3, 1).project(), Some([1; 16]));
+    assert_eq!(
+        event([0; 16], [2; 16], 3, 1).validate(),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        event([1; 16], [0; 16], 3, 1).validate(),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        event([1; 16], [2; 16], 0, 1).validate(),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        event([1; 16], [2; 16], 3, 0).validate(),
+        Err(Error::Invalid)
+    );
+    let text = serde_json::to_string(&event([1; 16], [2; 16], 3, 1)).unwrap();
+    let expected = [
+        r#"{"kind":"exec_cmd.secret_reference_refused","details":{"project":""#,
+        &"01".repeat(16),
+        r#"","operation":""#,
+        &"02".repeat(16),
+        r#"","generation":3,"ordinal":1}}"#,
+    ]
+    .concat();
+    assert_eq!(text, expected);
+    assert_eq!(
+        serde_json::from_str::<Event>(&text).unwrap(),
+        event([1; 16], [2; 16], 3, 1)
+    );
+    for extra in [r#","name":"GITHUB_TOKEN""#, r#","command":"x""#] {
+        let bad = text.replacen(r#""ordinal":1"#, &[r#""ordinal":1"#, extra].concat(), 1);
+        assert!(serde_json::from_str::<Event>(&bad).is_err(), "{bad}");
+    }
+}

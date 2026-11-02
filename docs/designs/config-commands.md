@@ -443,6 +443,7 @@ zero. No raw error string is permitted.
 | `conversation.admission` | `project`, `request`, optional `conversation`, optional `operation`, `requested_generation`, optional `current_generation`, `outcome`, `reason` |
 | `conversation.finished` | `project`, `conversation`, `operation`, `generation`, `outcome`, `reason` |
 | `tool.finished` | `project`, `operation`, `generation`, `ordinal`, `tool`, `outcome` |
+| `exec_cmd.secret_reference_refused` | `project`, `operation`, `generation`, `ordinal` (2026-11-02; [named secrets](named-secrets.md#model-commands)); never in the project view |
 
 Admission outcome is accepted, rejected or unconfirmed. Its reason is none,
 request_conflict, generation_conflict, unavailable, denied, invalid, busy, limit,

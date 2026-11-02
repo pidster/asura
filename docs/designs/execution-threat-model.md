@@ -227,7 +227,10 @@ Each entry gives the decision, the required outcome and where it is applied.
      ([SL7 implementation](secret-detection.md#sl7-implementation)). Three refusals
      stay because they are not a command-line secret:
      `placeholder_not_available`, `secret_in_cwd` and
-     `secret_detection_unavailable`.
+     `secret_detection_unavailable`. A fourth, for model commands alone,
+     refuses a command that names `$ASURA_SECRET_`
+     (`model_secret_reference`, owner, 2026-11-02;
+     [named secrets](named-secrets.md#model-commands)).
    - **Durable store (owner, 2026-10-20, EXD-2).** Person command values wait
      in the macOS Keychain, so held commands resume after a restart. See
      [secret store at rest](#secret-store-at-rest).

@@ -5089,7 +5089,9 @@ def person_named_journey(fixture, source):
     the launch report names it with its store action and never its value.
     NS-E2: /secrets store, the exists reply on a second store, replace, and
     the /secrets panel. NS-E3: a `!` command naming $ASURA_SECRET_PE_TOKEN
-    prints the token's digest; its env line says `named PE_TOKEN`. NS-E4:
+    prints the token's digest; its env line says `named PE_TOKEN`. NS-E6: a
+    scripted model command naming $ASURA_SECRET_PE_TOKEN is refused with the
+    fixed reason and writes nothing. NS-E4:
     after /secrets remove the same command is refused with the
     secret_not_found text and the draft is kept. NS-E5: no file in the
     fixture's Asura home and no TUI output byte holds the token. The scratch
@@ -5149,6 +5151,19 @@ def person_named_journey(fixture, source):
         trial.until(hashlib.sha256(token.encode()).hexdigest().encode(), plain=True, limit=30)
         notice_until(trial, "named PE_TOKEN", limit=10)
         print("PASS NS-E3: the command ran with the stored value; env line names it")
+        # NS-E6 (2026-11-02): a model command that names the stored secret is
+        # refused with the fixed reason; nothing runs.
+        harness.configure_model(trial)
+        harness.script[:] = [("exec_cmd", {"command": 'printf %s "$ASURA_SECRET_PE_TOKEN" > leaked.txt'}),
+                             "NS-E6-DONE"]
+        trial.send(b"Use the stored token.\r")
+        trial.until(b"NS-E6-DONE", plain=True, limit=40, reject="Incomplete response")
+        refusal = ("Command refused: it names an Asura secret variable ($ASURA_SECRET_...). Model commands "
+                   "cannot use stored secrets, so nothing ran. The person can run this command as a ! command.")
+        assert any(refusal in message for message in harness.tool_messages), harness.tool_messages
+        assert not (project / "leaked.txt").exists(), "the refused model command ran"
+        assert token not in "".join(harness.tool_messages), "the model saw the token"
+        print("PASS NS-E6: a model command naming $ASURA_SECRET_PE_TOKEN was refused with its reason; nothing ran")
         # NS-E4: remove, then the same command is refused; the draft stays.
         offset = len(trial.output)
         trial.send(b"/secrets remove PE_TOKEN\r")

@@ -1442,6 +1442,52 @@ fn j1_cwd_secret_and_detection_unavailable_refuse() {
     assert_eq!(refusal.code, RefusalCode::PlaceholderNotAvailable);
 }
 
+/// NS-U16 (named-secrets.md, model commands; owner, 2026-11-02): a model
+/// command that names `$ASURA_SECRET_` or `${ASURA_SECRET_` is refused with
+/// `model_secret_reference`, after the numbered placeholder check and before
+/// the cwd scan. The person path still plans a named reference.
+#[test]
+fn ns_u16_model_command_naming_a_secret_variable_is_refused() {
+    use super::rewrite::{rewrite_exec_cmd_call_with, rewrite_model_exec_cmd_call_with};
+    let text = "Command refused: it names an Asura secret variable ($ASURA_SECRET_...). \
+                Model commands cannot use stored secrets, so nothing ran. The person can \
+                run this command as a ! command.";
+    for command in [
+        "printf %s \"$ASURA_SECRET_GH\"",
+        "echo ${ASURA_SECRET_GH} > out.txt",
+        "eval \"$ASURA_SECRET_COMMAND\"",
+        "echo ${ASURA_SECRET_",
+        "echo '$ASURA_SECRET_GH'",
+        "x=$ASURA_SECRET_",
+    ] {
+        let refusal = rewrite_model_exec_cmd_call_with(rules(), command, ".").unwrap_err();
+        assert_eq!(refusal.code, RefusalCode::ModelSecretReference, "{command}");
+        assert!(refusal.code.kept());
+        assert_eq!((refusal.kind, refusal.word), (None, None));
+        assert_eq!(refusal.code.as_str(), "model_secret_reference");
+        assert_eq!(refusal.to_string(), text);
+        assert!(!refusal.to_string().contains("GH"));
+    }
+    // The numbered form keeps its own refusal.
+    let refusal =
+        rewrite_model_exec_cmd_call_with(rules(), "echo $ASURA_SECRET_2", ".").unwrap_err();
+    assert_eq!(refusal.code, RefusalCode::PlaceholderNotAvailable);
+    // Without `$` the word is ordinary text.
+    assert!(rewrite_model_exec_cmd_call_with(rules(), "echo ASURA_SECRET_GH", ".").is_ok());
+    assert!(rewrite_model_exec_cmd_call_with(rules(), "ls", "src").is_ok());
+    // Before the cwd scan.
+    let gh = github();
+    let refusal = rewrite_model_exec_cmd_call_with(
+        rules(),
+        "echo \"$ASURA_SECRET_GH\"",
+        &cat(&["dir/", &gh]),
+    )
+    .unwrap_err();
+    assert_eq!(refusal.code, RefusalCode::ModelSecretReference);
+    // The person path leaves named references to the resolver.
+    assert!(rewrite_exec_cmd_call_with(rules(), "printf %s \"$ASURA_SECRET_GH\"", ".").is_ok());
+}
+
 /// SDU-16 (model part; SO5, SL7): every SDU-12 form except the three kept
 /// refusals, 17 values and a rewrite over 8,192 bytes run through the
 /// whole-command variable. The executable command is the fixed `eval` text;

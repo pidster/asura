@@ -585,7 +585,9 @@ The same function serves both origins.
    `$ASURA_SECRET_<NAME>` is not a placeholder: for a person command the
    conversation owner resolves it after the rewrite
    ([named secrets](named-secrets.md#references-in-commands), 2026-11-01);
-   for a model command it stays text. A placeholder seen
+   for a model command it is refused with `model_secret_reference`
+   ([named secrets, model commands](named-secrets.md#model-commands),
+   2026-11-02). A placeholder seen
    in earlier output names no value in a new execution, because no variable is
    reused across commands.
 2. Scan the whole command with the rule set in whole-buffer mode: the same
@@ -715,6 +717,12 @@ secret in the command line:
   directory itself, so the path cannot travel in a variable.
 - `secret_detection_unavailable`: the rule set failed its startup self-check,
   a build defect; every command is refused.
+
+A fourth kept refusal applies to model commands alone (owner, 2026-11-02):
+`model_secret_reference`, for a model command that holds `$ASURA_SECRET_` or
+`${ASURA_SECRET_` and is not a numbered placeholder. It runs after the
+placeholder check and before the working directory scan
+([named secrets, model commands](named-secrets.md#model-commands)).
 
 For these, model origin records the display-redacted intent with the refused
 decision, and person origin returns the reason before kind 31. Nothing is

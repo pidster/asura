@@ -10,7 +10,7 @@ views replace the baseline's diagrams. Terms are defined in the
 [glossary](../glossary.md).
 
 What is fixed: the baseline, the designs linked from each element, and the owner
-decisions of 2026-10-31 and 2026-11-01 listed in [inputs](#inputs).
+decisions of 2026-10-31, 2026-11-01 and 2026-11-02 listed in [inputs](#inputs).
 
 What is open: every element marked **proposed**, and the
 [open decisions](#open-decisions-that-affect-the-picture).
@@ -34,12 +34,27 @@ This overview combines three kinds of source:
     model jobs ([taint exclusion hook](context-composer.md#taint-exclusion-hook)).
   - The "Asura sees" and "a model sees" principle, with trust classes A–F and
     flow rules F1–F7, is the selected direction.
-  - Developer ID first is a recommendation (AD-19). It is not decided.
-- **Proposals not on `main`.** The draft "Assurance and differentiation" design
-  (AD-1 to AD-26, differentiators DF1–DF7) and three session research reports
-  (secrets, Cedar, distribution, 2026-10-31). They are research inputs. This
-  document names them but does not link to them, because they are not in the
-  repository.
+  - AD-19 (2026-11-01): a signed, notarised DMG installed by a Homebrew cask is
+    the primary distribution, so the first releases are Developer ID.
+- **Owner decisions of 2026-11-02** ([assurance and differentiation](assurance-and-differentiation.md#owner-decisions)).
+  - AD-24: a person may approve a task envelope once, as an authorized policy
+    change; exact-action approval stays for anything outside it.
+  - AD-15 and AD-16: a `dangerous` or `unknown` classifier label stops a model
+    job to ask the person; without an answer the job waits in its agent's
+    queue. `!!` stays outside the classifier.
+  - AD-11 and AD-23: files that a tainted command writes are not tracked; the
+    "zero model access" claim states this and its other limits.
+  - AD-18: a Linux VM job backend is in product scope, after the Cedar policy
+    layer and the brokers. AD-21: an App Store companion GUI is later and
+    optional.
+  - `brew uninstall --zap --cask asura` moves all of `~/.asura` to the Trash
+    ([release distribution](release-distribution.md#zap-and-asura)).
+- **Proposals.** The draft [assurance and differentiation](assurance-and-differentiation.md)
+  design (AD-1 to AD-26, differentiators DF1–DF7), now on `main`, and three
+  session research reports (secrets, Cedar, distribution, 2026-10-31). The
+  reports are research inputs that are not in the repository, so this document
+  names them but does not link to them. Rows of the table below that still say
+  "not on `main`" were written before the draft was merged.
 
 ## How to read the diagrams
 
@@ -419,11 +434,14 @@ flowchart TB
 - The policy path is the
   [security policy brief](security-policy-brief.md#decision-and-enforcement-boundary)
   extended by the Cedar research. The format and evaluator are open (AD-13).
-  The classifier scope and its `unknown` result are open (AD-15, AD-16).
-- Envelope approval as a policy change is open (AD-24). Model jobs have no
-  approval flow today.
-- The XPC job class and the VM backend are only needed for an App Store edition
-  or for Linux jobs (AD-18, AD-19, AD-21).
+  The classifier scope and its `unknown` result are decided (AD-15, AD-16,
+  2026-11-02); the classifier is not built.
+- Envelope approval as a policy change is decided (AD-24, 2026-11-02); its
+  mechanism waits for the policy layer. Model jobs have no approval flow today;
+  AD-15 (2026-11-02) adds one for classifier labels.
+- The VM backend for Linux jobs is in product scope after native (AD-18,
+  2026-11-02). The XPC job class is only needed for an App Store edition, which
+  is later and optional (AD-21).
 
 ## 5. Context egress and the composer
 
@@ -569,8 +587,8 @@ flowchart TB
 | `Asura.app`, Developer ID, Hardened Runtime, notarisation | Built | [Release signing](release-signing.md) | 1, 2 |
 | Homebrew cask | Designed | [ADR-0008](../decisions/0008-homebrew-tap-distribution.md), [release distribution](release-distribution.md) | 1 |
 | DMG | Built (SG6) | [release distribution](release-distribution.md), [release signing](release-signing.md) | 1 |
-| Developer ID only for first releases | Proposed (AD-19) | Distribution research, not on `main` | 1 |
-| PCC Foundation Models for Developer ID | Proposed (AD-22) | Distribution research, not on `main` | 1 |
+| Developer ID only for first releases | Decided (AD-19, 2026-11-01) | [Assurance and differentiation](assurance-and-differentiation.md#owner-decisions) | 1 |
+| PCC Foundation Models for Developer ID | Proposed (AD-22, open) | [Assurance and differentiation](assurance-and-differentiation.md#distribution-stance) | 1 |
 | Per-user service and control API | Built | [System architecture](system-architecture.md), [user service and configuration](user-service-configuration.md) | 1, 2 |
 | Orchestrator: projects, queues, admission | Built (task lifecycle not built) | [Conversation admission](conversation-admission.md), [managed input queue](managed-input-queue.md), [core harness](core-harness-brief.md) | 2 |
 | Swift model helper, Protobuf channel | Built | [Swift/Rust boundary](swift-rust-boundary.md), [ADR-0009](../decisions/0009-supervised-local-model-helper.md), [ADR-0010](../decisions/0010-protobuf-model-channel.md) | 2 |
@@ -594,7 +612,7 @@ flowchart TB
 | Context egress policy and data classes (AD-25) | Designed, no governing design | Assurance draft; [execution threat model](execution-threat-model.md) EX13 | 5 |
 | Policy format and evaluator (Cedar) | Proposed (AD-13) | [Security policy brief](security-policy-brief.md) | 2, 4, 5 |
 | Parser, classifier, approval, grant, backend compiler | Proposed | [Security policy brief](security-policy-brief.md#decision-and-enforcement-boundary); Cedar research | 4 |
-| XPC job class and VM backend | Proposed (AD-18) | Cedar and distribution research, not on `main` | 2, 4 |
+| XPC job class and VM backend | Proposed; the Linux VM backend is in scope after native (AD-18, 2026-11-02) | [Assurance and differentiation](assurance-and-differentiation.md#distribution-stance) | 2, 4 |
 | Brokers: egress proxy, SSH and signing agent | Proposed (AD-4, AD-6, AD-7 for model jobs) | Secrets research, not on `main` | 2, 3, 6 |
 | Agent signing key in the Secure Enclave | Designed (AD-9); holder open (AD-8) | Assurance draft, not on `main` | 2, 3 |
 | Sandboxed data owner | Proposed (AD-20) | Distribution research, not on `main` | 2 |
@@ -603,16 +621,16 @@ flowchart TB
 
 - **AD-13, AD-14:** the policy format and evaluator, and how scopes combine.
   Cedar is the candidate for diagrams 4 and 5.
-- **AD-15, AD-16, AD-24:** the classifier scope, its `unknown` result and
-  envelope approval. They decide the approval branch in diagram 4.
+- **AD-15, AD-16, AD-24:** decided on 2026-11-02. The approval branch in
+  diagram 4 asks the person for an exact action or approves a task envelope;
+  their mechanisms wait for the policy layer.
 - **AD-4, AD-6, AD-7 (model jobs), AD-8:** raw delivery to model jobs, the
   provider key holder, the proxy-only network for model jobs and the holder of
   the agent key. They decide the broker in diagrams 2, 3 and 6.
-- **AD-18, AD-19, AD-20, AD-21:** the VM backend, Developer ID first, the
-  sandboxed data owner and an App Store companion. They decide the process
-  layout in diagram 2.
+- **AD-20:** the sandboxed data owner. It decides the process layout in
+  diagram 2. AD-18 (VM backend after native), AD-19 (Developer ID first) and
+  AD-21 (App Store companion later and optional) are decided.
 - **AD-22:** whether PCC serves Developer ID apps. It decides one model route.
-- **AD-23:** the wording and limits of the "zero model access" claim.
 - **SO4:** secret detection on messages, which stage 0 and stage 1 in diagram 6
   need.
 - **Governing designs for AD-5 and AD-25.** Both are selected, but no design on

@@ -639,6 +639,19 @@ pub enum Event {
         tool: Tool,
         outcome: ToolOutcome,
     },
+    /// A model exec_cmd call was refused because its command names
+    /// `$ASURA_SECRET_` (`model_secret_reference`; named-secrets.md, model
+    /// commands). It cites the call only: never the command, a secret name
+    /// or a value. Not in the project view, like the person command events.
+    #[serde(rename = "exec_cmd.secret_reference_refused")]
+    ExecCmdSecretReferenceRefused {
+        #[serde(with = "id")]
+        project: Id,
+        #[serde(with = "id")]
+        operation: Id,
+        generation: u64,
+        ordinal: u32,
+    },
     /// A job first waits for a start condition; once per job.
     #[serde(rename = "job.queued")]
     JobQueued {
@@ -926,6 +939,7 @@ impl Event {
             Self::ConversationAdmission { project, .. }
             | Self::ConversationFinished { project, .. }
             | Self::ToolFinished { project, .. }
+            | Self::ExecCmdSecretReferenceRefused { project, .. }
             | Self::JobQueued { project, .. }
             | Self::JobStarted { project, .. }
             | Self::JobCancelRequested { project, .. }
@@ -986,6 +1000,17 @@ impl Event {
                     && nonzero(operation)
                     && *generation > 0
                     // Every recorded call, including the over-limit record.
+                    && (1..=crate::authority::conversation::MAX_TOOL_CALL_ORDINAL).contains(ordinal)
+            }
+            Self::ExecCmdSecretReferenceRefused {
+                project,
+                operation,
+                generation,
+                ordinal,
+            } => {
+                nonzero(project)
+                    && nonzero(operation)
+                    && *generation > 0
                     && (1..=crate::authority::conversation::MAX_TOOL_CALL_ORDINAL).contains(ordinal)
             }
             Self::JobQueued {

@@ -434,6 +434,7 @@ fn refusal_code(code: RefusalCode) -> u8 {
         RefusalCode::DetectionUnavailable => 12,
         RefusalCode::RewrittenCommandTooLong => 13,
         RefusalCode::SecretInCwd => 14,
+        RefusalCode::ModelSecretReference => 15,
     }
 }
 fn refusal_from(code: u8) -> Result<RefusalCode> {
@@ -452,6 +453,7 @@ fn refusal_from(code: u8) -> Result<RefusalCode> {
         12 => RefusalCode::DetectionUnavailable,
         13 => RefusalCode::RewrittenCommandTooLong,
         14 => RefusalCode::SecretInCwd,
+        15 => RefusalCode::ModelSecretReference,
         _ => return Err(ReplayError::Corrupt),
     })
 }
@@ -4018,7 +4020,7 @@ mod tests {
             Err(ReplayError::Corrupt)
         );
     }
-    const REFUSALS: [RefusalCode; 14] = [
+    const REFUSALS: [RefusalCode; 15] = [
         RefusalCode::PlaceholderNotAvailable,
         RefusalCode::UnparsedCommand,
         RefusalCode::SecretInHeredoc,
@@ -4033,6 +4035,7 @@ mod tests {
         RefusalCode::DetectionUnavailable,
         RefusalCode::RewrittenCommandTooLong,
         RefusalCode::SecretInCwd,
+        RefusalCode::ModelSecretReference,
     ];
     #[test]
     fn j1t_01_code_tables_are_fixed() {
@@ -4051,6 +4054,7 @@ mod tests {
             "secret_detection_unavailable",
             "rewritten_command_too_long",
             "secret_in_cwd",
+            "model_secret_reference",
         ];
         for (index, name) in refusals.iter().enumerate() {
             let code = index as u8 + 1;
@@ -4078,7 +4082,7 @@ mod tests {
                 invalid14_record(ToolCall { refusal, ..wrong });
             }
         }
-        for code in [0, 15, 255] {
+        for code in [0, 16, 255] {
             assert_eq!(refusal_from(code), Err(ReplayError::Corrupt));
         }
         let kinds = [

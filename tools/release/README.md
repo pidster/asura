@@ -310,8 +310,16 @@ team ID and `R` the released commit. Use a clean worktree of `main` at `R`.
    version.
 
 `brew uninstall --cask asura` removes `/Applications/Asura.app` and the
-`asura` link only. The cask has no `zap` stanza, so no Homebrew command
-removes `~/.asura` (open owner question; default keep).
+`asura` link only; `~/.asura` stays. `brew uninstall --zap --cask asura`
+(owner, 2026-11-02) also moves all of `~/.asura` to the Trash, through the
+cask's `zap trash: "~/.asura"` stanza; empty the Trash to delete it. Stop the
+service first with `asura service stop`. Zap does not remove the secrets in the
+Keychain: remove named secrets with `/secrets remove NAME` before the zap.
+No check runs `--zap`, because it would remove the real `~/.asura`;
+`test-asura-bundle --static`, `asura-release cask` and `tap-test` check the
+stanza statically, and `tap-test` reads Homebrew's parse of it with
+`brew info --json=v2`
+([design](../../docs/designs/release-distribution.md#zap-and-asura)).
 
 ## What the dry run does not prove
 

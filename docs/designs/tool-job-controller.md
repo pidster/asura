@@ -1230,7 +1230,9 @@ this order, then two J1 codes: 1 `placeholder_not_available`, 2
 `secret_in_inner_script`, 6 `secret_single_quoted`, 7 `secret_ansi_quoted`, 8
 `secret_mixed_quoting`, 9 `secret_with_shell_syntax`, 10 `too_many_secrets`,
 11 `residual_secret`, 12 `secret_detection_unavailable`, 13
-`rewritten_command_too_long`, 14 `secret_in_cwd`. Secret kind codes are the
+`rewritten_command_too_long`, 14 `secret_in_cwd`, then 15
+`model_secret_reference` (2026-11-02,
+[named secrets](named-secrets.md#model-commands)). Secret kind codes are the
 positions 1–33 of `SecretKind::ALL` (`secrets.rs:59`). The codec holds both
 tables explicitly, so reordering an enum cannot change a stored code. A new
 secret kind needs a new rule-set revision and a new code.
@@ -1737,6 +1739,7 @@ sequenceDiagram
 | --- | --- | --- |
 | Turn cancelled after kind 14 `run`, before spawn | Setup stops; reservation released | Kind 23 `not_started`, kind 15 status 6 |
 | Rewrite refuses, including `rewritten_command_too_long` and `secret_in_cwd` | Nothing runs; model sees the reason | Kind 14 refused; status 3 rendered, no kind 15 |
+| Model command names `$ASURA_SECRET_` (2026-11-02) | Nothing runs; the model sees `model_secret_reference` and its fixed reason | Kind 14 refused, code 15; `exec_cmd.secret_reference_refused` audit event |
 | Detection self-check failed | Every exec_cmd call refused with `secret_detection_unavailable` | Kind 14 refused, argument form 4, rule-set revision 0 |
 | Quota short at admission and nothing expirable | `busy`, reason `quota` | Kind 14 busy; status 4 rendered, no kind 15 |
 | Pending-install list full, capture paused, or payload store not ready | `busy` with that reason | Kind 14 busy; status 4 rendered, no kind 15 |

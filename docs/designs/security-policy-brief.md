@@ -1,6 +1,8 @@
 # Security policy design brief
 
-Status: required capabilities with a proposed authorization contract.
+Status: required capabilities with a proposed authorization contract. Revised
+by the owner on 2026-11-02: [task envelopes](#owner-revision-of-2026-11-02-task-envelopes)
+(AD-24).
 
 Open decisions: policy format, evaluator and macOS enforcement mechanisms.
 No policy format or evaluator is implemented. The [exec_cmd tool](exec-cmd-tool.md)
@@ -62,7 +64,11 @@ the threat model before implementation:
   input until admitted through the policy administration contract.
 - Separate a denial from a request that policy permits a user to approve. User
   approval must bind to the exact action, limits and expiry; it cannot override a
-  hard deny. An authorized policy change is a separate operation.
+  hard deny. An authorized policy change is a separate operation. Revised by the
+  owner on 2026-11-02 (AD-24): a person may also approve a task envelope once,
+  as an authorized policy change; see
+  [task envelopes](#owner-revision-of-2026-11-02-task-envelopes). The
+  exact-action rule still applies to every action outside an active envelope.
 - Each decision and grant must identify the action, principal, host, policy
   revision and enforced limits. Before the host starts an action, it must check
   the current grant. The design must coordinate policy activation, revocation and
@@ -80,6 +86,25 @@ An authorization result and an OS sandbox profile are different artifacts. The
 policy design must define how permitted constraints map to host enforcement and
 how the host reports that the restrictions were established. Do not assume the
 policy engine itself confines processes.
+
+### Owner revision of 2026-11-02: task envelopes
+
+Owner decision AD-24 of the
+[assurance and differentiation](assurance-and-differentiation.md#owner-decisions)
+design, recorded here because it revises the exact-action invariant above.
+
+| Rule | Required behavior |
+| --- | --- |
+| Envelope approval | The person may approve an envelope of limits once per task: for example the folders it may write, the hosts it may reach, the secret bindings it may use, its budget and its expiry |
+| Authority | Asura records the approval as an authorized policy change, not as an approval of one action. It is subject to the policy lifecycle below: provenance, validation, atomic activation and an audit record |
+| Proof | Before activation, Asura proves the change, with Cedar when the policy layer is built ([DF1](assurance-and-differentiation.md#df1-approval-of-the-envelope-not-of-each-action)). The policy without the envelope must still meet every safety property |
+| Enforcement | Host enforcement applies the envelope's limits like any other grant |
+| End | The envelope ends when its task ends, or earlier on revocation. An ended envelope permits no new effect |
+| Outside the envelope | An action outside the envelope needs an exact-action approval bound to its action, limits and expiry, or is denied when policy permits no approval. An envelope never overrides a hard deny |
+
+The envelope's lifecycle is [DF1-S1](assurance-and-differentiation.md#df1-s1-envelope-lifecycle).
+No envelope mechanism exists; the format, evaluator and enforcement mapping are
+still the open decisions of this brief.
 
 ### Decision and enforcement boundary
 
@@ -180,7 +205,7 @@ The implementation packets must reference these resolved contracts.
 
 | Layer | Required evidence before its affected feature ships |
 | --- | --- |
-| Unit | Parser/schema rejection, deny precedence, scope narrowing, deterministic decisions, bounded failures, redaction and exact approval binding |
+| Unit | Parser/schema rejection, deny precedence, scope narrowing, deterministic decisions, bounded failures, redaction, exact approval binding, and an envelope's limits and end (AD-24) |
 | Integration | Canonical evaluator to host enforcement, atomic activation/restart, stale grants, revocation/launch races, symlink/executable substitution, subprocess confinement and unsupported controls |
 | End-to-end | Permit and denial through real CLI/TUI, safe non-interactive approval handling, policy update during a task, malicious repository policy, expired/revoked remote grants and host policy disagreement |
 | Adversarial and performance | Fuzz malformed policies/requests, attempt scope escalation and shell bypasses, saturate evaluation, and measure declared latency/resource limits |

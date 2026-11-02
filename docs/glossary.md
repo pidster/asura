@@ -115,7 +115,7 @@ or prove an operation completed.
 | Brokered delivery, proposed | A job uses a credential through an Asura proxy or agent and never receives its value; the only delivery allowed to a model-originated job |
 | Raw delivery, proposed | Asura places a secret value in a job's environment, arguments, standard input or a file; allowed only for person-typed jobs, and it makes the job tainted |
 | Tainted job, proposed | A job that received raw delivery, with its descendants; its output and every value derived from it never reach a model |
-| Envelope approval, proposed | A person's one-time approval of a task's bounded grant (folders, hosts, secret bindings, budget, expiry), made as an authorized policy change; see [DF1](designs/assurance-and-differentiation.md#df1-approval-of-the-envelope-not-of-each-action) |
+| Envelope approval | A person's one-time approval of a task's bounded grant (folders, hosts, secret bindings, budget, expiry), made as an authorized policy change that ends with the task or on revocation; decided by the owner on 2026-11-02 (AD-24), mechanism not built; see [DF1](designs/assurance-and-differentiation.md#df1-approval-of-the-envelope-not-of-each-action) |
 | Evidence gate, proposed | The rule that a capability is enabled only while every evidence item it requires is current; see [evidence gate lifecycle](designs/assurance-and-differentiation.md#evidence-gate-lifecycle) |
 | Escape, proposed | In a red-team run: an effect outside the compiled enforcement set, a canary secret in model-bound bytes, a tainted datum on a model-bound path, or a denied context item at a remote endpoint |
 

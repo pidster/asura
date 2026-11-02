@@ -437,7 +437,13 @@ Open decisions for the per-loop mapping:
    [ADR-0003](../decisions/0003-aggregate-budget-admission.md), and whether
    unknown model capacity refuses admission or uses a verified configured value.
 6. Whether the service takes ownership of the turn request loop from the helper.
-   Probe evidence for all four backends: [loop closure decision 6 probes](loop-closure-probes.md) (proposed, 2026-11-02).
+   Owner direction (2026-11-02): probe first. The probes ran for Foundation
+   Models, MLX, Core AI and Ollama: [loop closure decision 6 probes](loop-closure-probes.md).
+   **Decided by the owner, 2026-11-02: the service owns the turn tool loop
+   (stage B) on all four backends.** The Foundation Models path relies on an
+   undocumented workaround (executor transcript override and a throwing stop
+   tool), backed by a regression test that fails if a macOS update breaks it.
+   A Core AI run with a real local model comes before the build (composer CC4).
 
 Owner direction (2026-10-13): the closure that guarantees a turn's tool loop
 ends is derived from evidence. Asura logs tool-loop traces and builds a

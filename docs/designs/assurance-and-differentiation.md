@@ -7,16 +7,24 @@ also does not authorize code, probes or spikes. Each capability needs its own
 governing design under the [design process](../design-process.md) before any
 code is written. Terms are defined in the [glossary](../glossary.md).
 
+Revision of 2026-11-02: the owner decided AD-11, AD-15, AD-18, AD-21 and AD-24.
+AD-12, AD-16 and AD-23 are now decided by earlier owner rules and these
+decisions. Each row of the [owner decisions](#owner-decisions) table names who
+decided and when. The decisions select directions; they do not select a
+mechanism or authorize code. Each capability still needs its governing design.
+
 What is fixed:
 
 - the [architecture rule](../architecture.md#on-device-decisions) that model
   decisions operate inside independently enforced permissions;
 - the [security policy brief](security-policy-brief.md) invariants (default
-  deny, narrowing only, exact approval binding, decision records);
-- the implemented controls named in [current state](#current-state).
+  deny, narrowing only, decision records, and exact approval binding for any
+  action outside an approved task envelope; the envelope revision is AD-24);
+- the implemented controls named in [current state](#current-state);
+- the [owner decisions](#owner-decisions) marked decided.
 
-What is open: every [differentiator](#the-differentiators), every metric target,
-and the [open owner decisions](#open-owner-decisions).
+What is open: every [differentiator](#the-differentiators) mechanism, every
+metric target, and the owner decisions still marked open.
 
 Inputs: three session research reports dated 2026-10-31 (see
 [sources](#sources)). They are research, not designs, and they are not stored in
@@ -224,7 +232,12 @@ Required behavior (owner goal) compared with what the research can support.
 > and Asura never sends its value, or any value derived from it, to an
 > on-device or remote model. A secret that the person delivers raw to a command
 > they typed is placed only in that command; Asura never sends that command's
-> output, or anything computed from it, to a model.
+> output, or anything computed from it, to a model. Asura does not track the
+> files that such a command writes, so a model can read a value that the
+> command wrote to a file.
+
+The last sentence was added on 2026-11-02 under AD-11: the owner accepted the
+file limit and asked for it to be stated in the claim.
 
 The owner asked for "zero possibility". The research supports zero model access
 **by construction only for brokered delivery**. For raw delivery, the claim
@@ -236,12 +249,18 @@ section 16):
   (PT-H1);
 - a person-typed command that prints, sends or writes the value;
 - planted code that a later raw-delivery `!` command runs (PT2);
-- files that a tainted job writes and a model reads later (TN8);
+- files that a tainted job writes and a model reads later (TN8; accepted as a
+  stated limit under AD-11, 2026-11-02);
 - secrets that neither the exact matcher nor the rules detect;
+- a pasted secret that Asura does not yet know: the on-device stage 2 can see
+  it, on the device only (accepted under AD-5, 2026-10-31);
 - a value that a model already read from a file;
 - OS and dependency defects, and root, kernel or physical access.
 
-Decision AD-23 asks the owner to accept this wording and its limits.
+AD-23 asked the owner to accept this wording and its limits. The owner's
+decisions AD-5 (2026-10-31) and AD-11 (2026-11-02) accept the two limits that
+were in question and direct that the claim states them. AD-23 is therefore
+decided: Asura adopts the claim above with every limit in this list stated.
 
 ## The differentiators
 
@@ -265,11 +284,47 @@ enforces only effects inside the permitted set (`Enforced ⊆ Permitted`,
 [R-CED] section 5.1). Classifier tightening (DF4) can still move one action from
 "run" to "ask" inside the envelope.
 
-**Relation to the security brief.** The brief requires that "user approval must
+**Relation to the security brief.** The brief required that "user approval must
 bind to the exact action, limits and expiry" and that "an authorized policy
-change is a separate operation". An envelope is proposed as an authorized
-policy change, not a per-action approval. Decision AD-24 asks the owner to
-confirm this reading.
+change is a separate operation". This draft proposed an envelope as an
+authorized policy change, not a per-action approval (AD-24).
+
+**Owner decision AD-24 (2026-11-02): yes, envelopes.** The person may approve
+an envelope of limits once per task. Asura records the approval as an
+authorized policy change, proves it (with Cedar, when the policy layer is
+built), enforces it, and ends it when the task ends or when it is revoked. An
+action outside the envelope still needs an exact-action approval, or is denied
+when policy permits no approval. This revises the brief's exact-action rule;
+the [security policy brief](security-policy-brief.md#owner-revision-of-2026-11-02-task-envelopes)
+records the revision. The mechanism, the envelope's fields and its governing
+design remain to be written, and DF1 stays behind its evidence gate.
+
+#### DF1-S1: envelope lifecycle
+
+Required behavior (AD-24), mechanism open. The states belong to one envelope of
+one task. Arrows name the event that moves it. No state permits an action that
+the policy without the envelope (`P0`) forbids.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Drafted: Asura drafts limits for a task
+    Drafted --> Recorded: Person approves once
+    Drafted --> [*]: Person declines, so exact-action approvals only
+    Recorded --> Proving: Policy change persisted
+    Proving --> Active: Proof passes, grant activates atomically
+    Proving --> Refused: Proof fails or cannot run
+    Refused --> [*]
+    Active --> Active: Action inside the envelope runs without a prompt
+    Active --> Active: Action outside asks for an exact approval or is denied
+    Active --> Ended: Task ends
+    Active --> Revoked: Person or policy revokes it
+    Ended --> [*]
+    Revoked --> [*]
+```
+
+An ended or revoked envelope blocks new effects at once; active work under it
+reconciles under the brief's [policy lifecycle](security-policy-brief.md#policy-lifecycle-and-active-work).
+The proof step needs the Cedar policy layer, which is not built.
 
 **Evidence gate.**
 
@@ -282,8 +337,9 @@ confirm this reading.
 **Limits.** An envelope allows misuse within its limits. A shell command line
 cannot be checked by command-level rules alone, because the shell reinterprets
 the text; the backend sandbox is the authority for shell text ([R-CED] section
-11.2). Model jobs have no approval flow today, so a "requires approval" outcome
-for a model job is a new flow (decision AD-15).
+11.2). Model jobs have no approval flow today. AD-15 (owner, 2026-11-02) adds
+one: a classifier label can stop a model job to ask the person
+([DF4-F1](#df4-f1-classifier-approval-step-for-a-model-job)).
 
 ### DF2. Policy-controlled context egress to remote models
 
@@ -374,9 +430,48 @@ appear only in `forbid` policies) and with `check_implies(P, P0)`.
 
 Failure handling ([R-CED] section 11.3): an unavailable helper, an invalid
 label or a confidence below the calibrated threshold gives `unknown`. The
-research recommends that `unknown` takes the approval branch (decision AD-16).
-No fixed time limit ends a slow classifier call under AE-04; the closures are
-the person's cancel and the helper's stall bound (decision AD-12).
+research recommended that `unknown` takes the approval branch (AD-16). AD-15
+decides it: `unknown` adds the approval step, as `dangerous` does, and the
+tighten-only rule (CL-1) forbids the other choice, because "no tightening" on
+`unknown` would let a failed classifier pass an action that it was meant to
+check. No fixed time limit ends a slow classifier call under AE-04; the
+closures are the reply, the person's cancel and the helper's stall bound
+(AD-12, decided by the owner's no-default-time-bounds rule of 2026-10-15).
+
+**Owner decision AD-15 (2026-11-02).** The classifier may stop a model job to
+ask the person. A `dangerous` or `unknown` label adds an approval step. If
+nobody answers, as in unattended or CLI use, the job waits in its agent's
+queue with a short reason until the person answers or cancels. No time limit
+ends the wait (no-default-time-bounds rule). `!!` commands stay outside the
+classifier (PCR22): typing `!!` is the approval.
+
+#### DF4-F1: classifier approval step for a model job
+
+Required behavior (AD-15), mechanism open. Arrows show the order of checks for
+one model job action; labels name the label or the person's answer. The
+classifier only adds the approval step; the policy decision without it still
+applies on every path.
+
+```mermaid
+flowchart TD
+    Act["Model job action, parsed and redacted"] --> Clf{"Classifier label"}
+    Clf -->|"safe, above threshold"| Pol["Policy decision without the step"]
+    Clf -->|"dangerous"| Ask["Approval step: persist the request"]
+    Clf -->|"unknown: unavailable, invalid or below threshold"| Ask
+    Ask --> Ans{"Person's answer"}
+    Ans -->|"approve"| Pol
+    Ans -->|"deny"| Ref["Refused; the model gets the reason"]
+    Ans -->|"cancel"| Can["Job cancelled"]
+    Ans -->|"none yet: unattended or CLI"| Wait["Job waits in its agent's queue with a short reason"]
+    Wait -->|"person answers or cancels"| Ans
+    Pol -->|"deny"| Ref
+    Pol -->|"permit"| Run["Job runs inside its limits"]
+```
+
+The wait has no time limit. Its closures are the person's answer and the
+person's cancel, under the [per-agent queue rule](tool-job-controller.md) (AQ1:
+blocked work waits with a brief reason). The governing design must map the
+job's other closures (revocation, shutdown and restart) to this wait.
 
 **Evidence gate.**
 
@@ -613,7 +708,20 @@ Proposed, from [R-DIST] sections 1, 6 and 13.
   data owner beside the unsandboxed executor; probes IS-1 to IS-6 must run
   before that design.
 
-Future App Store-compatible shapes ([R-DIST] section 9.7), not selected:
+Owner decisions of 2026-11-02 on the job backends and the App Store:
+
+- **AD-18: a Linux VM job backend is in product scope, after native.** It is
+  a second backend for Linux-friendly work. It is built after the Cedar policy
+  layer and the brokers. Native macOS sandboxes stay the backend for Mac work.
+  Legal advice on the Xcode licence is still needed before any guest uses the
+  macOS SDK.
+- **AD-21: an App Store companion GUI is later and optional.** The owner
+  decides it when the GUI is designed. Nothing is built for it now.
+
+Future App Store-compatible shapes ([R-DIST] section 9.7), not selected. AD-18
+puts the shape-2 mechanism (Linux guests through Virtualization framework) in
+scope as a backend of the Developer ID product; it does not select an App Store
+edition.
 
 | Rank | Shape | Main loss |
 | --- | --- | --- |
@@ -650,41 +758,43 @@ each needs a governing design.
 | Security | Trust classes, flow rules and claim limits above |
 | Asynchronous execution | Constraints in [decision flow](#decision-flow); numeric limits belong to each design |
 | Validation | Evidence types and gates above; unit, integration and end-to-end cases belong to each design |
-| Decisions | [Open owner decisions](#open-owner-decisions) |
+| Decisions | [Owner decisions](#owner-decisions) |
 
-## Open owner decisions
+## Owner decisions
 
 Collected from the three reports and de-duplicated. "Source" names the report
-section. Recommendations are the reports' recommendations, not decisions.
+section. Recommendations are the reports' recommendations. A row is decided
+only when its "Decided by" cell names who decided and when; every other row is
+open. Earlier text of a decided row is kept as the question that was asked.
 
-| ID | Decision | Report recommendation | Source |
-| --- | --- | --- | --- |
-| AD-1 | Adopt trust classes A–F and flow rules F1–F7 as the governing rule for secrets | Yes | [R-SEC] §17 OD-1 |
-| AD-2 | PC10: may the model read person job streams? | Keep for untainted jobs; refuse for tainted jobs | [R-SEC] §17 OD-2, §3 |
-| AD-3 | What may a tainted job's notice carry (PCR13)? | Nothing that the job produced | [R-SEC] §17 OD-3, §9.2 TN1 |
-| AD-4 | Forbid raw delivery to model-originated jobs; SL7 becomes a "store and bind?" prompt | Forbid | [R-SEC] §17 OD-4 |
-| AD-5 | A stage-2 on-device model over stage-1-redacted paste text? | **Decided by the owner, 2026-10-31: yes, always.** "An on-device model may look at pasted text; arguably must look at pasted text: on-device is safer than off-device." Stage 0 (exact match of stored values) and stage 1 (deterministic rules) run first and redact what they find; the on-device stage 2 then checks every paste before any remote model can receive it. Stage 2 may only tighten (flag, offer to store, withhold from remote egress); it never releases text. Accepted limit: stage 2 can see a secret that Asura does not yet know, on the device only. The "zero model access" claim (AD-23) therefore covers secrets Asura knows; an unknown pasted secret is caught on the device before it can leave it | [R-SEC] §17 OD-5, §12.1 |
-| AD-6 | Provider keys through the Asura proxy instead of the helper (changes EX14 and EX8) | Proxy | [R-SEC] §17 OD-6, §6.6 |
-| AD-7 | Model job network only to the per-job proxy port when brokers ship; the same for `!`; PC3 `SSH_AUTH_SOCK` pass-through | **Person commands decided by the owner, 2026-10-31:** `!` and `!!` are the person's own commands, which they can always run in a terminal outside Asura, so Asura does not lock their network down; PC3 `SSH_AUTH_SOCK` pass-through stays. Model jobs: open, with the broker work | [R-SEC] §17 OD-7, §3 |
-| AD-8 | Owner of Secure Enclave keys: Rust in the service, or a small class A Swift signer (not the helper) | Either; not the helper | [R-SEC] §17 OD-8 |
-| AD-9 | Commit signing by model jobs: person key with Touch ID per use, a separate agent key, or none | **Decided by the owner, 2026-10-31: a separate agent key.** Model jobs sign with an Asura agent key, never the person's key; how the key is held follows AD-8 | [R-SEC] §17 OD-9 |
-| AD-10 | Secret reference syntax | No reference for brokered use; named references in messages; prefixed variables only for raw delivery | [R-SEC] §17 OD-10, §12.2 |
-| AD-11 | Files written by tainted `!` jobs: track or accept the limit | Accept and state; revisit with Endpoint Security | [R-SEC] §17 OD-11, §9.4 |
-| AD-12 | Time bounds: confirm none by default for the Touch ID wait, the classifier call and SymCC admission checks; closures are cancel, stall and shutdown | Confirm none | [R-SEC] §17 OD-12; [R-CED] §12 item 5, §11.3 |
-| AD-13 | Cedar as the D3 format and evaluator candidate, with Rego (regorus) as the comparison on the same corpus | Accept for the spike | [R-CED] §12 item 1 |
-| AD-14 | Scope composition: per-scope AND, or forbid-only lower scopes | Both provable; forbid-only is simpler for repository files | [R-CED] §12 item 2, §3.6 |
-| AD-15 | Classifier scope: PCR22 excludes `!!`; may a classifier tightening add an approval for model jobs, which have none today; behaviour in non-interactive use | Owner to decide | [R-CED] §12 item 3, §1 |
-| AD-16 | `unknown` classifier result: approval, or no tightening | Approval | [R-CED] §12 item 4, §11.3 |
-| AD-17 | cvc5 packaging for admission checks: bundled, developer-only or remote | Owner to decide | [R-CED] §12 item 6 |
-| AD-18 | A VM backend (Linux guests only) in product scope; includes legal advice on the Xcode licence for guests | Keep as the main App Store-only path if a store edition runs local jobs | [R-CED] §12 item 7; [R-DIST] §9.1, §13 item 4 |
-| AD-19 | Developer ID only for the first releases | **Decided by the owner, 2026-11-01: a signed, notarised DMG is the primary distribution, and Homebrew installs it through a cask.** That makes the first releases Developer ID; an App Store companion (AD-21) stays a later option | [R-DIST] §13 item 1 |
-| AD-20 | Goal 3 inside Developer ID: a sandboxed data owner, a group container socket and `NSDataAccessSecurityPolicy`; run IS-1 to IS-6 first | Yes (medium confidence) | [R-DIST] §11, §13 item 2 |
-| AD-21 | An App Store companion GUI later (shape 1) | Later and optional | [R-DIST] §13 item 3 |
-| AD-22 | Ask Apple whether PCC Foundation Models is available to Developer ID apps | Ask | [R-DIST] §12 item 4, §13 item 5 |
-| AD-23 | Accept the "zero model access" claim wording and its stated limits | Adopt | [R-SEC] §16 |
-| AD-24 | Treat an envelope approval (DF1) as an authorized policy change, not a per-action approval | This draft proposes yes | This document, DF1; [security policy brief](security-policy-brief.md#proposed-authorization-contract) |
-| AD-25 | Model context egress (DF2) as a Cedar action over data classes, destinations and projects under EX13 | **Decided by the owner, 2026-10-31: yes, policy decides.** Every piece of context is classified (by Asura's deterministic code and the on-device classifiers) before it leaves the Mac; a Cedar policy decides which data classes may go to which remote model for each project; denied context stays on the device | This document, DF2 |
-| AD-26 | Adopt the evidence gate as a release rule: no differentiator is enabled by default without current evidence | This draft proposes yes | This document |
+| ID | Decision | Report recommendation, or the decision | Decided by | Source |
+| --- | --- | --- | --- | --- |
+| AD-1 | Adopt trust classes A–F and flow rules F1–F7 as the governing rule for secrets | Yes | Open | [R-SEC] §17 OD-1 |
+| AD-2 | PC10: may the model read person job streams? | Keep for untainted jobs; refuse for tainted jobs | Open | [R-SEC] §17 OD-2, §3 |
+| AD-3 | What may a tainted job's notice carry (PCR13)? | Nothing that the job produced | Open | [R-SEC] §17 OD-3, §9.2 TN1 |
+| AD-4 | Forbid raw delivery to model-originated jobs; SL7 becomes a "store and bind?" prompt | Forbid | Open | [R-SEC] §17 OD-4 |
+| AD-5 | A stage-2 on-device model over stage-1-redacted paste text? | **Decided: yes, always.** "An on-device model may look at pasted text; arguably must look at pasted text: on-device is safer than off-device." Stage 0 (exact match of stored values) and stage 1 (deterministic rules) run first and redact what they find; the on-device stage 2 then checks every paste before any remote model can receive it. Stage 2 may only tighten (flag, offer to store, withhold from remote egress); it never releases text. Accepted limit: stage 2 can see a secret that Asura does not yet know, on the device only. The "zero model access" claim (AD-23) therefore covers secrets Asura knows; an unknown pasted secret is caught on the device before it can leave it | Owner, 2026-10-31 | [R-SEC] §17 OD-5, §12.1 |
+| AD-6 | Provider keys through the Asura proxy instead of the helper (changes EX14 and EX8) | Proxy | Open | [R-SEC] §17 OD-6, §6.6 |
+| AD-7 | Model job network only to the per-job proxy port when brokers ship; the same for `!`; PC3 `SSH_AUTH_SOCK` pass-through | **Person commands decided:** `!` and `!!` are the person's own commands, which they can always run in a terminal outside Asura, so Asura does not lock their network down; PC3 `SSH_AUTH_SOCK` pass-through stays. Model jobs: open, with the broker work | Owner, 2026-10-31, for person commands; model jobs open | [R-SEC] §17 OD-7, §3 |
+| AD-8 | Owner of Secure Enclave keys: Rust in the service, or a small class A Swift signer (not the helper) | Either; not the helper | Open | [R-SEC] §17 OD-8 |
+| AD-9 | Commit signing by model jobs: person key with Touch ID per use, a separate agent key, or none | **Decided: a separate agent key.** Model jobs sign with an Asura agent key, never the person's key; how the key is held follows AD-8 | Owner, 2026-10-31 | [R-SEC] §17 OD-9 |
+| AD-10 | Secret reference syntax | No reference for brokered use; named references in messages; prefixed variables only for raw delivery. **Named references in person commands decided:** `$ASURA_SECRET_<NAME>` in `!` and `!!` commands only ([named secrets](named-secrets.md#references-in-commands)). **Model commands decided:** a model `exec_cmd` command that names `$ASURA_SECRET_` is refused with a reason ([named secrets](named-secrets.md#model-commands)). Brokered use and references in messages stay open | Engineering choice the owner asked for, 2026-11-01 (person commands); owner, 2026-11-02 (model commands); the rest open | [R-SEC] §17 OD-10, §12.2 |
+| AD-11 | Files written by tainted `!` jobs: track or accept the limit | **Decided: accept and state the limit.** The output of a command that used a raw secret is private, but the files that command writes are not tracked. The limit is stated in the "zero model access" claim (AD-23) and in the user documentation for named secrets ([commands](../user/commands.md#named-secret-commands)). Endpoint Security tracking is not selected | Owner, 2026-11-02 | [R-SEC] §17 OD-11, §9.4 |
+| AD-12 | Time bounds: confirm none by default for the Touch ID wait, the classifier call and SymCC admission checks; closures are cancel, stall and shutdown | **Decided by an earlier rule: none.** No fixed time limit ends, refuses or fails work by default; each wait ends by a loop-closure condition (AE-04). The helper's stall bound is an owner-accepted wind-down bound that never ends the work | Owner's no-default-time-bounds rule, 2026-10-15 ([AE-04](../engineering.md#asynchronous-execution-and-recovery)) | [R-SEC] §17 OD-12; [R-CED] §12 item 5, §11.3 |
+| AD-13 | Cedar as the D3 format and evaluator candidate, with Rego (regorus) as the comparison on the same corpus | Accept for the spike | Open | [R-CED] §12 item 1 |
+| AD-14 | Scope composition: per-scope AND, or forbid-only lower scopes | Both provable; forbid-only is simpler for repository files | Open | [R-CED] §12 item 2, §3.6 |
+| AD-15 | Classifier scope: PCR22 excludes `!!`; may a classifier tightening add an approval for model jobs, which have none today; behaviour in non-interactive use | **Decided: the classifier may stop a model job to ask the person.** A `dangerous` or `unknown` label adds an approval step. If nobody answers (unattended or CLI use), the job waits in its agent's queue with a short reason until the person answers or cancels; no time limit ends the wait. `!!` stays outside the classifier (PCR22) ([DF4-F1](#df4-f1-classifier-approval-step-for-a-model-job)) | Owner, 2026-11-02 | [R-CED] §12 item 3, §1 |
+| AD-16 | `unknown` classifier result: approval, or no tightening | **Decided: approval.** It follows from AD-15 and the tighten-only rule CL-1: `unknown` adds the approval step | AD-15 (owner, 2026-11-02) and the tighten-only rule | [R-CED] §12 item 4, §11.3 |
+| AD-17 | cvc5 packaging for admission checks: bundled, developer-only or remote | Owner to decide | Open | [R-CED] §12 item 6 |
+| AD-18 | A VM backend (Linux guests only) in product scope; includes legal advice on the Xcode licence for guests | **Decided: yes, after native.** A Linux VM job backend is a second backend for Linux-friendly work, built after the Cedar policy layer and the brokers. Native macOS sandboxes stay for Mac work. Legal advice on the Xcode licence is still needed before any guest uses the macOS SDK. (Report recommendation: keep it as the main App Store-only path if a store edition runs local jobs) | Owner, 2026-11-02 | [R-CED] §12 item 7; [R-DIST] §9.1, §13 item 4 |
+| AD-19 | Developer ID only for the first releases | **Decided: a signed, notarised DMG is the primary distribution, and Homebrew installs it through a cask.** That makes the first releases Developer ID; an App Store companion (AD-21) stays a later option | Owner, 2026-11-01 | [R-DIST] §13 item 1 |
+| AD-20 | Goal 3 inside Developer ID: a sandboxed data owner, a group container socket and `NSDataAccessSecurityPolicy`; run IS-1 to IS-6 first | Yes (medium confidence) | Open | [R-DIST] §11, §13 item 2 |
+| AD-21 | An App Store companion GUI later (shape 1) | **Decided: later and optional.** The owner decides it when the GUI is designed; nothing is built now | Owner, 2026-11-02 | [R-DIST] §13 item 3 |
+| AD-22 | Ask Apple whether PCC Foundation Models is available to Developer ID apps | Ask | Open: no earlier owner rule decides it | [R-DIST] §12 item 4, §13 item 5 |
+| AD-23 | Accept the "zero model access" claim wording and its stated limits | **Decided: adopt the claim with its limits stated**, including the two that the owner accepted: an unknown pasted secret that stage 2 sees on the device (AD-5) and files that a tainted command writes (AD-11) ([the claim](#what-zero-model-access-can-honestly-claim)) | Owner decisions AD-5 (2026-10-31) and AD-11 (2026-11-02) | [R-SEC] §16 |
+| AD-24 | Treat an envelope approval (DF1) as an authorized policy change, not a per-action approval | **Decided: yes, envelopes.** The person may approve an envelope of limits once per task. Asura records it as an authorized policy change, proves it (Cedar, when built), enforces it, and ends it with the task or on revocation. Exact-action approval stays for anything outside the envelope. This revises the [security policy brief](security-policy-brief.md#owner-revision-of-2026-11-02-task-envelopes) rule that an approval binds to the exact action ([DF1-S1](#df1-s1-envelope-lifecycle)) | Owner, 2026-11-02 | This document, DF1; [security policy brief](security-policy-brief.md#proposed-authorization-contract) |
+| AD-25 | Model context egress (DF2) as a Cedar action over data classes, destinations and projects under EX13 | **Decided: yes, policy decides.** Every piece of context is classified (by Asura's deterministic code and the on-device classifiers) before it leaves the Mac; a Cedar policy decides which data classes may go to which remote model for each project; denied context stays on the device | Owner, 2026-10-31 | This document, DF2 |
+| AD-26 | Adopt the evidence gate as a release rule: no differentiator is enabled by default without current evidence | This draft proposes yes | Open | This document |
 
 Settled by existing rules, not open: [R-SEC] OD-13 asks to confirm that the wire
 protocol stays 0.1 and the journal format stays 1, with schemas evolving in
@@ -695,9 +805,17 @@ Conflicts with current decisions that the decisions above must resolve:
 - PC10 and PCR13 against the taint rule (AD-2, AD-3);
 - EX14 against "no model holds a secret", and EX8's "no proxy" rule (AD-6);
 - SL7 against the raw-delivery forbid (AD-4);
-- PC3 `SSH_AUTH_SOCK` pass-through against an Asura agent (AD-7);
-- PCR22 against a classifier on `!!` (AD-15);
-- the brief's exact-action approval binding against envelope approval (AD-24).
+- PC3 `SSH_AUTH_SOCK` pass-through against an Asura agent (AD-7; resolved for
+  person commands on 2026-10-31: the pass-through stays);
+- PCR22 against a classifier on `!!` (AD-15; resolved on 2026-11-02: `!!`
+  stays outside the classifier, so PCR22 is unchanged);
+- the brief's exact-action approval binding against envelope approval (AD-24;
+  resolved on 2026-11-02: the brief is revised, and exact-action approval stays
+  for anything outside the envelope).
+
+Diagram check (2026-11-02): DF1-S1 and DF4-F1 were rendered with the local
+Mermaid CLI at scale 2 into a temporary directory outside the repository and
+inspected. Rendering does not validate the decisions' mechanisms.
 
 ## Sources
 

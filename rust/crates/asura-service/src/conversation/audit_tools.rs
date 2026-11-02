@@ -180,6 +180,7 @@ pub(super) fn read(
                 | Event::ExecutionChanged { .. }
                 | Event::PersonCommandQueued { .. }
                 | Event::PersonCommandRefused { .. }
+                | Event::ExecCmdSecretReferenceRefused { .. }
                 | Event::SecretStorePut { .. }
                 | Event::SecretStoreGet { .. }
                 | Event::SecretStoreDelete { .. }
@@ -349,6 +350,27 @@ pub(super) fn tool_finished(
         ordinal,
         tool,
         outcome,
+    })
+}
+
+/// The `exec_cmd.secret_reference_refused` event of a model exec_cmd call
+/// refused with `model_secret_reference` (named-secrets.md, model commands).
+/// It cites the call by operation, generation and ordinal; no command, name
+/// or value. `None` for any other record.
+pub(super) fn secret_reference_refused(
+    turn: &asura_storage::authority::conversation::TurnAccepted,
+    record: &asura_storage::authority::conversation::ToolCall,
+) -> Option<Event> {
+    use asura_storage::authority::conversation::{RefusalCode, ToolDecision};
+    (record.decision == ToolDecision::Refused
+        && record
+            .refusal
+            .is_some_and(|r| r.code == RefusalCode::ModelSecretReference))
+    .then_some(Event::ExecCmdSecretReferenceRefused {
+        project: turn.project,
+        operation: turn.operation,
+        generation: turn.generation,
+        ordinal: record.ordinal,
     })
 }
 
