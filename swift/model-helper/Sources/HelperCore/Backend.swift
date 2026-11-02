@@ -5,10 +5,42 @@ import FoundationModels
 
 struct UnexpectedBackendCancellation: Error { let taskCancelled: Bool }
 
+/// The bridged domain of the system model's private `GenerativeError`.
+let generativeErrorDomain = "com.apple.GenerativeFunctionsFoundation.GenerativeError"
+/// The bridged code of its prompt `tooManyTokens` case (measured on macOS 27,
+/// Xcode 27.1, build 26A428; context-composer.md, CC4 prerequisites).
+let generativeTooManyTokensCode = 4_050_000
+
+/// True when `error` means the context window is full. The SDK reports a full
+/// window as `LanguageModelError.contextSizeExceeded` when its own admission
+/// check sees the input. Inside a turn, for example when the transcript holds
+/// tool calls and tool outputs, the system model reports it as its private
+/// `GenerativeError` with the prompt case `tooManyTokens`. Both are
+/// `context_limit` (loop-closure-probes.md, Q6). The private error is matched
+/// by its bridged domain and its code or case label, never by its text.
+func isContextOverflow(_ error: any Error) -> Bool {
+    if let sdk = error as? LanguageModelError, case .contextSizeExceeded = sdk { return true }
+    let bridged = error as NSError
+    guard bridged.domain == generativeErrorDomain else { return false }
+    return bridged.code == generativeTooManyTokensCode || reflectsCase(error, label: "tooManyTokens", depth: 4)
+}
+
+/// A bounded walk over an error's reflected children for one case label.
+private func reflectsCase(_ value: Any, label: String, depth: Int) -> Bool {
+    guard depth > 0 else { return false }
+    for child in Mirror(reflecting: value).children.prefix(16) {
+        if child.label == label { return true }
+        if reflectsCase(child.value, label: label, depth: depth - 1) { return true }
+    }
+    return false
+}
+
 /// Fixed classifications only; provider descriptions may contain private inputs.
 func modelFailureDiagnostic(_ error: any Error) -> String {
     let kind: String
-    if let sdk = error as? LanguageModelError {
+    if !(error is LanguageModelError), isContextOverflow(error) {
+        kind = "context_limit"
+    } else if let sdk = error as? LanguageModelError {
         switch sdk {
         case .contextSizeExceeded: kind = "context_limit"
         case .rateLimited: kind = "rate_limited"
@@ -327,6 +359,11 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
             try Task.checkCancellation()
             if let failure = await boundedModel.budget.recordedFailure() { throw failure }
             if let failure = error as? BackendFailure { throw failure }
+            // A full window inside a turn is a context limit (CC4 prerequisite).
+            if isContextOverflow(error) {
+                reportModelFailure(error)
+                throw BackendFailure(.contextLimit)
+            }
             guard let error = error as? LanguageModelError else { throw error }
             reportModelFailure(error)
             switch error {

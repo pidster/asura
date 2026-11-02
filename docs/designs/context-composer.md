@@ -1439,12 +1439,14 @@ requests appears in the next turn's notice, not in a later request.
    (about 2.1 GB); the native journey creates that cache on its first run.
    No download is needed.
 2. **Mid-turn overflow.** Measured 2026-11-02 (macOS 27, build 26A428, Xcode
-   27.1): a system model request whose transcript holds tool calls and tool
-   outputs above the 8,192-token window fails with the private
+   27.1): a system model request with project tools enabled whose transcript
+   holds tool calls and tool outputs above the 8,192-token window fails with
+   the private
    `GenerativeError`: bridged domain
    `com.apple.GenerativeFunctionsFoundation.GenerativeError`, code 4,050,000,
-   case `prompt(tooManyTokens)`. A plain prompt above the window still fails
-   with `LanguageModelError.contextSizeExceeded`. The helper's
+   case `prompt(tooManyTokens)`. The same input without enabled tools, and a
+   plain prompt above the window, fail with
+   `LanguageModelError.contextSizeExceeded`. The helper's
    `isContextOverflow` maps both to `context_limit`: the SDK case by type, the
    private error by its bridged domain and its code or its case label. It never
    reads error text. Tests: `generativeTooManyTokensIsContextLimit`,

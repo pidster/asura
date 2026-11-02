@@ -109,12 +109,12 @@ public struct BoundedToolModel<Base: LanguageModel>: LanguageModel {
             underlying = try Base.Executor(configuration: configuration)
         }
         /// A full context window ends the turn as a context limit, not an
-        /// internal error (loop closure; owner, 2026-10-18).
+        /// internal error (loop closure; owner, 2026-10-18). The system
+        /// model's mid-turn `GenerativeError` overflow is one too (CC4
+        /// prerequisite; `isContextOverflow`).
         static func typed(_ error: any Error) -> BackendFailure {
             if let failure = error as? BackendFailure { return failure }
-            if let error = error as? LanguageModelError, case .contextSizeExceeded = error {
-                return BackendFailure(.contextLimit)
-            }
+            if isContextOverflow(error) { return BackendFailure(.contextLimit) }
             return BackendFailure(.internalError)
         }
         public func respond(to request: LanguageModelExecutorGenerationRequest, model: Model,
