@@ -21,7 +21,7 @@ pub use rewrite::{
     MAX_REWRITTEN_COMMAND_BYTES, MAX_WHOLE_COMMAND_NUMBERS, Plan, Refusal, RefusalCode, Rewrite,
     SECRET_COMMAND_NAME, SecretCommand, SecretVariable, WHOLE_COMMAND, WHOLE_COMMAND_NOTICE,
     WholeCommand, display_redacted, note_redacted, rewrite_command, rewrite_exec_cmd_call,
-    rewrite_exec_cmd_call_with,
+    rewrite_exec_cmd_call_with, rewrite_model_exec_cmd_call_with,
 };
 pub use rules::{RULE_SET_DIGEST, RULE_SET_REVISION, RuleSet, SelfCheckError};
 pub use stream::{

@@ -3112,6 +3112,12 @@ impl Owner {
                     {
                         let _ = emitter.try_emit(event);
                     }
+                    if let Some(emitter) = &self.audit_emitter
+                        && let Some(event) =
+                            audit_tools::secret_reference_refused(&active.turn, &tool.record)
+                    {
+                        let _ = emitter.try_emit(event);
+                    }
                     let wire = mp::ToolResult {
                         ordinal: Some(tool.ordinal),
                         status: Some(i32::from(status)),
@@ -3558,11 +3564,12 @@ impl Owner {
         record.rule_set_digest = rules.digest();
         let parsed = tools::parse_call(name, text);
         // SL3, SL7: the exec_cmd command is rewritten, or planned for the
-        // whole-command variable, before the record.
+        // whole-command variable, before the record. A model command that
+        // names `$ASURA_SECRET_` is refused (`model_secret_reference`).
         let rewrite = match &parsed.arguments {
-            Ok(tools::Arguments::ExecCmd { command, cwd, .. }) => {
-                Some(secrets::rewrite_exec_cmd_call_with(rules, command, cwd))
-            }
+            Ok(tools::Arguments::ExecCmd { command, cwd, .. }) => Some(
+                secrets::rewrite_model_exec_cmd_call_with(rules, command, cwd),
+            ),
             _ => None,
         };
         let redacted = secrets::redact_arguments(

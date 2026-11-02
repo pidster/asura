@@ -163,6 +163,10 @@ pub enum RefusalCode {
     RewrittenCommandTooLong,
     /// J1: the working directory holds a detected secret.
     SecretInCwd,
+    /// A model command names `$ASURA_SECRET_` or `${ASURA_SECRET_` that is
+    /// not a numbered placeholder: model commands cannot use stored secrets
+    /// (named-secrets.md, model commands; owner, 2026-11-02).
+    ModelSecretReference,
 }
 impl RefusalCode {
     /// The refusals SO5 keeps: none is a secret in the command line, so the
@@ -170,7 +174,10 @@ impl RefusalCode {
     pub fn kept(self) -> bool {
         matches!(
             self,
-            Self::PlaceholderNotAvailable | Self::SecretInCwd | Self::DetectionUnavailable
+            Self::PlaceholderNotAvailable
+                | Self::SecretInCwd
+                | Self::DetectionUnavailable
+                | Self::ModelSecretReference
         )
     }
     pub fn as_str(self) -> &'static str {
@@ -189,6 +196,7 @@ impl RefusalCode {
             Self::DetectionUnavailable => "secret_detection_unavailable",
             Self::RewrittenCommandTooLong => "rewritten_command_too_long",
             Self::SecretInCwd => "secret_in_cwd",
+            Self::ModelSecretReference => "model_secret_reference",
         }
     }
     fn advice(self) -> &'static str {
@@ -224,6 +232,9 @@ impl RefusalCode {
             }
             Self::SecretInCwd => {
                 "the working directory holds a secret. Use a directory without one"
+            }
+            Self::ModelSecretReference => {
+                "it names an Asura secret variable ($ASURA_SECRET_...). Model commands cannot use stored secrets, so nothing ran. The person can run this command as a ! command"
             }
         }
     }
@@ -296,6 +307,35 @@ pub(crate) fn exec_cmd_call_checked(
         Err(_) => Err(refuse(RefusalCode::DetectionUnavailable, None, None)),
     }
 }
+/// The model exec_cmd call path (named-secrets.md, model commands): the
+/// checks of [`rewrite_exec_cmd_call_with`], with one more kept refusal after
+/// the numbered placeholder check and before the working directory scan. A
+/// command whose text holds `$ASURA_SECRET_` or `${ASURA_SECRET_` refuses
+/// with `model_secret_reference`, whatever follows and whatever the quoting:
+/// model commands cannot use stored secrets. The person path keeps
+/// [`rewrite_exec_cmd_call_with`], which leaves named references to the
+/// conversation owner's resolver.
+pub fn rewrite_model_exec_cmd_call_with(
+    rules: &'static RuleSet,
+    command: &str,
+    cwd: &str,
+) -> Result<Plan, Refusal> {
+    if references_placeholder(command.as_bytes()) {
+        return Err(refuse(RefusalCode::PlaceholderNotAvailable, None, None));
+    }
+    if names_secret_variable(command.as_bytes()) {
+        return Err(refuse(RefusalCode::ModelSecretReference, None, None));
+    }
+    rewrite_exec_cmd_call_with(rules, command, cwd)
+}
+/// `$ASURA_SECRET_` or `${ASURA_SECRET_` anywhere in the raw bytes.
+fn names_secret_variable(bytes: &[u8]) -> bool {
+    const DOLLAR: &[u8] = b"$ASURA_SECRET_";
+    const BRACED: &[u8] = b"${ASURA_SECRET_";
+    bytes.windows(DOLLAR.len()).any(|w| w == DOLLAR)
+        || bytes.windows(BRACED.len()).any(|w| w == BRACED)
+}
+
 /// [`rewrite_exec_cmd_call`] with a ready rule set, for a reactor caller
 /// that read it from [`super::compiled`]. That caller refuses with
 /// `secret_detection_unavailable` itself for a failed self-check or a set

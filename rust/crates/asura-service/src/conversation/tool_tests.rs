@@ -730,6 +730,57 @@ fn unknown_denied_and_limit_decisions_render_from_codes() {
     );
 }
 
+/// NS-U18 (named-secrets.md, model commands; 2026-11-02): a model exec_cmd
+/// command that names `$ASURA_SECRET_` is refused before any job, with code
+/// 15 and the fixed text; the audit helper gives its event for this record
+/// alone, and nothing names the secret.
+#[test]
+fn model_command_naming_a_secret_variable_is_refused() {
+    let mut fixture = Fixture::new();
+    fresh_turn(&mut fixture);
+    let text =
+        serde_json::json!({ "command": "printf %s \"$ASURA_SECRET_GITHUB_TOKEN\" > leaked.txt" })
+            .to_string();
+    propose(&mut fixture, wire(1, "exec_cmd", &text));
+    let record = pending_record(&mut fixture);
+    assert_eq!(record.decision, journal::ToolDecision::Refused);
+    assert!(!record.whole_command);
+    let refusal = record.refusal.expect("refusal fields");
+    assert_eq!(
+        refusal.code,
+        asura_platform::secrets::RefusalCode::ModelSecretReference
+    );
+    assert_eq!((refusal.kind, refusal.word), (None, None));
+    let tool = fixture.active().tool.as_ref().unwrap();
+    assert!(tool.call.is_none() && tool.exec.is_none());
+    let event = audit_tools::secret_reference_refused(&fixture.active().turn, &record)
+        .expect("audit event");
+    let line = serde_json::to_string(&event).unwrap();
+    assert!(line.contains("exec_cmd.secret_reference_refused") && !line.contains("GITHUB_TOKEN"));
+    fixture.acknowledge(Job::ToolIntent);
+    let results = sent(&mut fixture);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, Some(3));
+    let rendered = results[0].text.clone().unwrap();
+    assert_eq!(
+        rendered,
+        "Command refused: it names an Asura secret variable ($ASURA_SECRET_...). Model commands \
+         cannot use stored secrets, so nothing ran. The person can run this command as a ! command."
+    );
+    // Another kept refusal gives no secret reference event.
+    let other = journal::ToolCall {
+        refusal: Some(journal::ExecCmdRefusal {
+            code: asura_platform::secrets::RefusalCode::SecretInCwd,
+            kind: None,
+            word: None,
+        }),
+        ..record
+    };
+    let mut fixture = Fixture::new();
+    fresh_turn(&mut fixture);
+    assert!(audit_tools::secret_reference_refused(&fixture.active().turn, &other).is_none());
+}
+
 /// SL7 (owner layer): a single-quoted value is no longer refused. The record
 /// holds the display text and never the value. Bit 1 and the fallback reason
 /// belong to the `run` decision; the typed call holds the whole-command

@@ -804,6 +804,95 @@ fn whole_command_turn() -> Result<()> {
     Ok(())
 }
 
+/// NS-I10 (named-secrets.md, model commands; 2026-11-02): a model command
+/// that names `$ASURA_SECRET_` is refused before it runs. Both calls record
+/// kind 14 `refused` with code 15 and no job; nothing is written; the model
+/// receives the fixed reason; the audit log holds one
+/// `exec_cmd.secret_reference_refused` line per call and no secret name.
+fn secret_reference_turn() -> Result<()> {
+    let (fixture, model, project, directory) = setup("reference")?;
+    model.script(&[
+        Step::ExecCmd("printf %s \"$ASURA_SECRET_GITHUB_TOKEN\" > leaked.txt".into()),
+        Step::ExecCmd("printf %s '${ASURA_SECRET_X}' > leaked.txt".into()),
+        Step::Final,
+    ]);
+    let operation = submit(&fixture, project, "Use the stored token.")?;
+    let event = finish(&fixture, operation, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    let calls = exec_cmd_calls(&fixture, operation)?;
+    assert_eq!(calls.len(), 2);
+    for call in &calls {
+        assert_eq!(call.intent.disposition, Disposition::Refused);
+        assert_eq!(
+            call.intent.refusal.map(|r| r.code),
+            Some(journal::RefusalCode::ModelSecretReference)
+        );
+        assert!(call.settled.is_none() && call.result.is_none());
+        assert!(!call.record.whole_command);
+    }
+    assert!(
+        !directory.join("leaked.txt").exists(),
+        "a refused command ran"
+    );
+    let text = "Command refused: it names an Asura secret variable ($ASURA_SECRET_...). Model \
+                commands cannot use stored secrets, so nothing ran. The person can run this \
+                command as a ! command.";
+    let messages = model.tool_messages();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    for message in &messages {
+        assert!(message.contains(text), "{message}");
+        assert!(!message.contains("GITHUB_TOKEN"), "{message}");
+    }
+    let mut audit = String::new();
+    wait_for(Duration::from_secs(10), "audit lines", || {
+        audit = audit_text(&fixture.home);
+        audit.matches("exec_cmd.secret_reference_refused").count() == 2
+    })?;
+    for line in audit
+        .lines()
+        .filter(|l| l.contains("secret_reference_refused"))
+    {
+        assert!(
+            !line.contains("GITHUB_TOKEN") && !line.contains("ASURA_SECRET"),
+            "{line}"
+        );
+        assert!(line.contains(&hex(operation)), "{line}");
+    }
+    // The service answers the next turn.
+    model.script(&[Step::ExecCmd("printf after".into()), Step::Final]);
+    let next = submit(&fixture, project, "Again.")?;
+    assert_eq!(
+        finish(&fixture, next, Duration::from_secs(30))?.kind,
+        Some(3)
+    );
+    drop(model);
+    let mut fixture = fixture;
+    fixture.stop()?;
+    println!(
+        "PASS NS-I10 model commands naming $ASURA_SECRET_ refused with model_secret_reference: kind 14 code 15, no job, nothing written, the fixed reason to the model, two audit events without a name"
+    );
+    Ok(())
+}
+/// Every audit log line under the fixture's Asura home: `audit.jsonl` and
+/// its rotated files in `.asura/logs`.
+fn audit_text(home: &Path) -> String {
+    let mut text = String::new();
+    if let Ok(entries) = std::fs::read_dir(home.join(".asura/logs")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let audit = path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("audit"));
+            if audit && path.is_file() {
+                text.push_str(&String::from_utf8_lossy(
+                    &std::fs::read(&path).unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    text
+}
+
 /// J1T-05 integration: no 60 s limit; turn cancel stops a command. J3: the
 /// call returns `running` at its 10 s yield window and the job settles
 /// later with no turn running (J3T-04, TJ-02).
@@ -1344,8 +1433,9 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 8] = [
+    let cases: [Case; 9] = [
         ("secrets", secrets_turn),
+        ("reference", secret_reference_turn),
         ("whole", whole_command_turn),
         ("setup", setup_budget_removed),
         ("overload", overload),

@@ -58,7 +58,8 @@ Non-goals:
 
 - Host bindings, brokers, the egress proxy and the SSH agent (AD-4).
 - Named secrets in model `exec_cmd` calls. A model command never resolves a
-  named reference ([model commands](#model-commands)).
+  named reference, and one that names `$ASURA_SECRET_` is refused
+  ([model commands](#model-commands)).
 - Storing a value that the person types or pastes. The only source in this
   design is the TUI's captured terminal environment.
 - Rotation records, expiry and use counts (study section 12.4 and 12.5).
@@ -81,7 +82,7 @@ and the secrets study (trust classes and flow rules F1 to F7).
 | NS-R3 | The value travels terminal environment → TUI → control client → service → secret store worker → Keychain, all Asura-trusted code (class A). No model, journal record, log line, audit event, telemetry value, reply or model context holds it | ENV-O1, study F1 |
 | NS-R4 | A store never overwrites silently. When the name exists, the reply says so, and the person chooses `/secrets replace NAME` or keeps the stored value | ENV-O1 |
 | NS-R5 | A `!` or `!!` command uses a named secret only by explicit reference `$ASURA_SECRET_<NAME>` or `${ASURA_SECRET_<NAME>}`. The service resolves the reference at submit into a secret variable. The job is tainted under T1 | ENV-O1, T1 |
-| NS-R6 | A model `exec_cmd` command never resolves a named reference | Study F3, OD-4 |
+| NS-R6 | A model `exec_cmd` command never resolves a named reference. A model command that names `$ASURA_SECRET_` or `${ASURA_SECRET_` is refused with `model_secret_reference` and a reason before it runs (owner, 2026-11-02) | Study F3, OD-4; owner decision of 2026-11-02 |
 | NS-R7 | The person lists named secrets by name and removes one by name. No surface shows a value, a prefix, a length or a digest | ENV-O1, study 12.5 |
 | NS-R8 | A locked keychain, an unsigned build, a full store and a busy worker each give the person a reason and a next action; nothing falls back to disk | SSR4 |
 | NS-R9 | No step has a time bound. Each Keychain call runs on the secret store worker; each wait ends by its reply, a cancel, a disconnect or shutdown | AE-01 to AE-04 |
@@ -703,12 +704,50 @@ sequenceDiagram
 
 ### Model commands
 
-A model `exec_cmd` command is never resolved. The model path keeps its
-rewrite unchanged: a named reference in a model command is ordinary text, and
-the shell expands the unset variable to an empty string. No named read is
-made for a model call. This keeps the study's rule F3 (class D1 receives no
-raw value) for named secrets, while ENV4 remains the interim rule for values
-the model typed itself.
+Owner decision of 2026-11-02, mechanism selected (engineering). A model
+`exec_cmd` command is never resolved, and a model command that names an Asura
+secret variable is refused before it runs. Until 2026-11-02 a named reference
+in a model command was ordinary text, and the shell expanded the unset
+variable to an empty string; the model learned nothing about why its command
+did not work. Brokered use, which a later design adds, is separate: a brokered
+credential needs no reference in the command.
+
+| Item | Rule |
+| --- | --- |
+| Trigger | The model command's raw bytes contain `$ASURA_SECRET_` or `${ASURA_SECRET_`, whatever follows and whatever the quoting. This covers named references, `$ASURA_SECRET_COMMAND`, a malformed or empty name, and a reference inside single quotes |
+| Order | The model path's kept refusals run in this order: the rule set self-check (`secret_detection_unavailable`), a numbered placeholder `$ASURA_SECRET_<digits>` (`placeholder_not_available`, unchanged), this check, then the working directory scan (`secret_in_cwd`) |
+| Refusal code | `model_secret_reference`, kind 14 field 21 code 15, a kept refusal: it never selects the whole-command variable. It has no rule kind and no word index |
+| Text the model receives | Status 3, the rendered refusal: `Command refused: it names an Asura secret variable ($ASURA_SECRET_...). Model commands cannot use stored secrets, so nothing ran. The person can run this command as a ! command.` The text is fixed: it holds no name and no value |
+| Effects | Nothing runs: no job, no kind 26, no slot, no named read and no Keychain call. The call's kind 14 has decision `refused` and the display-redacted command, as for every kept refusal ([tool call records](tool-call-records.md#sl7-amendment-owner-2026-10-20)) |
+| Audit | `tool.finished` with outcome `invalid_arguments` (status 3), as for every refused call, and one new event `exec_cmd.secret_reference_refused` with `project`, `operation`, `generation` and `ordinal` alone. No audit field holds the command, a secret name or a value. The event stays out of the project audit view, like the `person_command.*` events |
+| Person commands | Unchanged. The person path keeps `rewrite_exec_cmd_call_with`, which leaves named references to the [resolver](#references-in-commands) |
+| Owner | `asura_platform::secrets::rewrite_model_exec_cmd_call_with`, called by the conversation owner at `ToolCall` in place of `rewrite_exec_cmd_call_with`. Bounded in-memory work on at most the exec_cmd command limit; no new blocking call, thread or queue |
+
+The check is a usability rule, not the security boundary. The boundary is
+that a model call never reads a named value: a form that the check does not
+see, such as `"$"ASURA_SECRET_X` or a variable built at run time, still finds
+no value, because the guardian passes no named value to a model job (study
+rule F3). ENV4 remains the interim rule for values the model typed itself.
+
+#### NS-F4: model command with a secret variable
+
+Selected design. Arrows are the owner's checks in order for one model
+`exec_cmd` call. Each refusal ends the call with status 3 and records kind 14
+`refused`; nothing runs.
+
+```mermaid
+flowchart TD
+    Call["Model exec_cmd call, parsed"] --> Rules{"Rule set ready?"}
+    Rules -->|No| RU["Refuse: secret_detection_unavailable"]
+    Rules -->|Yes| Num{"Command names $ASURA_SECRET_ followed by a digit?"}
+    Num -->|Yes| RP["Refuse: placeholder_not_available"]
+    Num -->|No| Var{"Command holds $ASURA_SECRET_ or ${ASURA_SECRET_?"}
+    Var -->|Yes| RM["Refuse: model_secret_reference"]
+    RM --> Aud["Audit: tool.finished and exec_cmd.secret_reference_refused, no name"]
+    Var -->|No| Cwd{"Working directory holds a secret?"}
+    Cwd -->|Yes| RC["Refuse: secret_in_cwd"]
+    Cwd -->|No| Plan["Rewrite or whole-command plan; admission as before"]
+```
 
 ## Failure handling
 
@@ -732,6 +771,7 @@ the model typed itself.
 | Named item data does not match its binding | `get_named`: `secret_not_found` at submit, audited `mismatch`; the item stays until the person replaces or removes it |
 | Remove while a command that used the name is queued | The queued command keeps its input item copy and runs |
 | Restart with a held command that used a name | Resume reads only the input item; no named read |
+| A model command names `$ASURA_SECRET_` | `model_secret_reference`, status 3 with the fixed reason; nothing runs; audited without a name |
 | Shutdown during a named request | Shutdown does not wait for the worker; the request completes or is lost; a lost put is visible in `/secrets` |
 
 ## Audit
@@ -753,6 +793,10 @@ alone. `person_command.refused` gains the reasons `secret_not_found`,
 values 14 `SECRET_NOT_FOUND`, 15 `SECRET_REFERENCE_INVALID` and 16
 `TOO_MANY_SECRETS`.
 
+`exec_cmd.secret_reference_refused` (2026-11-02) records a model command
+refused with `model_secret_reference`: `project`, `operation`, `generation`
+and `ordinal` only ([model commands](#model-commands)).
+
 `/status` adds no line: `item_count` already counts named items.
 
 ## Security
@@ -770,7 +814,8 @@ values 14 `SECRET_NOT_FOUND`, 15 `SECRET_REFERENCE_INVALID` and 16
 - **Capture.** The job's capture worker receives each value as a literal,
   as for every secret variable (SD3), so an echo of the value shows
   `$ASURA_SECRET_<n>` in the stored output.
-- **Model-written references.** A model cannot cause a named read
+- **Model-written references.** A model cannot cause a named read. A model
+  command that names `$ASURA_SECRET_` is refused before it runs
   ([model commands](#model-commands)). A model can write a project file that
   holds a reference; only a person command that the person types runs it,
   and that is the person's choice (PX3).
@@ -821,6 +866,9 @@ data-protection keychain.
 | NS-U13 | Audit: the four new events with each reply, including `absent` for `named_put`; a status on a success reply; the removed `replace_failed`; a name field | Valid events round-trip; the faults are invalid |
 | NS-U14 | Worker over a scripted port that keeps the named data it accepted: replace of a stored name; replace whose update fails with `locked`, then with `unavailable` -25291; replace whose update finds no item (removed after the check); replace at 64 names and 256 items | `replaced` and the new data, with one `update_named` and no list, add or delete; each failure reply with its status, the old data still stored and no add or delete; `absent` with nothing stored and no add; `replaced`, never `full` |
 | NS-U15 | Platform: `update_named` with the recording `Calls` fixture, scratch and data-protection tables: status 0, -25300, -25293 with the lock bit clear, -34018, -25291; a non-zero pre-check; an invalid name; data of 0 and 8,308 bytes. KC-U1 for the update dictionaries | `Changed`, `Absent`, `Locked`, `NotSigned`, `Unavailable`; scratch: a status call before every update and no update after a non-zero pre-check; `Invalid` with no call. The query sets the data-protection flag, the group, synchronizable false, UI fail, class, service and account, and no `kSecUseKeychain`; the attribute dictionary holds `kSecValueData` only |
+| NS-U16 | Platform, model path (2026-11-02): `$ASURA_SECRET_GH`, `${ASURA_SECRET_GH}`, `$ASURA_SECRET_COMMAND`, `${ASURA_SECRET_`, a reference in single quotes, `$ASURA_SECRET_2`, `ASURA_SECRET_GH` without `$`, a reference with a secret in the cwd; the person path with the same named reference | `model_secret_reference` for the first five, a kept code with no kind or word and the exact text; `placeholder_not_available` for the numbered form; the bare word plans normally; `model_secret_reference` before `secret_in_cwd`; the person path still plans the named reference |
+| NS-U17 | Storage and audit: kind 14 refusal code 15 round trip with `refused`, rejected with the whole-command bit; the code table; `exec_cmd.secret_reference_refused` serde name, fields and validation (zero IDs, generation 0, ordinal 0); no name field accepted | Code 15 is `model_secret_reference` and kept; the faults are `Corrupt` or invalid |
+| NS-U18 | Owner: a model `exec_cmd` call naming `$ASURA_SECRET_GITHUB_TOKEN` | Kind 14 `refused` with code 15; no call or job; status 3 with the fixed text; no name in the result text; the audit helper gives the event for this record and none for a `secret_in_cwd` refusal |
 
 ### Integration
 
@@ -835,6 +883,7 @@ data-protection keychain.
 | NS-I7 | Sweep: the startup sweep with a stored named secret and no live inputs | The named item stays |
 | NS-I9 | Worker layer on a scratch keychain (`tests/secret_store.rs`, gated port): store a named value; replace; a gated update failure; a locked update; an update held at the gate while the test removes the item through its own handle, then released | `replaced` and the new data read back; the gate records list and add for the store and one update alone for each replace; the gated failure and `locked` replies each keep the previous data; the held replace answers `absent` and no item exists afterwards |
 | NS-I8 | Value sweep: after NS-I4 and a scripted model turn that runs `job read` of the tainted job and receives a notice | No chat request the model received, no journal frame, no audit line, no service log line and no payload file holds the token, its SHA-256 hex digest or its base64 form |
+| NS-I10 | Real service, Swift helper and scripted model (`capture_flow reference`): the model runs `printf %s "$ASURA_SECRET_GITHUB_TOKEN" > leaked.txt`, then `${ASURA_SECRET_X}` in single quotes, then a final answer | Both calls kind 14 `refused` code 15; no job record and no `leaked.txt`; both tool messages hold the fixed text; the audit log holds two `exec_cmd.secret_reference_refused` lines and no `GITHUB_TOKEN`; the service answers the next turn |
 
 ### End to end
 
@@ -845,6 +894,7 @@ data-protection keychain.
 | NS-E3 | `!printf %s "$ASURA_SECRET_PE_TOKEN" \| shasum -a 256` | The env line shows `named PE_TOKEN`; the output is the token's digest; the screen shows no token |
 | NS-E4 | `/secrets remove PE_TOKEN`; the same command again; `/secrets replace PE_TOKEN` | `Removed…`; the command is refused with the `secret_not_found` text and the draft is kept; `No named secret PE_TOKEN exists to replace. Store it with /secrets store PE_TOKEN.` |
 | NS-E5 | The whole journey, then a raw-byte sweep of the scratch home (journal, payloads, logs, audit, configuration) | No byte sequence of the token is found |
+| NS-E6 | PTY journey `--person-named`, with `PE_TOKEN` stored: a scripted model turn whose `exec_cmd` command is `printf %s "$ASURA_SECRET_PE_TOKEN" > leaked.txt` | The turn completes with the model's final text; the model's tool message holds the fixed refusal text; no `leaked.txt` exists; no TUI output byte holds the token |
 
 Every `--person-*` PTY journey keeps passing; PE-E1 checks the new report
 text.
@@ -954,5 +1004,25 @@ Not verified:
   That run was not repeated for this revision.
 - A Keychain failure after a partial write of the update was not provoked
   ([failure atomicity](#replace-in-place)).
+
+### Model command refusal verification (2026-11-02)
+
+Implemented behavior, verified on macOS 27.0 with the debug build, the ad hoc
+model helper from `asura-bundle --ad-hoc`, scratch homes and scratch
+keychains. Diagram NS-F4 was rendered with the local Mermaid CLI at scale 2
+into a temporary directory outside the repository and inspected.
+
+| Case | Evidence | Result |
+| --- | --- | --- |
+| NS-U16 | `secrets::tests::ns_u16_model_command_naming_a_secret_variable_is_refused` | Pass |
+| NS-U17 | `audit::tests::ns_u17_secret_reference_refused_event`; `codec::tests::j1t_01_code_tables_are_fixed` (code 15 kept, refused round trip, whole-command form rejected) | Pass |
+| NS-U18 | `conversation::tool_tests::model_command_naming_a_secret_variable_is_refused` | Pass |
+| NS-I10 | `capture_flow reference` (real service, Swift helper, scripted model) | Pass |
+| NS-E6 | PTY journey `--person-named` | Pass |
+
+Not verified: a model that writes the reference in a form the byte check does
+not see (for example `"$"ASURA_SECRET_X`) is not refused; it runs and finds no
+value, as before. No real on-device or remote model was used; the model was
+scripted.
 
 Return to the [design index](README.md).

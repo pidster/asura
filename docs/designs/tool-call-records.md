@@ -458,8 +458,10 @@ Such a call is admitted with decision `run` and runs through the
 - Fields 21–23 hold the rewrite's reason, kind and word with decision `run`
   when bit 1 is set. With `refused` they keep their meaning.
 - Decision `refused` for exec_cmd remains only for `placeholder_not_available`,
-  `secret_in_cwd` and `secret_detection_unavailable`. The codec enforces it:
-  fields 21–23 of a `refused` record hold code 1 or 14 (detection unavailable
+  `secret_in_cwd`, `secret_detection_unavailable` and, from 2026-11-02,
+  `model_secret_reference` ([named secrets](named-secrets.md#model-commands)).
+  The codec enforces it: fields 21–23 of a `refused` record hold code 1, 14
+  or 15 (detection unavailable
   is recorded without them, as before), and of a bit 1 record any other code
   except 12.
 - Replay recomputes the executable command as the fixed text
@@ -538,7 +540,7 @@ must not decide a call again.
 | 1 | `run` | Parsed, valid, authorized, within the call limit; exec_cmd admitted | Yes | The outcome, from kind 15 |
 | 2 | `invalid_arguments` | Any parse or validation fault, including oversized text | No | 3 |
 | 3 | `unknown_tool` | Name not registered | No | 3 |
-| 4 | `refused` | exec_cmd kept refusal (`placeholder_not_available` or `secret_in_cwd`, SL7), or rule set unavailable (any tool) | No | 3 |
+| 4 | `refused` | exec_cmd kept refusal (`placeholder_not_available` or `secret_in_cwd`, SL7; `model_secret_reference`, 2026-11-02), or rule set unavailable (any tool) | No | 3 |
 | 5 | `busy` | exec_cmd busy reasons | No | 4 |
 | 6 | `denied` | The grant lacks the permission, such as `create_note` without a foreground person | No | 2 |
 | 7 | `limit` | Ordinal 201 | No | 7 |
