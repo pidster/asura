@@ -250,6 +250,8 @@ pub struct Prepared {
     pub model: String,
     pub asset_root: String,
     pub ollama_endpoint: Option<String>,
+    /// The llama.cpp settings of the same snapshot (llamacpp-backend.md).
+    pub llamacpp: crate::config::LlamacppSettings,
     pub model_capabilities: Option<u32>,
     /// The configured thinking level code (thinking-level.md).
     pub thinking: u8,

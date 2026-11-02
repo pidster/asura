@@ -1,6 +1,8 @@
 # llama.cpp backend and Asura's llama.cpp server
 
-Status: selected design, 2026-11-02, under the owner decision below. Protocol
+Status: selected design, 2026-11-02, under the owner decision below;
+**implemented 2026-11-02** (packets LC1 to LC5), with the evidence and gaps in
+[implementation evidence](#implementation-evidence-2026-11-02). Protocol
 numbering remains `0.1`; journal format remains `1`. The design adds a fifth
 provider, `llamacpp`, to the Swift model helper, and a `llama-server` router that
 Asura starts through a LaunchAgent. It records the probes that settled the
@@ -691,11 +693,12 @@ configuration sample every 30 s and on refresh, on the sampler thread:
 | `agent_file` | The agent file exists |
 | `answering` | `GET /health` answered 200 (asura, llama-app, url) |
 
-The health check connects without blocking and reads at most 4 KiB. It ends on
-the reply, an error, sampler cancellation or shutdown; until it ends the pane
-keeps the previous value. Approval is checked by size and modification time
-against the record; the digest is recomputed only when they differ, at most once
-per sample. `/status` shows, for example:
+The health check connects without blocking and reads at most 4 KiB; any HTTP
+reply counts as answering, because the router answers 401 without the key. It
+ends on the reply, an error, sampler cancellation or shutdown; until it ends the
+pane keeps the previous value. In `asura` mode each sample hashes the approved
+binary (at most 256 MiB; 33,616 bytes for Homebrew 0.7.0) and lists the folder
+(at most 64 links), on the sampler thread. `/status` shows, for example:
 
 ```text
 llama.cpp: asura on 127.0.0.1:8934, answering
@@ -742,7 +745,7 @@ Summary:
 | AE-01 | The relay runs on its own thread; the reactor only binds it and passes the key. The status sample runs on the sampler thread. Discovery and requests are cancellable `URLSession` tasks in the helper |
 | AE-02 | Blocking calls: the relay's sockets (nonblocking, `poll`), the Keychain read (secret store worker; in the serve step, the one-shot CLI process), file hashing (CLI command, sampler thread), `launchctl` (CLI child process) |
 | AE-03 | Relay: 4 connections, 16 KiB head, 64 KiB per direction, one per helper. Helper: 65,536-byte SSE line, 1 MiB discovery, 65,536-byte call arguments, 201 calls. Folder: 64 links. Secret store queue: 16 |
-| AE-04 | Every wait ends on its reply, error, cancel, helper exit or shutdown. The relay's key wait ends on the key, the refusal or stop. The relay's `poll` uses a 1 s pacing interval to observe stop; it ends nothing. No timeout is added |
+| AE-04 | Every wait ends on its reply, error, cancel, helper exit or shutdown. The relay's key wait ends on the key, the refusal or stop. Stop, the key and the refusal wake the relay's `poll` through a wake pair; its 60 s interval is pacing and ends nothing. No timeout is added |
 | AE-05 | No retry. A relay connection carries one request (`Connection: close`). Requests are idempotent reads except chat, whose outcome on a cut connection is unknown and is never retried |
 | AE-06 | The relay stops when its `ModelOwner` settles: it closes its listener and connections and its thread exits. The service does not own the server, so its shutdown never waits on it |
 | AE-07 | The [validation](#validation) cases below |
@@ -822,4 +825,30 @@ implementation record follows in
 
 ### Implementation evidence, 2026-11-02
 
-Pending: recorded with the delivery commits.
+macOS 27 (build 26A428), Xcode 27.1, Metal toolchain 32023.921.5; Homebrew
+`llama-server` 0.7.0 (build 11669); `Ternary-Bonsai-2-2B-Q2_0.gguf` from
+`~/models` (546,689,504 bytes, linked into scratch folders, never copied);
+helper from an ad hoc `asura-bundle` package copied beside the test binaries.
+
+| Case | Evidence | Result |
+| --- | --- | --- |
+| LC-U1 to LC-U5 | Swift `llamacppSettingsKeepTheLoopbackRuleAndTokenSize`, `llamacppDiscoveryUsesTheServerWindowAndDeclaredCaps`, `llamacppMessagesUsePositionalCallIDsAndNeverSendThinking`, `llamacppStreamGathersCallsAndRequiresDone`, `llamacppRefusalsAndFinishReasonsMapToAsuraFailures` | Pass |
+| LC-I1 to LC-I3 | Swift helper sessions against `LlamaFixtureServer`: text and window, `context_limit` from 400 and from `length`, 401 unavailable, unlisted model unavailable, stage B with byte-stable earlier messages and `call00001`, the relay token on all three requests | Pass |
+| LC-U6 | `config::tests::llamacpp_keys_validate_and_reach_the_snapshot` | Pass |
+| LC-U7, LC-U8 | `asura-storage` `llamacpp::tests` (approval, folder, log) | Pass |
+| LC-U9 | `asura-platform` `llamacpp::tests` (plan, environment, key pipe, agent file, fake `launchctl`) | Pass |
+| LC-U10, LC-U11 | `asura-service` `llamacpp::tests::heads_are_checked_and_rewritten`, `modes_resolve_to_routes_or_hold_reasons`, `only_visible_ascii_keys_reach_a_header` | Pass |
+| LC-U12 | `asura-control` `llamacpp_hello_fields_are_checked`, `llamacpp_status_is_bounded`; capacity source 5 accepted in `ModelContext` | Pass |
+| LC-U13, LC-U14 | `asura-cli` `llamacpp_status_lines`; `llamacpp_cli::tests` (arguments, every person command in a scratch home with a fake `launchctl`) | Pass |
+| LC-I4 | Relay against a fake upstream: key added, token never forwarded, 401, 403, 400, key wait then key, key refusal 503, missing router 502, four stalled connections and a fifth 503, stop closes all | Pass |
+| LC-I5, LC-I6 | `native_server_plan_and_relay` (opt-in): the plan through `spawn_for_test`, 401 without the key, no key in `ps`, `/v1/models` and a streamed chat through the relay, SIGTERM leaves no model process | Pass, 1.45 s |
+| LC-N1 | `nativeLlamaCppStageBTwoRequests` against a keyless scratch router: window 16,384, tools, thinking off and on; request 1 one `exec_cmd` call, request 2 a 74-byte answer | Pass, 4.6 s |
+| LC-E1, LC-E2 | `conversation_flow --native-llamacpp`: `/status` reports `url`, the endpoint and answering; a turn completes in `url` mode with capacity 8,192 (the server's `n_ctx`), 43 measured input tokens and no project tools | Pass |
+| `asura` mode through the service: secret store `GetServerKey`, `KeyTicket`, relay in `ModelOwner` | Parts tested (route, relay, real router through the relay); not run end to end, because the key needs a team-signed build's Keychain item and no test may use the data-protection keychain | Unverified end to end |
+| LaunchAgent under the person's launchd, `asura llamacpp serve` from launchd, the Keychain item | Not run: no test may register an agent or touch the data-protection keychain | Owner check on a signed build |
+| Project tools on Asura's own server through the service | Depends on the row above | Unverified; the helper-level stage B (LC-N1) passes |
+
+A finding during implementation: the control contract's `ModelContext` accepted
+capacity sources 1 to 4 only, so the first `--native-llamacpp` run ended with
+`service_unavailable` at the client; source 5 is now accepted there as well as
+in Hello.

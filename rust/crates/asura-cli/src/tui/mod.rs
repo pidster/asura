@@ -413,6 +413,7 @@ pub(crate) fn run(
                 job_worker.person_command(app.service_epoch()),
                 worker.secret_store(),
             );
+            app.set_llamacpp(worker.llamacpp());
             output.borrow_mut().pump()?;
             if dirty && !output.borrow().pending() {
                 screen.draw(|frame| app.draw(frame))?;

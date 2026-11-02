@@ -19,6 +19,11 @@ pub(crate) trait KeychainPort: Send + 'static {
     /// A replace in place: `SecItemUpdate` of the data alone.
     fn update_named(&self, key: &NamedKey, data: &[u8]) -> Result<Updated, Failure>;
     fn delete_named(&self, key: &NamedKey) -> Result<Removed, Failure>;
+    /// The llama.cpp server key item (llamacpp-backend.md). Ports without
+    /// one report it absent.
+    fn get_server_key(&self) -> Result<Found, Failure> {
+        Ok(Found::Missing)
+    }
 }
 
 impl KeychainPort for Keychain {
@@ -45,6 +50,9 @@ impl KeychainPort for Keychain {
     }
     fn delete_named(&self, key: &NamedKey) -> Result<Removed, Failure> {
         Keychain::delete_named(self, key)
+    }
+    fn get_server_key(&self) -> Result<Found, Failure> {
+        Keychain::get_server_key(self)
     }
 }
 

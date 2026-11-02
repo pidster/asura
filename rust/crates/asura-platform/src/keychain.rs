@@ -44,6 +44,12 @@ use std::sync::Arc;
 
 /// Service attribute prefix; the installation ID follows in lowercase hex.
 pub const SERVICE_PREFIX: &str = "asura.secret-store.";
+/// The service name of Asura's llama.cpp server key (llamacpp-backend.md,
+/// the key): one item outside every installation's service name, so the
+/// secret store's listing and sweep never see it.
+pub const SERVER_KEY_SERVICE: &str = "org.pidster.asura.llamacpp";
+/// The account of the server key item.
+pub const SERVER_KEY_ACCOUNT: &str = "server-key";
 /// Account attribute prefix; the input ID follows in lowercase hex.
 pub const ACCOUNT_PREFIX: &str = "input.";
 /// Account attribute prefix of a named secret; the secret name follows
@@ -459,6 +465,16 @@ impl Keychain {
     pub fn delete_named(&self, key: &NamedKey) -> Result<Removed, Failure> {
         key.valid()?;
         delete_raw_with(self.calls(), &key.service(), &key.account())
+    }
+
+    /// Adds the llama.cpp server key item once (the serve step).
+    pub fn add_server_key(&self, data: &[u8]) -> Result<Added, Failure> {
+        add_raw_with(self.calls(), SERVER_KEY_SERVICE, SERVER_KEY_ACCOUNT, data)
+    }
+
+    /// Reads the llama.cpp server key item into a zeroizing buffer.
+    pub fn get_server_key(&self) -> Result<Found, Failure> {
+        get_raw_with(self.calls(), SERVER_KEY_SERVICE, SERVER_KEY_ACCOUNT)
     }
 
     /// Lists the items of one installation, at most [`LIST_BOUND`] of them.

@@ -113,7 +113,7 @@ func reportModelFailure(_ error: any Error) {
 }
 
 public enum ContextCapacitySource: UInt32, Sendable {
-    case system = 1, coreai = 2, mlx = 3, ollama = 4
+    case system = 1, coreai = 2, mlx = 3, ollama = 4, llamacpp = 5
 }
 
 public struct BackendStatus: Sendable {

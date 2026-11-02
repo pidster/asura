@@ -473,6 +473,7 @@ fn j5t_09_notice_error_fails_the_turn_as_a_repair_case() {
         model: "system".into(),
         asset_root: String::new(),
         ollama_endpoint: None,
+        llamacpp: Default::default(),
         model_capabilities: None,
         thinking: 0,
         configuration_digest: [0; 32],

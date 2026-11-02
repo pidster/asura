@@ -534,6 +534,7 @@ fn model_inventory_contract_bounds_partial_results_and_direction() {
 fn stored_memory_status_is_bounded_truthful_and_paired_with_service_uptime() {
     let observation = pb::ServiceObservation {
         secret_store: None,
+        llamacpp: None,
         revision: Some(1),
         pending: Some(false),
         status: Some(pb::InspectReply {

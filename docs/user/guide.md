@@ -333,6 +333,7 @@ You can also type `/config set model SELECTOR`. The selectors are:
 | --- | --- |
 | `system` | The macOS system model; used when no model is set |
 | `ollama:MODEL` | A model served by a local Ollama |
+| `llamacpp:NAME` | A model served by llama.cpp's `llama-server`; see [llama.cpp](#llamacpp) |
 | `mlx:NAME` | An MLX model in `~/.asura/data/models/mlx/NAME` |
 | `coreai:NAME` | A Core AI model in `~/.asura/data/models/coreai/NAME` |
 
@@ -344,6 +345,43 @@ in `~/Library/Caches/coreai-cache/<macOS build>/org.pidster.asura.model`. This
 cache can use about 2 GB or more for each macOS build. Later starts reuse it.
 macOS owns the cache, and Asura does not delete it; you can delete the folder
 to free space, and the next start compiles the model again.
+
+### llama.cpp
+
+`llamacpp:NAME` uses llama.cpp's `llama-server`. Choose whose server with
+`/config set providers.llamacpp.server MODE`:
+
+| Mode | Server |
+| --- | --- |
+| `off` | None; `llamacpp:` messages wait with `llamacpp_server_off`. The default |
+| `asura` | Asura's own server, on `127.0.0.1` port 8934, with a key Asura keeps in the Keychain |
+| `llama-app` | Llama.app's server on `127.0.0.1` port 9931. It has no key, and any program on this Mac can use it |
+| `url` | A server you start, at `providers.llamacpp.endpoint` (a `127.0.0.1` or `::1` URL) |
+
+Asura's own server runs from a LaunchAgent, so it keeps running when Asura
+stops. Set it up from a terminal:
+
+```text
+asura llamacpp approve /opt/homebrew/bin/llama-server
+asura llamacpp add ~/models/Ternary-Bonsai-2-9B-Q2_0.gguf
+/config set providers.llamacpp.server asura          (in Asura)
+asura llamacpp start
+```
+
+`approve` records the program and its SHA-256. After `brew upgrade llama.cpp`
+the program changes, and the server does not start until you run `approve`
+again. `add` links a `.gguf` file into `~/.asura/data/models/llamacpp`; the
+file stays where it is, and its name without `.gguf` is the model name.
+`asura llamacpp list`, `remove NAME`, `status` and `stop` manage the rest.
+Asura's own server needs a signed Asura build, because its key is kept in
+the Keychain. Only this mode gives the model project tools.
+
+To use Wisp's server, store its key with `/secrets store WISP_LLAMACPP`, then
+set `providers.llamacpp.server url`, `providers.llamacpp.endpoint
+http://127.0.0.1:8933` and `providers.llamacpp.keySecret WISP_LLAMACPP`. The
+service adds the key to each request; the model never receives it.
+
+`/status` shows the mode, the endpoint and whether the server answers.
 
 ### Thinking level
 
@@ -488,6 +526,14 @@ Settings are in `~/.asura/config.yaml`. Use these commands:
 | `audit.keepFiles` | 1 to 10000 | `5` |
 | `audit.maxFileBytes` | 1 to 1099511627776 | `10485760` |
 | `providers.ollama.endpoint` | An `http` or `https` URL on `127.0.0.1` or `::1` | `http://127.0.0.1:11434` |
+| `providers.llamacpp.server` | `off`, `asura`, `llama-app` or `url` | `off` |
+| `providers.llamacpp.endpoint` | An `http` or `https` URL on `127.0.0.1` or `::1`, for `url`; an empty value removes it | Not set |
+| `providers.llamacpp.keySecret` | The name of a stored secret sent as the server's key, for `url`; an empty value removes it | Not set |
+| `providers.llamacpp.port` | 1024 to 65535, Asura's own server | `8934` |
+| `providers.llamacpp.contextLength` | 512 to 4194304 tokens each model holds, Asura's own server | `65536` |
+| `providers.llamacpp.slots` | 1 to 16 requests a model answers at once | `1` |
+| `providers.llamacpp.modelsLoaded` | 1 to 16 models in memory at once | `2` |
+| `providers.llamacpp.idleSeconds` | 0 to 86400 seconds before an idle model sleeps; 0 never sleeps | `600` |
 | `journal.quotaBytes` | 67108864 (64 MiB) to 1099511627776 (1 TiB) | `4294967296` (4 GiB) |
 | `jobs.liveService` | 1 to 16 | `4` |
 | `jobs.liveAgent` | 1 to 8 | `2` |

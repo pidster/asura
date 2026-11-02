@@ -211,7 +211,7 @@ pub enum DestinationKind {
     EndpointDependent,
 }
 
-static PROVIDERS: [Provider; 4] = [
+static PROVIDERS: [Provider; 5] = [
     Provider {
         name: "system",
         capabilities: &[Capability::Text],
@@ -221,6 +221,15 @@ static PROVIDERS: [Provider; 4] = [
     },
     Provider {
         name: "ollama",
+        capabilities: &[Capability::Text],
+        adapter: AdapterState::Connected,
+        destination: DestinationKind::EndpointDependent,
+        asset_directory: None,
+    },
+    // llama.cpp's llama-server (llamacpp-backend.md). Endpoint-dependent:
+    // only Asura's own server is the verified local route (LCD12).
+    Provider {
+        name: "llamacpp",
         capabilities: &[Capability::Text],
         adapter: AdapterState::Connected,
         destination: DestinationKind::EndpointDependent,
@@ -252,7 +261,7 @@ pub(crate) fn project_tools_allowed(selector: &str) -> bool {
         .and_then(|identifier| resolve(identifier, &[Capability::Text]).ok())
         .is_some_and(|selection| {
             selection.provider().destination_kind() == DestinationKind::OnDevice
-                || selection.provider().name() == "ollama"
+                || matches!(selection.provider().name(), "ollama" | "llamacpp")
         })
 }
 
@@ -352,6 +361,7 @@ mod tests {
             "mlx:fixture",
             "MLX:fixture",
             "ollama:fixture",
+            "llamacpp:fixture",
         ] {
             assert!(project_tools_allowed(selector), "{selector}");
         }
@@ -421,7 +431,7 @@ mod tests {
 
     #[test]
     fn system_declares_only_text_and_never_claims_runtime_readiness() {
-        assert_eq!(providers().len(), 4);
+        assert_eq!(providers().len(), 5);
         let selection = resolve("system".parse().unwrap(), &[Capability::Text]).unwrap();
         assert_eq!(selection.identifier().to_string(), "system");
         assert_eq!(selection.provider().name(), "system");
@@ -437,11 +447,14 @@ mod tests {
     #[test]
     fn inventory_is_not_admission_and_does_not_assume_ollama_is_local() {
         let inventory = providers();
-        assert_eq!(inventory.len(), 4);
-        let ollama = inventory.iter().find(|p| p.name == "ollama").unwrap();
-        assert_eq!(ollama.destination, DestinationKind::EndpointDependent);
-        assert_eq!(ollama.adapter, AdapterState::Connected);
-        for name in ["ollama", "coreai", "mlx"] {
+        assert_eq!(inventory.len(), 5);
+        for name in ["ollama", "llamacpp"] {
+            let provider = inventory.iter().find(|p| p.name == name).unwrap();
+            assert_eq!(provider.destination, DestinationKind::EndpointDependent);
+            assert_eq!(provider.adapter, AdapterState::Connected);
+            assert_eq!(provider.asset_directory, None);
+        }
+        for name in ["ollama", "llamacpp", "coreai", "mlx"] {
             let selection = resolve(
                 format!("{name}:example").parse().unwrap(),
                 &[Capability::Text],

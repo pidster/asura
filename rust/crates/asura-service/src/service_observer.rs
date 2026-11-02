@@ -15,6 +15,8 @@ struct ReadValue {
     thinking: Option<u8>,
     size: Result<u64, asura_storage::stored_memory::SizeError>,
     sampled: Instant,
+    /// The llama.cpp facts (llamacpp-backend.md, status).
+    llamacpp: Option<pb::LlamaCppStatus>,
 }
 /// One configuration and stored-bytes sample. No time bound (owner,
 /// 2026-10-16): it ends on completion, an error or shutdown; the pane shows
@@ -42,6 +44,8 @@ pub(crate) struct Observer {
     /// `ServiceObservation` field 8 from the secret store worker's facts;
     /// absent until the store exists (secret-store.md, operations).
     secret_store: Option<pb::SecretStoreStatus>,
+    /// `ServiceObservation` field 9, from the last completed sample.
+    llamacpp: Option<pb::LlamaCppStatus>,
 }
 impl Observer {
     pub fn new(runtime: RuntimeDirectory, wake: WakeSender, status: pb::InspectReply) -> Self {
@@ -61,6 +65,7 @@ impl Observer {
             closing: false,
             waiting: Vec::new(),
             secret_store: None,
+            llamacpp: None,
         }
     }
     /// The secret store facts at this reactor step. A change moves the
@@ -94,6 +99,7 @@ impl Observer {
     fn reply(&self, mut request: pb::Envelope, pending: bool) -> pb::Envelope {
         request.body = Some(Body::ServiceObservation(pb::ServiceObservation {
             secret_store: self.secret_store,
+            llamacpp: self.llamacpp.clone(),
             revision: Some(self.revision),
             pending: Some(pending),
             status: Some(self.status),
@@ -125,6 +131,7 @@ impl Observer {
         }
         let previous_model = (self.model.clone(), self.thinking);
         let previous_size = (self.size, self.size_reason);
+        let previous_llamacpp = self.llamacpp.clone();
         if let Some(read) = self.read.as_mut() {
             if !read.handle.is_finished() && !read.cancel.load(Ordering::Acquire) {
                 // A sample that has not returned shows as measuring, keeping
@@ -139,6 +146,7 @@ impl Observer {
                         Ok(value) => {
                             self.model = value.model;
                             self.thinking = value.thinking;
+                            self.llamacpp = value.llamacpp;
                             match value.size {
                                 Ok(bytes) => {
                                     self.size = Some((
@@ -176,12 +184,14 @@ impl Observer {
                         asura_storage::config::conversation_snapshot(runtime.clone(), &token).ok();
                     let thinking = snapshot.as_ref().map(|snapshot| snapshot.thinking);
                     let model = snapshot.map(|snapshot| snapshot.model);
+                    let llamacpp = crate::llamacpp::sample(&runtime, &token);
                     let size = asura_storage::stored_memory::stored_bytes(runtime, &token);
                     ReadValue {
                         model,
                         thinking,
                         size,
                         sampled: Instant::now(),
+                        llamacpp,
                     }
                 })
             {
@@ -197,6 +207,7 @@ impl Observer {
         if self.status != status
             || previous_model != (self.model.clone(), self.thinking)
             || previous_size != (self.size, self.size_reason)
+            || previous_llamacpp != self.llamacpp
         {
             self.status = status;
             self.revision = self
@@ -386,6 +397,7 @@ mod tests {
                 thinking: Some(4),
                 size: Ok(999),
                 sampled: Instant::now(),
+                llamacpp: None,
             }
         });
         owner.read = Some(Read {

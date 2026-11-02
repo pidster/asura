@@ -2280,6 +2280,16 @@ impl Owner {
         ) {
             return Err("remote_endpoint_restricted");
         }
+        // llama.cpp: the mode decides the endpoint, the relay and the key
+        // (llamacpp-backend.md, LC-F2). Every refusal holds the input.
+        let llamacpp = if resolved.provider().name() == "llamacpp" {
+            Some(crate::llamacpp::route(
+                &prepared.llamacpp,
+                self.persons.store.as_ref(),
+            )?)
+        } else {
+            None
+        };
         let project = queued.project;
         let original = Some(queued.conversation);
         let prompt = queued.prompt;
@@ -2342,17 +2352,31 @@ impl Owner {
             thinking_level: prepared.thinking,
             thinking_request: 0,
         };
+        let (endpoint, endpoint_token, llamacpp_local, relay) = match llamacpp {
+            Some(route) => (
+                Some(route.endpoint),
+                route.relay.as_ref().map(|(relay, _)| relay.token()),
+                route.local,
+                route.relay,
+            ),
+            None => (prepared.ollama_endpoint, None, false, None),
+        };
         let mut model = ModelOwner::new(
             self.runtime.clone(),
             self.package.ok_or("model_package_unavailable")?,
             crate::model_owner::Selection {
                 model: turn.model.clone(),
                 asset_root: Some(prepared.asset_root),
-                endpoint: prepared.ollama_endpoint,
+                endpoint,
                 model_capabilities: prepared.model_capabilities,
+                endpoint_token,
+                llamacpp_local,
             },
         )
         .map_err(|_| "model_unavailable")?;
+        if let Some((relay, key)) = relay {
+            model.attach_relay(relay, key);
+        }
         let mut tool_executor = tools::Executor::default();
         if let Some(wake) = &self.wake {
             model.register(wake.clone());

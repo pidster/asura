@@ -1,6 +1,24 @@
 import Foundation
 import FoundationModels
 
+/// A provider model name: 1 to 1,024 bytes, no whitespace or control characters.
+func validModelName(_ name: String) -> Bool {
+    !name.isEmpty && name.utf8.count <= 1024
+        && !name.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) })
+}
+
+/// The HTTP provider endpoint rule shared by Ollama and llama.cpp: `http` or
+/// `https` on numeric loopback, an optional port, no credentials, query,
+/// fragment or path. Remote endpoints stay restricted (EX7).
+func loopbackEndpoint(_ endpoint: URL) -> Bool {
+    guard let url = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
+        endpoint.absoluteString.utf8.count <= 2048,
+        let host = url.host, !host.isEmpty else { return false }
+    return ["http", "https"].contains(url.scheme ?? "") && ["127.0.0.1", "[::1]", "::1"].contains(host)
+        && url.user == nil && url.password == nil && url.query == nil && url.fragment == nil
+        && (url.path.isEmpty || url.path == "/") && (url.port.map({ (1...65535).contains($0) }) ?? true)
+}
+
 /// Provider translation only. The service owns admission, tools and cancellation.
 public struct OllamaLanguageModel: LanguageModel, Sendable {
     public enum Failure: Error, Equatable, Sendable {
@@ -10,16 +28,7 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
         public let endpoint: URL
         public let name: String
         public init(name: String, endpoint: URL = URL(string: "http://127.0.0.1:11434")!) throws {
-            guard !name.isEmpty, name.utf8.count <= 1024,
-                !name.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) }),
-                let url = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
-                endpoint.absoluteString.utf8.count <= 2048,
-                let host = url.host, !host.isEmpty,
-                // Remote endpoints stay restricted until the execution threat model is reviewed.
-                ["http", "https"].contains(url.scheme ?? ""), ["127.0.0.1", "[::1]", "::1"].contains(host),
-                url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
-                url.path.isEmpty || url.path == "/", url.port.map({ (1...65535).contains($0) }) ?? true
-            else { throw Failure.invalidConfiguration }
+            guard validModelName(name), loopbackEndpoint(endpoint) else { throw Failure.invalidConfiguration }
             self.name = name; self.endpoint = endpoint
         }
     }

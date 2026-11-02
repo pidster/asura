@@ -5,16 +5,18 @@ public enum ProviderFactory {
     public enum Failure: Error, Equatable { case invalidSelection, unsupportedProvider }
 
     public static func make(_ selector: String, assetRoot: String? = nil,
-        endpoint: String? = nil, capabilities: UInt32? = nil) async throws -> any ModelBackend {
+        endpoint: String? = nil, capabilities: UInt32? = nil, endpointToken: Data? = nil) async throws -> any ModelBackend {
         let task = Task.detached(priority: .userInitiated) {
-            try await selected(selector, assetRoot: assetRoot, endpoint: endpoint, capabilities: capabilities)
+            try await selected(selector, assetRoot: assetRoot, endpoint: endpoint, capabilities: capabilities,
+                endpointToken: endpointToken)
         }
         return try await withTaskCancellationHandler {
             try await task.value
         } onCancel: { task.cancel() }
     }
 
-    static func selected(_ selector: String, assetRoot: String?, endpoint: String?, capabilities: UInt32? = nil) async throws -> any ModelBackend {
+    static func selected(_ selector: String, assetRoot: String?, endpoint: String?, capabilities: UInt32? = nil,
+        endpointToken: Data? = nil) async throws -> any ModelBackend {
         guard !selector.isEmpty, selector.utf8.count <= 1024,
             !selector.unicodeScalars.contains(where: {
                 CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0)
@@ -39,6 +41,23 @@ public enum ProviderFactory {
                 reportedContextTokens: model.reportedContextTokens, contextSource: .ollama,
                 modelName: "ollama:\(name)", supportsTools: model.supportsTools,
                 localToolDestination: model.localToolModel != nil,
+                instrumentationFactory: { usage, callback, reporter in
+                    var instrumented = model
+                    instrumented.inputObserver = OllamaInputObserver(snapshot: callback)
+                    instrumented.usageObserver = usage
+                    instrumented.unregisteredToolHandler = reporter
+                    return instrumented
+                }, thinkingControls: model.thinkingControls)
+        case "llamacpp":
+            // The service always sends the endpoint for llama.cpp (llamacpp-backend.md, modes).
+            guard let endpoint, let url = URL(string: endpoint) else { throw Failure.invalidSelection }
+            let model = try await LlamaCppLanguageModel.discover(.init(name: name, endpoint: url, token: endpointToken))
+            return FoundationBackend(model: model, contextTokens: model.contextTokens,
+                reportedContextTokens: model.contextTokens, contextSource: .llamacpp,
+                modelName: "llamacpp:\(name)", supportsTools: model.supportsTools,
+                // Loopback only; the service decides whether this route is
+                // the verified local one (asura mode, LCD12).
+                localToolDestination: true,
                 instrumentationFactory: { usage, callback, reporter in
                     var instrumented = model
                     instrumented.inputObserver = OllamaInputObserver(snapshot: callback)

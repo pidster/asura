@@ -71,6 +71,24 @@ as each page arrives. Press Ctrl-C to stop it.
 | `/config get NAME` | Show one setting |
 | `/config set NAME VALUE` | Change one setting; dotted names select nested settings |
 
+### llama.cpp server commands
+
+Run these in a terminal. They manage Asura's own `llama-server`
+([guide](guide.md#llamacpp)); the model cannot run them.
+
+| Terminal command | Effect |
+| --- | --- |
+| `asura llamacpp approve PATH` | Approve this `llama-server` program; Asura records its SHA-256 and starts only this file |
+| `asura llamacpp add PATH` | Link a `.gguf` file as the model `llamacpp:NAME`; a running server restarts |
+| `asura llamacpp remove NAME` | Remove the link; the file stays |
+| `asura llamacpp list` | List the linked models, with broken links |
+| `asura llamacpp start` | Register and start the LaunchAgent `org.pidster.asura.llamacpp`, or restart it |
+| `asura llamacpp stop` | Stop the server and remove its LaunchAgent |
+| `asura llamacpp status` | Show the mode, settings, approval, models and LaunchAgent state |
+
+The server writes to `~/.asura/logs/llamacpp.log`. Run `asura llamacpp stop`
+before you remove Asura, because the LaunchAgent file stays otherwise.
+
 ## Inspection commands
 
 | Command | Action |

@@ -36,6 +36,7 @@ mod lifetime;
 pub use lifetime::{ServiceLease, ServiceLifetime};
 pub mod exec_cmd;
 pub mod keychain;
+pub mod llamacpp;
 mod runtime;
 pub mod secrets;
 mod startup;
@@ -117,6 +118,11 @@ pub(crate) fn effective_uid() -> Result<libc::uid_t> {
     } else {
         Ok(uid)
     }
+}
+
+/// The effective user ID of a non-root process; root is refused.
+pub fn account_uid() -> Result<u32> {
+    effective_uid()
 }
 
 pub fn random_id() -> [u8; 16] {

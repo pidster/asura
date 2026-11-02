@@ -201,6 +201,25 @@ impl std::fmt::Debug for NamedGetReply {
     }
 }
 
+/// Reply to [`Store::get_server_key`] (llamacpp-backend.md, the key).
+#[derive(PartialEq, Eq)]
+pub enum ServerKeyReply {
+    Key(zeroize::Zeroizing<Vec<u8>>),
+    /// No item: the serve step has not run yet.
+    Missing,
+    Failed(StoreFailure),
+}
+impl std::fmt::Debug for ServerKeyReply {
+    /// The value never reaches a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Key(_) => f.write_str("Key"),
+            Self::Missing => f.write_str("Missing"),
+            Self::Failed(failure) => write!(f, "Failed({failure:?})"),
+        }
+    }
+}
+
 /// Reply to [`Store::list_named`]: the stored names in byte order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NamedListReply {
@@ -332,6 +351,9 @@ pub(crate) enum Request {
     },
     ListNamed {
         reply: SyncSender<NamedListReply>,
+    },
+    GetServerKey {
+        reply: SyncSender<ServerKeyReply>,
     },
 }
 
@@ -511,6 +533,11 @@ impl Store {
     /// Lists the stored names.
     pub fn list_named(&self) -> Result<Ticket<NamedListReply>, Refused> {
         self.submit(|reply| Request::ListNamed { reply })
+    }
+
+    /// Reads the llama.cpp server key for the relay (llamacpp-backend.md).
+    pub fn get_server_key(&self) -> Result<Ticket<ServerKeyReply>, Refused> {
+        self.submit(|reply| Request::GetServerKey { reply })
     }
 
     /// True while a request would be admitted.

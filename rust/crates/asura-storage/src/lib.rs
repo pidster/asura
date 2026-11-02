@@ -4,6 +4,7 @@ pub mod authority;
 
 pub mod audit;
 pub mod config;
+pub mod llamacpp;
 pub mod logs;
 #[cfg(feature = "embedded-memory")]
 pub mod memory;

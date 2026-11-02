@@ -425,12 +425,253 @@ struct Providers {
     ollama: Ollama,
     #[serde(default, skip_serializing_if = "Mlx::is_empty")]
     mlx: Mlx,
+    #[serde(default, skip_serializing_if = "Llamacpp::is_empty")]
+    llamacpp: Llamacpp,
 }
 impl Providers {
     fn is_empty(&self) -> bool {
-        self.ollama.is_empty() && self.mlx.is_empty()
+        self.ollama.is_empty() && self.mlx.is_empty() && self.llamacpp.is_empty()
     }
 }
+/// `providers.llamacpp` (llamacpp-backend.md, configuration). Absent keys
+/// take their defaults; the file holds only what the person set.
+#[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Llamacpp {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    #[serde(default, rename = "keySecret", skip_serializing_if = "Option::is_none")]
+    key_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    port: Option<u64>,
+    #[serde(
+        default,
+        rename = "contextLength",
+        skip_serializing_if = "Option::is_none"
+    )]
+    context_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slots: Option<u64>,
+    #[serde(
+        default,
+        rename = "modelsLoaded",
+        skip_serializing_if = "Option::is_none"
+    )]
+    models_loaded: Option<u64>,
+    #[serde(
+        default,
+        rename = "idleSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    idle_seconds: Option<u64>,
+}
+/// Whose llama.cpp server a `llamacpp:` model uses (LCD11).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LlamacppServer {
+    #[default]
+    Off,
+    Asura,
+    LlamaApp,
+    Url,
+}
+impl LlamacppServer {
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "off" => Self::Off,
+            "asura" => Self::Asura,
+            "llama-app" => Self::LlamaApp,
+            "url" => Self::Url,
+            _ => return None,
+        })
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Asura => "asura",
+            Self::LlamaApp => "llama-app",
+            Self::Url => "url",
+        }
+    }
+}
+/// The effective llama.cpp settings, defaults applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LlamacppSettings {
+    pub server: LlamacppServer,
+    pub endpoint: Option<String>,
+    pub key_secret: Option<String>,
+    pub port: u16,
+    pub context_length: u32,
+    pub slots: u32,
+    pub models_loaded: u32,
+    pub idle_seconds: u32,
+}
+impl Default for LlamacppSettings {
+    fn default() -> Self {
+        Llamacpp::default().settings()
+    }
+}
+/// Defaults and ranges (llamacpp-backend.md, server settings).
+pub const LLAMACPP_PORT: u64 = 8934;
+pub const LLAMACPP_CONTEXT_LENGTH: u64 = 65_536;
+pub const LLAMACPP_SLOTS: u64 = 1;
+pub const LLAMACPP_MODELS_LOADED: u64 = 2;
+pub const LLAMACPP_IDLE_SECONDS: u64 = 600;
+/// Llama.app's router port (Llama.app 0.46.1, Wisp probe of 2026-10-29).
+pub const LLAMA_APP_ENDPOINT: &str = "http://127.0.0.1:9931";
+const LLAMACPP_RANGES: [(&str, u64, u64); 5] = [
+    ("port", 1_024, 65_535),
+    ("contextLength", 512, 4_194_304),
+    ("slots", 1, 16),
+    ("modelsLoaded", 1, 16),
+    ("idleSeconds", 0, 86_400),
+];
+impl Llamacpp {
+    fn is_empty(&self) -> bool {
+        self.server.is_none()
+            && self.endpoint.is_none()
+            && self.key_secret.is_none()
+            && self.port.is_none()
+            && self.context_length.is_none()
+            && self.slots.is_none()
+            && self.models_loaded.is_none()
+            && self.idle_seconds.is_none()
+    }
+    fn number(&self, key: &str) -> Option<Option<u64>> {
+        Some(match key {
+            "port" => self.port,
+            "contextLength" => self.context_length,
+            "slots" => self.slots,
+            "modelsLoaded" => self.models_loaded,
+            "idleSeconds" => self.idle_seconds,
+            _ => return None,
+        })
+    }
+    fn valid(&self) -> bool {
+        self.server
+            .as_deref()
+            .is_none_or(|s| LlamacppServer::parse(s).is_some())
+            && self.endpoint.as_deref().is_none_or(valid_endpoint)
+            && self
+                .key_secret
+                .as_deref()
+                .is_none_or(asura_platform::secrets::named::name_valid)
+            && LLAMACPP_RANGES.iter().all(|(key, low, high)| {
+                self.number(key)
+                    .flatten()
+                    .is_none_or(|value| (*low..=*high).contains(&value))
+            })
+    }
+    fn settings(&self) -> LlamacppSettings {
+        LlamacppSettings {
+            server: self
+                .server
+                .as_deref()
+                .and_then(LlamacppServer::parse)
+                .unwrap_or_default(),
+            endpoint: self.endpoint.clone(),
+            key_secret: self.key_secret.clone(),
+            port: self.port.unwrap_or(LLAMACPP_PORT) as u16,
+            context_length: self.context_length.unwrap_or(LLAMACPP_CONTEXT_LENGTH) as u32,
+            slots: self.slots.unwrap_or(LLAMACPP_SLOTS) as u32,
+            models_loaded: self.models_loaded.unwrap_or(LLAMACPP_MODELS_LOADED) as u32,
+            idle_seconds: self.idle_seconds.unwrap_or(LLAMACPP_IDLE_SECONDS) as u32,
+        }
+    }
+    /// The effective mapping, defaults included, for `get`.
+    fn effective(&self) -> Mapping {
+        let settings = self.settings();
+        let mut map = Mapping::new();
+        let mut put = |k: &str, v: Value| {
+            map.insert(Value::String(k.into()), v);
+        };
+        put("server", Value::String(settings.server.name().into()));
+        if let Some(endpoint) = settings.endpoint {
+            put("endpoint", Value::String(endpoint));
+        }
+        if let Some(name) = settings.key_secret {
+            put("keySecret", Value::String(name));
+        }
+        put("port", Value::from(settings.port));
+        put("contextLength", Value::from(settings.context_length));
+        put("slots", Value::from(settings.slots));
+        put("modelsLoaded", Value::from(settings.models_loaded));
+        put("idleSeconds", Value::from(settings.idle_seconds));
+        map
+    }
+    /// Sets one leaf. An empty string removes `endpoint` or `keySecret`.
+    fn set(&mut self, leaf: &str, value: Value) -> Result<()> {
+        match leaf {
+            "server" => {
+                let Value::String(text) = value else {
+                    return Err("config_invalid_value");
+                };
+                self.server = match LlamacppServer::parse(&text) {
+                    Some(LlamacppServer::Off) => None,
+                    Some(_) => Some(text),
+                    None => return Err("config_invalid_value"),
+                };
+            }
+            "endpoint" => {
+                let Value::String(text) = value else {
+                    return Err("config_invalid_value");
+                };
+                if text.is_empty() {
+                    self.endpoint = None;
+                } else if !valid_endpoint(&text) {
+                    return Err("config_invalid_value");
+                } else if !loopback_endpoint(&text) {
+                    return Err("config_remote_endpoint_restricted");
+                } else {
+                    self.endpoint = Some(text);
+                }
+            }
+            "keySecret" => {
+                let Value::String(text) = value else {
+                    return Err("config_invalid_value");
+                };
+                if text.is_empty() {
+                    self.key_secret = None;
+                } else if asura_platform::secrets::named::name_valid(&text) {
+                    self.key_secret = Some(text);
+                } else {
+                    return Err("config_invalid_value");
+                }
+            }
+            leaf => {
+                let (_, low, high) = LLAMACPP_RANGES
+                    .iter()
+                    .find(|(key, _, _)| *key == leaf)
+                    .ok_or("config_unknown_key")?;
+                let number = value.as_u64().ok_or("config_invalid_value")?;
+                if !(*low..=*high).contains(&number) {
+                    return Err("config_invalid_value");
+                }
+                let slot = match leaf {
+                    "port" => &mut self.port,
+                    "contextLength" => &mut self.context_length,
+                    "slots" => &mut self.slots,
+                    "modelsLoaded" => &mut self.models_loaded,
+                    _ => &mut self.idle_seconds,
+                };
+                *slot = Some(number);
+            }
+        }
+        Ok(())
+    }
+}
+/// The leaf keys of `providers.llamacpp`.
+pub const LLAMACPP_KEYS: [&str; 8] = [
+    "server",
+    "endpoint",
+    "keySecret",
+    "port",
+    "contextLength",
+    "slots",
+    "modelsLoaded",
+    "idleSeconds",
+];
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Mlx {
@@ -673,6 +914,9 @@ impl Config {
         {
             return Err("config_invalid_value");
         }
+        if !self.providers.llamacpp.valid() {
+            return Err("config_invalid_value");
+        }
         if self.providers.mlx.models.len() > 64 {
             return Err("config_invalid_value");
         }
@@ -733,6 +977,16 @@ impl Config {
             "providers" => yaml(&self.providers),
             "providers.ollama" => yaml(&self.providers.ollama),
             "providers.mlx" => yaml(&self.providers.mlx),
+            "providers.llamacpp" => yaml(&self.providers.llamacpp.effective()),
+            key if key.starts_with("providers.llamacpp.") => {
+                let leaf = &key["providers.llamacpp.".len()..];
+                let map = self.providers.llamacpp.effective();
+                match map.get(Value::String(leaf.into())) {
+                    Some(value) => yaml(value),
+                    None if LLAMACPP_KEYS.contains(&leaf) => yaml(&""),
+                    None => Err("config_unknown_key"),
+                }
+            }
             "providers.mlx.models" => yaml(&self.providers.mlx.models),
             "providers.ollama.endpoint" => yaml(
                 self.providers
@@ -824,6 +1078,11 @@ impl Config {
             "providers.mlx.models" => {
                 self.providers.mlx.models =
                     serde_yaml_ng::from_value(value).map_err(|_| "config_invalid_value")?;
+            }
+            key if key.starts_with("providers.llamacpp.") => {
+                self.providers
+                    .llamacpp
+                    .set(&key["providers.llamacpp.".len()..], value)?;
             }
             "providers.ollama.endpoint" => {
                 let Value::String(endpoint) = value else {
@@ -1130,6 +1389,7 @@ pub fn execute(
                 | "providers.ollama.endpoint"
                 | "providers.mlx"
                 | "providers.mlx.models"
+                | "providers.llamacpp"
                 | "retention"
                 | "retention.quotaBytes"
                 | "journal"
@@ -1150,6 +1410,9 @@ pub fn execute(
         )
         && !key.starts_with(EXECUTION_PROJECTS_PREFIX)
         && !key.starts_with(PERSON_ENVIRONMENT_PREFIX)
+        && !key
+            .strip_prefix("providers.llamacpp.")
+            .is_some_and(|leaf| LLAMACPP_KEYS.contains(&leaf))
     {
         return Err("config_unknown_key");
     }
@@ -1290,7 +1553,20 @@ pub struct ConversationSnapshot {
     pub model_capabilities: Option<u32>,
     /// The thinking level code, 0 default through 4 high (thinking-level.md).
     pub thinking: u8,
+    /// The llama.cpp settings in the same snapshot (llamacpp-backend.md).
+    pub llamacpp: LlamacppSettings,
     pub digest: [u8; 32],
+}
+
+/// The effective llama.cpp settings, read with the bounded read pipeline on
+/// the caller's worker (the serve step, the CLI commands and the status
+/// sampler). No time bound: it ends on completion, an error or cancel.
+pub fn llamacpp_settings(
+    runtime: RuntimeDirectory,
+    cancel: &AtomicBool,
+) -> Result<LlamacppSettings> {
+    let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
+    Ok(Config::read(&snapshot.bytes)?.providers.llamacpp.settings())
 }
 
 /// Validated canonical configuration identity for durable admission. The
@@ -1314,6 +1590,7 @@ pub fn conversation_snapshot(
         model_capabilities,
         thinking: config.thinking(),
         model: config.model.unwrap_or_else(|| "system".into()),
+        llamacpp: config.providers.llamacpp.settings(),
         ollama_endpoint: config.providers.ollama.endpoint,
         digest,
     })
@@ -3038,5 +3315,150 @@ mod tests {
         );
         let cancelled = AtomicBool::new(true);
         assert!(allow_outside_sandbox(runtime, &cancelled).is_err());
+    }
+
+    /// LC-U6 (llamacpp-backend.md): keys, defaults, ranges, removal, YAML
+    /// and the conversation snapshot.
+    #[test]
+    fn llamacpp_keys_validate_and_reach_the_snapshot() {
+        use std::os::unix::fs::DirBuilderExt;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Scratch(
+            format!(
+                "/private/tmp/asura-llama-cfg-{:x}",
+                u128::from_ne_bytes(asura_platform::random_id())
+            )
+            .into(),
+        );
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root.0)
+            .unwrap();
+        let runtime = RuntimeDirectory::scratch(&root.0, true).unwrap();
+        let cancel = AtomicBool::new(false);
+        let call = |key: &str, value: Option<&str>| {
+            execute(runtime.clone(), key, value, &cancel).map(|reply| reply.value_yaml)
+        };
+        let defaults = llamacpp_settings(runtime.clone(), &cancel).unwrap();
+        assert_eq!(defaults, LlamacppSettings::default());
+        assert_eq!(defaults.server, LlamacppServer::Off);
+        assert_eq!(
+            (
+                defaults.port,
+                defaults.context_length,
+                defaults.slots,
+                defaults.models_loaded,
+                defaults.idle_seconds
+            ),
+            (8934, 65_536, 1, 2, 600)
+        );
+        assert_eq!(call("providers.llamacpp.server", None).unwrap(), "off\n");
+        assert_eq!(call("providers.llamacpp.endpoint", None).unwrap(), "''\n");
+        assert_eq!(
+            call("providers.llamacpp.server", Some("asura")).unwrap(),
+            "asura\n"
+        );
+        assert_eq!(
+            call("providers.llamacpp.port", Some("8935")).unwrap(),
+            "8935\n"
+        );
+        assert_eq!(
+            call("providers.llamacpp.idleSeconds", Some("0")).unwrap(),
+            "0\n"
+        );
+        assert_eq!(
+            call("providers.llamacpp.endpoint", Some("http://127.0.0.1:8933")).unwrap(),
+            "http://127.0.0.1:8933\n"
+        );
+        assert_eq!(
+            call("providers.llamacpp.keySecret", Some("WISP_LLAMACPP")).unwrap(),
+            "WISP_LLAMACPP\n"
+        );
+        for (key, value, error) in [
+            ("providers.llamacpp.server", "wisp", "config_invalid_value"),
+            ("providers.llamacpp.port", "80", "config_invalid_value"),
+            ("providers.llamacpp.port", "65536", "config_invalid_value"),
+            (
+                "providers.llamacpp.contextLength",
+                "511",
+                "config_invalid_value",
+            ),
+            ("providers.llamacpp.slots", "17", "config_invalid_value"),
+            (
+                "providers.llamacpp.modelsLoaded",
+                "0",
+                "config_invalid_value",
+            ),
+            (
+                "providers.llamacpp.idleSeconds",
+                "86401",
+                "config_invalid_value",
+            ),
+            (
+                "providers.llamacpp.keySecret",
+                "COMMAND",
+                "config_invalid_value",
+            ),
+            (
+                "providers.llamacpp.keySecret",
+                "has-dash",
+                "config_invalid_value",
+            ),
+            (
+                "providers.llamacpp.endpoint",
+                "https://models.example",
+                "config_remote_endpoint_restricted",
+            ),
+            (
+                "providers.llamacpp.endpoint",
+                "http://127.0.0.1/v1",
+                "config_invalid_value",
+            ),
+            ("providers.llamacpp.token", "x", "config_unknown_key"),
+        ] {
+            assert_eq!(call(key, Some(value)), Err(error), "{key} {value}");
+        }
+        let snapshot = conversation_snapshot(runtime.clone(), &cancel).unwrap();
+        assert_eq!(snapshot.llamacpp.server, LlamacppServer::Asura);
+        assert_eq!(snapshot.llamacpp.port, 8935);
+        assert_eq!(snapshot.llamacpp.idle_seconds, 0);
+        assert_eq!(
+            snapshot.llamacpp.key_secret.as_deref(),
+            Some("WISP_LLAMACPP")
+        );
+        let whole = call("providers.llamacpp", None).unwrap();
+        assert!(
+            whole.contains("server: asura") && whole.contains("contextLength: 65536"),
+            "{whole}"
+        );
+        // Empty strings remove; `off` removes the mode.
+        call("providers.llamacpp.endpoint", Some("''")).unwrap();
+        call("providers.llamacpp.keySecret", Some("''")).unwrap();
+        call("providers.llamacpp.server", Some("off")).unwrap();
+        let file = std::fs::read_to_string(root.0.join(".asura/config.yaml")).unwrap();
+        assert!(
+            !file.contains("endpoint") && !file.contains("server") && file.contains("port: 8935"),
+            "{file}"
+        );
+        // A hand-written file is checked as it loads.
+        for text in [
+            "providers: {llamacpp: {server: wisp}}",
+            "providers: {llamacpp: {port: 1}}",
+            "providers: {llamacpp: {apiKey: x}}",
+            "providers: {llamacpp: {endpoint: 'https://models.example'}}",
+        ] {
+            let parsed = Config::read(text.as_bytes());
+            if text.contains("https") {
+                // Like Ollama: a stored remote endpoint loads; preparation refuses it.
+                assert!(parsed.is_ok(), "{text}");
+            } else {
+                assert!(parsed.is_err(), "{text}");
+            }
+        }
     }
 }

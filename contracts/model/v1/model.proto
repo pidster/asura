@@ -63,6 +63,10 @@ message Hello {
   // Thinking forms the loaded model accepts: off 1, on 2, low 4, medium 8,
   // high 16 (thinking-level.md). Nonzero requires reasoning support.
   optional uint32 thinking_controls = 23;
+  // Service only, with `endpoint`: the 32-byte token the helper sends to the
+  // service's llama.cpp relay as its bearer credential (llamacpp-backend.md).
+  // It is not the server key and is not derived from it.
+  optional bytes endpoint_token = 24;
 }
 message Begin {
   optional string model = 1;

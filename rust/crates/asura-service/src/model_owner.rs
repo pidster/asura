@@ -27,6 +27,11 @@ pub(crate) struct Selection {
     pub asset_root: Option<String>,
     pub endpoint: Option<String>,
     pub model_capabilities: Option<u32>,
+    /// The llama.cpp relay token sent in Hello field 24 (llamacpp-backend.md).
+    pub endpoint_token: Option<Vec<u8>>,
+    /// The route is Asura's own llama.cpp server: the verified local route
+    /// for project tools (LCD12).
+    pub llamacpp_local: bool,
 }
 /// Package resources the selected provider needs beside the helper copy.
 /// MLX needs `mlx.metallib`; MLX and Core AI load Hub tokenizers, which read
@@ -186,8 +191,21 @@ pub(crate) struct ModelOwner {
     completion: crate::completion::Completion,
     cleanup_completion: crate::completion::Completion,
     wake: Option<asura_platform::events::WakeSender>,
+    /// The llama.cpp relay and its pending key read; both end with this owner.
+    relay: Option<crate::llamacpp::Relay>,
+    relay_key: Option<crate::llamacpp::KeyTicket>,
 }
 impl ModelOwner {
+    /// Keeps the llama.cpp relay for this helper's lifetime and the key read
+    /// that feeds it (llamacpp-backend.md, LC-F2).
+    pub(crate) fn attach_relay(
+        &mut self,
+        relay: crate::llamacpp::Relay,
+        key: crate::llamacpp::KeyTicket,
+    ) {
+        self.relay = Some(relay);
+        self.relay_key = Some(key);
+    }
     pub(crate) fn register(&mut self, wake: asura_platform::events::WakeSender) {
         self.completion.register(wake.clone());
         self.cleanup_completion.register(wake.clone());
@@ -330,6 +348,8 @@ impl ModelOwner {
             completion,
             cleanup_completion: Default::default(),
             wake: None,
+            relay: None,
+            relay_key: None,
         })
     }
     pub(crate) fn begin(
@@ -510,6 +530,11 @@ impl ModelOwner {
     }
     pub(crate) fn poll(&mut self, now: Instant) -> Vec<ModelEvent> {
         let mut events = Vec::new();
+        if let (Some(relay), Some(key)) = (&self.relay, &mut self.relay_key)
+            && key.poll(relay)
+        {
+            self.relay_key = None;
+        }
         if self
             .preparation
             .as_ref()
@@ -520,7 +545,7 @@ impl ModelOwner {
                     self.child = Some(child);
                     if self.phase == Phase::Preparing {
                         self.phase = Phase::Hello;
-                        let hello = Body::Hello(pb::Hello {
+                        let hello = Body::Hello(Box::new(pb::Hello {
                             local_tool_destination: None,
                             thinking_controls: None,
                             supported_capabilities: None,
@@ -529,6 +554,7 @@ impl ModelOwner {
                             selected_model: Some(self.selection.model.clone()),
                             asset_root: self.selection.asset_root.clone(),
                             endpoint: self.selection.endpoint.clone(),
+                            endpoint_token: self.selection.endpoint_token.clone(),
                             build_id: Some(self.identity.build_id.to_vec()),
                             schema_digest: Some(self.identity.schema_digest.to_vec()),
                             max_frame_bytes: Some(65536),
@@ -542,7 +568,7 @@ impl ModelOwner {
                             inventory_only: self.inventory_only.then_some(true),
                             models: Vec::new(),
                             issues: Vec::new(),
-                        });
+                        }));
                         if self.queue(hello).is_err() {
                             self.fail("model_protocol_fault", now, &mut events);
                         }
@@ -762,7 +788,16 @@ impl ModelOwner {
                 return Ok(());
             }
             if hello.availability != Some(1) {
-                events.push(ModelEvent::Failed("model_unavailable"));
+                // A relay that refused a request for want of the key names it.
+                let key_refused = self
+                    .relay
+                    .as_ref()
+                    .is_some_and(crate::llamacpp::Relay::refused_a_request);
+                events.push(ModelEvent::Failed(if key_refused {
+                    "llamacpp_key_unavailable"
+                } else {
+                    "model_unavailable"
+                }));
                 self.cancel(4, Instant::now());
                 return Ok(());
             }
@@ -1033,6 +1068,9 @@ fn local_tool_destination(selection: &Selection, attested: bool) -> bool {
     if resolved.provider().destination_kind() == crate::model::DestinationKind::OnDevice {
         return true;
     }
+    if resolved.provider().name() == "llamacpp" {
+        return attested && selection.llamacpp_local;
+    }
     if resolved.provider().name() != "ollama" || !attested {
         return false;
     }
@@ -1168,6 +1206,8 @@ mod tests {
                 asset_root: None,
                 endpoint: None,
                 model_capabilities: None,
+                endpoint_token: None,
+                llamacpp_local: false,
             },
         );
         assert!(created.is_err());
@@ -1222,6 +1262,8 @@ mod tests {
                 asset_root: None,
                 endpoint: None,
                 model_capabilities: None,
+                endpoint_token: None,
+                llamacpp_local: false,
             },
             tools_available: false,
             inventory_only: false,
@@ -1258,6 +1300,8 @@ mod tests {
             completion: Default::default(),
             cleanup_completion: Default::default(),
             wake: None,
+            relay: None,
+            relay_key: None,
         }
     }
     fn message(body: Body) -> pb::Envelope {
@@ -1495,7 +1539,7 @@ mod tests {
         for supported in [None, Some(0), Some(1), Some(4), Some(5)] {
             let mut owner = owner(Phase::Hello);
             let hello = pb::Envelope {
-                body: Some(Body::Hello(pb::Hello {
+                body: Some(Body::Hello(Box::new(pb::Hello {
                     build_id: Some(vec![1; 32]),
                     schema_digest: Some(vec![2; 32]),
                     selected_model: Some("system".into()),
@@ -1506,7 +1550,7 @@ mod tests {
                     supported_capabilities: supported,
                     capability_source: supported.map(|_| 1),
                     ..Default::default()
-                })),
+                }))),
                 ..Default::default()
             };
             owner.receive(hello, &mut Vec::new()).unwrap();
@@ -2174,7 +2218,7 @@ mod tests {
         let hello = pb::Envelope {
             operation_id: None,
             generation: None,
-            body: Some(Body::Hello(pb::Hello {
+            body: Some(Body::Hello(Box::new(pb::Hello {
                 local_tool_destination: None,
                 tool_schema_bytes: None,
                 thinking_controls: None,
@@ -2193,7 +2237,7 @@ mod tests {
                     detail: None,
                 }],
                 ..Default::default()
-            })),
+            }))),
         };
         owner.receive(hello, &mut events).unwrap();
         assert!(matches!(events.as_slice(), [ModelEvent::Inventory { .. }]));
@@ -2218,7 +2262,7 @@ mod tests {
         let hello = pb::Envelope {
             operation_id: None,
             generation: None,
-            body: Some(Body::Hello(pb::Hello {
+            body: Some(Body::Hello(Box::new(pb::Hello {
                 local_tool_destination: None,
                 tool_schema_bytes: None,
                 thinking_controls: None,
@@ -2231,6 +2275,7 @@ mod tests {
                 selected_model: None,
                 asset_root: None,
                 endpoint: None,
+                endpoint_token: None,
                 build_id: Some(vec![9; 32]),
                 schema_digest: Some(vec![2; 32]),
                 max_frame_bytes: Some(65536),
@@ -2240,7 +2285,7 @@ mod tests {
                 context_source: Some(1),
                 model_name: None,
                 reason: Some(0),
-            })),
+            }))),
         };
         assert!(owner.receive(hello, &mut events).is_err());
         assert!(events.is_empty());

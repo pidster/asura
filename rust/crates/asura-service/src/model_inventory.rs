@@ -155,6 +155,8 @@ impl Owner {
                                 model: "system".into(),
                                 asset_root: Some(config.asset_root),
                                 endpoint: config.ollama_endpoint,
+                                endpoint_token: None,
+                                llamacpp_local: false,
                             },
                         ) {
                             Ok(mut model) => {
@@ -244,8 +246,10 @@ fn include_selection(configured: &str, rows: &mut Vec<pb::ModelInventoryEntry>) 
             .parse::<crate::model::ModelIdentifier>()
             .ok()
             .filter(|id| {
-                matches!(id.provider(), "system" | "ollama" | "coreai" | "mlx")
-                    && id.to_string() == configured
+                matches!(
+                    id.provider(),
+                    "system" | "ollama" | "coreai" | "mlx" | "llamacpp"
+                ) && id.to_string() == configured
             })
             .map(|id| id.provider().to_owned());
         rows.push(pb::ModelInventoryEntry {

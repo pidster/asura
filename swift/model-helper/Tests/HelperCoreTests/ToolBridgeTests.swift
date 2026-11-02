@@ -136,7 +136,7 @@ func openSession(selector: String = "system", backend: any ModelBackend) async t
     #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
     let helper = try Transport(fd: fds[0]); let service = try Transport(fd: fds[1])
     let identity = Data(repeating: 1, count: 32)
-    let session = HelperSession(transport: helper, factory: { _, _, _, _ in backend },
+    let session = HelperSession(transport: helper, factory: { _, _, _, _, _ in backend },
         buildID: identity, schemaDigest: identity)
     let running = Task { await session.run() }
     let channel = ToolSessionChannel(helper: helper, service: service, running: running)
@@ -257,7 +257,7 @@ func everyProposalIsSentUnread(source: ContextCapacitySource) async throws {
     defer { helper.close(); raw.close() }
     let identity = Data(repeating: 1, count: 32)
     let script = RequestScript([.calls("", proposals)])
-    let session = HelperSession(transport: helper, factory: { _, _, _, _ in ToolScript(script: script, source: .system) },
+    let session = HelperSession(transport: helper, factory: { _, _, _, _, _ in ToolScript(script: script, source: .system) },
         buildID: identity, schemaDigest: identity)
     let running = Task { await session.run() }
     defer { running.cancel() }

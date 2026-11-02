@@ -16,8 +16,9 @@ struct Main {
             let transport = try Transport(fd: 3)
             let session = HelperSession(
                 transport: transport,
-                factory: { selector, assets, endpoint, capabilities in
-                    try await ProviderFactory.make(selector, assetRoot: assets, endpoint: endpoint, capabilities: capabilities)
+                factory: { selector, assets, endpoint, capabilities, token in
+                    try await ProviderFactory.make(selector, assetRoot: assets, endpoint: endpoint,
+                        capabilities: capabilities, endpointToken: token)
                 },
                 buildID: Data(BuildIdentity.buildID), schemaDigest: Data(BuildIdentity.schemaDigest))
             await session.run()

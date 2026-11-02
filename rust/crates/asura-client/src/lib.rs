@@ -197,6 +197,8 @@ pub struct ServiceUpdate {
     /// The secret store worker's counts, for `/status` detail
     /// (secret-store.md, operations and audit).
     pub secret_store: Option<pb::SecretStoreStatus>,
+    /// Asura's llama.cpp server facts (llamacpp-backend.md, status).
+    pub llamacpp: Option<pb::LlamaCppStatus>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
@@ -488,6 +490,7 @@ impl Client {
                     configured_model: value.configured_model,
                     thinking_level: value.thinking_level,
                     secret_store: value.secret_store,
+                    llamacpp: value.llamacpp,
                 })
             }
             _ => Err(Error::Protocol),

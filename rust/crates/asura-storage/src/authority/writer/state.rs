@@ -1932,6 +1932,7 @@ impl State {
                     model: config.model,
                     asset_root: config.asset_root,
                     ollama_endpoint: config.ollama_endpoint,
+                    llamacpp: config.llamacpp,
                     model_capabilities: config.model_capabilities,
                     thinking: config.thinking,
                     configuration_digest: config.digest,

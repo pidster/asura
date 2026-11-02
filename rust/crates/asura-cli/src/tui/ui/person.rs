@@ -735,6 +735,52 @@ pub(super) fn secret_store_lines(status: Option<&pb::SecretStoreStatus>) -> Vec<
     lines
 }
 
+/// `/status` lines for llama.cpp (llamacpp-backend.md, status). They read
+/// the last observation only; nothing is shown while the mode is off.
+pub(super) fn llamacpp_lines(status: Option<&pb::LlamaCppStatus>) -> Vec<String> {
+    let Some(status) = status else {
+        return Vec::new();
+    };
+    let mode = match status.mode {
+        Some(2) => "asura",
+        Some(3) => "llama-app",
+        Some(4) => "url",
+        _ => return Vec::new(),
+    };
+    let answering = match status.answering {
+        Some(true) => ", answering",
+        Some(false) => ", not answering",
+        None => "",
+    };
+    let endpoint = status
+        .endpoint
+        .as_deref()
+        .map(|e| format!(" at {e}"))
+        .unwrap_or_else(|| " with no endpoint set".into());
+    let mut lines = vec![format!("llama.cpp: {mode}{endpoint}{answering}")];
+    if mode == "asura" {
+        let approval = match status.approval {
+            Some(1) => "not approved (asura llamacpp approve PATH)",
+            Some(2) => "approved",
+            Some(3) => "changed since approval (asura llamacpp approve PATH)",
+            Some(4) => "missing",
+            _ => "unreadable",
+        };
+        let models = match status.model_count {
+            Some(1) => "1 model".to_owned(),
+            Some(n) => format!("{n} models"),
+            None => "models unreadable".to_owned(),
+        };
+        let agent = if status.agent_file == Some(true) {
+            "LaunchAgent file present"
+        } else {
+            "no LaunchAgent (asura llamacpp start)"
+        };
+        lines.push(format!("llama.cpp binary: {approval}; {models}; {agent}"));
+    }
+    lines
+}
+
 /// What a person command log entry knows. Display state only: every fact
 /// about the job comes from the job API.
 #[derive(Clone, Debug, Default)]
@@ -1129,6 +1175,12 @@ impl App {
             self.person.secret_store = secret_store;
         }
     }
+    /// The last observed llama.cpp facts; contention keeps the previous.
+    pub(in super::super) fn set_llamacpp(&mut self, status: Option<pb::LlamaCppStatus>) {
+        if status.is_some() {
+            self.person.llamacpp = status;
+        }
+    }
     pub(in super::super) fn service_epoch(&self) -> Option<&str> {
         self.view.epoch.as_deref()
     }
@@ -1148,6 +1200,7 @@ impl App {
         }
         lines.push(String::new());
         lines.extend(secret_store_lines(self.person.secret_store.as_ref()));
+        lines.extend(llamacpp_lines(self.person.llamacpp.as_ref()));
         lines.join("\n")
     }
 
@@ -1960,6 +2013,8 @@ pub(super) struct Person {
     pub rows: Vec<CommandRow>,
     /// The last observed secret store status (`/status`).
     pub secret_store: Option<pb::SecretStoreStatus>,
+    /// `ServiceObservation.llamacpp` (llamacpp-backend.md, status).
+    pub llamacpp: Option<pb::LlamaCppStatus>,
     pub launch: Launch,
     /// Whether the service lists capability 8 (OD3), for the current epoch.
     pub supported: Option<bool>,
@@ -3217,6 +3272,69 @@ mod tests {
         assert!(text.ends_with("1 Keychain item"));
         assert!(app.take_job_request().is_none());
         assert!(app.take_queue_request(std::time::Instant::now()).is_none());
+    }
+
+    /// LC-U13 (llamacpp-backend.md): the llama.cpp lines of `/status`.
+    #[test]
+    fn llamacpp_status_lines() {
+        assert!(llamacpp_lines(None).is_empty());
+        let off = pb::LlamaCppStatus {
+            mode: Some(1),
+            ..Default::default()
+        };
+        assert!(llamacpp_lines(Some(&off)).is_empty());
+        let asura = pb::LlamaCppStatus {
+            mode: Some(2),
+            port: Some(8934),
+            approval: Some(2),
+            model_count: Some(3),
+            agent_file: Some(true),
+            answering: Some(true),
+            endpoint: Some("http://127.0.0.1:8934".into()),
+        };
+        assert_eq!(
+            llamacpp_lines(Some(&asura)),
+            [
+                "llama.cpp: asura at http://127.0.0.1:8934, answering",
+                "llama.cpp binary: approved; 3 models; LaunchAgent file present",
+            ]
+        );
+        let changed = pb::LlamaCppStatus {
+            approval: Some(3),
+            model_count: Some(1),
+            agent_file: Some(false),
+            answering: Some(false),
+            ..asura
+        };
+        assert_eq!(
+            llamacpp_lines(Some(&changed)),
+            [
+                "llama.cpp: asura at http://127.0.0.1:8934, not answering",
+                "llama.cpp binary: changed since approval (asura llamacpp approve PATH); 1 model; no LaunchAgent (asura llamacpp start)",
+            ]
+        );
+        let url = pb::LlamaCppStatus {
+            mode: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(
+            llamacpp_lines(Some(&url)),
+            ["llama.cpp: url with no endpoint set"]
+        );
+        let mut app = app();
+        app.set_llamacpp(Some(pb::LlamaCppStatus {
+            mode: Some(3),
+            endpoint: Some("http://127.0.0.1:9931".into()),
+            answering: Some(false),
+            ..Default::default()
+        }));
+        typed(&mut app, "/status");
+        press(&mut app, KeyCode::Enter);
+        let text = app.config_result.clone().unwrap();
+        assert!(
+            text.ends_with("llama.cpp: llama-app at http://127.0.0.1:9931, not answering"),
+            "{text}"
+        );
     }
     #[test]
     fn restored_entries_follow_their_turns_and_fold_through_the_job_api() {

@@ -55,6 +55,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let descriptor = out.join("model-descriptor.bin");
     prost_build::Config::new()
         .protoc_executable(&executable)
+        // Hello is the largest envelope body by far (llamacpp-backend.md
+        // added its relay token); a box keeps every other frame small.
+        .boxed(".asura.model.v1.Envelope.body.hello")
         .file_descriptor_set_path(&descriptor)
         .compile_protos(&[model], &[root.join("contracts/model/v1")])?;
     let set = FileDescriptorSet::decode(fs::read(descriptor)?.as_slice())?;

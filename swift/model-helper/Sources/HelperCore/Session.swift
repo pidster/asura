@@ -85,7 +85,8 @@ public actor HelperSession {
         try await Task.sleep(for: .milliseconds(Int(milliseconds)))
     }
 
-    public typealias BackendFactory = @Sendable (String, String?, String?, UInt32?) async throws -> any ModelBackend
+    /// Selector, asset root, endpoint, MLX capabilities and the llama.cpp relay token.
+    public typealias BackendFactory = @Sendable (String, String?, String?, UInt32?, Data?) async throws -> any ModelBackend
     public init(transport: Transport, factory: @escaping BackendFactory, buildID: Data, schemaDigest: Data) {
         self.transport = transport; self.factory = factory; self.backend = nil
         self.buildID = buildID; self.schemaDigest = schemaDigest; self.timerSleep = Self.sleep
@@ -173,7 +174,8 @@ public actor HelperSession {
             }
             if let factory {
                 backend = try? await factory(selectedModel, hello.hasAssetRoot ? hello.assetRoot : nil,
-                    hello.hasEndpoint ? hello.endpoint : nil, hello.hasModelCapabilities ? hello.modelCapabilities : nil)
+                    hello.hasEndpoint ? hello.endpoint : nil, hello.hasModelCapabilities ? hello.modelCapabilities : nil,
+                    hello.hasEndpointToken ? hello.endpointToken : nil)
             }
             let status = await backend?.status() ?? BackendStatus(contextTokens: nil)
             supportsTools = status.supportsTools

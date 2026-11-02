@@ -277,7 +277,7 @@ pub(super) fn valid(body: &Body) -> bool {
                         (None, None, None) => {
                             m.model_name.is_some() && m.input_tokens.is_none() && m.basis.is_none()
                         }
-                        (Some(c), Some(max), Some(1..=4)) if c > 512 && max >= c => {
+                        (Some(c), Some(max), Some(1..=5)) if c > 512 && max >= c => {
                             match (m.input_tokens, m.basis) {
                                 (None, None) => true,
                                 (Some(n), Some(1)) => n <= c,

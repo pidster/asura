@@ -9,7 +9,7 @@ fn envelope(body: Body) -> pb::Envelope {
     }
 }
 fn hello(service: bool) -> pb::Envelope {
-    envelope(Body::Hello(pb::Hello {
+    envelope(Body::Hello(Box::new(pb::Hello {
         local_tool_destination: None,
         thinking_controls: None,
         supported_capabilities: None,
@@ -21,6 +21,7 @@ fn hello(service: bool) -> pb::Envelope {
         selected_model: Some("system".into()),
         asset_root: None,
         endpoint: None,
+        endpoint_token: None,
         model_name: None,
         build_id: Some(vec![1; 32]),
         schema_digest: Some(vec![2; 32]),
@@ -31,7 +32,7 @@ fn hello(service: bool) -> pb::Envelope {
         context_source: (!service).then_some(1),
         tool_schema_bytes: None,
         reason: Some(0),
-    }))
+    })))
 }
 fn fixtures() -> Vec<(pb::Envelope, Direction)> {
     use Direction::*;
@@ -1594,4 +1595,62 @@ fn cc_u33_request_loop_wire_shapes() {
     .encode_to_vec();
     bytes.extend_from_slice(&[0xaa, 0x01, 0x02, 0x08, 0x01]);
     assert!(decode_body(&bytes, Direction::ServiceToHelper).is_err());
+}
+
+/// LC-U12 (llamacpp-backend.md): context source 5 only for llamacpp
+/// selectors; the relay token only from the service, 32 bytes, with an
+/// endpoint and a llamacpp selector.
+#[test]
+fn llamacpp_hello_fields_are_checked() {
+    let with = |service: bool, change: &dyn Fn(&mut pb::Hello)| {
+        let mut value = hello(service);
+        let Some(Body::Hello(hello)) = value.body.as_mut() else {
+            unreachable!()
+        };
+        change(hello);
+        validate_semantics(
+            &value,
+            if service {
+                Direction::ServiceToHelper
+            } else {
+                Direction::HelperToService
+            },
+        )
+        .is_ok()
+    };
+    assert!(with(false, &|h| {
+        h.selected_model = Some("llamacpp:Bonsai".into());
+        h.context_source = Some(5);
+    }));
+    assert!(!with(false, &|h| {
+        h.selected_model = Some("ollama:x".into());
+        h.context_source = Some(5);
+    }));
+    assert!(!with(false, &|h| {
+        h.selected_model = Some("llamacpp:Bonsai".into());
+        h.context_source = Some(4);
+    }));
+    let service = |h: &mut pb::Hello| {
+        h.selected_model = Some("llamacpp:Bonsai".into());
+        h.endpoint = Some("http://127.0.0.1:50000".into());
+        h.endpoint_token = Some(vec![9; 32]);
+    };
+    assert!(with(true, &service));
+    assert!(!with(true, &|h| {
+        service(h);
+        h.endpoint_token = Some(vec![9; 16]);
+    }));
+    assert!(!with(true, &|h| {
+        service(h);
+        h.endpoint = None;
+    }));
+    assert!(!with(true, &|h| {
+        service(h);
+        h.selected_model = Some("ollama:x".into());
+    }));
+    assert!(!with(false, &|h| {
+        h.selected_model = Some("llamacpp:Bonsai".into());
+        h.context_source = Some(5);
+        h.endpoint_token = Some(vec![9; 32]);
+    }));
 }

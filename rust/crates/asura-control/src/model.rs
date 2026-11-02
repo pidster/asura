@@ -276,7 +276,7 @@ pub fn validate_semantics(
                     v.reported_context_tokens,
                     v.context_source,
                 ) {
-                    (Some(effective), Some(reported), Some(source @ 1..=4)) => {
+                    (Some(effective), Some(reported), Some(source @ 1..=5)) => {
                         !service
                             && v.inventory_only != Some(true)
                             && effective > 512
@@ -292,6 +292,7 @@ pub fn validate_semantics(
                                 Some(("coreai", _)) => source == 2,
                                 Some(("mlx", _)) => source == 3,
                                 Some(("ollama", _)) => source == 4,
+                                Some(("llamacpp", _)) => source == 5,
                                 _ => false,
                             }
                     }
@@ -310,6 +311,16 @@ pub fn validate_semantics(
                 })
                 && v.endpoint.as_ref().is_none_or(|p| {
                     service && !p.is_empty() && p.len() <= 2048 && !p.chars().any(char::is_control)
+                })
+                // The llama.cpp relay token (llamacpp-backend.md): service
+                // only, with an endpoint, 32 bytes.
+                && v.endpoint_token.as_ref().is_none_or(|token| {
+                    service
+                        && token.len() == 32
+                        && v.endpoint.is_some()
+                        && v.selected_model
+                            .as_deref()
+                            .is_some_and(|m| m.to_lowercase().starts_with("llamacpp:"))
                 })
                 && v.model_name.as_ref().is_none_or(|n| {
                     !n.is_empty() && n.len() <= 256 && !n.chars().any(char::is_control)

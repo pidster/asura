@@ -9,6 +9,9 @@ import Testing
 //   ASURA_TEST_OLLAMA_MODEL=granite4.1:8b a local Ollama model
 //   ASURA_TEST_MLX_ROOT=<root with mlx/fixture> an MLX model (CC-N3)
 //   ASURA_TEST_COREAI_ROOT=<root with coreai/fixture> a Core AI model (CC-N5)
+//   ASURA_TEST_LLAMACPP_ENDPOINT=http://127.0.0.1:<port> and
+//   ASURA_TEST_LLAMACPP_MODEL=<name> a llama-server router the test run
+//     started in a scratch folder, with no key (llamacpp-backend.md, LC-N1)
 // Request 1 must return the model's tool call; request 2 carries the call and
 // a fabricated output in its continuation and must end with text or calls,
 // never a failure. A model that answers request 1 without a call is a model
@@ -21,6 +24,8 @@ private let ollamaModel = environment["ASURA_TEST_OLLAMA_MODEL"]
 private let mlxRoot = environment["ASURA_TEST_MLX_ROOT"]
 /// An asset root holding `coreai/fixture` (regular files, no links).
 private let coreAIRoot = environment["ASURA_TEST_COREAI_ROOT"]
+private let llamaEndpoint = environment["ASURA_TEST_LLAMACPP_ENDPOINT"]
+private let llamaModel = environment["ASURA_TEST_LLAMACPP_MODEL"]
 
 private let instructions = "You are a coding assistant in a Rust project. Use the exec_cmd tool to run shell commands. Answer briefly."
 private let request = "Run the shell command `ls src` with the exec_cmd tool, then tell me which files are there."
@@ -73,6 +78,17 @@ private func twoRequests(_ engine: any ToolModelBackend, label: String) async th
         let engine = try #require(backend as? any ToolModelBackend)
         #expect(await backend.status().supportsTools)
         try await twoRequests(engine, label: "coreai:fixture")
+    }
+
+    // LC-N1: discovery reads the server's window; request 1 returns a call;
+    // request 2 answers from the continuation.
+    @Test(.enabled(if: llamaEndpoint != nil && llamaModel != nil)) func nativeLlamaCppStageBTwoRequests() async throws {
+        let backend = try await ProviderFactory.make("llamacpp:\(llamaModel ?? "")", endpoint: llamaEndpoint)
+        let engine = try #require(backend as? any ToolModelBackend)
+        let status = await backend.status()
+        print("LC-N1 llamacpp:\(llamaModel ?? "") window \(status.contextTokens ?? 0) tools \(status.supportsTools) thinking \(status.thinkingControls.rawValue)")
+        #expect(status.supportsTools && status.contextSource == .llamacpp && (status.contextTokens ?? 0) > 512)
+        try await twoRequests(engine, label: "llamacpp:\(llamaModel ?? "")")
     }
 
     @Test(.enabled(if: ollamaModel != nil)) func nativeOllamaStageBTwoRequests() async throws {

@@ -2467,6 +2467,192 @@ fn native_ollama() -> Result<()> {
     result.map_err(|error| format!("native-ollama {stage}: {error}").into())
 }
 
+/// LC-E1 (llamacpp-backend.md): the real service and helper in `url` mode
+/// against a `llama-server` router this journey starts in its scratch home,
+/// with no key. `ASURA_TEST_LLAMACPP_SERVER` names the binary and
+/// `ASURA_TEST_LLAMACPP_GGUF` a small GGUF file. The journey never uses
+/// `~/.asura`, never registers a LaunchAgent and stops the router itself.
+fn native_llamacpp() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut stage = "model selection";
+    let mut router: Option<std::process::Child> = None;
+    let result = (|| -> Result<()> {
+        let binary = std::env::var("ASURA_TEST_LLAMACPP_SERVER")
+            .map_err(|_| "set ASURA_TEST_LLAMACPP_SERVER")?;
+        let gguf = std::path::PathBuf::from(
+            std::env::var("ASURA_TEST_LLAMACPP_GGUF")
+                .map_err(|_| "set ASURA_TEST_LLAMACPP_GGUF")?,
+        );
+        let name = gguf
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or("invalid GGUF name")?
+            .to_owned();
+        let mut fixture = Fixture::new()?;
+        stage = "router start";
+        let models = fixture.home.join("llama-models");
+        fs::create_dir(&models)?;
+        std::os::unix::fs::symlink(&gguf, models.join(format!("{name}.gguf")))?;
+        let free = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = free.local_addr()?.port();
+        drop(free);
+        let log = fs::File::create(fixture.home.join("llama-server.log"))?;
+        router = Some(
+            std::process::Command::new(&binary)
+                .args([
+                    "--models-dir",
+                    models.to_str().ok_or("invalid path")?,
+                    "--models-max",
+                    "1",
+                    "--ctx-size",
+                    "8192",
+                    "--parallel",
+                    "1",
+                    "--no-ui",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &port.to_string(),
+                ])
+                .env_clear()
+                .stdout(log.try_clone()?)
+                .stderr(log)
+                .process_group(0)
+                .spawn()?,
+        );
+        // Ready when /v1/models answers; the router's exit ends the wait.
+        // 100 ms between attempts is pacing.
+        loop {
+            if let Some(status) = router.as_mut().unwrap().try_wait()? {
+                return Err(format!("llama-server exited: {status}").into());
+            }
+            if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                use std::io::{Read, Write};
+                stream.write_all(
+                    format!("GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )?;
+                let mut reply = String::new();
+                let _ = stream.read_to_string(&mut reply);
+                if reply.starts_with("HTTP/1.1 200") {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        stage = "service startup";
+        fixture.start()?;
+        stage = "installation ready";
+        wait_ready(&fixture, None)?;
+        let directory = fixture.home.join("llamacpp-project");
+        fs::create_dir(&directory)?;
+        stage = "project registration";
+        let project = checked_id(
+            fixture
+                .attach()?
+                .register_project(
+                    pb::ProjectRegister {
+                        request_id: Some(asura_platform::random_id().to_vec()),
+                        location: Some(directory.to_str().ok_or("invalid fixture path")?.into()),
+                    },
+                    &|| false,
+                )?
+                .project_id,
+        )?;
+        stage = "provider configuration";
+        for (key, value) in [
+            ("providers.llamacpp.server", "url".to_owned()),
+            (
+                "providers.llamacpp.endpoint",
+                format!("http://127.0.0.1:{port}"),
+            ),
+            ("model", format!("llamacpp:{name}")),
+        ] {
+            let reply = fixture.attach()?.config(key, Some(&value), &|| false)?;
+            assert!(reply.error.is_none(), "configuration failed: {reply:?}");
+        }
+        // LC-E2: `/status` facts through the real service; the sampler runs
+        // on refresh and every 30 s. The harness bound is 40 observations.
+        stage = "status";
+        let mut client = fixture.attach()?;
+        let mut revision = None;
+        let mut status = None;
+        for _ in 0..40 {
+            let update = client.observe_service(revision)?;
+            revision = Some(update.revision);
+            if update
+                .llamacpp
+                .as_ref()
+                .is_some_and(|s| s.mode == Some(4) && s.answering.is_some())
+            {
+                status = update.llamacpp;
+                break;
+            }
+        }
+        let status = status.ok_or("llama.cpp status not observed")?;
+        assert_eq!(status.endpoint, Some(format!("http://127.0.0.1:{port}")));
+        assert_eq!(status.answering, Some(true));
+        drop(client);
+        stage = "native submit";
+        let accepted = provider_submit(
+            &fixture,
+            project,
+            None,
+            0,
+            "Say hello in one short sentence.",
+        )
+        .inspect_err(|_| fixture.print_model_diagnostics())?;
+        stage = "native completion";
+        let keep_log = || {
+            fixture.print_model_diagnostics();
+            let _ = fs::copy(
+                fixture.home.join("service.log"),
+                "/private/tmp/asura-native-llamacpp.log",
+            );
+        };
+        let terminal =
+            observe(&fixture, checked_id(accepted.operation_id)?).inspect_err(|_| keep_log())?;
+        if terminal.kind != Some(3) {
+            keep_log();
+        }
+        assert_eq!(
+            terminal.kind,
+            Some(3),
+            "llama.cpp completion failed: {terminal:?}"
+        );
+        assert!(!terminal.text.as_deref().unwrap_or_default().is_empty());
+        assert!(
+            terminal.tools.is_empty(),
+            "a url route is endpoint-dependent and gets no project tools (LCD12)"
+        );
+        let context = terminal
+            .model_context
+            .as_ref()
+            .ok_or("llama.cpp context measurement missing")?;
+        assert_eq!(
+            context.model_name.as_deref(),
+            Some(format!("llamacpp:{name}").as_str())
+        );
+        // The server's window, never the model's training length (P3).
+        assert_eq!(context.capacity_tokens, Some(8192));
+        assert_eq!(context.reported_max_tokens, Some(8192));
+        assert!(context.input_tokens.is_some_and(|count| count > 0));
+        stage = "service shutdown";
+        fixture.stop()?;
+        println!(
+            "PASS native llama.cpp (llamacpp:{name}) through the service in url mode, window 8192 tokens, {} input tokens measured",
+            context.input_tokens.unwrap_or(0)
+        );
+        Ok(())
+    })();
+    if let Some(mut child) = router {
+        // SAFETY: signals the router's own process group, made at spawn.
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGTERM) };
+        let _ = child.wait();
+    }
+    result.map_err(|error| format!("native-llamacpp {stage}: {error}").into())
+}
+
 /// TL-04, TL-09, TL-10 and TL-13 with a live local thinking model
 /// (thinking-level.md). `ASURA_TEST_OLLAMA_THINKING_MODEL` selects it
 /// (default `qwen3:1.7b`). The journey sets `thinking: high`, checks the
@@ -2858,6 +3044,8 @@ fn main() {
         inventory_journey()
     } else if args.iter().any(|a| a == "--native-ollama-thinking") {
         native_ollama_thinking()
+    } else if args.iter().any(|a| a == "--native-llamacpp") {
+        native_llamacpp()
     } else if args.iter().any(|a| a == "--native-ollama") {
         native_ollama()
     } else if args.iter().any(|a| a == "--bundle-sandbox") {

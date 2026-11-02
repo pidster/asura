@@ -95,6 +95,17 @@ message ServiceObservation {
   optional ThinkingLevel thinking_level = 7;
   // The secret store worker's counts (secret-store.md, operations and audit).
   optional SecretStoreStatus secret_store = 8;
+  // Asura's llama.cpp server and backend (llamacpp-backend.md, status).
+  optional LlamaCppStatus llamacpp = 9;
+}
+message LlamaCppStatus {
+  optional uint32 mode = 1;        // 1 off, 2 asura, 3 llama-app, 4 url
+  optional uint32 port = 2;        // the asura mode port, 1024-65535
+  optional uint32 approval = 3;    // 1 unset, 2 approved, 3 changed, 4 missing, 5 unreadable
+  optional uint32 model_count = 4; // valid links in the model folder, 0-64
+  optional bool agent_file = 5;    // the LaunchAgent file exists
+  optional bool answering = 6;     // the server answered GET /health; absent when not checked
+  optional string endpoint = 7;    // the endpoint the backend uses, at most 2,048 bytes
 }
 message SecretStoreStatus {
   // Stranded items were removed by SG3 (release-signing.md, what SG3 removes).
@@ -618,7 +629,8 @@ enum ToolProgressState { TOOL_PROGRESS_STATE_UNSPECIFIED = 0; TOOL_PROGRESS_STAT
 
 // basis 1 means the measured input at generation start, not current occupancy.
 // capacity_tokens is the selected effective request window. Input counts are optional.
-// capacity_source: 1 system runtime, 2 CoreAI bundle, 3 MLX config, 4 Ollama show.
+// capacity_source: 1 system runtime, 2 CoreAI bundle, 3 MLX config, 4 Ollama show,
+// 5 llama.cpp /props n_ctx (llamacpp-backend.md).
 message ModelContext { optional string model_name = 1; optional uint32 input_tokens = 2; optional uint32 capacity_tokens = 3; optional uint32 basis = 4; optional uint32 reported_max_tokens = 5; optional uint32 capacity_source = 6; optional bool reasoning = 7; optional uint32 thinking_controls = 8; }
 
 // Inventory states: 1 available, 2 installed, 3 listed, 4 unavailable, 5 unchecked.

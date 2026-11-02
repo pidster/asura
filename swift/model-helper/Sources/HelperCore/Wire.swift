@@ -110,6 +110,7 @@ public enum Wire {
                 if selector.hasPrefix("coreai:") { return ContextCapacitySource.coreai.rawValue }
                 if selector.hasPrefix("mlx:") { return ContextCapacitySource.mlx.rawValue }
                 if selector.hasPrefix("ollama:") { return ContextCapacitySource.ollama.rawValue }
+                if selector.hasPrefix("llamacpp:") { return ContextCapacitySource.llamacpp.rawValue }
                 return nil
             }()
             try check(!v.hasToolSchemaBytes || (!service && !v.inventoryOnly && v.availability == .available
@@ -119,6 +120,9 @@ public enum Wire {
             try check(v.hasReportedContextTokens == v.hasContextSource)
             try check(!v.hasAssetRoot || (service && v.assetRoot.hasPrefix("/") && v.assetRoot.utf8.count <= 4096 && !v.assetRoot.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })))
             try check(!v.hasEndpoint || (service && !v.endpoint.isEmpty && v.endpoint.utf8.count <= 2048 && !v.endpoint.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })))
+            // The relay token (llamacpp-backend.md): service only, 32 bytes, with an endpoint.
+            try check(!v.hasEndpointToken || (service && v.hasEndpoint && v.endpointToken.count == 32
+                && v.selectedModel.lowercased().hasPrefix("llamacpp:")))
             try check(!v.hasModelName || (!service && !v.modelName.isEmpty && v.modelName.utf8.count <= 256 && !v.modelName.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })))
             try check(v.hasBuildID && v.buildID.count == 32 && v.hasSchemaDigest && v.schemaDigest.count == 32
                 && v.hasMaxFrameBytes && v.maxFrameBytes == 65_536 && v.hasAvailability && v.hasReason)

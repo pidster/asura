@@ -37,7 +37,8 @@ The private Hello adds `reported_context_tokens` and `context_source` fields.
 The public `ModelContext` adds `reported_max_tokens` and `capacity_source` fields.
 The existing `context_tokens` and `capacity_tokens` fields mean effective request
 capacity. Sources are 1 system runtime, 2 CoreAI bundle, 3 MLX configuration,
-and 4 Ollama show. The helper sets both new fields only when available. The
+4 Ollama show and 5 llama.cpp `/props` `n_ctx`
+([llama.cpp backend](llamacpp-backend.md#usage-and-capacity)). The helper sets both new fields only when available. The
 reported maximum must be positive and at least the effective capacity. The
 service rejects malformed pairs or sources that disagree with the selected
 provider. The public observation may carry capacity without input tokens; `basis`

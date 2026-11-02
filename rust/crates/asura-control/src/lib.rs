@@ -258,6 +258,16 @@ fn secret_store_status(v: &pb::SecretStoreStatus) -> bool {
     let count = |n: Option<u32>| n.is_none_or(|n| n <= MAX_SECRET_STORE_COUNT);
     count(v.item_count) && count(v.unrecognized_count)
 }
+/// `ServiceObservation.llamacpp` (llamacpp-backend.md, status).
+fn llamacpp_status(v: &pb::LlamaCppStatus) -> bool {
+    v.mode.is_some_and(|m| (1..=4).contains(&m))
+        && v.port.is_none_or(|p| (1024..=65_535).contains(&p))
+        && v.approval.is_none_or(|a| (1..=5).contains(&a))
+        && v.model_count.is_none_or(|n| n <= 64)
+        && v.endpoint
+            .as_ref()
+            .is_none_or(|e| !e.is_empty() && e.len() <= 2048 && !e.chars().any(char::is_control))
+}
 /// Validates domain shape and direction. Attachment state stays with its owner.
 pub fn validate_semantics(
     envelope: &pb::Envelope,
@@ -348,6 +358,7 @@ pub fn validate_semantics(
             v.uptime_ms.is_some()
                 && v.thinking_level.is_none_or(|n| (0..=4).contains(&n))
                 && v.secret_store.as_ref().is_none_or(secret_store_status)
+                && v.llamacpp.as_ref().is_none_or(llamacpp_status)
                 && v.stored_memory.as_ref().is_some_and(|memory| {
                     let available = v
                         .status
@@ -521,7 +532,10 @@ pub(crate) fn inventory_selector(value: &str, max: usize) -> bool {
         && !value.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 pub(crate) fn inventory_provider(value: Option<&str>) -> bool {
-    matches!(value, Some("system" | "ollama" | "coreai" | "mlx"))
+    matches!(
+        value,
+        Some("system" | "ollama" | "coreai" | "mlx" | "llamacpp")
+    )
 }
 pub(crate) fn inventory_reason(value: Option<&str>) -> bool {
     value.is_some_and(|v| {
@@ -653,9 +667,62 @@ mod person_command_tests {
                 }),
                 thinking_level: None,
                 secret_store,
+                llamacpp: None,
             }),
             false,
         )
+    }
+    /// ServiceObservation field 9 (llamacpp-backend.md, status).
+    #[test]
+    fn llamacpp_status_is_bounded() {
+        let full = pb::LlamaCppStatus {
+            mode: Some(2),
+            port: Some(8934),
+            approval: Some(2),
+            model_count: Some(64),
+            agent_file: Some(true),
+            answering: Some(true),
+            endpoint: Some("http://127.0.0.1:8934".into()),
+        };
+        let mut value = observation(None);
+        let Some(Body::ServiceObservation(observed)) = value.body.as_mut() else {
+            unreachable!()
+        };
+        observed.llamacpp = Some(full.clone());
+        assert!(validate_semantics(&value, Direction::ServerToClient).is_ok());
+        assert!(round_trips(&value));
+        for changed in [
+            pb::LlamaCppStatus {
+                mode: None,
+                ..full.clone()
+            },
+            pb::LlamaCppStatus {
+                mode: Some(5),
+                ..full.clone()
+            },
+            pb::LlamaCppStatus {
+                port: Some(80),
+                ..full.clone()
+            },
+            pb::LlamaCppStatus {
+                approval: Some(6),
+                ..full.clone()
+            },
+            pb::LlamaCppStatus {
+                model_count: Some(65),
+                ..full.clone()
+            },
+            pb::LlamaCppStatus {
+                endpoint: Some(String::new()),
+                ..full.clone()
+            },
+        ] {
+            let Some(Body::ServiceObservation(observed)) = value.body.as_mut() else {
+                unreachable!()
+            };
+            observed.llamacpp = Some(changed);
+            assert!(validate_semantics(&value, Direction::ServerToClient).is_err());
+        }
     }
     /// ServiceObservation field 8: counts 0-257; the stranded fields 4 and
     /// 6 are gone (KC-U3, SG3): a peer that sends them has them ignored as

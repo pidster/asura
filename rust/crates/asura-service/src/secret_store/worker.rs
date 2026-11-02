@@ -6,8 +6,8 @@ use super::codec::{self, DIGEST_BYTES};
 use super::port::KeychainPort;
 use super::{
     COUNT_TRUNCATED, DeleteReply, GetReply, INVALID_REQUEST, ITEM_LIMIT, NAMED_LIMIT, NOT_SIGNED,
-    NamedGetReply, NamedListReply, NamedPutReply, Observation, PutReply, Request, Session, Shared,
-    StoreFailure, SweepReport,
+    NamedGetReply, NamedListReply, NamedPutReply, Observation, PutReply, Request, ServerKeyReply,
+    Session, Shared, StoreFailure, SweepReport,
 };
 use asura_platform::keychain::{
     Added, Failure, Found, ItemKey, Listing, MISSING_ENTITLEMENT, NamedKey, Removed, Updated,
@@ -122,6 +122,14 @@ where
                 }
                 Request::ListNamed { reply } => {
                     let answer = self.list_named();
+                    self.answer(reply, answer);
+                }
+                Request::GetServerKey { reply } => {
+                    let answer = match self.call(|port| port.get_server_key()) {
+                        Ok(Found::Data(data)) => ServerKeyReply::Key(data),
+                        Ok(Found::Missing) => ServerKeyReply::Missing,
+                        Err(failure) => ServerKeyReply::Failed(failure),
+                    };
                     self.answer(reply, answer);
                 }
             }

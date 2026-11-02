@@ -109,7 +109,7 @@ private func ollamaSession(_ server: OllamaFixtureServer) async throws -> ToolSe
     #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
     let helper = try Transport(fd: fds[0]); let service = try Transport(fd: fds[1])
     let identity = Data(repeating: 1, count: 32)
-    let session = HelperSession(transport: helper, factory: { selected, root, endpoint, capabilities in
+    let session = HelperSession(transport: helper, factory: { selected, root, endpoint, capabilities, _ in
         try await ProviderFactory.make(selected, assetRoot: root, endpoint: endpoint, capabilities: capabilities)
     }, buildID: identity, schemaDigest: identity)
     let running = Task { await session.run() }

@@ -1,3 +1,5 @@
+#[path = "llamacpp_cli.rs"]
+mod llamacpp_cli;
 #[path = "sensors_cli.rs"]
 mod sensors_cli;
 use asura_client::{Client, Error as ClientError};
@@ -31,6 +33,8 @@ enum Command {
         notice: bool,
         owned: bool,
     },
+    /// `asura llamacpp …` (llamacpp-backend.md).
+    Llamacpp(llamacpp_cli::Command),
 }
 fn parse(args: &[String]) -> Result<Command, ()> {
     let words: Vec<_> = args.iter().map(String::as_str).collect();
@@ -55,6 +59,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                 revision: Some(revision.parse().map_err(|_| ())?),
             })
         }
+        ["llamacpp", rest @ ..] => llamacpp_cli::parse(rest).map(Command::Llamacpp).ok_or(()),
         ["--help" | "-h"] => Ok(Command::Help),
         ["--version"] => Ok(Command::Version),
         ["service", "start"] => Ok(Command::Start),
@@ -445,9 +450,34 @@ pub fn entry_with_logs(
     match parsed.map(|(command, _)| command) {
         Ok(Command::Help) => {
             println!(
-                "Asura\nUsage:\n  asura (interactive TUI)\n  asura --version\n  asura service start [--logs DIR]\n  asura service status --json [--logs DIR]\n  asura service stop [--logs DIR]\n  asura service run [--logs DIR]\n  asura installation status [--json] [--logs DIR]\n  asura init\n  asura project add PATH\n  asura project list\n  asura sensors PROJECT_ID [OFFSET REVISION]"
+                "Asura\nUsage:\n  asura (interactive TUI)\n  asura --version\n  asura service start [--logs DIR]\n  asura service status --json [--logs DIR]\n  asura service stop [--logs DIR]\n  asura service run [--logs DIR]\n  asura installation status [--json] [--logs DIR]\n  asura init\n  asura project add PATH\n  asura project list\n  asura sensors PROJECT_ID [OFFSET REVISION]\n{}",
+                llamacpp_cli::USAGE
             );
             0
+        }
+        Ok(Command::Llamacpp(command)) => {
+            let Ok(runtime) = resolve(false) else {
+                eprintln!("The Asura home is unavailable; run asura init first.");
+                return 3;
+            };
+            if command == llamacpp_cli::Command::Serve {
+                return llamacpp_cli::serve(&runtime);
+            }
+            let (Ok(uid), Ok(program)) = (
+                asura_platform::account_uid(),
+                std::env::current_exe().and_then(|p| p.canonicalize()),
+            ) else {
+                eprintln!("The account or this program's path is unavailable.");
+                return 3;
+            };
+            llamacpp_cli::run(
+                command,
+                &runtime,
+                uid,
+                &program,
+                &asura_platform::llamacpp::SystemLaunchctl,
+                &mut std::io::stdout(),
+            )
         }
         Ok(Command::Version) => {
             println!("{}", env!("CARGO_PKG_VERSION"));

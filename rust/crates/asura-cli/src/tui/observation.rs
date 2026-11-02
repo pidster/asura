@@ -95,6 +95,8 @@ pub(super) struct Worker {
     /// `ServiceObservation.secret_store` of the last successful observation
     /// (secret-store.md, operations and audit); `/status` reads it.
     secret_store: Arc<Mutex<Option<asura_control::pb::SecretStoreStatus>>>,
+    /// `ServiceObservation.llamacpp` of the last successful observation.
+    llamacpp: Arc<Mutex<Option<asura_control::pb::LlamaCppStatus>>>,
 }
 impl Worker {
     pub(super) fn start(
@@ -111,6 +113,8 @@ impl Worker {
         let mut spawned = false;
         let secret_store: Arc<Mutex<Option<asura_control::pb::SecretStoreStatus>>> = Arc::default();
         let observed = secret_store.clone();
+        let llamacpp: Arc<Mutex<Option<asura_control::pb::LlamaCppStatus>>> = Arc::default();
+        let observed_llamacpp = llamacpp.clone();
         let mut worker = Self::start_notified(
             move |stop| {
                 if client.is_none() {
@@ -127,6 +131,8 @@ impl Worker {
                             spawned = false;
                         }
                         *observed.lock().unwrap_or_else(|e| e.into_inner()) = update.secret_store;
+                        *observed_llamacpp.lock().unwrap_or_else(|e| e.into_inner()) =
+                            update.llamacpp;
                         let details = super::ui::ServiceDetails {
                             owned: owned_epoch == Some(update.snapshot.service_epoch),
                             uptime_ms: update.uptime_ms,
@@ -147,6 +153,7 @@ impl Worker {
         )?;
         *worker.lease.lock().unwrap_or_else(|e| e.into_inner()) = Some(lease);
         worker.secret_store = secret_store;
+        worker.llamacpp = llamacpp;
         Ok(worker)
     }
     #[cfg(test)]
@@ -225,12 +232,17 @@ impl Worker {
             handle: Some(handle),
             lease: Mutex::new(None),
             secret_store: Arc::default(),
+            llamacpp: Arc::default(),
         })
     }
     /// The secret store status of the last successful observation. The
     /// lock is held only for a copy; contention reports nothing this cycle.
     pub(super) fn secret_store(&self) -> Option<asura_control::pb::SecretStoreStatus> {
         *self.secret_store.try_lock().ok()?
+    }
+    /// The llama.cpp facts of the last successful observation.
+    pub(super) fn llamacpp(&self) -> Option<asura_control::pb::LlamaCppStatus> {
+        self.llamacpp.try_lock().ok()?.clone()
     }
     pub fn running(&self) -> bool {
         self.handle.as_ref().is_some_and(|h| !h.is_finished())
@@ -435,6 +447,7 @@ mod tests {
             handle: None,
             lease: Mutex::new(None),
             secret_store: Arc::default(),
+            llamacpp: Arc::default(),
         };
         let guard = shared.latest.lock().unwrap();
         let (send, receive) = std::sync::mpsc::sync_channel(1);
