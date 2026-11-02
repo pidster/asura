@@ -960,3 +960,23 @@ Selected design changes, in the order they are delivered:
 The earlier implementation evidence above records the state before this
 revision: its `url` journey asserted no project tools. The revision's evidence
 follows in [revision evidence](#revision-evidence-2026-11-02).
+
+#### Revision evidence, 2026-11-02
+
+Same host and tools as the [implementation evidence](#implementation-evidence-2026-11-02);
+helper from an ad hoc `asura-bundle` package built from this revision.
+
+| Case | Evidence | Result |
+| --- | --- | --- |
+| LC-U9 | `asura-platform` `llamacpp::tests::arguments_follow_the_settings`, `every_plan_closes_cors`, `llama_variables_never_reach_the_server` (now with `LLAMA_ARG_CORS_*`) | Pass |
+| LC-U11 | `asura-service` `model_owner::tests::llamacpp_tool_permission_in_every_mode_requires_attestation_and_loopback`, `llamacpp::tests::modes_resolve_to_routes_or_hold_reasons` | Pass |
+| LC-I5 to LC-I7 | `native_server_plan_and_relay` with the real `llama-server` 0.7.0 and the 2B model: the model process holds the four CORS arguments and no key; preflight and simple `GET` from `http://evil.example` get no matching `Access-Control-Allow-Origin` and no credentials on the router and the model process; router 401, model process 200 (the LCQ3 gap) | Pass, 2.1 s |
+| LC-E1 | `conversation_flow --native-llamacpp`: a turn in `url` mode, capacity 8,192; 1,815 measured input tokens, against 43 before LCQ1, because the project tool declarations are now sent | Pass |
+| LC-E3 | `conversation_flow --native-llamacpp-tools` with `Ternary-Bonsai-2-2B-Q2_0`: three passes in six runs. The failures were the model's: it sent malformed `read_file` arguments (text in llama.cpp's XML-like parameter form inside `command`), which the service refused as `invalid_arguments`, or answered without the token. With `Ternary-Bonsai-2-4B-Q2_0`: one pass in one run | Path verified; 2B tool quality is unreliable |
+| P13 to P18 | Recorded in [CORS probes](#cors-probes-2026-11-02), including the Chromium page | Probe, not automated |
+
+Not verified: `asura` mode end to end through the service (it needs a
+team-signed build's Keychain item, as before); the LaunchAgent under the
+person's launchd; Safari and other browsers against the CORS settings; and
+Chrome's local network access prompts for public pages, which Asura does not
+rely on.

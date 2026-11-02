@@ -2472,10 +2472,25 @@ fn native_ollama() -> Result<()> {
 /// with no key. `ASURA_TEST_LLAMACPP_SERVER` names the binary and
 /// `ASURA_TEST_LLAMACPP_GGUF` a small GGUF file. The journey never uses
 /// `~/.asura`, never registers a LaunchAgent and stops the router itself.
-fn native_llamacpp() -> Result<()> {
+/// LC-E1 and LC-E2; with `tools`, LC-E3 too (LCQ1): after the text turn,
+/// the model reads a scratch project file with the `project` tool in `url`
+/// mode and answers with its token.
+fn native_llamacpp(tools: bool) -> Result<()> {
     use std::os::unix::process::CommandExt;
+    /// Stops the router's process group on every exit, including a failed
+    /// assertion's unwind, so no scratch router or model process is left.
+    struct RouterGroup(Option<std::process::Child>);
+    impl Drop for RouterGroup {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                // SAFETY: signals the router's own process group, made at spawn.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGTERM) };
+                let _ = child.wait();
+            }
+        }
+    }
     let mut stage = "model selection";
-    let mut router: Option<std::process::Child> = None;
+    let mut router = RouterGroup(None);
     let result = (|| -> Result<()> {
         let binary = std::env::var("ASURA_TEST_LLAMACPP_SERVER")
             .map_err(|_| "set ASURA_TEST_LLAMACPP_SERVER")?;
@@ -2497,7 +2512,7 @@ fn native_llamacpp() -> Result<()> {
         let port = free.local_addr()?.port();
         drop(free);
         let log = fs::File::create(fixture.home.join("llama-server.log"))?;
-        router = Some(
+        router.0 = Some(
             std::process::Command::new(&binary)
                 .args([
                     "--models-dir",
@@ -2523,7 +2538,7 @@ fn native_llamacpp() -> Result<()> {
         // Ready when /v1/models answers; the router's exit ends the wait.
         // 100 ms between attempts is pacing.
         loop {
-            if let Some(status) = router.as_mut().unwrap().try_wait()? {
+            if let Some(status) = router.0.as_mut().unwrap().try_wait()? {
                 return Err(format!("llama-server exited: {status}").into());
             }
             if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
@@ -2546,6 +2561,7 @@ fn native_llamacpp() -> Result<()> {
         wait_ready(&fixture, None)?;
         let directory = fixture.home.join("llamacpp-project");
         fs::create_dir(&directory)?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
         stage = "project registration";
         let project = checked_id(
             fixture
@@ -2621,10 +2637,6 @@ fn native_llamacpp() -> Result<()> {
             "llama.cpp completion failed: {terminal:?}"
         );
         assert!(!terminal.text.as_deref().unwrap_or_default().is_empty());
-        assert!(
-            terminal.tools.is_empty(),
-            "a url route is endpoint-dependent and gets no project tools (LCD12)"
-        );
         let context = terminal
             .model_context
             .as_ref()
@@ -2637,6 +2649,56 @@ fn native_llamacpp() -> Result<()> {
         assert_eq!(context.capacity_tokens, Some(8192));
         assert_eq!(context.reported_max_tokens, Some(8192));
         assert!(context.input_tokens.is_some_and(|count| count > 0));
+        if tools {
+            // LC-E3: url mode offers project tools (LCQ1). The token is only
+            // in the file, so the answer proves the tool ran.
+            stage = "native tool submit";
+            let secret = format!(
+                "READ_{:032x}",
+                u128::from_ne_bytes(asura_platform::random_id())
+            );
+            fs::write(directory.join("proof.txt"), format!("{secret}\n"))?;
+            let accepted = provider_submit(
+                &fixture,
+                project,
+                None,
+                0,
+                "Use project with command read_file to read proof.txt with offset 0 and limit 1024. Reply with the exact token in the file, and nothing else. Do not guess the file contents.",
+            )
+            .inspect_err(|_| fixture.print_model_diagnostics())?;
+            stage = "native tool completion";
+            let event = observe(&fixture, checked_id(accepted.operation_id)?)
+                .inspect_err(|_| keep_log())?;
+            if event.kind != Some(3) {
+                keep_log();
+            }
+            assert_eq!(
+                event.kind,
+                Some(3),
+                "llama.cpp tool turn failed: {:?}",
+                event.reason
+            );
+            assert!(
+                event
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name.as_deref() == Some("project")
+                        && tool.state == Some(2)
+                        && tool.status == Some(1)),
+                "no committed successful project tool event: {:?}",
+                event.tools
+            );
+            assert!(
+                event.text.as_deref().unwrap_or_default().contains(&secret),
+                "answer did not contain the file-only token: {:?}; tools {:?}",
+                event.text,
+                event.tools
+            );
+            println!(
+                "PASS native llama.cpp tools (llamacpp:{name}) in url mode: {} tool events, file token returned",
+                event.tools.len()
+            );
+        }
         stage = "service shutdown";
         fixture.stop()?;
         println!(
@@ -2645,11 +2707,7 @@ fn native_llamacpp() -> Result<()> {
         );
         Ok(())
     })();
-    if let Some(mut child) = router {
-        // SAFETY: signals the router's own process group, made at spawn.
-        unsafe { libc::kill(-(child.id() as i32), libc::SIGTERM) };
-        let _ = child.wait();
-    }
+    drop(router);
     result.map_err(|error| format!("native-llamacpp {stage}: {error}").into())
 }
 
@@ -3044,8 +3102,10 @@ fn main() {
         inventory_journey()
     } else if args.iter().any(|a| a == "--native-ollama-thinking") {
         native_ollama_thinking()
+    } else if args.iter().any(|a| a == "--native-llamacpp-tools") {
+        native_llamacpp(true)
     } else if args.iter().any(|a| a == "--native-llamacpp") {
-        native_llamacpp()
+        native_llamacpp(false)
     } else if args.iter().any(|a| a == "--native-ollama") {
         native_ollama()
     } else if args.iter().any(|a| a == "--bundle-sandbox") {

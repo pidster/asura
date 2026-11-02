@@ -364,17 +364,16 @@ fn modes_resolve_to_routes_or_hold_reasons() {
     );
     let app = route(&settings(LlamacppServer::LlamaApp, None, None), None).unwrap();
     assert_eq!(app.endpoint, "http://127.0.0.1:9931");
-    assert!(app.relay.is_none() && !app.local);
+    assert!(app.relay.is_none());
     let url = route(
         &settings(LlamacppServer::Url, Some("http://[::1]:8080"), None),
         None,
     )
     .unwrap();
     assert_eq!(url.endpoint, "http://[::1]:8080");
-    assert!(
-        url.relay.is_none() && !url.local,
-        "only asura mode is the local route"
-    );
+    // Every route is loopback; tools follow the destination rule in
+    // `model_owner` for every mode (LCQ1).
+    assert!(url.relay.is_none());
 }
 
 #[test]
@@ -392,7 +391,7 @@ fn only_visible_ascii_keys_reach_a_header() {
     }
 }
 
-/// LC-I5 and LC-I6, native: the server plan through the test-only launch
+/// LC-I5, LC-I6 and LC-I7, native: the server plan through the test-only launch
 /// path with the real `llama-server`, its key from a pipe, in a scratch
 /// folder; then a chat request through the relay. Opt-in:
 ///   ASURA_TEST_LLAMACPP_SERVER=/opt/homebrew/bin/llama-server
@@ -434,6 +433,18 @@ fn native_server_plan_and_relay() {
     let key = asura_platform::llamacpp::new_key();
     let log = std::fs::File::create(root.join("server.log")).unwrap();
     let mut child = asura_platform::llamacpp::spawn_for_test(&plan, &key, &log).unwrap();
+    /// Stops the router's group if an assertion fails first, so no scratch
+    /// router or model process outlives a failed run.
+    struct StopGroup(Option<i32>);
+    impl Drop for StopGroup {
+        fn drop(&mut self) {
+            if let Some(group) = self.0 {
+                // SAFETY: signals the group made by spawn_for_test.
+                unsafe { libc::kill(-group, libc::SIGTERM) };
+            }
+        }
+    }
+    let mut on_failure = StopGroup(Some(child.id() as i32));
     // Ready when /health answers; the child's exit ends the wait. 100 ms
     // between attempts is pacing.
     let cancel = AtomicBool::new(false);
@@ -487,7 +498,92 @@ fn native_server_plan_and_relay() {
         "{chat}"
     );
     relay.join();
+    // LC-I7 (LCD16): the chat loaded the model; its process inherits the
+    // CORS arguments, not the key, and no browser origin may read a reply
+    // from the router or from it.
+    let model_pid = String::from_utf8(
+        std::process::Command::new("/usr/bin/pgrep")
+            .args(["-P", &child.id().to_string()])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let model_pid = model_pid.trim();
+    assert!(
+        !model_pid.is_empty() && !model_pid.contains('\n'),
+        "one model process: {model_pid:?}"
+    );
+    let model_args = String::from_utf8(
+        std::process::Command::new("/bin/ps")
+            .args(["-o", "command=", "-p", model_pid])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(
+        model_args.contains(&asura_platform::llamacpp::CORS_ARGUMENTS[..2].join(" "))
+            && model_args.contains("--no-cors-credentials")
+            && model_args.contains("--cors-methods GET")
+            && model_args.contains("--cors-headers Content-Type")
+            && !model_args.contains("api-key")
+            && !model_args.contains(std::str::from_utf8(&key).unwrap()),
+        "{model_args}"
+    );
+    let listening = String::from_utf8(
+        std::process::Command::new("/usr/sbin/lsof")
+            .args(["-nP", "-a", "-p", model_pid, "-iTCP", "-sTCP:LISTEN", "-Fn"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let model_port: u16 = listening
+        .lines()
+        .find_map(|line| line.strip_prefix("n127.0.0.1:"))
+        .and_then(|port| port.parse().ok())
+        .unwrap_or_else(|| panic!("model process port: {listening}"));
+    let ask = |port: u16, request: String| {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).unwrap();
+        reply
+    };
+    for port in [port, model_port] {
+        let preflight = ask(
+            port,
+            format!(
+                "OPTIONS /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://evil.example\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: content-type\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        let simple = ask(
+            port,
+            format!(
+                "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://evil.example\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        for reply in [&preflight, &simple] {
+            let head = reply.split("\r\n\r\n").next().unwrap().to_ascii_lowercase();
+            assert!(
+                !head.contains("access-control-allow-origin: http://evil.example")
+                    && !head.contains("access-control-allow-origin: *")
+                    && !head.contains("access-control-allow-credentials: true"),
+                "port {port}: {head}"
+            );
+        }
+        if port == model_port {
+            // The LCQ3 gap (LT3, LT4): a model process has no key and answers.
+            // A llama.cpp change that closes it fails here, so the threat
+            // model is revised with it.
+            assert!(simple.starts_with("HTTP/1.1 200"), "{simple}");
+        } else {
+            assert!(simple.starts_with("HTTP/1.1 401"), "{simple}");
+        }
+    }
     // SIGTERM stops the router and the model process it started.
+    on_failure.0 = None;
     // SAFETY: signals the child's own process group, made by spawn_for_test.
     unsafe { libc::kill(-(child.id() as i32), libc::SIGTERM) };
     child.wait().unwrap();

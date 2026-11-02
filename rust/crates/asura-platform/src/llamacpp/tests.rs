@@ -27,7 +27,8 @@ fn arguments_follow_the_settings() {
         args.join(" "),
         "--models-dir /Users/p/.asura/data/models/llamacpp --models-max 2 --ctx-size 65536 \
          --parallel 1 --sleep-idle-seconds 600 --no-ui --host 127.0.0.1 --port 8934 \
-         --api-key-file /dev/fd/5"
+         --api-key-file /dev/fd/5 --cors-origins asura-no-browser-origin \
+         --no-cors-credentials --cors-methods GET --cors-headers Content-Type"
     );
     let never = ServerPlan {
         idle_seconds: 0,
@@ -41,6 +42,40 @@ fn arguments_follow_the_settings() {
     );
 }
 
+/// LCD16: CORS is closed whatever the settings. The origin is not a valid
+/// serialised origin (no scheme), so no page's origin can equal it; it is
+/// not `*`, `null` or `localhost`, which let pages read replies.
+#[test]
+fn every_plan_closes_cors() {
+    for plan in [
+        plan(),
+        ServerPlan {
+            idle_seconds: 0,
+            port: 1024,
+            slots: 16,
+            ..plan()
+        },
+    ] {
+        let args: Vec<String> = plan
+            .arguments(3)
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        let value = |flag: &str| {
+            let at = args.iter().position(|a| a == flag).unwrap();
+            assert_eq!(args.iter().filter(|a| *a == flag).count(), 1, "{flag} once");
+            args[at + 1].clone()
+        };
+        let origin = value("--cors-origins");
+        assert!(!origin.contains("://") && !origin.contains(','), "{origin}");
+        assert!(!["*", "null", "localhost", ""].contains(&origin.as_str()));
+        assert_eq!(value("--cors-methods"), "GET");
+        assert_eq!(value("--cors-headers"), "Content-Type");
+        assert!(args.iter().any(|a| a == "--no-cors-credentials"));
+        assert!(!args.iter().any(|a| a == "--cors-credentials"));
+    }
+}
+
 #[test]
 fn llama_variables_never_reach_the_server() {
     let kept = environment([
@@ -48,6 +83,9 @@ fn llama_variables_never_reach_the_server() {
         ("LLAMA_API_KEY".into(), "x".into()),
         ("LLAMA_ARG_HOST".into(), "0.0.0.0".into()),
         ("LLAMA_ARG_PORT".into(), "1".into()),
+        // Would reopen CORS on the router and its model processes (LCD16).
+        ("LLAMA_ARG_CORS_ORIGINS".into(), "*".into()),
+        ("LLAMA_ARG_CORS_CREDENTIALS".into(), "1".into()),
         ("HOME".into(), "/Users/p".into()),
     ]);
     let names: Vec<_> = kept.iter().map(|(n, _)| n.to_str().unwrap()).collect();

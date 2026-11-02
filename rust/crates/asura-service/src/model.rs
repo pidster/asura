@@ -227,7 +227,7 @@ static PROVIDERS: [Provider; 5] = [
         asset_directory: None,
     },
     // llama.cpp's llama-server (llamacpp-backend.md). Endpoint-dependent:
-    // only Asura's own server is the verified local route (LCD12).
+    // tools in every mode on a loopback endpoint with attestation (LCD12).
     Provider {
         name: "llamacpp",
         capabilities: &[Capability::Text],

@@ -2352,14 +2352,13 @@ impl Owner {
             thinking_level: prepared.thinking,
             thinking_request: 0,
         };
-        let (endpoint, endpoint_token, llamacpp_local, relay) = match llamacpp {
+        let (endpoint, endpoint_token, relay) = match llamacpp {
             Some(route) => (
                 Some(route.endpoint),
                 route.relay.as_ref().map(|(relay, _)| relay.token()),
-                route.local,
                 route.relay,
             ),
-            None => (prepared.ollama_endpoint, None, false, None),
+            None => (prepared.ollama_endpoint, None, None),
         };
         let mut model = ModelOwner::new(
             self.runtime.clone(),
@@ -2370,7 +2369,6 @@ impl Owner {
                 endpoint,
                 model_capabilities: prepared.model_capabilities,
                 endpoint_token,
-                llamacpp_local,
             },
         )
         .map_err(|_| "model_unavailable")?;

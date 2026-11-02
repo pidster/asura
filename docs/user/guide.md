@@ -374,7 +374,15 @@ again. `add` links a `.gguf` file into `~/.asura/data/models/llamacpp`; the
 file stays where it is, and its name without `.gguf` is the model name.
 `asura llamacpp list`, `remove NAME`, `status` and `stop` manage the rest.
 Asura's own server needs a signed Asura build, because its key is kept in
-the Keychain. Only this mode gives the model project tools.
+the Keychain.
+
+Every mode except `off` gives the model project tools. A program that answers
+on the configured port sees the conversation and the tool results, so point
+`url` only at a server you trust.
+
+Asura's own server tells web browsers that no web page may read its replies.
+A web page can still make a loaded model run, without seeing the answer.
+Llama.app's server and a server you start keep their own browser settings.
 
 To use Wisp's server, store its key with `/secrets store WISP_LLAMACPP`, then
 set `providers.llamacpp.server url`, `providers.llamacpp.endpoint

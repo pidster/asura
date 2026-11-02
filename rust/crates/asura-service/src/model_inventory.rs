@@ -156,7 +156,6 @@ impl Owner {
                                 asset_root: Some(config.asset_root),
                                 endpoint: config.ollama_endpoint,
                                 endpoint_token: None,
-                                llamacpp_local: false,
                             },
                         ) {
                             Ok(mut model) => {

@@ -55,8 +55,8 @@ public enum ProviderFactory {
             return FoundationBackend(model: model, contextTokens: model.contextTokens,
                 reportedContextTokens: model.contextTokens, contextSource: .llamacpp,
                 modelName: "llamacpp:\(name)", supportsTools: model.supportsTools,
-                // Loopback only; the service decides whether this route is
-                // the verified local one (asura mode, LCD12).
+                // Loopback only; the service offers tools in every mode when
+                // the endpoint is loopback (LCD12, LCQ1).
                 localToolDestination: true,
                 instrumentationFactory: { usage, callback, reporter in
                     var instrumented = model

@@ -29,9 +29,6 @@ pub(crate) struct Selection {
     pub model_capabilities: Option<u32>,
     /// The llama.cpp relay token sent in Hello field 24 (llamacpp-backend.md).
     pub endpoint_token: Option<Vec<u8>>,
-    /// The route is Asura's own llama.cpp server: the verified local route
-    /// for project tools (LCD12).
-    pub llamacpp_local: bool,
 }
 /// Package resources the selected provider needs beside the helper copy.
 /// MLX needs `mlx.metallib`; MLX and Core AI load Hub tokenizers, which read
@@ -1068,18 +1065,24 @@ fn local_tool_destination(selection: &Selection, attested: bool) -> bool {
     if resolved.provider().destination_kind() == crate::model::DestinationKind::OnDevice {
         return true;
     }
-    if resolved.provider().name() == "llamacpp" {
-        return attested && selection.llamacpp_local;
-    }
-    if resolved.provider().name() != "ollama" || !attested {
+    if !attested {
         return false;
     }
-    asura_storage::config::loopback_endpoint(
-        selection
+    // Ollama and llama.cpp in every mode (LCQ1, llamacpp-backend.md LCD12):
+    // the helper attests a local destination and its endpoint is loopback.
+    // The service always sends llama.cpp an endpoint; none means no tools.
+    let endpoint = match resolved.provider().name() {
+        "ollama" => selection
             .endpoint
             .as_deref()
             .unwrap_or(DEFAULT_OLLAMA_ENDPOINT),
-    )
+        "llamacpp" => match selection.endpoint.as_deref() {
+            Some(endpoint) => endpoint,
+            None => return false,
+        },
+        _ => return false,
+    };
+    asura_storage::config::loopback_endpoint(endpoint)
 }
 
 const DEFAULT_OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
@@ -1207,7 +1210,6 @@ mod tests {
                 endpoint: None,
                 model_capabilities: None,
                 endpoint_token: None,
-                llamacpp_local: false,
             },
         );
         assert!(created.is_err());
@@ -1263,7 +1265,6 @@ mod tests {
                 endpoint: None,
                 model_capabilities: None,
                 endpoint_token: None,
-                llamacpp_local: false,
             },
             tools_available: false,
             inventory_only: false,
@@ -1559,6 +1560,36 @@ mod tests {
                 supported.is_some_and(|mask| mask & 1 != 0)
             );
         }
+    }
+
+    /// LC-U11, LCQ1: every llama.cpp mode gets tools under the Ollama rule.
+    /// The relay (`asura`, keyed `url`), Llama.app's port and a keyless `url`
+    /// endpoint are loopback; attestation is still required, a missing or
+    /// non-loopback endpoint never gets tools.
+    #[test]
+    fn llamacpp_tool_permission_in_every_mode_requires_attestation_and_loopback() {
+        let mut selection = owner(Phase::Available).selection;
+        selection.model = "llamacpp:Ternary-Bonsai-2-2B-Q2_0".into();
+        for endpoint in [
+            "http://127.0.0.1:53111",
+            "http://127.0.0.1:9931",
+            "http://127.0.0.1:8933",
+            "http://[::1]:8080",
+        ] {
+            selection.endpoint = Some(endpoint.into());
+            assert!(local_tool_destination(&selection, true), "{endpoint}");
+            assert!(!local_tool_destination(&selection, false), "{endpoint}");
+        }
+        for endpoint in [
+            "https://models.example",
+            "http://localhost:9931",
+            "http://127.0.0.1.evil:9931",
+        ] {
+            selection.endpoint = Some(endpoint.into());
+            assert!(!local_tool_destination(&selection, true), "{endpoint}");
+        }
+        selection.endpoint = None;
+        assert!(!local_tool_destination(&selection, true));
     }
 
     #[test]

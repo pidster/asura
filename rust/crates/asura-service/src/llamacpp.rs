@@ -175,8 +175,6 @@ pub(crate) struct Route {
     pub endpoint: String,
     /// The relay and its key read, when a key is added.
     pub relay: Option<(Relay, KeyTicket)>,
-    /// Asura's own server: the verified local route for tools.
-    pub local: bool,
 }
 
 /// Resolves the mode at turn preparation. Pure except for the relay bind and
@@ -198,7 +196,6 @@ pub(crate) fn route(
         LlamacppServer::LlamaApp => Ok(Route {
             endpoint: asura_storage::config::LLAMA_APP_ENDPOINT.into(),
             relay: None,
-            local: false,
         }),
         LlamacppServer::Asura => {
             let (relay, ticket) = relayed(settings.port, &|store| {
@@ -207,7 +204,6 @@ pub(crate) fn route(
             Ok(Route {
                 endpoint: relay.url(),
                 relay: Some((relay, ticket)),
-                local: true,
             })
         }
         LlamacppServer::Url => {
@@ -219,7 +215,6 @@ pub(crate) fn route(
                 return Ok(Route {
                     endpoint,
                     relay: None,
-                    local: false,
                 });
             };
             // The relay speaks HTTP to 127.0.0.1 only.
@@ -240,7 +235,6 @@ pub(crate) fn route(
             Ok(Route {
                 endpoint: relay.url(),
                 relay: Some((relay, ticket)),
-                local: false,
             })
         }
     }

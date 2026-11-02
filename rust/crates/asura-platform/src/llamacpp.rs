@@ -17,6 +17,20 @@ use std::process::{Command, Stdio};
 pub const LABEL: &str = "org.pidster.asura.llamacpp";
 /// The key: 32 random bytes as 64 lower-case hex digits.
 pub const KEY_HEX_BYTES: usize = 64;
+/// The CORS arguments (LCD16). The allowed origin is not a valid serialised
+/// origin, so no page's origin equals it and no browser reads a reply. The
+/// relay sends no `Origin` and is not affected. The router passes these four
+/// arguments to each model process it starts (probe P13). They are fixed:
+/// no setting changes them.
+pub const CORS_ARGUMENTS: [&str; 7] = [
+    "--cors-origins",
+    "asura-no-browser-origin",
+    "--no-cors-credentials",
+    "--cors-methods",
+    "GET",
+    "--cors-headers",
+    "Content-Type",
+];
 
 /// What the serve step starts. Values come from the validated configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +74,7 @@ impl ServerPlan {
             ]
             .map(OsString::from),
         );
+        args.extend(CORS_ARGUMENTS.map(OsString::from));
         args
     }
 }
