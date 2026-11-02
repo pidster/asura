@@ -437,6 +437,7 @@ Open decisions for the per-loop mapping:
    [ADR-0003](../decisions/0003-aggregate-budget-admission.md), and whether
    unknown model capacity refuses admission or uses a verified configured value.
 6. Whether the service takes ownership of the turn request loop from the helper.
+   Probe evidence for all four backends: [loop closure decision 6 probes](loop-closure-probes.md) (proposed, 2026-11-02).
 
 Owner direction (2026-10-13): the closure that guarantees a turn's tool loop
 ends is derived from evidence. Asura logs tool-loop traces and builds a
