@@ -589,6 +589,9 @@ model not_started execution_off: result: not started: the person turned executio
 model exited outside_sandbox_off: result: exit 101; then stopped: running outside the sandbox is turned off
 model cancelled outside_sandbox_off: result: cancelled: running outside the sandbox is turned off
 model not_started outside_sandbox_off: result: not started: running outside the sandbox is turned off
+model exited enforcement_mismatch: result: exit 101; then stopped: the sandbox profile did not match the policy decision
+model cancelled enforcement_mismatch: result: cancelled: the sandbox profile did not match the policy decision
+model not_started enforcement_mismatch: result: not started: the sandbox profile did not match the policy decision
 person exited none: result: exit 0
 person signalled none: result: signal 9
 person interrupted restart: result: interrupted by a service restart; effects unknown
@@ -653,6 +656,9 @@ person not_started execution_off: result: not started: the person turned executi
 person exited outside_sandbox_off: result: exit 101; then stopped: running outside the sandbox is turned off
 person cancelled outside_sandbox_off: result: stopped: running outside the sandbox is turned off
 person not_started outside_sandbox_off: result: not started: running outside the sandbox is turned off
+person exited enforcement_mismatch: result: exit 101; then stopped: the sandbox profile did not match the policy decision
+person cancelled enforcement_mismatch: result: stopped: the sandbox profile did not match the policy decision
+person not_started enforcement_mismatch: result: not started: the sandbox profile did not match the policy decision
 person-outside exited none: result: exit 0
 person-outside signalled none: result: signal 9
 person-outside interrupted restart: result: interrupted by a service restart; effects unknown
@@ -717,8 +723,11 @@ person-outside not_started execution_off: result: not started: the person turned
 person-outside exited outside_sandbox_off: result: exit 101; then stopped: running outside the sandbox is turned off
 person-outside cancelled outside_sandbox_off: result: stopped: running outside the sandbox is turned off
 person-outside not_started outside_sandbox_off: result: not started: running outside the sandbox is turned off
+person-outside exited enforcement_mismatch: result: exit 101; then stopped: the sandbox profile did not match the policy decision
+person-outside cancelled enforcement_mismatch: result: stopped: the sandbox profile did not match the policy decision
+person-outside not_started enforcement_mismatch: result: not started: the sandbox profile did not match the policy decision
 "#,
-        "c537e6cfd35796dbfb623193f2a3aab6fdbda800f7d1c38d5b08d22e28553146",
+        "486e586b1ae22e0daced6e77fdd0955128313ac6ee1c79b00bde60126ee14114",
     );
 }
 

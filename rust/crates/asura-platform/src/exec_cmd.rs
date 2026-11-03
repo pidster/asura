@@ -1,6 +1,7 @@
 //! Bounded noninteractive command process owner. Filesystem work is worker-only.
 mod capture;
 mod cleanup;
+mod constraints;
 pub mod environment;
 mod escapee;
 mod guardian;
@@ -15,6 +16,9 @@ use crate::{PollInterest, ProjectIdentity, RuntimeDirectory, StateBoundary};
 use capture::Capture;
 pub use capture::{DRAIN_BUDGET, OutputSink, READ_BUFFER, Stream};
 pub use cleanup::ExecCmdCleanup;
+pub use constraints::{Constraints, Root, profile_digest, render_model1};
+#[cfg(any(test, feature = "test-support"))]
+pub use constraints::{legacy_model1_for_test, template_for_test};
 #[cfg(feature = "test-support")]
 pub use escapee::scan_for_test as escapee_scan_for_test;
 pub use guardian::run_guardian;
@@ -46,6 +50,9 @@ pub enum ExecCmdError {
     Protocol,
     CleanupUnconfirmed,
     Io,
+    /// The guardian's rendered `model-1` profile differs from the
+    /// decision's digest (setup reason 10, PL1 enforcement evidence).
+    EnforcementMismatch,
 }
 /// Why a settled job stopped. Reason 3 `output_limit` is unassigned since
 /// J1; nothing produces it.
@@ -143,6 +150,9 @@ impl From<ExecCmdError> for ExecCmdFailure {
 /// Commands and secret variables share the 8192-byte limit (secret detection,
 /// environment path).
 pub const MAX_COMMAND_BYTES: usize = 8192;
+/// The private guardian argv bound: the command plus 1 KiB for the
+/// executable, marker, job ID, profile and constraint set tokens.
+pub const MAX_ARGV_BYTES: usize = 9216;
 /// One exec_cmd execution. `secrets` are the command's secret variables from the
 /// rewrite: numbers 1–16, each distinct, values without NUL and at most
 /// [`MAX_COMMAND_BYTES`] in total. `secret_command` is the whole-command
@@ -162,6 +172,9 @@ pub struct ExecCmdRequest {
     pub cwd: Option<String>,
     pub secrets: Vec<SecretVariable>,
     pub secret_command: Option<SecretCommand>,
+    /// The policy decision's constraint set: required for `model-1`,
+    /// absent for the person profiles (security-policy.md, PL1).
+    pub constraints: Option<Constraints>,
 }
 pub struct PreparedExecCmd {
     request: ExecCmdRequest,
@@ -182,6 +195,8 @@ pub struct PreparedExecCmd {
     profile_token_for_test: Option<String>,
     #[cfg(feature = "test-support")]
     frame_for_test: Option<Vec<u8>>,
+    #[cfg(feature = "test-support")]
+    corrupt_digest_for_test: bool,
     cleanup: Option<ExecCmdCleanup>,
 }
 fn check(cancel: &AtomicBool) -> Result<(), ExecCmdError> {
@@ -202,6 +217,7 @@ fn validate(request: &ExecCmdRequest) -> Result<(), ExecCmdError> {
         || cwd.starts_with('/')
         || cwd.contains('\0')
         || cwd.split('/').any(|p| p == "..")
+        || request.constraints.is_some() != (request.profile == Profile::Model1)
     {
         return Err(ExecCmdError::Invalid);
     }
@@ -344,6 +360,8 @@ impl PreparedExecCmd {
             profile_token_for_test: None,
             #[cfg(feature = "test-support")]
             frame_for_test: None,
+            #[cfg(feature = "test-support")]
+            corrupt_digest_for_test: false,
             cleanup: Some(cleanup),
         };
         if let Err(reason) = check(cancel) {
@@ -386,6 +404,12 @@ impl PreparedExecCmd {
     #[cfg(feature = "test-support")]
     pub fn replace_frame_for_test(&mut self, frame: Vec<u8>) {
         self.frame_for_test = Some(frame);
+    }
+    /// Send a profile digest that differs from the rendered profile, to
+    /// qualify the guardian's enforcement evidence check (PL-I4).
+    #[cfg(feature = "test-support")]
+    pub fn corrupt_profile_digest_for_test(&mut self) {
+        self.corrupt_digest_for_test = true;
     }
     /// After a successful spawn ownership always transfers to ExecCmdJob.
     /// The request's secret values are dropped (and zeroed) whether or not
@@ -463,12 +487,33 @@ impl PreparedExecCmd {
             }
             None => None,
         };
+        // The expected profile digest, from the decision's constraint set
+        // and the pinned descriptor paths read as the guardian reads them.
+        let constraints = match &self.request.constraints {
+            Some(set) => {
+                // The guardian's pinned paths are these descriptor paths
+                // after its identity checks; a descriptor that fails them
+                // is refused there, before the digest is compared.
+                let project = spawn::path(self.project.as_raw_fd())?;
+                let scratch = spawn::path(scratch.as_raw_fd())?;
+                let asura = spawn::path(self.asura.as_raw_fd())?;
+                #[allow(unused_mut)]
+                let mut digest = profile_digest(&render_model1(set, &project, &scratch, &asura)?);
+                #[cfg(feature = "test-support")]
+                if self.corrupt_digest_for_test {
+                    digest[0] ^= 0xff;
+                }
+                set.token(&digest)
+            }
+            None => "-".into(),
+        };
         #[allow(unused_mut)]
         let mut args = vec![
             executable.to_string_lossy().into_owned(),
             "--asura-exec-cmd-guardian".into(),
             hex(self.request.job_id),
             self.request.profile.token().into(),
+            constraints,
             self.request.command.clone(),
         ];
         #[cfg(feature = "test-support")]
@@ -477,7 +522,7 @@ impl PreparedExecCmd {
         }
         #[cfg(feature = "test-support")]
         args.extend(self.guardian_fault_for_test.clone());
-        if args.iter().map(|value| value.len() + 1).sum::<usize>() > 8704 {
+        if args.iter().map(|value| value.len() + 1).sum::<usize>() > MAX_ARGV_BYTES {
             return Err(ExecCmdError::Invalid);
         }
         let mut mappings = vec![
@@ -893,6 +938,7 @@ impl ExecCmdJob {
                 Some(match n.reason {
                     7 => ExecCmdError::Denied,
                     8 => ExecCmdError::Protocol,
+                    10 => ExecCmdError::EnforcementMismatch,
                     9 => ExecCmdError::CleanupUnconfirmed,
                     _ => ExecCmdError::Unavailable,
                 })

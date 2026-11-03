@@ -266,6 +266,8 @@ pub fn run_jobs(
                     gate_home: runtime.scratch_home_for_test().map(|p| p.to_path_buf()),
                 },
                 person: job.person.map(Person::launch),
+                constraints: (job.profile == Profile::Model1)
+                    .then(asura_platform::exec_cmd::template_for_test),
             },
         )
         .map_err(|e| format!("start: {e:?}"))?;
@@ -860,6 +862,7 @@ impl JobHarness {
             command_cut: false,
             whole_command: false,
             refusal: None,
+            policy: None,
         };
         self.append(journal::Record::ToolCall(Box::new(call)), None)
             .map_err(|e| format!("kind 14: {e:?}"))?;
@@ -916,6 +919,7 @@ impl JobHarness {
             duplicate_digest: digest.finalize().into(),
             stored_command: stored,
             person: None,
+            constraints: Some(asura_platform::exec_cmd::template_for_test()),
         };
         let admission = self
             .owner

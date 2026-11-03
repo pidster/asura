@@ -145,6 +145,7 @@ pub(crate) fn audit_reason(reason: JobReason) -> record::JobReason {
         JobReason::SetupFailed => A::SetupFailed,
         JobReason::ExecutionOff => A::ExecutionOff,
         JobReason::OutsideSandboxOff => A::OutsideSandboxOff,
+        JobReason::EnforcementMismatch => A::EnforcementMismatch,
     }
 }
 

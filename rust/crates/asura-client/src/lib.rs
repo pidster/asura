@@ -199,6 +199,8 @@ pub struct ServiceUpdate {
     pub secret_store: Option<pb::SecretStoreStatus>,
     /// Asura's llama.cpp server facts (llamacpp-backend.md, status).
     pub llamacpp: Option<pb::LlamaCppStatus>,
+    /// The policy owner's facts (security-policy.md, `/status` in PL1).
+    pub policy: Option<pb::PolicyStatus>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
@@ -491,6 +493,7 @@ impl Client {
                     thinking_level: value.thinking_level,
                     secret_store: value.secret_store,
                     llamacpp: value.llamacpp,
+                    policy: value.policy,
                 })
             }
             _ => Err(Error::Protocol),

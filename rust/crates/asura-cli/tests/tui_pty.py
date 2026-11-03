@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production TUI journeys using only an isolated CLI fixture executable.
 
-Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--context-views|--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer|--thinking|--jobs|--job-viewer|--job-retention|--execution-setting|--job-notices|--person-commands|--person-outside|--person-model|--person-restart|--person-secrets|--person-named|--path-guard]
+Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--context-views|--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer|--thinking|--jobs|--job-viewer|--job-retention|--execution-setting|--job-notices|--person-commands|--person-outside|--person-model|--person-restart|--person-secrets|--person-named|--path-guard|--policy]
 The job journeys (--jobs, --job-viewer, --job-retention, --execution-setting)
 need a service that lists CAPABILITY_JOBS; they run after packet J34-E.
 --job-notices needs the J5 job notice; it runs after packet J5-E.
@@ -3865,6 +3865,86 @@ def execution_setting_journey(fixture, source):
         harness.close()
 
 
+def journal_kinds(fixture):
+    """The kind of every authority journal frame, in order (segment files
+    concatenated; kind at bytes 10-11, frame length at bytes 12-15)."""
+    control = fixture.root / "home/.asura/state/control"
+    data = b"".join((control / name).read_bytes() for name in sorted(
+        p.name for p in control.iterdir() if p.name.startswith("seg-") and p.name.endswith(".log")))
+    kinds, offset = [], 0
+    while offset + 16 <= len(data):
+        length = struct.unpack(">I", data[offset + 12:offset + 16])[0]
+        assert length > 0, "journal frame length"
+        kinds.append(struct.unpack(">H", data[offset + 10:offset + 12])[0])
+        offset += length
+    return kinds
+
+
+def policy_journey(fixture, source):
+    """--policy: PL-E1 (security-policy.md, PL1): a scripted model's
+    exec_cmd runs as before under the policy owner; /status shows the policy
+    line; the journal holds kind 35 and kind 34 before the call's kind 14.
+    PL-E2: with the test-only denying set (a `policy-test-deny` file in the
+    scratch home, test-support build), the model receives the policy denial
+    text, the TUI shows it, and nothing runs."""
+    harness = JobsHarness(fixture, source)
+    project = harness.project("policy")
+    trial = None
+    try:
+        fixture.start()
+        trial = fixture.launch()
+        trial.resize(170, 48)
+        harness.configure(trial, project)
+        harness.script[:] = [("exec_cmd", {"command": "printf policy-ok > policy.txt"}), "POLICY-RAN"]
+        trial.send(b"Run the policy fixture.\r")
+        trial.until(b"POLICY-RAN", plain=True, limit=40, reject="Incomplete response")
+        end = time.monotonic() + 10
+        while not (project / "policy.txt").exists():
+            assert time.monotonic() < end, "the command did not run"
+            trial.read(0.05)
+        assert (project / "policy.txt").read_text() == "policy-ok"
+        harness.command(trial, "/status",
+                        "policy: revision 1 · installation ok · user ok · workspace 0 · repository 0 · solver: none · 0 approvals waiting")
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        kinds = journal_kinds(fixture)
+        assert 35 in kinds and 34 in kinds, kinds
+        assert kinds.index(35) < kinds.index(34) < len(kinds) - 1 and kinds[kinds.index(34) + 1] == 14, kinds
+        assert kinds.count(35) == 1, kinds
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        trial = None
+        fixture.stop()
+        print("PASS PL-E1 TUI: model exec_cmd runs under the policy owner; /status policy line; "
+              "kind 35 then kind 34 immediately before kind 14")
+        # PL-E2: the test-only denying set.
+        (fixture.root / "home/policy-test-deny").write_bytes(b"")
+        fixture.start()
+        trial = fixture.launch()
+        trial.resize(170, 48)
+        harness.select(trial, project)
+        harness.script[:] = [("exec_cmd", {"command": "printf ran > denied.txt"}), "POLICY-DENIED-DONE"]
+        trial.send(b"Try the denied command.\r")
+        trial.until(b"POLICY-DENIED-DONE", plain=True, limit=40, reject="Incomplete response")
+        text = "denied: policy: installation: test_denied: the test policy denies model commands; do not retry"
+        assert any(m.endswith(text) for m in harness.tool_messages), harness.tool_messages[-2:]
+        trial.until(b"denied: policy: installation", plain=True, limit=10)
+        assert not (project / "denied.txt").exists()
+        kinds = journal_kinds(fixture)
+        assert kinds[-1] != 26 and kinds.count(34) == 2, kinds
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        trial = None
+        fixture.stop()
+        (fixture.root / "home/policy-test-deny").unlink()
+        print("PASS PL-E2 TUI: the test-only denying set refuses the call; the model receives the "
+              "policy denial text; the TUI shows the denying scope; nothing ran")
+    finally:
+        if trial is not None:
+            trial.close()
+        harness.close()
+
+
 def job_notices_journey(fixture, source):
     """--job-notices: J5T-01 and J5T-08 (end to end; tool-job-controller.md,
     J5 validation). A model job settles while no turn runs; the next turn's
@@ -5461,7 +5541,8 @@ def main():
                  "--person-secrets": person_secrets_journey,
                  "--person-named": person_named_journey,
                  "--context-views": context_views_journey,
-                 "--path-guard": path_guard_journey}
+                 "--path-guard": path_guard_journey,
+                 "--policy": policy_journey}
     job_mode = job_modes.get(sys.argv[2]) if len(sys.argv) == 3 else None
     assert len(sys.argv) == 2 or job_mode or thinking or segmented or restore or records or steer or steps or waits_client or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
     if native:

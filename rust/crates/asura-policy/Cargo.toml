@@ -1,0 +1,22 @@
+[package]
+name = "asura-policy"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Asura's effect policy: schema, built-in sets, deny-on-any-error wrapper and the model-1 region compiler"
+
+[features]
+# The test-only denying installation set (security-policy.md, test-only sets).
+test-support = []
+
+[dependencies]
+cedar-policy = "=4.14.1"
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+
+[[bin]]
+name = "policy-bench"
+path = "src/bin/policy-bench.rs"
+test = false

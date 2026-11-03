@@ -739,6 +739,8 @@ fn guardian_setup_reason(setup_reason: u8) -> JobReason {
         6 => JobReason::SandboxUnavailable,
         7 => JobReason::ProjectChanged,
         8 => JobReason::ProtocolFault,
+        // PL1 enforcement evidence: the rendered profile differed.
+        10 => JobReason::EnforcementMismatch,
         _ => JobReason::SetupFailed,
     }
 }
@@ -822,6 +824,7 @@ impl Worker {
             secret_command,
             mut capture,
             person: _,
+            constraints,
         } = start;
         let person_matches = match &person {
             None => !profile.person(),
@@ -840,6 +843,7 @@ impl Worker {
             cwd: Some(cwd),
             secrets,
             secret_command,
+            constraints,
         };
         let sink = handle.output_sink();
         let work = spawn("asura-job-setup", self.wake.as_ref(), move |cancel| {

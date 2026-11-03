@@ -1,8 +1,9 @@
+use super::constraints::{Constraints, profile_digest, render_model1};
 use super::escapee::{self, EnvMarker, FREEZE_ROUND_LIMIT, Gate, GateFacts, Libproc, Sweep, Tally};
 use super::protocol::{
     KIND_ESCAPEE_REPORT, KIND_LEADER_EXITED, LEASE_KILL, LEASE_TERM, Notice, Profile,
-    REASON_CANCEL, REASON_CLEANUP_FAILED, REASON_ESCAPEE_TERMINATED, REASON_ESCAPEE_UNTERMINATED,
-    REASON_KILL, REASON_LEASE_ENDED,
+    REASON_CANCEL, REASON_CLEANUP_FAILED, REASON_ENFORCEMENT_MISMATCH, REASON_ESCAPEE_TERMINATED,
+    REASON_ESCAPEE_UNTERMINATED, REASON_KILL, REASON_LEASE_ENDED,
 };
 use super::{ExecCmdError, MAX_COMMAND_BYTES, person, spawn};
 use crate::runtime::{open_at, stat_fd};
@@ -395,8 +396,12 @@ fn leader_exit(code: i32, status: i32) -> Option<(u8, u32)> {
 /// The command has no time bound: it runs until it ends, its lease asks
 /// for a stop or closes, or its leader exits. An unknown profile token
 /// exits with status 1 before any effect and before any notice.
-pub fn run_guardian(jobhex: &str, profile: &str, command: &str) -> i32 {
-    match guardian(jobhex, profile, command, Faults::default()) {
+///
+/// `constraints` is the policy decision's constraint set token for
+/// `model-1` and `-` for the person profiles (security-policy.md, PL1
+/// constraint set); any other form exits with status 1 before any effect.
+pub fn run_guardian(jobhex: &str, profile: &str, constraints: &str, command: &str) -> i32 {
+    match guardian(jobhex, profile, constraints, command, Faults::default()) {
         Ok(()) => 0,
         Err(_) => 1,
     }
@@ -404,11 +409,17 @@ pub fn run_guardian(jobhex: &str, profile: &str, command: &str) -> i32 {
 /// The guardian with one escapee-control fault (escapee-control.md,
 /// test-support faults). An unknown fault refuses before any effect.
 #[cfg(feature = "test-support")]
-pub fn run_guardian_for_test(jobhex: &str, profile: &str, command: &str, fault: &str) -> i32 {
+pub fn run_guardian_for_test(
+    jobhex: &str,
+    profile: &str,
+    constraints: &str,
+    command: &str,
+    fault: &str,
+) -> i32 {
     let Some(fault) = escapee::Fault::parse(fault) else {
         return 1;
     };
-    match guardian(jobhex, profile, command, Faults(fault)) {
+    match guardian(jobhex, profile, constraints, command, Faults(fault)) {
         Ok(()) => 0,
         Err(_) => 1,
     }
@@ -602,7 +613,7 @@ const IMPLICIT_FILES: [&str; 6] = [
 /// keeps its bound of 8. Seatbelt's regex dialect does not honour `{m,n}`
 /// (such a filter never matches; macOS 27 probe, 2026-10-23), so the rule
 /// uses `+` only.
-fn implicit_deny_rules(project: &str) -> Result<String, ExecCmdError> {
+pub(super) fn implicit_deny_rules(project: &str) -> Result<String, ExecCmdError> {
     let escape = |s: &str| crate::git_observer::regex_escaped(s).map_err(|_| ExecCmdError::Denied);
     let project = project.trim_end_matches('/');
     let mut filters = format!(
@@ -621,30 +632,27 @@ fn implicit_deny_rules(project: &str) -> Result<String, ExecCmdError> {
     filters.push_str(&format!(" (regex {})", quote(&regex)?));
     Ok(format!("(deny file-write*{filters})"))
 }
+/// The `model-1` profile for the template set, for the profile tests.
+#[cfg(test)]
 fn seatbelt(project: &str, scratch: &str, asura: &str) -> Result<String, ExecCmdError> {
-    let roots = [
-        "/bin",
-        "/usr/bin",
-        "/sbin",
-        "/usr/sbin",
-        "/usr/lib",
-        "/usr/share",
-        "/System",
+    super::constraints::render_model1(
+        &super::constraints::template_for_test(),
         project,
         scratch,
-    ];
-    let mut filters = String::new();
-    for root in roots {
-        filters.push_str(&format!(" (subpath {})", quote(root)?));
+        asura,
+    )
+}
+/// The constraint set of the profile: required for `model-1`, `-` for the
+/// person profiles until PL6 compiles them.
+fn constraint_token(
+    profile: Profile,
+    token: &str,
+) -> Result<Option<(Constraints, [u8; 32])>, ExecCmdError> {
+    match profile {
+        Profile::Model1 => Constraints::parse_token(token).map(Some),
+        Profile::Person1 | Profile::PersonOutside1 if token == "-" => Ok(None),
+        Profile::Person1 | Profile::PersonOutside1 => Err(ExecCmdError::Invalid),
     }
-    let metadata = ancestor_literals(&roots)?;
-    let state = state_rules(asura, scratch)?;
-    let deny = implicit_deny_rules(project)?;
-    Ok(format!(
-        "(version 1)(deny default)(allow file-read* file-test-existence (literal \"/\"))(allow file-read* (literal \"/private/var/select/sh\"))(allow file-read-metadata (literal \"/private\") (literal \"/private/var\") (literal \"/private/var/select\"))(allow process-fork)(allow process-exec file-map-executable file-read*{filters})(allow file-read-metadata{metadata})(allow file-write* (subpath {}) (subpath {}))(allow sysctl-read)(allow file-read* file-write* (literal \"/dev/null\"))(allow file-read* (literal \"/dev/random\") (literal \"/dev/urandom\")){state}{deny}",
-        quote(project)?,
-        quote(scratch)?
-    ))
 }
 fn notice(fd: i32, n: Notice, id: [u8; 16]) -> Result<(), ExecCmdError> {
     let bytes = n.encode(id);
@@ -659,11 +667,13 @@ fn notice(fd: i32, n: Notice, id: [u8; 16]) -> Result<(), ExecCmdError> {
 fn guardian(
     jobhex: &str,
     profile: &str,
+    constraints: &str,
     command: &str,
     faults: Faults,
 ) -> Result<(), ExecCmdError> {
     let id = parse_id(jobhex)?;
     let profile = Profile::parse(profile).ok_or(ExecCmdError::Invalid)?;
+    let constraints = constraint_token(profile, constraints)?;
     if command.is_empty() || command.len() > MAX_COMMAND_BYTES || command.contains('\0') {
         return Err(ExecCmdError::Invalid);
     }
@@ -702,7 +712,17 @@ fn guardian(
             None => Vec::new(),
         };
         let sandbox = match profile {
-            Profile::Model1 => Some(seatbelt(&project, &scratch, &asura)?),
+            Profile::Model1 => {
+                // PL1 enforcement evidence: the rendered profile must be the
+                // one the service computed from the decision's constraint
+                // set, or the command never starts.
+                let (set, expected) = constraints.ok_or(ExecCmdError::Invalid)?;
+                let text = render_model1(&set, &project, &scratch, &asura)?;
+                if profile_digest(&text) != expected {
+                    return Err(ExecCmdError::EnforcementMismatch);
+                }
+                Some(text)
+            }
             Profile::Person1 => Some(person::seatbelt(&person::PersonPaths::from_roots(
                 &roots, &project, &scratch, &asura,
             )?)?),
@@ -772,6 +792,7 @@ fn guardian(
                     reason: match error {
                         ExecCmdError::Denied => 7,
                         ExecCmdError::Unavailable => 6,
+                        ExecCmdError::EnforcementMismatch => REASON_ENFORCEMENT_MISMATCH,
                         _ => 5,
                     },
                     exit_kind: 0,

@@ -515,6 +515,9 @@ fn identity() -> Result<()> {
 fn cancel_before_intent() -> Result<()> {
     let (fixture, model, project, directory) = setup("j21", &[])?;
     let hold = fixture.home.join("journal-hold-appends");
+    // PL1: the call's kind 35 and kind 34 commit before its kind 14; the
+    // hold applies from the kind 14 append on.
+    std::fs::write(fixture.home.join("journal-hold-appends-pass"), b"2")?;
     model.script(&[
         Step::Create(
             hold.clone(),
@@ -816,11 +819,14 @@ type Case = (&'static str, fn() -> Result<()>);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if let [_, flag, job, profile, command] = args.as_slice()
+    if let [_, flag, job, profile, constraints, command] = args.as_slice()
         && flag == "--asura-exec-cmd-guardian"
     {
         std::process::exit(asura_platform::exec_cmd::run_guardian(
-            job, profile, command,
+            job,
+            profile,
+            constraints,
+            command,
         ));
     }
     if args.get(1).map(String::as_str) == Some(CHILD) {

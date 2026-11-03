@@ -414,6 +414,7 @@ pub(crate) fn run(
                 worker.secret_store(),
             );
             app.set_llamacpp(worker.llamacpp());
+            app.set_policy(worker.policy());
             output.borrow_mut().pump()?;
             if dirty && !output.borrow().pending() {
                 screen.draw(|frame| app.draw(frame))?;

@@ -10,6 +10,7 @@ mod named_secrets;
 mod notice;
 mod path_guard;
 mod person_command;
+mod policy_call;
 mod response;
 use crate::model_owner::{ModelOwner, PackageIdentity};
 use crate::{job_control, job_text, sensors, tools};
@@ -422,6 +423,7 @@ fn with_control<R>(
 /// call; `Busy` records `busy` with its reason (J3-E3). The SL3 rewrite and
 /// secrets move into the `StartRequest`; the record keeps the stored
 /// command, its only copy (G8).
+#[allow(clippy::too_many_arguments)]
 fn submit_exec(
     tool: &mut LiveTool,
     turn: &journal::TurnAccepted,
@@ -429,6 +431,7 @@ fn submit_exec(
     execution: bool,
     registration: Option<journal::ProjectRegistered>,
     boundary: asura_platform::StateBoundary,
+    constraints: Option<asura_platform::exec_cmd::Constraints>,
     now: Instant,
 ) {
     use crate::job_controller::{Admission, AgentKey, BusyReason, Origin, StartRequest};
@@ -451,6 +454,11 @@ fn submit_exec(
         registration,
         asura_platform::secrets::compiled().and_then(Result::ok),
     ) else {
+        return refuse(tool, D::Denied, None);
+    };
+    // A `run` policy decision carries the constraint set (PL1); without it
+    // nothing reaches the controller.
+    let Some(constraints) = constraints else {
         return refuse(tool, D::Denied, None);
     };
     let Some(mut exec) = tool.exec.take() else {
@@ -486,6 +494,7 @@ fn submit_exec(
         duplicate_digest: tool.digest,
         stored_command: stored_command.clone(),
         person: None,
+        constraints: Some(constraints),
     };
     match controller.submit(request, now) {
         Admission::Accepted { job } | Admission::Existing { job } => {
@@ -534,6 +543,8 @@ struct LiveTool {
     exec: Option<exec_cmd_call::ExecStart>,
     /// A job-mode call (codes 10-16) from its kind 14 to its kind 29.
     job: Option<job_tool::JobCall>,
+    /// A `run` exec_cmd call's policy decision (PL1).
+    policy: policy_call::Stage,
 }
 impl LiveTool {
     /// TCR-D8: a call not yet appended when cancel or turn end occurs is
@@ -817,6 +828,10 @@ enum Job {
     Cancel,
     Finish,
     ToolIntent,
+    /// Kind 35 of the running build's policy revision (PL1).
+    PolicyRevision,
+    /// Kind 34 of the active exec_cmd call (PL1).
+    PolicyDecision,
     ToolResult,
     /// One kind 24 response segment (response-text-transfer.md).
     ResponseText,
@@ -924,6 +939,11 @@ pub(crate) struct Owner {
     /// The execution path guard: dispatch checks, `/paths` requests and
     /// the worker (P5).
     paths: path_guard::Paths,
+    /// The policy owner (PL1), started with the reactor's wake.
+    policy: Option<crate::policy::PolicyOwner>,
+    /// Test-support: the denying installation set (PL-I3, PL-E2). Read
+    /// once at owner start from `HOME/policy-test-deny` in a scratch home.
+    policy_test_deny: bool,
     /// The reply to the last harness record or command.
     #[cfg(feature = "test-support")]
     fixture: Option<writer::Result<writer::Reply>>,
@@ -940,6 +960,12 @@ impl Owner {
         let notice_fault = runtime
             .scratch_home_for_test()
             .is_some_and(|home| home.join("job-notice-invalid").exists());
+        #[cfg(feature = "test-support")]
+        let policy_test_deny = runtime
+            .scratch_home_for_test()
+            .is_some_and(|home| home.join("policy-test-deny").exists());
+        #[cfg(not(feature = "test-support"))]
+        let policy_test_deny = false;
         #[cfg(feature = "test-support")]
         let hold_append = runtime
             .scratch_home_for_test()
@@ -988,6 +1014,8 @@ impl Owner {
             rules: Default::default(),
             persons: Default::default(),
             paths: Default::default(),
+            policy: None,
+            policy_test_deny,
             #[cfg(feature = "test-support")]
             fixture: None,
             #[cfg(feature = "test-support")]
@@ -1561,6 +1589,32 @@ impl Owner {
             writer.set_wake(wake.clone());
         }
         self.wake = Some(wake);
+        self.start_policy();
+    }
+    /// Start the policy owner's workers once, with the reactor's wake.
+    fn start_policy(&mut self) {
+        if self.policy.is_none() && !self.closing {
+            self.policy = Some(crate::policy::PolicyOwner::start(
+                self.runtime
+                    .asura_home_path()
+                    .to_string_lossy()
+                    .into_owned(),
+                self.wake.clone(),
+                self.policy_test_deny,
+            ));
+        }
+    }
+    /// The `/status` policy facts, with the journaled revision sequence
+    /// of the running build's revision (0 before its kind 35).
+    pub(crate) fn policy_status(&self) -> Option<pb::PolicyStatus> {
+        let policy = self.policy.as_ref()?;
+        let revision = self
+            .replay
+            .as_ref()
+            .and_then(|r| r.policy.active())
+            .filter(|(_, digest)| *digest == policy.digest())
+            .map_or(0, |(seq, _)| seq);
+        Some(policy.status(revision))
     }
     pub(crate) fn interests(&self) -> Vec<asura_platform::PollInterest> {
         let mut interests = self
@@ -2791,7 +2845,11 @@ impl Owner {
                     | Job::QueueList(request) => self.out.push_back(error(request, message)),
                     // The journal holds normal records at its quota or disk
                     // floor: the turn pauses, nothing is lost (OD-SJ-2).
-                    Job::ResponseText | Job::ThinkingText | Job::ToolIntent
+                    Job::ResponseText
+                    | Job::ThinkingText
+                    | Job::ToolIntent
+                    | Job::PolicyRevision
+                    | Job::PolicyDecision
                         if matches!(
                             cause,
                             writer::Error::JournalQuota | writer::Error::JournalDiskSpace
@@ -3211,6 +3269,14 @@ impl Owner {
                     ));
                 }
             }
+            // Kind 35: the replay now holds the active revision; the call's
+            // next step appends its kind 34.
+            Job::PolicyRevision => {}
+            Job::PolicyDecision => {
+                if let Some(tool) = self.active.as_mut().and_then(|a| a.tool.as_mut()) {
+                    policy_call::recorded(&mut tool.policy);
+                }
+            }
             Job::ToolIntent => {
                 let active = self.active.as_mut().expect("active tool intent");
                 let tool = active.tool.as_mut().expect("pending tool");
@@ -3228,6 +3294,7 @@ impl Owner {
                     record.fault,
                     record.reason,
                     record.refusal,
+                    record.policy.as_ref(),
                 ) {
                     let tool = active.tool.take().expect("pending tool");
                     let index = tool.ordinal as usize - 1;
@@ -3703,6 +3770,7 @@ impl Owner {
             command_cut: false,
             whole_command: false,
             refusal: None,
+            policy: None,
         };
         let mut tool = LiveTool {
             ordinal,
@@ -3716,6 +3784,7 @@ impl Owner {
             result: None,
             exec: None,
             job: None,
+            policy: policy_call::Stage::Idle,
         };
         let cancelled = active.cancel.is_some() || active.terminal.is_some();
         // Fail closed: without a ready rule set nothing is retained
@@ -4111,6 +4180,9 @@ impl Owner {
         }
     }
     pub(crate) fn poll(&mut self, now: Instant) -> Vec<pb::Envelope> {
+        if let Some(policy) = &mut self.policy {
+            policy.poll();
+        }
         self.forward_journal_quota();
         self.log_journal_status();
         if let Some(result) = self.pending.as_mut().and_then(|(ticket, _)| ticket.poll()) {
@@ -4663,6 +4735,7 @@ impl Owner {
                 if (active.cancel.is_some() || active.terminal.is_some())
                     && tool.record.decision != journal::ToolDecision::Cancelled
                 {
+                    policy_call::cancel(&mut tool.policy, self.policy.as_mut());
                     tool.cancel_before_commit();
                 } else if tool.exec.is_some() {
                     // J3 call flow steps 2 and 3, in the reactor step that
@@ -4683,15 +4756,110 @@ impl Owner {
                             .get(&active.turn.project)
                             .map(|p| p.registration.clone())
                     });
-                    submit_exec(
-                        tool,
-                        &active.turn,
-                        controller,
-                        execution,
-                        registration,
-                        self.runtime.state_boundary(),
-                        now,
-                    );
+                    // PL1: the policy decision, after the EX11 setting and
+                    // before job admission. Kind 35 and kind 34 commit
+                    // before this call's kind 14.
+                    let mut constraints = None;
+                    if execution
+                        && let Some(location) = registration.as_ref().map(|r| r.location.clone())
+                    {
+                        let policy = self.policy.get_or_insert_with(|| {
+                            crate::policy::PolicyOwner::start(
+                                self.runtime
+                                    .asura_home_path()
+                                    .to_string_lossy()
+                                    .into_owned(),
+                                self.wake.clone(),
+                                self.policy_test_deny,
+                            )
+                        });
+                        let turn = &active.turn;
+                        let ordinal = tool.ordinal;
+                        let command = journal::exec_cmd_command(&tool.record).unwrap_or_default();
+                        let request = || crate::policy::JobRequest {
+                            agent: crate::job_controller::AgentKey {
+                                conversation: turn.conversation,
+                                agent: 0,
+                            },
+                            job: journal::job_id(&journal::JobOrigin::Model {
+                                operation: turn.operation,
+                                generation: turn.generation,
+                                ordinal,
+                            }),
+                            project: turn.project,
+                            location,
+                            command_digest: policy_call::command_digest(&command),
+                            now_ms: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
+                        };
+                        let (revision, last_seq) = self
+                            .replay
+                            .as_ref()
+                            .map_or((None, 0), |r| (r.policy.active(), r.policy.last_seq));
+                        match policy_call::step(
+                            &mut tool.policy,
+                            policy,
+                            request,
+                            revision,
+                            last_seq,
+                            (turn.operation, turn.generation, ordinal),
+                        ) {
+                            policy_call::Next::Wait => return,
+                            policy_call::Next::Append(record, decision) => {
+                                let job = if decision {
+                                    Job::PolicyDecision
+                                } else {
+                                    Job::PolicyRevision
+                                };
+                                if let Err(e) = self.append(record, job, None) {
+                                    self.unavailable = Some(storage_error(e));
+                                }
+                                return;
+                            }
+                            policy_call::Next::Busy => {
+                                use journal::{ToolDecision as D, ToolDecisionReason as R};
+                                tool.record.decision = D::Busy;
+                                tool.record.reason = Some(R::PolicyBusy);
+                                tool.record.refusal = None;
+                                tool.record.command_cut = false;
+                                tool.record.whole_command = false;
+                                tool.exec = None;
+                                tool.call = None;
+                            }
+                            policy_call::Next::Ready(decision) => {
+                                if decision.run {
+                                    constraints = decision.constraints;
+                                } else {
+                                    use journal::{ToolDecision as D, ToolDecisionReason as R};
+                                    tool.record.decision = D::Denied;
+                                    tool.record.reason = Some(if decision.unavailable {
+                                        R::PolicyUnavailable
+                                    } else {
+                                        R::PolicyDenied
+                                    });
+                                    tool.record.policy = policy_call::refusal(&decision);
+                                    tool.record.refusal = None;
+                                    tool.record.command_cut = false;
+                                    tool.record.whole_command = false;
+                                    tool.exec = None;
+                                    tool.call = None;
+                                }
+                            }
+                        }
+                    }
+                    if tool.exec.is_some() {
+                        submit_exec(
+                            tool,
+                            &active.turn,
+                            controller,
+                            execution,
+                            registration,
+                            self.runtime.state_boundary(),
+                            constraints,
+                            now,
+                        );
+                    }
                 }
                 let record = journal::Record::ToolCall(Box::new(tool.record.clone()));
                 if let Err(e) = self.append(record, Job::ToolIntent, None) {
@@ -4988,8 +5156,13 @@ impl Owner {
             .enumerate()
             .skip(first)
             .map(|(index, tool)| {
-                let rendered =
-                    tools::not_run_result(tool.decision, tool.fault, tool.reason, tool.refusal);
+                let rendered = tools::not_run_result(
+                    tool.decision,
+                    tool.fault,
+                    tool.reason,
+                    tool.refusal,
+                    tool.policy.as_ref(),
+                );
                 let job = self.progress_job(operation, index as u32 + 1, tool);
                 pb::ToolProgress {
                     ordinal: Some(index as u32 + 1),
@@ -5183,6 +5356,9 @@ impl Owner {
     }
     pub(crate) fn shutdown(&mut self) {
         self.closing = true;
+        if let Some(policy) = &mut self.policy {
+            policy.shutdown();
+        }
         self.close_path_guard();
         self.payloads.shutdown(Instant::now());
         self.jobs.close(Instant::now());
@@ -5218,6 +5394,10 @@ impl Owner {
             && self.payloads.settled(Instant::now())
             && self.jobs.settled(Instant::now())
             && self.writer.as_mut().is_none_or(|writer| writer.settled())
+            && self
+                .policy
+                .as_mut()
+                .is_none_or(crate::policy::PolicyOwner::settled)
     }
     /// The project's effective execution setting (EX11); on until the
     /// start-time read.

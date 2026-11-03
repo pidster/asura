@@ -3,6 +3,7 @@
 mod codec;
 mod execution_path;
 mod job_command;
+mod policy;
 mod state;
 mod types;
 
@@ -13,5 +14,6 @@ pub use codec::{
 };
 pub use execution_path::*;
 pub use job_command::{MAX_JOB_COMMAND_EXCERPT_BYTES, command_excerpt, exec_cmd_command};
+pub use policy::*;
 pub use state::*;
 pub use types::*;

@@ -5,7 +5,9 @@ Status: **ready for implementation, 2026-11-03**, for delivery packet
 [packet table](#delivery-packets) says so; the others wait for the named
 designs, probes or [evidence](#evidence-still-missing). The owner answered
 the [owner questions](#open-owner-questions) on 2026-11-03.
-Nothing in this design is implemented. Protocol numbering stays `0.1` and the
+Packet PL1 is implemented (2026-11-03) with two budgets failing, PL-B1 and
+PL-B2, reported to the owner ([PL1 delivery record](#pl1-delivery-record)).
+Later packets are not implemented. Protocol numbering stays `0.1` and the
 journal format stays `1` until release 1.0.0; schemas change in place.
 
 This is the D3 policy design that the [security policy brief](security-policy-brief.md)
@@ -222,7 +224,7 @@ never runs on the reactor.
 | --- | --- |
 | Workers | `clamp(available_parallelism() / 2, 2, 8)`: 8 on the 16-core reference Mac |
 | Engine copies | Each worker holds its own deep copy of each active scope set, the schema and the standing entities. No `PolicySet` or `Entities` is shared across workers (spike finding: sharing cost about 2.5 times the single-thread time) |
-| Action split | Each scope set is partitioned by action group: `file`, `process`, `network`, `secret`, `mach`, `egress`. A request evaluates only its group's sets (spike: exact, and halves the work) |
+| Action split | Each scope set is partitioned by action group: `file`, `process`, `network`, `secret`, `mach`, `egress`. A request evaluates only its group's sets (spike: exact, and halves the work). PL1 refines this to one set per action: each policy enters the set of every action its action scope names, with `file.any` and `process.exec.any` expanded; this is exact for the same reason. A lower-scope set that holds only the baseline permit allows without calling Cedar |
 | In flight | At most 2 requests per worker; the dispatcher holds the rest |
 | Installation of a revision | The owner sends the compiled revision to each worker; each worker builds its own copy and replies `installed(seq)`. A worker keeps the previous revision until its in-flight requests under it finish |
 
@@ -2251,8 +2253,13 @@ unavailable`.
 ### Test-only sets
 
 The `test-support` feature of `asura-policy` adds a denying installation
-set: the built-in text plus one forbid of model `process.exec` with reason
-`test_denied`. With the service's `test-support` feature, the owner uses it
+set: the built-in text plus one tighten-only forbid (`@intent`) of model
+`process.exec` with reason `test_denied`, conditioned on `context has
+intent`. A plain forbid would also deny the region compile's exec requests,
+which carry no intent, so every job would be `cannot_enforce` instead of
+`test_denied`; the intent condition keeps the denial on the entry request.
+Because the forbid is tighten-only and no scope permits `process.exec.ask`,
+the outcome is `deny`, not `ask`. With the service's `test-support` feature, the owner uses it
 when the file `policy-test-deny` exists in the scratch home of a scratch
 runtime at owner start, as the other test-support seams are read. Production
 builds have neither the text nor the check. PL-I3 and PL-E2 use it.
@@ -2274,6 +2281,30 @@ builds have neither the text nor the check. PL-I3 and PL-E2 use it.
 | PL-E1 | PTY journey: a scripted model's `exec_cmd` runs as before; `/status` shows the policy line; the journal holds kinds 35 and 34 |
 | PL-E2 | PTY journey with the test-only denying set: the model receives the policy denial text, and the TUI shows it |
 | PL-B1 to PL-B5 | `policy-bench` in `asura-policy` (PL-B1, PL-B4, the PL-B5 fuzz and determinism parts), a service-level bench (PL-B2), stripped release sizes (PL-B3). PL-B5 proof budgets (PES-M15 to M18) need the solver and move to PL3 |
+
+### PL1 delivery record
+
+Verified, 2026-11-03, on the reference Mac (Apple M4 Max, 16 cores,
+macOS 27), a shared machine whose load average is given with each figure.
+The checks, their results and the proof limits are in the packet report;
+the budget figures are recorded here because the budgets are this design's.
+
+| Budget | Measurement | Result |
+| --- | --- | --- |
+| PL-B1 decision p50 at most 100 µs | `policy-bench` (release): scale workload of 204 static policies and 54 grants over four scopes, 40 projects, 1,000 requests, 10,000 decisions, load 2.6 to 3.4 | **Fail**: p50 130.7 µs, p99 160.6 µs. Entity and context construction with schema checks takes p50 53.9 µs of it. The built-in sets alone (PL1 production) decide the exec entry at p50 88.9 µs, p99 112.5 µs. A region compile on a cache miss takes p50 2.6 ms |
+| PL-B2 end-to-end p99 at most 1 ms at 64 concurrent requesters | Service-level bench: `decide_job` on a reactor-like loop to the reply taken after the worker's wake, 8 workers, 64 closed-loop requesters, 20,000 decisions after 2,000 warm-up, built-in sets, three runs at load 3.4 to 11.6 | **Fail**: p99 1.044 to 1.126 ms (p50 966 to 993 µs). With 64 requests outstanding on 8 workers, queueing dominates: each decision waits for about 7 others on its worker |
+| PL-B3 at most 8 MiB added to `asura` (AD-31) | Stripped release `asura` (`cargo build --release -p asura-cli`, `strip`) at PL1 against the same build at `35cc82b` | **Pass**: +6,138,056 bytes (5.85 MiB), 58,018,520 to 64,156,576 bytes |
+| PL-B4 startup at most 200 ms | `policy-bench`: 8 workers, each building the schema and every scope, then the first decision, median of 10 | **Pass**: 37.2 ms (36.7 to 39.2) |
+| PL-B5 safety | `policy-bench` and the unit suites | PES-M4 **pass** (0 allows in 1,000,000 malformed requests); M5 **pass** (identical decisions on fresh engines; PL-U8 across 8 threads); M3 (injected errors deny) and M6 (12 seeded defects, warnings refuse) **pass** as PL-U3 and PL-U4; M7 reasons pass as PL-U5 and PL-U6. M15 to M18 need the solver: PL3 |
+
+Evidence item SP-P2 is answered: with per-request entity slices and the
+schema-checked wrapper (W2), PL-B1 does not hold on the product scale
+workload. Under the [budget rule](#performance-budgets) these failures go to
+the owner; the mechanism is not changed silently. Options the owner may
+choose between, none applied: re-measure on an idle machine; build entities
+without the per-request schema check (saves about 30 µs, changes rule W2);
+cache each principal's entities per worker; for PL-B2, more workers than
+`clamp(n / 2, 2, 8)` or a lower concurrency in the budget's definition.
 
 ## Delivery packets
 
@@ -2371,7 +2402,7 @@ Probes to run in the named packet, before the code that depends on them.
 | SV-P5 | Is the host-paths scan clean for the solver files? | PL4b |
 | SV-P6 | Is there a usable memory bound for a child process on macOS 27? | PL3 |
 | SP-P1 | Which spelling does a path walk give across firmlinks, `/private` aliases and case-insensitive volumes? | PL2 |
-| SP-P2 | Per-request entity slices: does PL-B1 hold on the product schema? | PL1 |
+| SP-P2 | Per-request entity slices: does PL-B1 hold on the product schema? Answered by PL1: no ([delivery record](#pl1-delivery-record)) | PL1 |
 | ER-1 to ER-3, ES-1 to ES-5, NE-1, NE-2, VM-1 | [Live enforcement research](#live-enforcement-later-proposed) | Later designs |
 
 ## Design verification

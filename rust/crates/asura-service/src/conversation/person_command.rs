@@ -2018,6 +2018,8 @@ impl Owner {
             duplicate_digest: record.digest,
             stored_command: record.command_text().to_owned(),
             person: Some(launch),
+            // Person profiles have no compiled constraint set until PL6.
+            constraints: None,
         };
         let Some(controller) = self.jobs.controller() else {
             return Dispatch::Ready(record);

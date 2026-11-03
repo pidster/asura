@@ -35,6 +35,7 @@ fn call(generation: u64, arguments: &str) -> ToolCall {
         command_cut: false,
         whole_command: false,
         refusal: None,
+        policy: None,
     }
 }
 fn arguments(command: &str, cwd: Option<&str>) -> String {

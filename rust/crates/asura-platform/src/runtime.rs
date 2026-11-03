@@ -287,6 +287,17 @@ impl RuntimeDirectory {
             .join("data/models")
     }
 
+    /// The Asura home that holds this runtime directory, as a path
+    /// projection only: no IO or availability check. The policy owner names
+    /// job scratch paths beneath it (security-policy.md, PL1 paths).
+    pub fn asura_home_path(&self) -> PathBuf {
+        self.0
+            .path
+            .parent()
+            .expect("runtime path has managed parent")
+            .to_path_buf()
+    }
+
     pub(crate) fn model_root(&self) -> Result<(OwnedFd, PathBuf, libc::uid_t)> {
         self.validate()?;
         let directory = self.0.directories.last().ok_or(Error::UnsafeRuntime)?;

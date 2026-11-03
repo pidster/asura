@@ -1061,10 +1061,15 @@ fn main() {
         survivor(Path::new(dir), mode);
         return;
     }
-    if let [_, flag, id, profile, command] = args.as_slice()
+    if let [_, flag, id, profile, constraints, command] = args.as_slice()
         && flag == "--asura-exec-cmd-guardian"
     {
-        std::process::exit(asura_platform::exec_cmd::run_guardian(id, profile, command));
+        std::process::exit(asura_platform::exec_cmd::run_guardian(
+            id,
+            profile,
+            constraints,
+            command,
+        ));
     }
     let selected: Vec<&str> = args[1..]
         .iter()

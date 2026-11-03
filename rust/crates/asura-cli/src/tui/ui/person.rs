@@ -735,6 +735,51 @@ pub(super) fn secret_store_lines(status: Option<&pb::SecretStoreStatus>) -> Vec<
     lines
 }
 
+/// The `/status` policy line (security-policy.md, `/status` in PL1). It
+/// reads the last observation only; nothing is shown before one arrives.
+pub(super) fn policy_line(status: Option<&pb::PolicyStatus>) -> Option<String> {
+    let status = status?;
+    let scope = |state: Option<u32>| {
+        if state == Some(1) {
+            "ok"
+        } else {
+            "unavailable"
+        }
+    };
+    Some(match status.state {
+        Some(1) => "policy: starting".into(),
+        Some(2) => {
+            let revision = match status.revision {
+                Some(n) if n > 0 => n.to_string(),
+                _ => "pending".into(),
+            };
+            let changed = match status.repository_changed.unwrap_or(0) {
+                0 => String::new(),
+                n => format!(" ({n} changed, not admitted)"),
+            };
+            let solver = match status.solver {
+                Some(2) => "available",
+                Some(3) => "unavailable",
+                _ => "none",
+            };
+            let approvals = status.approvals_waiting.unwrap_or(0);
+            format!(
+                "policy: revision {revision} · installation {} · user {} · workspace {} · repository {}{changed} · solver: {solver} · {approvals} approval{} waiting",
+                scope(status.installation),
+                scope(status.user),
+                status.workspace_sets.unwrap_or(0),
+                status.repository_sets.unwrap_or(0),
+                if approvals == 1 { "" } else { "s" },
+            )
+        }
+        _ => format!(
+            "policy: unavailable · installation {} · user {}",
+            scope(status.installation),
+            scope(status.user)
+        ),
+    })
+}
+
 /// `/status` lines for llama.cpp (llamacpp-backend.md, status). They read
 /// the last observation only; nothing is shown while the mode is off.
 pub(super) fn llamacpp_lines(status: Option<&pb::LlamaCppStatus>) -> Vec<String> {
@@ -1175,6 +1220,12 @@ impl App {
             self.person.secret_store = secret_store;
         }
     }
+    /// The last observed policy facts; contention keeps the previous.
+    pub(in super::super) fn set_policy(&mut self, status: Option<pb::PolicyStatus>) {
+        if status.is_some() {
+            self.person.policy = status;
+        }
+    }
     /// The last observed llama.cpp facts; contention keeps the previous.
     pub(in super::super) fn set_llamacpp(&mut self, status: Option<pb::LlamaCppStatus>) {
         if status.is_some() {
@@ -1201,6 +1252,7 @@ impl App {
         lines.push(String::new());
         lines.extend(secret_store_lines(self.person.secret_store.as_ref()));
         lines.extend(llamacpp_lines(self.person.llamacpp.as_ref()));
+        lines.extend(policy_line(self.person.policy.as_ref()));
         lines.join("\n")
     }
 
@@ -2015,6 +2067,8 @@ pub(super) struct Person {
     pub secret_store: Option<pb::SecretStoreStatus>,
     /// `ServiceObservation.llamacpp` (llamacpp-backend.md, status).
     pub llamacpp: Option<pb::LlamaCppStatus>,
+    /// `ServiceObservation.policy` (security-policy.md, `/status` in PL1).
+    pub policy: Option<pb::PolicyStatus>,
     pub launch: Launch,
     /// Whether the service lists capability 8 (OD3), for the current epoch.
     pub supported: Option<bool>,
@@ -3217,6 +3271,52 @@ mod tests {
             let refusal = R::try_from(code).unwrap();
             assert!(!refusal_text(refusal, Some(1)).is_empty());
         }
+    }
+    #[test]
+    fn status_shows_the_policy_line() {
+        let active = pb::PolicyStatus {
+            state: Some(2),
+            revision: Some(1),
+            installation: Some(1),
+            user: Some(1),
+            workspace_sets: Some(0),
+            repository_sets: Some(0),
+            repository_changed: Some(0),
+            solver: Some(1),
+            approvals_waiting: Some(0),
+        };
+        assert_eq!(
+            policy_line(Some(&active)).unwrap(),
+            "policy: revision 1 · installation ok · user ok · workspace 0 · repository 0 · solver: none · 0 approvals waiting"
+        );
+        let changed = pb::PolicyStatus {
+            revision: Some(12),
+            workspace_sets: Some(2),
+            repository_sets: Some(1),
+            repository_changed: Some(1),
+            approvals_waiting: Some(1),
+            ..active
+        };
+        assert_eq!(
+            policy_line(Some(&changed)).unwrap(),
+            "policy: revision 12 · installation ok · user ok · workspace 2 · repository 1 (1 changed, not admitted) · solver: none · 1 approval waiting"
+        );
+        let starting = pb::PolicyStatus {
+            state: Some(1),
+            ..active
+        };
+        assert_eq!(policy_line(Some(&starting)).unwrap(), "policy: starting");
+        let down = pb::PolicyStatus {
+            state: Some(3),
+            installation: Some(2),
+            user: Some(2),
+            ..active
+        };
+        assert_eq!(
+            policy_line(Some(&down)).unwrap(),
+            "policy: unavailable · installation unavailable · user unavailable"
+        );
+        assert_eq!(policy_line(None), None);
     }
     #[test]
     fn status_lists_secret_store_notices() {

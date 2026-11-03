@@ -9,6 +9,7 @@ fn request() -> ExecCmdRequest {
         cwd: None,
         secrets: Vec::new(),
         secret_command: None,
+        constraints: Some(crate::exec_cmd::template_for_test()),
     }
 }
 #[test]
@@ -305,9 +306,20 @@ fn spawn_rejects_replaced_project_and_retains_scratch() {
 }
 #[test]
 fn guardian_normal_invocation_without_private_descriptors_fails_closed() {
-    assert_eq!(run_guardian("not-a-job", "model-1", "printf no"), 1);
+    let token = crate::exec_cmd::template_for_test().token(&[0; 32]);
+    assert_eq!(run_guardian("not-a-job", "model-1", &token, "printf no"), 1);
     let job = "0123456789abcdef0123456789abcdef";
-    assert_eq!(run_guardian(job, "model-2", "printf no"), 1);
+    assert_eq!(run_guardian(job, "model-2", &token, "printf no"), 1);
+    // A malformed or misplaced constraint set refuses before any effect,
+    // before the descriptors are read (PL1 constraint set).
+    for (profile, constraints) in [
+        ("model-1", "-"),
+        ("model-1", "m1:1ff:1ff:180"),
+        ("person-1", token.as_str()),
+        ("person-outside-1", ""),
+    ] {
+        assert_eq!(run_guardian(job, profile, constraints, "printf no"), 1);
+    }
 }
 
 #[test]
@@ -2005,6 +2017,7 @@ fn p1_prepare_requires_the_matching_person_setup() {
     let cancel = AtomicBool::new(false);
     let with = |profile| ExecCmdRequest {
         profile,
+        constraints: (profile == Profile::Model1).then(crate::exec_cmd::template_for_test),
         ..request()
     };
     for profile in [Profile::Person1, Profile::PersonOutside1] {

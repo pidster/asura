@@ -1962,6 +1962,180 @@ fn full_window() -> Result<()> {
     Ok(())
 }
 
+/// PL-I1 and PL-I2 (service part): a model exec_cmd call is decided by
+/// the policy owner on a worker. Kind 35 `activated`, kind 34 `run` and
+/// kind 14 `run` commit in that order before the job's kind 26; the
+/// constraint digest is the `model-1` template's; a later turn and a
+/// restart add no second kind 35; replay accepts the journal throughout.
+fn policy_decisions() -> Result<()> {
+    let (mut fixture, model, project, directory) = setup("policy")?;
+    model.script(&[
+        call(
+            "exec_cmd",
+            json!({"command": "printf policy-ok > policy.txt"}),
+        ),
+        Step::Final,
+    ]);
+    let first = submit(&fixture, project, "PL-I1")?;
+    let event = finish(&fixture, first, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    wait_for(Duration::from_secs(10), "the job's file", || {
+        directory.join("policy.txt").exists()
+    })?;
+    assert_eq!(std::fs::read(directory.join("policy.txt"))?, b"policy-ok");
+    let template = asura_platform::exec_cmd::template_for_test().digest();
+    let (bytes, _) = fixture.journal()?;
+    let kinds = frames(&bytes)?;
+    let revisions: Vec<&journal::PolicyRevision> = kinds
+        .iter()
+        .filter_map(|(_, r)| match r {
+            journal::Record::PolicyRevision(r) => Some(&**r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(revisions.len(), 1, "one activation");
+    assert_eq!(revisions[0].seq, 1);
+    assert_eq!(revisions[0].event, journal::PolicyRevisionEvent::Activated);
+    assert_eq!(revisions[0].scopes.len(), 2);
+    let position = |want: &dyn Fn(&journal::Record) -> bool| {
+        kinds
+            .iter()
+            .position(|(_, r)| want(r))
+            .ok_or("record absent")
+    };
+    let p35 = position(&|r| matches!(r, journal::Record::PolicyRevision(_)))?;
+    let p34 = position(&|r| {
+        matches!(r, journal::Record::PolicyDecision(d)
+        if matches!(d.subject, journal::PolicySubject::ModelCall { operation, ordinal: 1, .. } if operation == first))
+    })?;
+    let p14 = position(&|r| matches!(r, journal::Record::ToolCall(c) if c.operation == first))?;
+    let p26 = position(&|r| matches!(r, journal::Record::JobIntent(_)))?;
+    assert!(
+        p35 < p34 && p34 + 1 == p14 && p14 < p26,
+        "{p35} {p34} {p14} {p26}"
+    );
+    let journal::Record::PolicyDecision(decision) = &kinds[p34].1 else {
+        unreachable!()
+    };
+    assert_eq!(decision.outcome, journal::PolicyOutcome::Run);
+    assert_eq!(decision.revision_seq, 1);
+    assert_eq!(decision.revision_digest, revisions[0].digest);
+    assert_eq!(decision.constraint_digest, Some(template));
+    assert_eq!(decision.scopes.len(), 2);
+    assert!(decision.scopes.iter().all(|s| s.allow && s.error == 0));
+    assert!(decision.intent_digest.is_some());
+    println!(
+        "PASS PL-I1 kind 35, kind 34 run and kind 14 run commit in order before kind 26; replay accepts"
+    );
+    println!(
+        "PASS PL-I2 service part: the decision's constraint set is the model-1 template (byte-equal profile)"
+    );
+    // A later turn reuses the active revision.
+    model.script(&[
+        call("exec_cmd", json!({"command": "printf again"})),
+        Step::Final,
+    ]);
+    let second = submit(&fixture, project, "PL-I1 again")?;
+    assert_eq!(
+        finish(&fixture, second, Duration::from_secs(60))?.kind,
+        Some(3)
+    );
+    fixture.stop()?;
+    fixture.start()?;
+    fixture.wait_ready()?;
+    model.script(&[
+        call("exec_cmd", json!({"command": "printf restarted"})),
+        Step::Final,
+    ]);
+    let third = submit(&fixture, project, "PL-I1 restart")?;
+    assert_eq!(
+        finish(&fixture, third, Duration::from_secs(60))?.kind,
+        Some(3)
+    );
+    let (bytes, _) = fixture.journal()?;
+    let kinds = frames(&bytes)?;
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|(_, r)| matches!(r, journal::Record::PolicyRevision(_)))
+            .count(),
+        1,
+        "no second activation for the same revision"
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|(_, r)| matches!(r, journal::Record::PolicyDecision(_)))
+            .count(),
+        3
+    );
+    fixture.stop()?;
+    println!("PASS PL-I1 restart: replay keeps revision 1; three decisions recorded");
+    Ok(())
+}
+
+/// PL-I3: the test-only denying installation set. The call is `denied`
+/// with reason `policy_denied` and the installation scope; kind 34 `deny`
+/// precedes it; no kind 26 and no process; the model receives the fixed
+/// denial text.
+fn policy_denied() -> Result<()> {
+    let model = Model::start()?;
+    let mut fixture = Fixture::new("policy-deny")?;
+    std::fs::write(fixture.home.join("policy-test-deny"), b"")?;
+    fixture.start()?;
+    fixture.wait_ready()?;
+    let (project, directory) = fixture.project("project")?;
+    fixture.model(&model.endpoint)?;
+    model.script(&[
+        call("exec_cmd", json!({"command": "printf ran > denied.txt"})),
+        Step::Final,
+    ]);
+    let operation = submit(&fixture, project, "PL-I3")?;
+    let event = finish(&fixture, operation, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    let recorded = calls(&fixture, operation)?;
+    let record = &recorded[0].call;
+    assert_eq!(record.decision, ToolDecision::Denied);
+    assert_eq!(
+        record.reason,
+        Some(journal::ToolDecisionReason::PolicyDenied)
+    );
+    let refusal = record.policy.as_ref().ok_or("policy refusal fields")?;
+    assert_eq!(refusal.scope, 1);
+    assert_eq!(refusal.reason, "test_denied");
+    assert_eq!(refusal.rule, "installation:test_deny_model_exec");
+    let (bytes, _) = fixture.journal()?;
+    let kinds = frames(&bytes)?;
+    assert!(
+        !kinds
+            .iter()
+            .any(|(_, r)| matches!(r, journal::Record::JobIntent(_))),
+        "no kind 26"
+    );
+    let p34 = kinds
+        .iter()
+        .position(|(_, r)| matches!(r, journal::Record::PolicyDecision(d) if d.outcome == journal::PolicyOutcome::Deny))
+        .ok_or("kind 34 deny")?;
+    assert!(matches!(&kinds[p34 + 1].1, journal::Record::ToolCall(c) if c.operation == operation));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!directory.join("denied.txt").exists(), "no process ran");
+    let delivered = model.tool_messages();
+    // The helper renders a refused call as `Tool failed: <status>` and the
+    // service's text.
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert!(
+        delivered[0].ends_with(
+            "\ndenied: policy: installation: test_denied: the test policy denies model commands; do not retry"
+        ),
+        "{delivered:?}"
+    );
+    fixture.stop()?;
+    println!(
+        "PASS PL-I3 test-only denying set: denied policy_denied, kind 34 deny before kind 14, no kind 26, no spawn, fixed model text"
+    );
+    Ok(())
+}
+
 fn child(home: &Path) -> Result<()> {
     asura_platform::journal_gate::install_file_gate(home);
     tracing_subscriber::fmt()
@@ -1978,11 +2152,14 @@ type Case = (&'static str, fn() -> Result<()>);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if let [_, flag, job, profile, command] = args.as_slice()
+    if let [_, flag, job, profile, constraints, command] = args.as_slice()
         && flag == "--asura-exec-cmd-guardian"
     {
         std::process::exit(asura_platform::exec_cmd::run_guardian(
-            job, profile, command,
+            job,
+            profile,
+            constraints,
+            command,
         ));
     }
     if args.get(1).map(String::as_str) == Some("--tool-call-child") {
@@ -1997,7 +2174,7 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 14] = [
+    let cases: [Case; 16] = [
         ("requests", request_loop),
         ("loop-cancel", request_loop_cancel),
         ("loop-restart", request_loop_restart),
@@ -2012,6 +2189,8 @@ fn main() {
         ("roll", roll_crash),
         ("thinking", thinking),
         ("window", full_window),
+        ("policy", policy_decisions),
+        ("policy-deny", policy_denied),
     ];
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {

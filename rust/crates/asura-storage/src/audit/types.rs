@@ -472,6 +472,9 @@ pub enum JobReason {
     ExecutionOff = 19,
     /// The person `!!` switch was off when the job's slot was granted (PCR23).
     OutsideSandboxOff = 20,
+    /// The guardian's profile digest differed from the decision's; the
+    /// command never started (security-policy.md, PL1).
+    EnforcementMismatch = 21,
 }
 impl JobReason {
     /// Whether kind 27 allows this reason for `requester` (reason table).
@@ -1275,7 +1278,8 @@ impl Event {
             && *escapees == 0
             && *elapsed_ms == 0;
         // Code 19 `execution_off` follows the cancel reasons 1-8; code 20
-        // `outside_sandbox_off` is a slot-grant refusal (job reason codes).
+        // `outside_sandbox_off` is a slot-grant refusal and code 21
+        // `enforcement_mismatch` a setup refusal (job reason codes).
         let process_reason = code <= 10 || *reason == JobReason::ExecutionOff;
         let cancel_reason = (1..=8).contains(&code) || *reason == JobReason::ExecutionOff;
         let outcome_rules = match outcome {
@@ -1283,7 +1287,7 @@ impl Event {
             JobOutcome::Signalled => process_reason && *exit_kind == JobExitKind::Signalled && ran,
             JobOutcome::Cancelled => cancel_reason && *exit_kind != JobExitKind::Unknown && ran,
             JobOutcome::NotStarted => {
-                ((1..=7).contains(&code) || (12..=20).contains(&code))
+                ((1..=7).contains(&code) || (12..=21).contains(&code))
                     && no_process
                     && *capture_state == JobCaptureState::NotStarted
             }

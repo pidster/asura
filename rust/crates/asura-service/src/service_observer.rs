@@ -46,6 +46,8 @@ pub(crate) struct Observer {
     secret_store: Option<pb::SecretStoreStatus>,
     /// `ServiceObservation` field 9, from the last completed sample.
     llamacpp: Option<pb::LlamaCppStatus>,
+    /// `ServiceObservation` field 10 from the policy owner (PL1).
+    policy: Option<pb::PolicyStatus>,
 }
 impl Observer {
     pub fn new(runtime: RuntimeDirectory, wake: WakeSender, status: pb::InspectReply) -> Self {
@@ -66,6 +68,17 @@ impl Observer {
             waiting: Vec::new(),
             secret_store: None,
             llamacpp: None,
+            policy: None,
+        }
+    }
+    /// The policy facts at this reactor step; a change moves the revision.
+    pub fn set_policy(&mut self, value: Option<pb::PolicyStatus>) {
+        if value != self.policy {
+            self.policy = value;
+            self.revision = self
+                .revision
+                .checked_add(1)
+                .expect("service revision exhausted");
         }
     }
     /// The secret store facts at this reactor step. A change moves the
@@ -100,6 +113,7 @@ impl Observer {
         request.body = Some(Body::ServiceObservation(pb::ServiceObservation {
             secret_store: self.secret_store,
             llamacpp: self.llamacpp.clone(),
+            policy: self.policy,
             revision: Some(self.revision),
             pending: Some(pending),
             status: Some(self.status),

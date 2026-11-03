@@ -268,6 +268,20 @@ fn llamacpp_status(v: &pb::LlamaCppStatus) -> bool {
             .as_ref()
             .is_none_or(|e| !e.is_empty() && e.len() <= 2048 && !e.chars().any(char::is_control))
 }
+/// `ServiceObservation.policy` (security-policy.md, `/status` in PL1).
+fn policy_status(v: &pb::PolicyStatus) -> bool {
+    let scope = |s: Option<u32>| s.is_some_and(|s| (1..=2).contains(&s));
+    let sets = |n: Option<u32>| n.is_none_or(|n| n <= 1024);
+    v.state.is_some_and(|s| (1..=3).contains(&s))
+        && v.revision.is_some()
+        && scope(v.installation)
+        && scope(v.user)
+        && sets(v.workspace_sets)
+        && sets(v.repository_sets)
+        && sets(v.repository_changed)
+        && v.solver.is_some_and(|s| (1..=3).contains(&s))
+        && v.approvals_waiting.is_none_or(|n| n <= 512)
+}
 /// Validates domain shape and direction. Attachment state stays with its owner.
 pub fn validate_semantics(
     envelope: &pb::Envelope,
@@ -359,6 +373,7 @@ pub fn validate_semantics(
                 && v.thinking_level.is_none_or(|n| (0..=4).contains(&n))
                 && v.secret_store.as_ref().is_none_or(secret_store_status)
                 && v.llamacpp.as_ref().is_none_or(llamacpp_status)
+                && v.policy.as_ref().is_none_or(policy_status)
                 && v.stored_memory.as_ref().is_some_and(|memory| {
                     let available = v
                         .status
@@ -668,9 +683,69 @@ mod person_command_tests {
                 thinking_level: None,
                 secret_store,
                 llamacpp: None,
+                policy: None,
             }),
             false,
         )
+    }
+    /// ServiceObservation field 10 (security-policy.md, `/status` in PL1).
+    #[test]
+    fn policy_status_is_bounded() {
+        let full = pb::PolicyStatus {
+            state: Some(2),
+            revision: Some(3),
+            installation: Some(1),
+            user: Some(1),
+            workspace_sets: Some(0),
+            repository_sets: Some(0),
+            repository_changed: Some(0),
+            solver: Some(1),
+            approvals_waiting: Some(0),
+        };
+        let mut value = observation(None);
+        let Some(Body::ServiceObservation(observed)) = value.body.as_mut() else {
+            unreachable!()
+        };
+        observed.policy = Some(full);
+        assert!(validate_semantics(&value, Direction::ServerToClient).is_ok());
+        assert!(round_trips(&value));
+        for changed in [
+            pb::PolicyStatus {
+                state: None,
+                ..full
+            },
+            pb::PolicyStatus {
+                state: Some(4),
+                ..full
+            },
+            pb::PolicyStatus {
+                revision: None,
+                ..full
+            },
+            pb::PolicyStatus {
+                installation: Some(3),
+                ..full
+            },
+            pb::PolicyStatus { user: None, ..full },
+            pb::PolicyStatus {
+                workspace_sets: Some(1025),
+                ..full
+            },
+            pb::PolicyStatus {
+                solver: Some(0),
+                ..full
+            },
+            pb::PolicyStatus {
+                approvals_waiting: Some(513),
+                ..full
+            },
+        ] {
+            let Some(Body::ServiceObservation(observed)) = value.body.as_mut() else {
+                unreachable!()
+            };
+            observed.policy = Some(changed);
+            assert!(validate_semantics(&value, Direction::ServerToClient).is_err());
+        }
     }
     /// ServiceObservation field 9 (llamacpp-backend.md, status).
     #[test]

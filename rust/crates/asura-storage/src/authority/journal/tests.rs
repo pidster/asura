@@ -1060,6 +1060,7 @@ fn exec_call(operation: Id, generation: u64, ordinal: u32) -> Record {
         command_cut: false,
         whole_command: false,
         refusal: None,
+        policy: None,
     }))
 }
 fn intent(operation: Id, generation: u64, ordinal: u32) -> Record {
@@ -1319,7 +1320,10 @@ fn j2t_03_w_and_x_entries_and_checkpoint_jobs() {
     // The checkpoint lists the job: kind 26 then kind 27 locators.
     let job = &unsettled(reopened.state())[0];
     let bytes = canonical(reopened.state());
-    let tail = &bytes[bytes.len() - 40 - 52..bytes.len() - 40];
+    // The policy facts follow the jobs: last sequence, no active revision
+    // and no pending kind 34 (13 bytes).
+    let tail = &bytes[bytes.len() - 40 - 13 - 52..bytes.len() - 40 - 13];
+    assert_eq!(&bytes[bytes.len() - 40 - 13..bytes.len() - 40], &[0; 13]);
     assert_eq!(&tail[..4], &1u32.to_be_bytes());
     assert_eq!(&tail[4..28], &job.intent.encode());
     assert_eq!(&tail[28..52], &job.cancel.unwrap().frame.encode());
@@ -2580,6 +2584,308 @@ fn cc_u34_request_started_needs_a_new_resolved_call_and_the_next_ordinal() {
     h.finish(conversation, operation, generation, 0);
     assert_eq!(
         h.append(request(operation, generation, 4)),
+        Err(Failure::Invalid)
+    );
+}
+
+// ----- PL1 kinds 34 and 35 (security-policy.md, replay rules R1 to R7). -----
+
+fn revision35(seq: u64, previous_seq: u64, digest: u8) -> Record {
+    Record::PolicyRevision(Box::new(PolicyRevision {
+        seq,
+        digest: [digest; 32],
+        previous_seq,
+        event: PolicyRevisionEvent::Activated,
+        schema_digest: [9; 32],
+        cedar_lang: "4.5".into(),
+        cedar_sdk: "4.14.1".into(),
+        solver_digest: None,
+        admission_digest: None,
+        scopes: vec![
+            PolicyScopeSet {
+                scope: 1,
+                project: None,
+                text_digest: [10; 32],
+                source: "builtin".into(),
+                policy_ids: vec!["model1_read".into()],
+            },
+            PolicyScopeSet {
+                scope: 2,
+                project: None,
+                text_digest: [11; 32],
+                source: "builtin".into(),
+                policy_ids: vec!["model1_read".into()],
+            },
+        ],
+    }))
+}
+#[allow(clippy::too_many_arguments)]
+fn decision34(
+    operation: Id,
+    generation: u64,
+    ordinal: u32,
+    project: Id,
+    conversation: Id,
+    seq: u64,
+    digest: u8,
+    outcome: PolicyOutcome,
+) -> Record {
+    let run = outcome == PolicyOutcome::Run;
+    Record::PolicyDecision(Box::new(PolicyDecision {
+        subject: PolicySubject::ModelCall {
+            operation,
+            generation,
+            ordinal,
+        },
+        action: 5,
+        origin: 1,
+        profile: 1,
+        project,
+        task_conversation: conversation,
+        task_agent: 0,
+        resource_digest: [12; 32],
+        request_digest: [13; 32],
+        intent_digest: Some([14; 32]),
+        revision_seq: seq,
+        revision_digest: [digest; 32],
+        scopes: vec![
+            PolicyScopeResult {
+                scope: 1,
+                allow: run,
+                error: 0,
+                rules: if run {
+                    vec!["installation:model1_exec".into()]
+                } else {
+                    vec!["installation:test_deny_model_exec".into()]
+                },
+            },
+            PolicyScopeResult {
+                scope: 2,
+                allow: true,
+                error: 0,
+                rules: vec!["user:model1_exec".into()],
+            },
+        ],
+        outcome,
+        primary_scope: if run { 0 } else { 1 },
+        reason: if run { "model1_region" } else { "test_denied" }.into(),
+        constraint_digest: run.then_some([15; 32]),
+        now_ms: 1_762_000_000_000,
+    }))
+}
+/// A kind 14 `denied` `policy_denied` exec_cmd call with its refusal.
+fn policy_denied_call(operation: Id, generation: u64, ordinal: u32) -> Record {
+    let Record::ToolCall(mut call) = exec_call(operation, generation, ordinal) else {
+        unreachable!()
+    };
+    call.decision = ToolDecision::Denied;
+    call.reason = Some(ToolDecisionReason::PolicyDenied);
+    call.policy = Some(PolicyRefusal {
+        scope: 1,
+        reason: "test_denied".into(),
+        rule: "installation:test_deny_model_exec".into(),
+        explain: "the test policy denies model commands".into(),
+    });
+    Record::ToolCall(call)
+}
+
+/// PL-U13 (unit, replay): R1 to R7 through the real append path, a roll
+/// whose checkpoint holds a pending kind 34, and genesis replay.
+#[test]
+fn pl_u13_policy_replay_rules_r1_to_r7() {
+    let mut h = Harness::new();
+    let project = h.register(1);
+    let (conversation, operation, generation) = h.start(project, None);
+    let d = |ordinal, seq, digest, outcome| {
+        decision34(
+            operation,
+            generation,
+            ordinal,
+            project,
+            conversation,
+            seq,
+            digest,
+            outcome,
+        )
+    };
+    // R3: no activated revision yet.
+    assert_eq!(
+        h.append(d(1, 1, 7, PolicyOutcome::Run)),
+        Err(Failure::Invalid)
+    );
+    // R1: the first sequence is 1 with previous 0.
+    assert_eq!(h.append(revision35(2, 0, 7)), Err(Failure::Invalid));
+    assert_eq!(h.append(revision35(1, 1, 7)), Err(Failure::Invalid));
+    // R2: only `activated`.
+    let Record::PolicyRevision(mut superseded) = revision35(1, 0, 7) else {
+        unreachable!()
+    };
+    superseded.event = PolicyRevisionEvent::Superseded;
+    assert_eq!(
+        h.append(Record::PolicyRevision(superseded)),
+        Err(Failure::Invalid)
+    );
+    h.append(revision35(1, 0, 7)).unwrap();
+    assert_eq!(h.state().policy.active(), Some((1, [7; 32])));
+    // R1: the next activation names the active revision as previous.
+    assert_eq!(h.append(revision35(2, 0, 8)), Err(Failure::Invalid));
+    h.append(revision35(2, 1, 8)).unwrap();
+    assert_eq!(h.state().policy.active(), Some((2, [8; 32])));
+    // R3: a superseded revision, or a wrong digest.
+    assert_eq!(
+        h.append(d(1, 1, 7, PolicyOutcome::Run)),
+        Err(Failure::Invalid)
+    );
+    assert_eq!(
+        h.append(d(1, 2, 7, PolicyOutcome::Run)),
+        Err(Failure::Invalid)
+    );
+    // `ask` waits for PL7.
+    let Record::PolicyDecision(mut ask) = d(1, 2, 8, PolicyOutcome::Deny) else {
+        unreachable!()
+    };
+    ask.outcome = PolicyOutcome::Ask;
+    assert_eq!(h.append(Record::PolicyDecision(ask)), Err(Failure::Invalid));
+    // R4: the next ordinal only; one pending decision per call.
+    assert_eq!(
+        h.append(d(2, 2, 8, PolicyOutcome::Run)),
+        Err(Failure::Invalid)
+    );
+    h.append(d(1, 2, 8, PolicyOutcome::Run)).unwrap();
+    assert_eq!(
+        h.append(d(1, 2, 8, PolicyOutcome::Run)),
+        Err(Failure::Invalid)
+    );
+    assert_eq!(
+        h.state().policy.pending(operation, generation, 1),
+        Some(PolicyOutcome::Run)
+    );
+    // R7: the kind 14 clears it.
+    h.job(operation, generation, 1);
+    assert_eq!(h.state().policy.pending(operation, generation, 1), None);
+    // R6: a pending `deny` refuses a `run` kind 14.
+    h.append(d(2, 2, 8, PolicyOutcome::Deny)).unwrap();
+    assert_eq!(
+        h.append(exec_call(operation, generation, 2)),
+        Err(Failure::Invalid)
+    );
+    h.append(policy_denied_call(operation, generation, 2))
+        .unwrap();
+    // R5: `policy_denied` needs a pending `deny`.
+    assert_eq!(
+        h.append(policy_denied_call(operation, generation, 3)),
+        Err(Failure::Invalid)
+    );
+    // A model exec_cmd `run` without kind 34 stays valid.
+    h.job(operation, generation, 3);
+    // A pending decision survives a roll and its checkpoint.
+    h.append(d(4, 2, 8, PolicyOutcome::Run)).unwrap();
+    h.journal.roll().unwrap();
+    let files = h.files();
+    let reopened = open(files.clone(), false).unwrap();
+    assert!(reopened.state().base > 0);
+    assert_eq!(reopened.state().policy, h.state().policy);
+    assert_eq!(canonical(reopened.state()), canonical(h.state()));
+    assert_eq!(canonical(&genesis(&files)), canonical(h.state()));
+    // R7: a terminal other than `interrupted` with a pending kind 34.
+    h.append(Record::CancelRequested(CancelRequested {
+        operation,
+        generation,
+        cause: Cause::UserCancel,
+    }))
+    .unwrap();
+    let cancelled = Record::TurnTerminal(TurnTerminal {
+        operation,
+        generation,
+        kind: TerminalKind::Cancelled,
+        cause: Cause::UserCancel,
+        final_cursor: u64::MAX,
+        usage_known: true,
+        output_tokens: 0,
+        text_offset: 0,
+        text: String::new(),
+    });
+    assert_eq!(h.append(cancelled), Err(Failure::Invalid));
+    // A restart ends the turn `interrupted`, which clears it; kind 35 stays
+    // valid across the owner generation.
+    h.append(Record::OwnerGeneration).unwrap();
+    h.append(Record::TurnTerminal(TurnTerminal {
+        operation,
+        generation,
+        kind: TerminalKind::Interrupted,
+        cause: Cause::Restart,
+        final_cursor: u64::MAX,
+        usage_known: false,
+        output_tokens: 0,
+        text_offset: 0,
+        text: String::new(),
+    }))
+    .unwrap();
+    assert_eq!(h.state().policy.pending(operation, generation, 4), None);
+    h.append(revision35(3, 2, 9)).unwrap();
+    let files = h.files();
+    assert_eq!(canonical(&genesis(&files)), canonical(h.state()));
+    let reopened = open(files, false).unwrap();
+    assert_eq!(reopened.state().policy.active(), Some((3, [9; 32])));
+}
+
+/// PL-U13 (unit, replay): a kind 34 needs an accepted, started, open turn
+/// of this owner generation.
+#[test]
+fn pl_u13_policy_decision_needs_an_open_started_turn() {
+    let mut h = Harness::new();
+    let project = h.register(1);
+    h.append(revision35(1, 0, 7)).unwrap();
+    // An unknown operation.
+    assert_eq!(
+        h.append(decision34(
+            id(999),
+            1,
+            1,
+            project,
+            id(998),
+            1,
+            7,
+            PolicyOutcome::Run
+        )),
+        Err(Failure::Invalid)
+    );
+    let (record, conversation, operation, generation) = h.accepted(project, None, 0, 0);
+    h.append(record).unwrap();
+    // Accepted but not started.
+    let decision = decision34(
+        operation,
+        generation,
+        1,
+        project,
+        conversation,
+        1,
+        7,
+        PolicyOutcome::Run,
+    );
+    assert_eq!(h.append(decision.clone()), Err(Failure::Invalid));
+    let helper = h.fresh();
+    h.append(Record::StartAuthorized(StartAuthorized {
+        operation,
+        generation,
+        helper,
+        input_digest: [2; 32],
+    }))
+    .unwrap();
+    h.append(decision).unwrap();
+    // A stale owner generation refuses a new decision for the old turn.
+    h.append(Record::OwnerGeneration).unwrap();
+    assert_eq!(
+        h.append(decision34(
+            operation,
+            generation,
+            2,
+            project,
+            conversation,
+            1,
+            7,
+            PolicyOutcome::Run
+        )),
         Err(Failure::Invalid)
     );
 }

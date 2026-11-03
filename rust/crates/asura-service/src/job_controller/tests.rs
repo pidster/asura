@@ -109,6 +109,8 @@ impl Harness {
             duplicate_digest: [digest; 32],
             stored_command: "printf secret-command-text".into(),
             person: None,
+            constraints: matches!(origin, Origin::Model { .. })
+                .then(asura_platform::exec_cmd::template_for_test),
         }
     }
     fn submit(&mut self, origin: Origin, agent: AgentKey, project: Id) -> Admission {
