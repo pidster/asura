@@ -939,7 +939,7 @@ mod tests {
     /// a reactor-like loop to the reply taken in the loop after the
     /// worker's wake, 64 closed-loop requesters on the product worker
     /// pool, 20,000 decisions after 2,000 warm-up decisions. The p99 must
-    /// be at most 1 ms (security-policy.md, PL-B2).
+    /// be at most 1.5 ms (security-policy.md, PL-B2, revised by AD-33).
     #[test]
     #[ignore = "bench: cargo test --release ... pl_b2 -- --ignored --nocapture"]
     fn pl_b2_end_to_end_p99_at_64_concurrent_requesters() {

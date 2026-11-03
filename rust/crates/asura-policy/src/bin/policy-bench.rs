@@ -347,13 +347,13 @@ fn main() {
     times.sort();
     let p50 = percentile(&times, 0.5);
     println!(
-        "PL-B1 decision: p50 {:.1} µs, p90 {:.1} µs, p99 {:.1} µs, max {:.1} µs over {} decisions; budget p50 <= 100 µs: {}",
+        "PL-B1 decision: p50 {:.1} µs, p90 {:.1} µs, p99 {:.1} µs, max {:.1} µs over {} decisions; budget p50 <= 150 µs (AD-33): {}",
         micros(p50),
         micros(percentile(&times, 0.9)),
         micros(percentile(&times, 0.99)),
         micros(*times.last().unwrap()),
         times.len(),
-        if p50 <= Duration::from_micros(100) {
+        if p50 <= Duration::from_micros(150) {
             "PASS"
         } else {
             "FAIL"

@@ -5,8 +5,9 @@ Status: **ready for implementation, 2026-11-03**, for delivery packet
 [packet table](#delivery-packets) says so; the others wait for the named
 designs, probes or [evidence](#evidence-still-missing). The owner answered
 the [owner questions](#open-owner-questions) on 2026-11-03.
-Packet PL1 is implemented (2026-11-03) with two budgets failing, PL-B1 and
-PL-B2, reported to the owner ([PL1 delivery record](#pl1-delivery-record)).
+Packet PL1 is implemented (2026-11-03). Against the owner's revised budgets
+(AD-33), PL-B1 passes and the single PL-B2 run missed by 28 µs, reported to
+the owner ([PL1 delivery record](#pl1-delivery-record)).
 Later packets are not implemented. Protocol numbering stays `0.1` and the
 journal format stays `1` until release 1.0.0; schemas change in place.
 
@@ -2308,6 +2309,19 @@ The owner then revised PL-B1 to p50 at most 150 µs and PL-B2 to p99 at most
 1.5 ms (AD-33, 2026-11-03): pattern A evaluates four scopes over 258 policies, about 80 µs of the decision, and a model turn takes seconds. The figures above stay
 as the history against the earlier targets; the re-measurement against the
 revised budgets follows.
+
+Re-measurement against the revised budgets, on the reverted tree, one run
+each as the owner asked, release builds, 1-minute load 2.6:
+
+| Budget | Result | Verdict |
+| --- | --- | --- |
+| PL-B1 p50 at most 150 µs | p50 137.4 µs, p99 165.7 µs (built-in sets' exec entry p50 93.8 µs) | **Pass** |
+| PL-B2 p99 at most 1.5 ms at 64 requesters | p99 1.528 ms, p50 957 µs, max 2.21 ms | **Fail** by 28 µs |
+
+Two later diagnostic PL-B2 runs at load 2.4 and 2.9, not the verdict, gave
+p99 1.144 and 1.061 ms. The single-run verdict is the failure above; the
+owner decides. PL-B4 (38.0 ms) and PL-B5 (0 allows in 1,000,000 malformed
+requests; deterministic) pass again.
 
 Evidence item SP-P2 is answered: with per-request entity slices and the
 schema-checked wrapper (W2), PL-B1 does not hold on the product scale
