@@ -56,6 +56,38 @@ impl Fixture {
             executable: std::env::current_exe()?,
         })
     }
+    /// Runs the service from an `Asura.app` layout in the scratch home: a copy
+    /// of this test binary in `Contents/MacOS` beside the bundle's helper, with
+    /// its `mlx.metallib` and Hub bundle in `Contents/Resources`. With the
+    /// SG-V5 test variant (`test-asura-bundle --sandbox` or `--sandbox-journeys`)
+    /// the helper is App-Sandboxed and reads the scratch home through its
+    /// test-only `/private/tmp/` exception. Returns the bundle's `Contents`.
+    fn use_bundle(&mut self, bundle: &Path) -> Result<PathBuf> {
+        let packaged = bundle.join("Contents");
+        let contents = self.home.join("Asura.app/Contents");
+        fs::create_dir_all(contents.join("MacOS"))?;
+        fs::create_dir(contents.join("Resources"))?;
+        let executable = contents.join("MacOS/conversation_flow");
+        fs::copy(std::env::current_exe()?, &executable)?;
+        fs::copy(
+            packaged.join("MacOS/asura-model"),
+            contents.join("MacOS/asura-model"),
+        )?;
+        fs::copy(
+            packaged.join("Resources/mlx.metallib"),
+            contents.join("Resources/mlx.metallib"),
+        )?;
+        let hub = format!("Resources/{}", asura_platform::HUB_BUNDLE_NAME);
+        copy_assets(
+            &packaged.join(&hub),
+            &contents.join(&hub),
+            0,
+            &mut 0,
+            &mut 0,
+        )?;
+        self.executable = executable;
+        Ok(packaged)
+    }
     fn runtime(&self) -> Result<RuntimeDirectory> {
         Ok(RuntimeDirectory::scratch(&self.home, true)?)
     }
@@ -2062,29 +2094,8 @@ fn bundle_sandbox() -> Result<()> {
             assert!(!name.chars().any(char::is_whitespace));
         }
         stage = "bundle layout";
-        let packaged = bundle.join("Contents");
-        let contents = fixture.home.join("Asura.app/Contents");
-        fs::create_dir_all(contents.join("MacOS"))?;
-        fs::create_dir(contents.join("Resources"))?;
-        let executable = contents.join("MacOS/conversation_flow");
-        fs::copy(std::env::current_exe()?, &executable)?;
-        fs::copy(
-            packaged.join("MacOS/asura-model"),
-            contents.join("MacOS/asura-model"),
-        )?;
-        fs::copy(
-            packaged.join("Resources/mlx.metallib"),
-            contents.join("Resources/mlx.metallib"),
-        )?;
+        let packaged = fixture.use_bundle(&bundle)?;
         let hub = format!("Resources/{}", asura_platform::HUB_BUNDLE_NAME);
-        copy_assets(
-            &packaged.join(&hub),
-            &contents.join(&hub),
-            0,
-            &mut 0,
-            &mut 0,
-        )?;
-        fixture.executable = executable;
         stage = "service startup";
         fixture.start()?;
         stage = "installation ready";
