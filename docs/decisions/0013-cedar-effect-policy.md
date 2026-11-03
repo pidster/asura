@@ -52,8 +52,16 @@ AD-32 in the [owner decisions table](../designs/assurance-and-differentiation.md
 2. **The default "ask first" intent list** (AD-29): `git push` with its force
    flags, publish commands, privilege tools, hard-to-undo Git commands and
    unparsed text. Packet PL7 ships it as tighten-only rules.
-3. **An LGPL-free cvc5 build is probed first** (AD-30). The solver packaging
-   in decision item 5 waits on that probe and may change after it.
+3. **An LGPL-free cvc5 build is probed first** (AD-30). After the
+   [probe](../designs/solver-build-probes.md), the owner reversed that choice
+   the same day (SBQ1): cvc5 ships with GMP 6.3.0 as a replaceable
+   `@rpath/libgmp.10.dylib` under LGPL-3.0, with the GMP source, the build
+   script, the licence texts and a notice in each release; the fork prototype
+   was stopped. LibPoly is dropped (SBQ2). The licence question is closed by
+   the owner's position: Asura is open source (MIT), so anyone can rebuild
+   it with another GMP and sign it with their own identity; Asura complies
+   with the licence terms by the replaceable dylib, the published GMP source
+   and build script, and the shipped licence texts and notice.
 4. **The 8 MiB size budget covers the `asura` executable only** (AD-31). The
    solver's size is reported for each release, with no limit.
 5. **No replacement solver for now** (AD-32). Only the bundled, signed solver

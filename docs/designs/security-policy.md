@@ -28,12 +28,15 @@ spike evidence only.
 | --- | --- | --- |
 | AD-28 | Task envelopes (PL8) wait for a task design (OQ1) | 2026-11-03 |
 | AD-29 | The full default "ask first" intent list for PL7 (OQ2) | 2026-11-03 |
-| AD-30 | Probe an LGPL-free cvc5 build before the solver packaging (OQ3) | 2026-11-03 |
+| AD-30 | Probe an LGPL-free cvc5 build before the solver packaging (OQ3); answered by SBQ1 and SBQ2 below | 2026-11-03 |
+| SBQ1 | Ship GMP after all: cvc5 is bundled with GMP 6.3.0 as a separate, replaceable `@rpath/libgmp.10.dylib` under LGPL-3.0; each release publishes the exact GMP source, the build script, the licence texts and a notice | 2026-11-03 |
+| SBQ2 | Drop LibPoly (`--no-poly`), subject to re-running SV-P1 on the product corpus at PL4a | 2026-11-03 |
+| OQ3 legal | No open legal question and no release gate: Asura is open source (MIT), so anyone can rebuild it with another GMP and sign it themselves; compliance is the replaceable dylib, the published GMP source and build script, and the shipped licence texts and notice | 2026-11-03 |
 | AD-31 | The 8 MiB budget covers the `asura` executable only; the solver's size is reported each release with no limit (OQ4) | 2026-11-03 |
 | AD-32 | No replacement solver for now; only the bundled, signed solver (OQ5) | 2026-11-03 |
 | AD-13 | Cedar is the policy language and decision engine. It decides; it does not enforce | 2026-11-03 |
 | AD-14 | Pattern A: each scope is evaluated separately; allow only if every scope allows; a refusal names the denying scope | 2026-11-03 |
-| AD-17 | cvc5 built from source with a dynamic or replaceable GMP, signed and notarised inside `Asura.app`; proofs on the person's Mac, offline; a bounded admission tool with no default time limit | 2026-11-03 |
+| AD-17 | cvc5 built from source with a dynamic or replaceable GMP, signed and notarised inside `Asura.app`; proofs on the person's Mac, offline; a bounded admission tool with no default time limit. Refined by SBQ1 (GMP 6.3.0 as `@rpath/libgmp.10.dylib`) and SBQ2 (no LibPoly) | 2026-11-03 |
 | AD-27 | Effects are the authority. Commands, MCP tools and skills are intent: they may only tighten | 2026-11-03 |
 | Budgets | Decision p50 at most 100 µs; end-to-end p99 at most 1 ms at 64 concurrent requests; at most 8 MiB added to the `asura` executable (AD-31); startup at most 200 ms | 2026-11-03 |
 | AD-24 | Envelope approval is an authorized policy change; envelopes end with their task or on revocation | 2026-11-02 |
@@ -1660,8 +1663,9 @@ signing order) to match.
 | Item | Selected |
 | --- | --- |
 | Sources | cvc5 1.3.1 release source and GMP 6.3.0 source, each pinned by URL and SHA-256 in a tracked lock file `tools/release/solver/solver.lock`. Every dependency that the cvc5 build would download (CaDiCaL, SymFPU and others) is fetched by the script into a scratch cache from pinned URLs and digests first; the build then runs offline. Evidence missing: the exact dependency list of cvc5 1.3.1 and whether its CMake checks hashes (SV-B2) |
-| Licences of the build | cvc5 production build, with every GPL option off (no CLN, no GLPK). LibPoly (LGPL-3.0, linked in the upstream binary) is left out if probe SV-P1 shows that SymCC's queries do not need it; otherwise it is a second dynamic LGPL library under the same rules as GMP |
-| GMP | Built shared (`libgmp.10.dylib`, and `libgmpxx.4.dylib` if cvc5 needs the C++ interface), install names `@rpath/...`. cvc5's own libraries stay static (BSD-3-Clause); only GMP is dynamic. Evidence missing: that cvc5 1.3.1 builds with static cvc5 libraries and a shared GMP (SV-B1) |
+| Licences of the build | cvc5 production build, with every GPL option off (no CLN, no GLPK) and without LibPoly (`--no-poly`, owner SBQ2, 2026-11-03). PL4a re-runs SV-P1 on the product corpus; if the answers differ from the upstream binary, the packet stops and reports to the owner |
+| GMP | GMP 6.3.0 built shared as `libgmp.10.dylib` with install name `@rpath/libgmp.10.dylib` (owner SBQ1, 2026-11-03). cvc5 links `libgmp` only, so `libgmpxx` is not shipped ([probe F3](solver-build-probes.md#findings-for-the-solver-adapter)). cvc5's own libraries stay static (BSD-3-Clause); only GMP is dynamic. The probe built this shape (SV-B1 evidence in [the probe](solver-build-probes.md#q5-the-built-solver-against-the-upstream-binary)) |
+| Probe findings F1 to F5 | Requirements of the PL4a build script and its adapter ([findings](solver-build-probes.md#findings-for-the-solver-adapter)): F1, pass `GMP_LIBRARIES` and `GMPXX_LIBRARIES` explicitly, exclude `/opt/homebrew`, and check that `otool -L cvc5` lists exactly `@rpath/libgmp.10.dylib`, `libc++` and `libSystem`; F2, check the GMP version against the lock file in the script; F3, ship one dylib; F4, the SymCC adapter reads standard output and standard error while it writes standard input, and a full output buffer refuses the candidate (`solver_failed`), never stalls the admission worker, with a stalled-solver case in PL-I6; F5, `(set-logic ALL)` is kept |
 | Toolchain | The owner's release Mac, arm64, the pinned Xcode clang, `MACOSX_DEPLOYMENT_TARGET=27.0` |
 | Host paths | The same `-ffile-prefix-map` maps and linker `-S` as the helper build ([build-host paths](release-signing.md#build-host-paths-sg4-o1)); the host-paths scanner covers cvc5 and every dylib |
 | Script | `tools/release/solver/build`: inputs the lock file and a scratch directory; output an unsigned package directory `solver/` with `MacOS/cvc5`, `Frameworks/libgmp*.dylib`, the licence files and a manifest of SHA-256 digests. The same output serves development tests (unsigned) and `asura-bundle` (signed) |
@@ -1674,7 +1678,6 @@ Asura.app/Contents/
   MacOS/asura-model
   MacOS/cvc5                         Developer ID, Hardened Runtime, identifier org.pidster.asura.cvc5
   Frameworks/libgmp.10.dylib         Developer ID, identifier org.pidster.asura.gmp
-  Frameworks/libgmpxx.4.dylib        only if cvc5 needs it
   Resources/licenses/solver/         notice and licence texts (sealed)
 ```
 
@@ -1689,19 +1692,34 @@ Asura.app/Contents/
 
 ### Licence obligations and notice
 
-Required: meet LGPL-3.0 for GMP (and LibPoly if linked) and the notice
-conditions of cvc5 (BSD-3-Clause), CaDiCaL, SymFPU and MiniSat. Proposed
-mechanism: the owner decided (AD-30, [OQ3](#open-owner-questions)) to probe
-an LGPL-free cvc5 build first. The probe records its results in
-`docs/designs/solver-build-probes.md`. The solver packaging (this section,
-PL4a and PL4b) waits on that probe and is revised from its result.
+Required: meet LGPL-3.0 for GMP and the notice conditions of cvc5
+(BSD-3-Clause), CaDiCaL, SymFPU and MiniSat. Selected mechanism (owner
+SBQ1, 2026-11-03): GMP 6.3.0 ships as the separate, replaceable
+`@rpath/libgmp.10.dylib`, and each release publishes the exact GMP source,
+the build script, the licence texts and a notice.
+
+History: the owner first chose to probe an LGPL-free cvc5 build (AD-30,
+[OQ3](#open-owner-questions)). The [solver build probes](solver-build-probes.md)
+showed that GMP cannot be avoided without forking cvc5's number backend. The
+owner then reversed the LGPL-free choice once the trade-off was clear; the
+fork prototype was stopped. The legal part of OQ3 is decided, with no open
+legal question and no release gate. The owner's position (2026-11-03):
+Asura is open source (MIT). Anyone who wants to rebuild it and swap GMP for
+another library, whether in practice or in theory, can fork it, submit a
+pull request, or build it themselves. The owner is not obliged to sign their
+build with his key, provided Asura complies with the licence terms.
+Compliance stays as designed: GMP is a separate, replaceable `@rpath` dylib;
+the exact GMP source and the build script are published with each release;
+the LGPL-3.0 and GPL-3.0 texts and the notice ship in the licence folder;
+Asura's own source is public, so a person can rebuild it and sign with their
+own identity.
 
 | Obligation | How Asura meets it |
 | --- | --- |
 | LGPL-3.0 §4(d)(1): a shared library mechanism that works with a modified, interface-compatible GMP | GMP is a separate `@rpath` dylib. A person can build a modified GMP, put it into a copy of `cvc5` and `Frameworks/`, sign both ad hoc (`codesign -f -s -`), and run that cvc5. Asura's service uses only the shipped, digest-checked files |
 | LGPL-3.0 §4(a), (b): notice and licence texts | `Resources/licenses/solver/` holds `NOTICE.txt`, the GMP `COPYING.LESSERv3` and `COPYINGv3` texts, cvc5 `COPYING`, and the CaDiCaL, SymFPU and MiniSat licence texts; the DMG `LICENSE` file points to them |
 | GPL-3.0 §6(d) through LGPL §4(d): corresponding source of GMP | The exact GMP source archive, the cvc5 source archive and the build script are published as assets of the same GitHub release as the DMG, for as long as that DMG is offered |
-| Installation Information (GPL-3.0 §6) | Not required: Asura is not conveyed with the sale of a User Product. Needs legal confirmation if the LGPL route remains after the AD-30 probe |
+| Installation Information (GPL-3.0 §6) | Not required: Asura is not conveyed with the sale of a User Product. Asura is open source, so a person can rebuild it and sign with their own identity; the owner's OQ3 position (2026-11-03) |
 | BSD-3-Clause and MIT notices | Reproduced in the licence folder |
 
 Notice text (`NOTICE.txt`), fixed:
@@ -2235,9 +2253,9 @@ unavailable`.
 The `test-support` feature of `asura-policy` adds a denying installation
 set: the built-in text plus one forbid of model `process.exec` with reason
 `test_denied`. With the service's `test-support` feature, the owner uses it
-when the file `policy-test-deny` exists in the runtime's Asura home at
-start (read on a worker thread). Production builds have neither the text
-nor the check. PL-I3 and PL-E2 use it.
+when the file `policy-test-deny` exists in the scratch home of a scratch
+runtime at owner start, as the other test-support seams are read. Production
+builds have neither the text nor the check. PL-I3 and PL-E2 use it.
 
 ### PL1 validation map
 
@@ -2266,7 +2284,7 @@ needs a change. Owned paths are exclusive while a packet runs.
 | --- | --- | --- | --- | --- |
 | PL1 | The policy owner; schema v1; built-in installation and default user sets; deny-on-any-error wrapper; installation and user scopes; region compiler for `model-1`; model exec_cmd job decisions by effect envelope with the command as intent; constraint set to the guardian (byte-equal profile); kinds 34 and 35; `/status` line; denial text | `rust/crates/asura-policy/**` (new, with `AGENTS.md`), `rust/crates/asura-service/src/policy.rs` and `policy/**`, the exec_cmd decision point in `conversation.rs` and `tools.rs`, the guardian profile input in `asura-platform/src/exec_cmd/guardian.rs`, kinds 34–35 in `asura-storage/src/authority/**`, `Cargo.toml`, `Cargo.lock` | This design | PL-U1–U8, U13; PL-I1–I4, I10, I12; PL-E1, E2; PL-B1–B5 recorded |
 | PL2 | Canonicaliser, program identity, intent extractor; person command decisions; named secret `secret_use` | `asura-platform/src/project_identity.rs`, new `asura-platform/src/code_identity.rs`, `exec_cmd/split.rs`, person dispatch in `conversation.rs`, `asura-policy` request types | PL1 | PL-U9, U10; PL-I15; PL-N1 |
-| PL4a | Solver build script and lock file; unsigned package for tests | `tools/release/solver/**` | The AD-30 LGPL-free build probe, then this design revised; probes SV-B1, SV-B2, SV-P1 | Script builds offline; SV probes recorded |
+| PL4a | Solver build script and lock file; unsigned package for tests; probe findings F1 to F5 as script and adapter requirements | `tools/release/solver/**` | The solver build probes (SBQ1, SBQ2); SV-P1 re-run on the product corpus | Script builds offline; SV probes recorded |
 | PL3 | Admission worker, SymCC solver adapter, platform solver process, lints, proofs, change difference, lifecycle with user-scope admission, rollback, restart reproving, control messages, audit | `rust/crates/asura-policy-admission/**` (new), `asura-platform/src/solver.rs`, `asura-service/src/policy/admission*`, control messages in `asura-control`, kind 35 events | PL1, PL4a | PL-U11; PL-I5–I8, I11, I13; PL-E3 |
 | PL4b | Bundle placement, signing, notice, licence folder, release checks | `tools/release/asura-bundle`, `tools/release/asura-release`, `tools/release/host-paths`, `docs/designs/release-signing.md` (first), DMG `LICENSE` | PL4a, PL3 | PL-N2; release proof gate |
 | PL5 | Workspace and repository scopes, forbid-only lint, baseline permit, `rel` literals | `asura-service/src/policy/scopes*`, `asura-policy` lints, repository source read | PL3 | PL-U5, U6; PL-I7; PL-E4 |
@@ -2284,7 +2302,7 @@ that point to it pass their gates.
 ```mermaid
 flowchart TD
     D["This design and ADR-0013"] --> PL1["PL1: owner, schema, exec_cmd effect decisions, kinds 34-35"]
-    Probe["AD-30: LGPL-free cvc5 build probe"] --> PL4a["PL4a: solver build script; probes SV-B1, SV-B2, SV-P1"]
+    Probe["Solver build probes; SBQ1 GMP dylib, SBQ2 no LibPoly"] --> PL4a["PL4a: solver build script; probes SV-B1, SV-B2, SV-P1"]
     D --> PL4a
     PL1 --> PL2["PL2: canonicaliser, identity, intent, person commands"]
     PL1 --> PL3["PL3: admission, proofs, lifecycle, rollback"]
@@ -2302,8 +2320,8 @@ flowchart TD
     PL6 --> PL10["PL10: proxy and egress (own designs)"]
 ```
 
-Every arrow is a dependency. The AD-30 probe and the task design are
-prerequisites outside this design.
+Every arrow is a dependency. The solver build probes and the task design
+are prerequisites outside this design.
 
 ## Decisions and alternatives
 
@@ -2330,7 +2348,7 @@ The question and the recommendation stay as asked.
 | --- | --- | --- | --- | --- |
 | OQ1 | Asura has no task entity yet. What ends a task envelope? | Bind it to one conversation's main agent; end it on the person's `/envelope end`, on an optional person-set expiry, on revocation, and when the person starts `/new` from that conversation | **Wait for a task design** (AD-28). No interim binding is selected | PL8 is blocked until a new task design defines the task entity; PL8 depends on that design |
 | OQ2 | Which model command intents ask for approval by default (for example `git push`, force flags, `cargo publish`, privilege tools, `unparsed` text)? | Ship the spike corpus's set as default user-scope intent forbids, editable by the person | **The full default "ask first" list** (AD-29): `git push`, including force flags; publish commands (`cargo publish`, `npm publish`, `gem push`, `twine upload`, `swift package-registry publish` and similar); privilege tools (`sudo`, `su`, `doas`, admin `osascript`, `launchctl` changes); hard-to-undo Git commands (`git reset --hard`, `git clean -fdx` and similar); unparsed text | The [default intent rules](#default-intent-rules-ad-29) of PL7. PL1 ships none of them |
-| OQ3 | Legal confirmation of the LGPL-3.0 mechanism, the notice text and the source offer as release assets | Ask for legal review before PL4b ships a release | **Probe an LGPL-free cvc5 build first** (AD-30). A separate probe records its results in `docs/designs/solver-build-probes.md` | The [solver package](#solver-package-ad-17) and packets PL4a and PL4b wait on that probe; this design changes after it |
+| OQ3 | Legal confirmation of the LGPL-3.0 mechanism, the notice text and the source offer as release assets | Ask for legal review before PL4b ships a release | **Probe an LGPL-free cvc5 build first** (AD-30); the [probe](solver-build-probes.md) followed. Then **SBQ1: ship GMP after all** as a replaceable `@rpath` dylib with source, script, licences and notice, and **SBQ2: drop LibPoly**. **Legal part decided, no open question:** the owner's position (2026-11-03): Asura is open source (MIT). Anyone who wants to rebuild it and swap GMP for another library, whether in practice or in theory, can fork it, submit a pull request, or build it themselves. The owner is not obliged to sign their build with his key, provided Asura complies with the licence terms (all 2026-11-03) | The [solver package](#solver-package-ad-17) is selected; compliance as designed; no release gate |
 | OQ4 | Does the 8 MiB size budget cover the `asura` executable only, with cvc5 and GMP (about 20 MiB or more) recorded separately? | Yes: apply it to `asura`; record the solver files separately | **The `asura` executable only** (AD-31). The solver's size is reported for each release, with no limit | PL-B3 measures `asura` only |
 | OQ5 | Should a person be able to approve a replacement solver binary? | Not now; the LGPL route does not need it | **No replacement solver for now** (AD-32). Only the bundled, signed solver runs | The solver lifecycle runs only the shipped, digest-checked files |
 
@@ -2346,7 +2364,7 @@ Probes to run in the named packet, before the code that depends on them.
 | --- | --- | --- |
 | SV-B1 | Does cvc5 1.3.1 build with static cvc5 libraries and a shared GMP on macOS 27 arm64? | PL4a |
 | SV-B2 | What does the cvc5 build download, and can every dependency be pinned and built offline? | PL4a |
-| SV-P1 | Do SP-AQ1 to SP-AQ8 give the same answers with a LibPoly-free build as with the upstream binary? | PL4a |
+| SV-P1 | Do SP-AQ1 to SP-AQ8 give the same answers with a LibPoly-free build as with the upstream binary? The probe answered it on the spike corpus; PL4a re-runs it on the product corpus (SBQ2) | PL4a |
 | SV-P2 | Does cvc5 run under the deny-default solver profile? | PL4a, PL4b |
 | SV-P3 | Does the Hardened Runtime cvc5 load the team-signed GMP through `@rpath`, from the bundle and from the pinned copy? | PL4b |
 | SV-P4 | Does notarisation accept the bundle with no issue for cvc5 and the dylibs? | PL4b |

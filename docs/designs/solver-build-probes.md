@@ -4,7 +4,9 @@ Status: **Proposed. Probe record, 2026-11-03.** It records evidence for the
 owner's question on OQ3 of the [security policy](security-policy.md#open-owner-questions):
 can Asura build cvc5 with no LGPL component? It also gives early evidence for
 probes SV-B1, SV-B2 and SV-P1 of [the solver package](security-policy.md#solver-package-ad-17).
-This record selects nothing and authorizes no code. The owner decides.
+The record itself selects nothing and authorizes no code. The owner answered
+its questions on 2026-11-03 ([owner questions](#owner-questions)): ship GMP as
+a replaceable dylib (SBQ1) and drop LibPoly (SBQ2).
 Protocol numbering stays `0.1` and the journal format stays `1`.
 
 Labels follow the [writing standard](../writing-standard.md#status-and-requirements).
@@ -400,7 +402,8 @@ package and the lifecycle.
 
 ## Recommendation
 
-Proposed; the owner decides.
+The recommendation as written before the owner's answers; the owner chose
+items 1 and 2 ([owner questions](#owner-questions)).
 
 1. **Keep AD-17's route.** Build cvc5 1.3.1 `--static --no-poly` with GMP
    6.3.0 as the only dynamic library, under LGPL-3.0. The build works,
@@ -429,16 +432,37 @@ flowchart TD
     F -->|"No"| Z{"Fork SymCC to encode sets for Z3?"}
     Z -->|"Yes"| ZF["SymCC encoder fork on Z3 4.16.0, MIT"]
     Z -->|"No"| Off["No bundled solver: developer-only or remote proofs; AD-17 reopened"]
-    A --> Legal["OQ3 legal review of the GMP mechanism"]
+    A --> Comply["Selected (SBQ1): replaceable GMP dylib, published source and script, licence texts and notice"]
 ```
 
 ## Owner questions
 
-| ID | Question | Recommendation |
-| --- | --- | --- |
-| SBQ1 | Is one LGPL-3.0 component (GMP), shipped as a replaceable `@rpath` dylib with source and notice, acceptable? This is the only copyleft left after `--no-poly` | Yes; legal review stays under OQ3 |
-| SBQ2 | Should the build drop LibPoly (`--no-poly`)? | Yes, subject to SV-P1 on the product corpus |
-| SBQ3 | If SBQ1 is no: fund an Asura-maintained cvc5 fork with a permissive number backend, or fork SymCC's set encoding for Z3? | Neither, unless SBQ1 is no; then the cvc5 fork, because SymCC's encoding stays upstream |
+The owner answered SBQ1 and SBQ2 on 2026-11-03; SBQ3 does not arise. The
+canonical record is AD-30 and AD-17 in the
+[owner decisions table](assurance-and-differentiation.md#owner-decisions);
+the [security policy design](security-policy.md#solver-package-ad-17)
+applies them.
+
+| ID | Question | Recommendation | Owner decision, 2026-11-03 |
+| --- | --- | --- | --- |
+| SBQ1 | Is one LGPL-3.0 component (GMP), shipped as a replaceable `@rpath` dylib with source and notice, acceptable? This is the only copyleft left after `--no-poly` | Yes; legal review stays under OQ3 | **Yes: ship GMP after all.** cvc5 is bundled with GMP 6.3.0 as a separate, replaceable `@rpath/libgmp.10.dylib` under LGPL-3.0. Each release publishes the exact GMP source, the build script, the licence texts and a notice. History: the owner first chose an LGPL-free fork (OQ3, AD-30), then reversed that choice once the trade-off was clear; the fork prototype was stopped |
+| SBQ2 | Should the build drop LibPoly (`--no-poly`)? | Yes, subject to SV-P1 on the product corpus | **Yes: drop LibPoly** (`--no-poly`), subject to re-running SV-P1 on the product corpus at PL4a |
+| SBQ3 | If SBQ1 is no: fund an Asura-maintained cvc5 fork with a permissive number backend, or fork SymCC's set encoding for Z3? | Neither, unless SBQ1 is no; then the cvc5 fork, because SymCC's encoding stays upstream | Does not arise: SBQ1 is yes |
+
+OQ3's legal part is decided, with no open legal question and no release
+gate. The owner's position (2026-11-03): Asura is open source (MIT). Anyone
+who wants to rebuild it and swap GMP for another library, whether in
+practice or in theory, can fork it, submit a pull request, or build it
+themselves. The owner is not obliged to sign their build with his key,
+provided Asura complies with the licence terms. Compliance stays as
+designed: GMP is a separate, replaceable `@rpath` dylib; the exact GMP
+source and the build script are published with each release; the LGPL-3.0
+and GPL-3.0 texts and the notice ship; Asura's own source is public, so a
+person can rebuild it and sign it with their own identity.
+
+Findings F1 to F5 are requirements of the PL4a build script and its solver
+adapter ([security policy, build](security-policy.md#build)). PL4a is not
+built yet.
 
 ## Reproduction
 
