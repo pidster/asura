@@ -19,6 +19,10 @@ The approval covers:
 - the [probe results](#validation) of 2026-10-14 and the cases still unrun;
 - the person-typed commands section, with decisions PX1–PX6.
 
+The [policy layer](#policy-layer) section (2026-11-03) is proposed with the
+security policy design and is not part of the owner's review of 2026-10-14
+and 2026-10-15.
+
 On 2026-10-19 the owner added unsandboxed `!!` person commands. The decision
 and its accepted exposure are recorded in
 [unsandboxed person commands](#unsandboxed-person-commands) as EXD-1. It
@@ -814,6 +818,48 @@ P17 `text/plain` chat request, and answers the start's key. LC-U15 covers the
 key replacement at every start. The browser results (P17) are recorded probes,
 not automated tests. LT7 is a stated exposure, not a tested claim.
 
+## Policy layer
+
+Status: proposed with the [security policy design](security-policy.md),
+2026-11-03, under the owner decisions AD-13, AD-14, AD-17 and AD-27. Nothing
+here is implemented. This section revises the earlier command-level view of
+authority: under AD-27 the policy decides **effects** (files, program
+execution, network, secrets, Mach lookups, context egress), and a command,
+MCP tool call or skill is **intent** that may only tighten. Threats EX1 to
+EX16 and PX1 to PX6 keep their decisions; the policy layer becomes the
+decision owner for the effects they name, and Seatbelt stays their enforcer.
+
+What changes:
+
+- One policy owner in the service decides every job's effect envelope with
+  Cedar and compiles it into the job's Seatbelt profile.
+- Policy text arrives from four scopes, one of them (repository) untrusted.
+- A bundled cvc5 process parses SMT-LIB generated from admitted policy text.
+- Journal kinds 34 to 36 record decisions, revisions and grants.
+
+| ID | Threat | Mitigation (design) | Residual or gap |
+| --- | --- | --- | --- |
+| PL-T1 | A repository policy widens authority | Pattern A: every scope must allow; workspace and repository sets are forbid-only with an Asura-added baseline permit; the person admits each text | None for widening. A repository forbid can deny work (denial of service the person can remove) |
+| PL-T2 | An evaluation error skips a forbid (spike FE1) | Deny on any error at run time (W3); strict validation; warnings refuse; `check_never_errors` at admission | None known; the proof assumes a well-formed entity store, so W3 stays |
+| PL-T3 | Path canonicalisation bypass: symlink, `..`, firmlink, case, hard link | Retained descriptors with `O_NOFOLLOW`; identity comparison; Seatbelt is the authority for job effects | A pre-existing hard link inside a write region lets a job change the linked file; probe SP-P1 must confirm spellings |
+| PL-T4 | Parser differential: the shell runs something other than the parsed intent | Intent never grants (AD-27); the effect envelope bounds whatever the shell runs | A missed intent tightening asks less often; it cannot widen |
+| PL-T5 | Work starts under a revoked or stale grant | Revision fencing at slot grant; queued work rechecked and starting work cancelled in the activation step; running jobs re-evaluated and revoked | Effects of a running job before its revocation signal may have occurred and are reported by settlement |
+| PL-T6 | A hostile policy text exploits cvc5 through generated SMT-LIB | cvc5 runs from a verified copy under a deny-default Seatbelt profile with no network and no write; a failure or `unknown` refuses the candidate; no runtime decision depends on the solver | A cvc5 defect could prove a false property; the runtime wrapper and the profile still bound effects. SV-P2 must show the profile works |
+| PL-T7 | cvc5 or GMP is replaced in the bundle or the run copy | Developer ID signatures, library validation, SHA-256 of each file compiled into `asura`, checked on every copy | Same-UID processes are one principal (D1) |
+| PL-T8 | Intent or classifier attributes widen a decision | Tighten-only lint and the CL-1 style proof `check_implies(P, P0)` at every admission | Host code outside Cedar that uses the attributes is trusted code |
+| PL-T9 | An over-broad envelope or a deceptive approval | Fixed approval texts from typed fields; change difference with examples; hard forbids unaffected; containment proof | Misuse inside approved limits is possible (DF1 limit) |
+| PL-T10 | Decision flooding starves other agents | Per-agent decision queues (8), service bound (512), worker in-flight bound, rotation across agents | None known |
+| PL-T11 | Policy explanations inject instructions into the model | Workspace and repository `@explain` text never reaches a model; rule IDs are restricted to `[a-z0-9_.-]` | None known |
+| PL-T12 | The journal or the pinned policy texts are edited | Digest checks at load; a damaged scope becomes unavailable and denies | Same-UID edits are accepted under D1 |
+| PL-T13 | A policy requires a limit the backend cannot enforce | Admission refuses uncompilable shapes (`cannot_enforce`); no silent weakening | Per-host network waits for the proxy |
+| PL-T14 | A model approves its own action | Approvals arrive only on authenticated control attachments; the model channel has no approval message | None known |
+| PL-T15 | The clock moves back and an expired grant applies again | Expiry is enforced by `context.now` and by grant removal at the first decision after expiry | A grant removed while the clock was wrong stays removed |
+
+Required evidence: the [security policy validation](security-policy.md#validation)
+cases PL-U3, PL-I2, PL-I4, PL-I6 to PL-I9, PL-E2 and PL-E4. Live
+enforcement (Endpoint Security, Network Extension) is proposed only; see
+[live enforcement](security-policy.md#live-enforcement-later-proposed).
+
 ## Design verification
 
 Recorded on 2026-10-13: the facts were gathered from the code by a read-only
@@ -916,3 +962,8 @@ document changed.
 Recorded on 2026-11-03: LT2, LT3, LT4 and LT7 were revised with the owner
 decision LCQ3 and the socket and key probes P19 to P25. No diagram in this
 document changed.
+
+Recorded on 2026-11-03: the [policy layer](#policy-layer) section was added
+with the [security policy design](security-policy.md), under the owner
+decisions AD-13, AD-14, AD-17 and AD-27. No diagram in this document
+changed. No code or test was run.

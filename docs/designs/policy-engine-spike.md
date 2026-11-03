@@ -6,6 +6,15 @@ document **before** any measurement and were not changed afterwards. The spike c
 [`experiments/policy-engine-spike/`](../../experiments/policy-engine-spike/).
 [Results](#results) record the measured outcome against these budgets.
 
+Owner decisions of 2026-11-03, after the results: AD-13 Cedar, AD-14 pattern A
+(per-scope AND), AD-17 cvc5 built from source and bundled, and AD-27 (effects
+are the policy subject; commands are intent). The owner also revised four
+budgets to reachable values for the product
+([budget revision](#owner-revision-of-2026-11-03-budgets)). The original
+budgets and the results below are kept unchanged as the history of the spike.
+The product schema differs from this corpus: under AD-27 it is written over
+effects, not commands.
+
 This design answers the security policy brief's requirement that "any
 executable evaluation spike needs its own scoped ready design"
 ([format and evaluator evaluation](security-policy-brief.md#format-and-evaluator-evaluation)).
@@ -1351,8 +1360,9 @@ flowchart TD
 - **Selected: separate spike workspace.** Alternative: a member of the product
   workspace. Rejected because the product lock and gate must stay untouched.
 
-Open owner decisions: AD-13, AD-14 and AD-17. The spike informs them; it does
-not resolve them.
+Open owner decisions when the spike was written: AD-13, AD-14 and AD-17. The
+spike informed them; the owner decided them on 2026-11-03
+([owner decisions](#owner-decisions-needed)).
 
 ## Results
 
@@ -1467,12 +1477,46 @@ use.
 
 ### Owner decisions needed
 
+Decided by the owner on 2026-11-03. The evidence column is kept as it was
+written before the decisions.
+
+| Decision | Owner decision, 2026-11-03 |
+| --- | --- |
+| AD-13: engine | Cedar. It decides; it does not enforce |
+| AD-14: scope composition | Pattern A: each scope is evaluated separately; allow only if every scope allows; a refusal names the denying scope |
+| AD-17: cvc5 packaging | Build cvc5 from source with a dynamic or replaceable GMP (LGPL-3.0), sign and notarise it inside `Asura.app`, run proofs on the person's Mac, offline |
+| Budgets | Revised to reachable values, built with the action split and per-worker engines ([budget revision](#owner-revision-of-2026-11-03-budgets)) |
+| AD-27: policy level (new) | Effects are the authority; commands, MCP tools and skills are intent that may only tighten |
+
 | Decision | Evidence from this spike |
 | --- | --- |
 | AD-13: engine | The budget results and recommendation above |
 | AD-14: scope composition | Patterns A and B gave identical decisions on 1,064 requests and the same latency (A's lower-scope sets are small). Both are provable: the forbid-only lint plus AQ4 for B; per-set evaluation for A. B needs one evaluation and one set; A names the denying scope directly. Neither changes the engine choice |
 | AD-17: cvc5 packaging | The analysis is fast enough for interactive envelope approval (387 ms per envelope). The binary is 21.1 MB (a 35.0 MB archive), not signed by Asura, BSD-3-Clause, and links GMP statically (LGPL-3.0); it links the system C++ library dynamically. Bundling it means signing it and meeting the LGPL obligations; a developer-only or remote option avoids that but removes DF1 and DF6 on the person's Mac |
 | Budgets | PES-M9 to PES-M12 failed for Cedar as designed. If Cedar is selected, the owner decides whether D3 must meet them with the mechanisms above or whether they change |
+
+### Owner revision of 2026-11-03: budgets
+
+The owner revised four budgets to reachable values for the product policy
+layer. The product must meet them with the action split (one policy set per
+action group) and one engine copy per worker, the two diagnostic mechanisms
+above. The original budgets stay in [measurements and budgets](#measurements-and-budgets)
+as the history; the spike results against them do not change. The
+[security policy design](security-policy.md#performance-budgets) owns the
+product budgets and their measurement.
+
+| ID | Original budget (set 2026-11-03, before measurement) | Revised budget (owner, 2026-11-03) |
+| --- | --- | --- |
+| PES-M11 Evaluation latency | p50 at most 50 µs, p95 at most 200 µs, p99 at most 1 ms, 64 concurrent requests on 8 workers | p50 at most 100 µs. The p95 and p99 values are not revised |
+| PES-M12 End-to-end latency | p99 at most 1 ms with 64 closed-loop clients on 8 workers | p99 at most 1 ms at 64 concurrent requests (value restated, unchanged) |
+| PES-M9 Build size | At most 4 MiB added to a stripped release binary | At most 8 MiB added |
+| PES-M10 Startup | Median at most 100 ms; peak resident memory at most 64 MiB | At most 200 ms. The memory value is not revised |
+
+Measured against the revised values, the diagnostic variant "partitioned by
+action, one engine per worker" gave p50 76 µs and end-to-end p99 921 µs,
+inside the revised budgets. Startup (136 ms) is inside 200 ms. Size
+(+6.89 MiB, or +5.10 MiB with fat LTO) is inside 8 MiB for the decision path
+alone. These are spike figures; the product must measure its own build.
 
 ### Deviations from the design
 

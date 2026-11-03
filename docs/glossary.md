@@ -115,11 +115,23 @@ or prove an operation completed.
 | Brokered delivery, proposed | A job uses a credential through an Asura proxy or agent and never receives its value; the only delivery allowed to a model-originated job |
 | Raw delivery, proposed | Asura places a secret value in a job's environment, arguments, standard input or a file; allowed only for person-typed jobs, and it makes the job tainted |
 | Tainted job, proposed | A job that received raw delivery, with its descendants; its output and every value derived from it never reach a model |
-| Envelope approval | A person's one-time approval of a task's bounded grant (folders, hosts, secret bindings, budget, expiry), made as an authorized policy change that ends with the task or on revocation; decided by the owner on 2026-11-02 (AD-24), mechanism not built; see [DF1](designs/assurance-and-differentiation.md#df1-approval-of-the-envelope-not-of-each-action) |
+| Envelope approval | A person's one-time approval of a task's bounded grant (folders, hosts, secret bindings, budget, expiry), made as an authorized policy change that ends with the task or on revocation; decided by the owner on 2026-11-02 (AD-24), mechanism not built; an envelope is an effect set (AD-27); see [DF1](designs/assurance-and-differentiation.md#df1-approval-of-the-envelope-not-of-each-action) and [task envelopes](designs/security-policy.md#task-envelopes-ad-24) |
+| Effect | An operation on a resource that a job can cause: a file read, write, creation or deletion, a program execution, a network connection, a secret use, a Mach lookup or a context egress; the subject of every policy decision (AD-27); see the [security policy](designs/security-policy.md) |
+| Intent | What a proposer asked for (a command line, an MCP tool call or a skill step) and its parsed features; policy context that may only tighten, never grant (AD-27) |
+| Policy owner | The service module `asura-service::policy`, the one owner of policy decisions, revisions and admission; see the [security policy](designs/security-policy.md#ownership) |
+| Policy scope | One source of policy: installation, user, workspace or repository (later remote host); each is evaluated separately and all must allow (AD-14) |
+| Policy revision | The numbered, immutable set of active scope sets that a decision names; journal kind 35 |
+| Hard forbid | An installation policy that no approval, envelope or lower scope can lift |
+| Tighten-only attribute | A policy context attribute that only `forbid` policies may read: intent and classifier labels; admission proves that removing them never denies less |
+| Effect envelope | The effects one job may cause, computed from the policy for the job's principal and compiled into its Seatbelt profile |
+| Constraint set | The typed compilation of an effect envelope for one backend; the guardian renders it as the job's Seatbelt profile |
+| Decision record | Journal kind 34: one policy decision with its revision, scope results, reasons and constraint digest |
+| Admission proof | A SymCC query that cvc5 answers on the person's Mac before a policy revision activates; a failure or `unknown` refuses the revision |
 | Evidence gate, proposed | The rule that a capability is enabled only while every evidence item it requires is current; see [evidence gate lifecycle](designs/assurance-and-differentiation.md#evidence-gate-lifecycle) |
 | Escape, proposed | In a red-team run: an effect outside the compiled enforcement set, a canary secret in model-bound bytes, a tainted datum on a model-bound path, or a denied context item at a remote endpoint |
 
-The [policy brief](designs/security-policy-brief.md) defines authorization duties.
+The [policy brief](designs/security-policy-brief.md) defines authorization duties;
+the [security policy design](designs/security-policy.md) is their contract.
 The [harness brief](designs/core-harness-brief.md) defines task and session checks.
 
 ## Persistence, recovery and budgets

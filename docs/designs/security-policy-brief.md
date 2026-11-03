@@ -2,10 +2,17 @@
 
 Status: required capabilities with a proposed authorization contract. Revised
 by the owner on 2026-11-02: [task envelopes](#owner-revision-of-2026-11-02-task-envelopes)
-(AD-24).
+(AD-24). Revised by the owner on 2026-11-03:
+[engine, composition, solver, policy level and budgets](#owner-decisions-of-2026-11-03)
+(AD-13, AD-14, AD-17, AD-27).
 
-Open decisions: policy format, evaluator and macOS enforcement mechanisms.
-No policy format or evaluator is implemented. The [exec_cmd tool](exec-cmd-tool.md)
+Decided on 2026-11-03: the policy format and evaluator (Cedar). The
+[security policy design](security-policy.md) resolves this brief's open
+decisions for the policy layer: the effect schema, the wrapper, scope
+composition, the lifecycle, compilation to per-job Seatbelt profiles and the
+solver package. Live enforcement (Endpoint Security, Network Extension)
+stays proposed there. The brief keeps the requirements; the design is the
+canonical contract. No policy format or evaluator is implemented. The [exec_cmd tool](exec-cmd-tool.md)
 and Git observer apply fixed `sandbox-exec` profiles; those profiles are not a
 policy format or a selected general mechanism. Terms are defined in the
 [glossary](../glossary.md).
@@ -105,6 +112,20 @@ design, recorded here because it revises the exact-action invariant above.
 The envelope's lifecycle is [DF1-S1](assurance-and-differentiation.md#df1-s1-envelope-lifecycle).
 No envelope mechanism exists; the format, evaluator and enforcement mapping are
 still the open decisions of this brief.
+
+### Owner decisions of 2026-11-03
+
+Recorded here because they resolve open decisions of this brief and revise
+the command-invocation scope. The [owner decisions table](assurance-and-differentiation.md#owner-decisions)
+is the canonical record.
+
+| ID | Decision |
+| --- | --- |
+| AD-13 | Cedar is Asura's policy language and decision engine. It decides; it does not enforce |
+| AD-14 | Pattern A: each scope (installation, user, workspace, repository; later remote host) is evaluated separately. A request is allowed only if every scope allows it. A refusal names the scope that denied |
+| AD-17 | cvc5 is built from source with a dynamic or replaceable GMP, so the LGPL-3.0 obligations are met; it is signed and notarised inside `Asura.app`; proofs run on the person's Mac, offline; the service runs it as a bounded admission tool with no default time limit |
+| AD-27 | Effects are the authority. Policies are written over resources and operations (files, program execution by path and code-signing identity, network connections, secret use, Mach lookups if needed). Commands, MCP tools and skills are intent: context that may only tighten, never grant. Envelopes are effect sets. This revises the "command invocation" row of the [scope table](#scope-and-inputs): a command is authorized through the effects it may cause, and its structured features are intent |
+| Budgets | Decision p50 at most 100 µs; end-to-end p99 at most 1 ms at 64 concurrent requests; added size at most 8 MiB; startup at most 200 ms; built with the action split and per-worker engines. The original targets stay in the [spike](policy-engine-spike.md#owner-revision-of-2026-11-03-budgets) |
 
 ### Decision and enforcement boundary
 
