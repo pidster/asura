@@ -7,6 +7,12 @@ also does not authorize code, probes or spikes. Each capability needs its own
 governing design under the [design process](../design-process.md) before any
 code is written. Terms are defined in the [glossary](../glossary.md).
 
+Revision of 2026-11-03: the owner decided AD-13 (Cedar), AD-14 (per-scope
+evaluation, pattern A), AD-17 (cvc5 built from source and bundled) and AD-27
+(effects are the policy subject; commands are intent). The owner also revised
+the policy budgets; the [policy engine spike](policy-engine-spike.md#owner-revision-of-2026-11-03-budgets)
+keeps the original targets beside the revised ones.
+
 Revision of 2026-11-02: the owner decided AD-11, AD-15, AD-18, AD-21 and AD-24.
 AD-12, AD-16 and AD-23 are now decided by earlier owner rules and these
 decisions. Each row of the [owner decisions](#owner-decisions) table names who
@@ -86,7 +92,7 @@ Verified behavior and selected designs that this document builds on:
 | Queued person secrets are held in the team Keychain store | Implemented (SG3) | [Secret store](secret-store.md), [release signing](release-signing.md) |
 | Escapees of sandboxed model jobs are found and stopped | Implemented 2026-10-21 | [Escapee control](escapee-control.md) |
 | Developer ID signing, notarisation and stapling | NT-P1 passed 2026-10-27; SG5 recorded 2026-10-29 | [Release signing](release-signing.md) |
-| A policy format and evaluator | **Not implemented.** Cedar is a candidate only | [Security policy brief](security-policy-brief.md) |
+| A policy format and evaluator | **Not implemented.** Cedar selected by the owner on 2026-11-03 (AD-13) | [Security policy brief](security-policy-brief.md) |
 
 Today, model jobs already run under a fixed envelope (the `model-1` profile)
 with no per-command prompt. The differentiators below propose to make that
@@ -535,7 +541,9 @@ path.
 **Limits.** One query returns one counterexample, not the full difference.
 Asura repeats the query with exclusions to list more. `cedar-policy-symcc` is
 pre-1.0 (0.8.0, 2026-10-17), so a solver failure must refuse the change, never
-accept it. The packaging of cvc5 is open (decision AD-17).
+accept it. AD-17 (owner, 2026-11-03): Asura builds cvc5 from source with a
+replaceable, dynamically linked GMP, signs it inside `Asura.app`, and runs the
+proofs on the person's Mac, offline.
 
 ### DF7. Offline operation and lower cost through local triage
 
@@ -781,11 +789,11 @@ open. Earlier text of a decided row is kept as the question that was asked.
 | AD-10 | Secret reference syntax | No reference for brokered use; named references in messages; prefixed variables only for raw delivery. **Named references in person commands decided:** `$ASURA_SECRET_<NAME>` in `!` and `!!` commands only ([named secrets](named-secrets.md#references-in-commands)). **Model commands decided:** a model `exec_cmd` command that names `$ASURA_SECRET_` is refused with a reason ([named secrets](named-secrets.md#model-commands)). Brokered use and references in messages stay open | Engineering choice the owner asked for, 2026-11-01 (person commands); owner, 2026-11-02 (model commands); the rest open | [R-SEC] §17 OD-10, §12.2 |
 | AD-11 | Files written by tainted `!` jobs: track or accept the limit | **Decided: accept and state the limit.** The output of a command that used a raw secret is private, but the files that command writes are not tracked. The limit is stated in the "zero model access" claim (AD-23) and in the user documentation for named secrets ([commands](../user/commands.md#named-secret-commands)). Endpoint Security tracking is not selected | Owner, 2026-11-02 | [R-SEC] §17 OD-11, §9.4 |
 | AD-12 | Time bounds: confirm none by default for the Touch ID wait, the classifier call and SymCC admission checks; closures are cancel, stall and shutdown | **Decided by an earlier rule: none.** No fixed time limit ends, refuses or fails work by default; each wait ends by a loop-closure condition (AE-04). The helper's stall bound is an owner-accepted wind-down bound that never ends the work | Owner's no-default-time-bounds rule, 2026-10-15 ([AE-04](../engineering.md#asynchronous-execution-and-recovery)) | [R-SEC] §17 OD-12; [R-CED] §12 item 5, §11.3 |
-| AD-13 | Cedar as the D3 format and evaluator candidate, with Rego (regorus) as the comparison on the same corpus | Accept for the spike | Open | [R-CED] §12 item 1 |
-| AD-14 | Scope composition: per-scope AND, or forbid-only lower scopes | Both provable; forbid-only is simpler for repository files | Open | [R-CED] §12 item 2, §3.6 |
+| AD-13 | Cedar as the D3 format and evaluator candidate, with Rego (regorus) as the comparison on the same corpus | **Decided: Cedar.** Cedar is Asura's policy language and decision engine. It decides; it does not enforce. Host services enforce. Rego is not selected. (Spike recommendation: Cedar, about 75 %, [results](policy-engine-spike.md#recommendation)) | Owner, 2026-11-03 | [R-CED] §12 item 1; [policy engine spike](policy-engine-spike.md) |
+| AD-14 | Scope composition: per-scope AND, or forbid-only lower scopes | **Decided: pattern A, per-scope AND.** Asura evaluates each scope (installation, user, workspace, repository; later remote host) separately. A request is allowed only if every scope allows it. A refusal names the scope that denied. (Report recommendation: both provable; forbid-only is simpler for repository files) | Owner, 2026-11-03 | [R-CED] §12 item 2, §3.6; [spike composition](policy-engine-spike.md#scope-composition) |
 | AD-15 | Classifier scope: PCR22 excludes `!!`; may a classifier tightening add an approval for model jobs, which have none today; behaviour in non-interactive use | **Decided: the classifier may stop a model job to ask the person.** A `dangerous` or `unknown` label adds an approval step. If nobody answers (unattended or CLI use), the job waits in its agent's queue with a short reason until the person answers or cancels; no time limit ends the wait. `!!` stays outside the classifier (PCR22) ([DF4-F1](#df4-f1-classifier-approval-step-for-a-model-job)) | Owner, 2026-11-02 | [R-CED] §12 item 3, §1 |
 | AD-16 | `unknown` classifier result: approval, or no tightening | **Decided: approval.** It follows from AD-15 and the tighten-only rule CL-1: `unknown` adds the approval step | AD-15 (owner, 2026-11-02) and the tighten-only rule | [R-CED] §12 item 4, §11.3 |
-| AD-17 | cvc5 packaging for admission checks: bundled, developer-only or remote | Owner to decide | Open | [R-CED] §12 item 6 |
+| AD-17 | cvc5 packaging for admission checks: bundled, developer-only or remote | **Decided: build cvc5 from source and bundle it.** The build uses an LGPL-friendly GMP setup: dynamic or replaceable GMP, so the LGPL-3.0 obligations are met. Asura signs and notarises cvc5 inside `Asura.app`. Proofs run on the person's Mac, offline. The service launches cvc5 as a bounded admission tool with no default time limit: it ends when its input closes or on cancel | Owner, 2026-11-03 | [R-CED] §12 item 6; [spike evidence](policy-engine-spike.md#owner-decisions-needed) |
 | AD-18 | A VM backend (Linux guests only) in product scope; includes legal advice on the Xcode licence for guests | **Decided: yes, after native.** A Linux VM job backend is a second backend for Linux-friendly work, built after the Cedar policy layer and the brokers. Native macOS sandboxes stay for Mac work. Legal advice on the Xcode licence is still needed before any guest uses the macOS SDK. (Report recommendation: keep it as the main App Store-only path if a store edition runs local jobs) | Owner, 2026-11-02 | [R-CED] §12 item 7; [R-DIST] §9.1, §13 item 4 |
 | AD-19 | Developer ID only for the first releases | **Decided: a signed, notarised DMG is the primary distribution, and Homebrew installs it through a cask.** That makes the first releases Developer ID; an App Store companion (AD-21) stays a later option | Owner, 2026-11-01 | [R-DIST] §13 item 1 |
 | AD-20 | Goal 3 inside Developer ID: a sandboxed data owner, a group container socket and `NSDataAccessSecurityPolicy`; run IS-1 to IS-6 first | Yes (medium confidence) | Open | [R-DIST] §11, §13 item 2 |
@@ -795,6 +803,7 @@ open. Earlier text of a decided row is kept as the question that was asked.
 | AD-24 | Treat an envelope approval (DF1) as an authorized policy change, not a per-action approval | **Decided: yes, envelopes.** The person may approve an envelope of limits once per task. Asura records it as an authorized policy change, proves it (Cedar, when built), enforces it, and ends it with the task or on revocation. Exact-action approval stays for anything outside the envelope. This revises the [security policy brief](security-policy-brief.md#owner-revision-of-2026-11-02-task-envelopes) rule that an approval binds to the exact action ([DF1-S1](#df1-s1-envelope-lifecycle)) | Owner, 2026-11-02 | This document, DF1; [security policy brief](security-policy-brief.md#proposed-authorization-contract) |
 | AD-25 | Model context egress (DF2) as a Cedar action over data classes, destinations and projects under EX13 | **Decided: yes, policy decides.** Every piece of context is classified (by Asura's deterministic code and the on-device classifiers) before it leaves the Mac; a Cedar policy decides which data classes may go to which remote model for each project; denied context stays on the device | Owner, 2026-10-31 | This document, DF2 |
 | AD-26 | Adopt the evidence gate as a release rule: no differentiator is enabled by default without current evidence | This draft proposes yes | Open | This document |
+| AD-27 | Policy level: what is the subject of a policy decision, the command or its effects? | **Decided: effects are the authority.** The Cedar schema is written over resources and operations: `file.read`, `file.write`, `file.create` and `file.delete` on canonical paths; `process.exec` of a program identified by canonical path and code-signing identity; `network.connect` to a host or IP range and port; `secret_use` with raw or brokered delivery; Mach service lookups if needed. Envelopes (AD-24) are effect sets. Commands, MCP tools and skills are **intent**: context for approval, explanation, the journal and the classifier. Intent never grants by itself; it may only tighten, under the same forbid-only rule as the classifier attributes, provable as in CL-1. The classifier watches effects as well as intent and may tighten mid-run (revoke, or pause and ask), never widen. Enforcement today: effect policy compiled into per-job Seatbelt profiles, with effect evidence from sandbox reports; person commands keep AD-7. Live enforcement through Endpoint Security and Network Extension is a later, proposed research item | Owner, 2026-11-03 | This document; [security policy brief](security-policy-brief.md#owner-decisions-of-2026-11-03) |
 
 Settled by existing rules, not open: [R-SEC] OD-13 asks to confirm that the wire
 protocol stays 0.1 and the journal format stays 1, with schemas evolving in
