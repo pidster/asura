@@ -467,14 +467,15 @@ impl Keychain {
         delete_raw_with(self.calls(), &key.service(), &key.account())
     }
 
-    /// Adds the llama.cpp server key item once (the serve step).
-    pub fn add_server_key(&self, data: &[u8]) -> Result<Added, Failure> {
-        add_raw_with(self.calls(), SERVER_KEY_SERVICE, SERVER_KEY_ACCOUNT, data)
-    }
-
     /// Reads the llama.cpp server key item into a zeroizing buffer.
     pub fn get_server_key(&self) -> Result<Found, Failure> {
         get_raw_with(self.calls(), SERVER_KEY_SERVICE, SERVER_KEY_ACCOUNT)
+    }
+
+    /// Replaces the llama.cpp server key item's data with a new start's key
+    /// (llamacpp-backend.md, LCD6): updated in place, or added when absent.
+    pub fn put_server_key(&self, data: &[u8]) -> Result<(), Failure> {
+        put_raw_with(self.calls(), SERVER_KEY_SERVICE, SERVER_KEY_ACCOUNT, data)
     }
 
     /// Lists the items of one installation, at most [`LIST_BOUND`] of them.
@@ -695,6 +696,31 @@ pub(crate) fn update_raw_with<C: Calls + ?Sized>(
         // scratch pre-check returned 0 in this call.
         Err(ERR_SEC_ITEM_NOT_FOUND) => Ok(Updated::Absent),
         Err(code) => Err(calls.classify(code)),
+    }
+}
+
+/// Replaces one item's data: update in place; when absent, add; when the
+/// add finds a duplicate (another writer added it between the calls),
+/// update once more. A second absence after that duplicate is reported as
+/// unavailable, never as success. At most three item calls.
+pub(crate) fn put_raw_with<C: Calls + ?Sized>(
+    calls: &C,
+    service: &str,
+    account: &str,
+    data: &[u8],
+) -> Result<(), Failure> {
+    if update_raw_with(calls, service, account, data)? == Updated::Changed {
+        return Ok(());
+    }
+    if add_raw_with(calls, service, account, data)? == Added::Stored {
+        return Ok(());
+    }
+    match update_raw_with(calls, service, account, data)? {
+        Updated::Changed => Ok(()),
+        Updated::Absent => Err(Failure::Unavailable {
+            status: ERR_SEC_ITEM_NOT_FOUND,
+            item_call: true,
+        }),
     }
 }
 

@@ -24,7 +24,7 @@ explains project terms.
 | [ADR-0009: Supervised local-model helper](0009-supervised-local-model-helper.md) | Run the first macOS Foundation Models implementation in a supervised Swift process. |
 | [ADR-0010: Protobuf model and control channels](0010-protobuf-model-channel.md) | Shared pinned generation with separate contracts; model channel uses chunk frames, bounded credit and an exact helper match. |
 | [ADR-0011: Decouple tool output from model input](0011-tool-job-controller.md) | Run long-running tools as conversation-scoped jobs; the model reads retained output on request. |
-| [ADR-0012: A llama.cpp server through a LaunchAgent](0012-llamacpp-server-launchagent.md) | Asura's own `llama-server` router runs under a LaunchAgent, not the per-user service; its key stays in the team Keychain and reaches requests through a service relay. |
+| [ADR-0012: A llama.cpp server through a LaunchAgent](0012-llamacpp-server-launchagent.md) | Asura's own `llama-server` router runs under a LaunchAgent, not the per-user service; a fresh key at every start, kept in the team Keychain and given to the router's environment, reaches requests through a service relay. |
 
 Return to the [documentation index](../README.md).
 

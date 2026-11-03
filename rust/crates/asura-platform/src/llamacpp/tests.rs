@@ -76,20 +76,77 @@ fn every_plan_closes_cors() {
     }
 }
 
+/// LCD6: inherited `LLAMA_*` variables never reach the server; the start's
+/// own key is the one `LLAMA_*` variable it receives, once.
 #[test]
-fn llama_variables_never_reach_the_server() {
-    let kept = environment([
-        ("PATH".into(), "/usr/bin".into()),
-        ("LLAMA_API_KEY".into(), "x".into()),
-        ("LLAMA_ARG_HOST".into(), "0.0.0.0".into()),
-        ("LLAMA_ARG_PORT".into(), "1".into()),
-        // Would reopen CORS on the router and its model processes (LCD16).
-        ("LLAMA_ARG_CORS_ORIGINS".into(), "*".into()),
-        ("LLAMA_ARG_CORS_CREDENTIALS".into(), "1".into()),
-        ("HOME".into(), "/Users/p".into()),
-    ]);
-    let names: Vec<_> = kept.iter().map(|(n, _)| n.to_str().unwrap()).collect();
-    assert_eq!(names, ["PATH", "HOME"]);
+fn llama_variables_never_reach_the_server_except_the_start_key() {
+    let key = new_key();
+    let kept = environment(
+        [
+            ("PATH".into(), "/usr/bin".into()),
+            // An inherited key would let another key open the server.
+            ("LLAMA_API_KEY".into(), "inherited".into()),
+            ("LLAMA_ARG_HOST".into(), "0.0.0.0".into()),
+            ("LLAMA_ARG_PORT".into(), "1".into()),
+            // Would reopen CORS on the router and its model processes (LCD16).
+            ("LLAMA_ARG_CORS_ORIGINS".into(), "*".into()),
+            ("LLAMA_ARG_CORS_CREDENTIALS".into(), "1".into()),
+            ("HOME".into(), "/Users/p".into()),
+        ],
+        &key,
+    )
+    .unwrap();
+    let pairs: Vec<(&str, &str)> = kept
+        .iter()
+        .map(|(n, v)| (n.to_str().unwrap(), v.to_str().unwrap()))
+        .collect();
+    assert_eq!(
+        pairs,
+        [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/Users/p"),
+            (KEY_VARIABLE, std::str::from_utf8(&key).unwrap()),
+        ]
+    );
+    assert_eq!(KEY_VARIABLE, "LLAMA_API_KEY");
+}
+
+#[test]
+fn a_malformed_key_never_reaches_the_environment() {
+    for bad in [&b""[..], b"short", &[b'g'; 64][..], &[b'a'; 65][..]] {
+        assert!(environment([("PATH".into(), "/usr/bin".into())], bad).is_err());
+    }
+}
+
+/// The key is never an argument: the plan names only the pipe (LCD6), and
+/// `--no-ui` is always present; the router passes it on as `--no-webui`
+/// (P25).
+#[test]
+fn the_plan_keeps_the_ui_off_and_the_key_out_of_the_arguments() {
+    let key = new_key();
+    for plan in [
+        plan(),
+        ServerPlan {
+            idle_seconds: 0,
+            ..plan()
+        },
+    ] {
+        let args: Vec<String> = plan
+            .arguments(9)
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        assert_eq!(args.iter().filter(|a| *a == "--no-ui").count(), 1);
+        assert!(!args.iter().any(|a| a == "--ui" || a == "--webui"));
+        assert!(!args.iter().any(|a| a == "--api-key"));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains(std::str::from_utf8(&key).unwrap()))
+        );
+        let at = args.iter().position(|a| a == "--api-key-file").unwrap();
+        assert_eq!(args[at + 1], "/dev/fd/9");
+    }
 }
 
 #[test]

@@ -1,6 +1,6 @@
 //! Asura's llama.cpp server process (llamacpp-backend.md): the server plan,
-//! the key pipe, the signal reset before `execve`, the LaunchAgent file and
-//! the `launchctl` calls.
+//! the start's key in the environment and a pipe (LCD6), the signal reset
+//! before `execve`, the LaunchAgent file and the `launchctl` calls.
 //!
 //! The serve step and the CLI commands are one-shot processes; their waits
 //! (a `launchctl` child) end on the child's exit or the person's interrupt.
@@ -15,8 +15,12 @@ use std::process::{Command, Stdio};
 
 /// The LaunchAgent label.
 pub const LABEL: &str = "org.pidster.asura.llamacpp";
-/// The key: 32 random bytes as 64 lower-case hex digits.
+/// The key: 32 random bytes as 64 lower-case hex digits, new at every start.
 pub const KEY_HEX_BYTES: usize = 64;
+/// The variable that carries the key to the router, which passes its
+/// environment to every model process it starts (probes P14, P22, P23).
+/// llama.cpp 0.7.0 gives a model process a key no other way.
+pub const KEY_VARIABLE: &str = "LLAMA_API_KEY";
 /// The CORS arguments (LCD16). The allowed origin is not a valid serialised
 /// origin, so no page's origin equals it and no browser reads a reply. The
 /// relay sends no `Origin` and is not affected. The router passes these four
@@ -79,23 +83,37 @@ impl ServerPlan {
     }
 }
 
-/// The environment passed on: every `LLAMA_*` variable is removed, so none
-/// can change the host, the port or the key.
+/// The environment passed on: every inherited `LLAMA_*` variable is
+/// removed, so none can change the host, the port, CORS or the key; then
+/// [`KEY_VARIABLE`] is set to the start's key (LCD6), so the router and every
+/// model process it starts require it. A malformed key is refused.
 pub fn environment<I: IntoIterator<Item = (OsString, OsString)>>(
     vars: I,
-) -> Vec<(OsString, OsString)> {
-    vars.into_iter()
+    key: &[u8],
+) -> io::Result<Vec<(OsString, OsString)>> {
+    let key = valid_key(key)?;
+    let mut kept: Vec<(OsString, OsString)> = vars
+        .into_iter()
         .filter(|(name, _)| !name.as_encoded_bytes().starts_with(b"LLAMA_"))
-        .collect()
+        .collect();
+    kept.push((KEY_VARIABLE.into(), key.into()));
+    Ok(kept)
+}
+
+/// 64 hex digits, as [`new_key`] makes them.
+fn valid_key(key: &[u8]) -> io::Result<&str> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "key");
+    if key.len() != KEY_HEX_BYTES || !key.iter().all(u8::is_ascii_hexdigit) {
+        return Err(invalid());
+    }
+    std::str::from_utf8(key).map_err(|_| invalid())
 }
 
 /// A pipe holding the key: the write end is written and closed at once,
 /// the read end stays open across `execve`. 65 bytes is below `PIPE_BUF`,
 /// so the write cannot block.
 fn key_pipe(key: &[u8]) -> io::Result<OwnedFd> {
-    if key.len() != KEY_HEX_BYTES || !key.iter().all(u8::is_ascii_hexdigit) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "key"));
-    }
+    valid_key(key)?;
     let mut fds = [0; 2];
     // SAFETY: fds is a writable array of two descriptors.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -115,14 +133,15 @@ fn key_pipe(key: &[u8]) -> io::Result<OwnedFd> {
 }
 
 /// The command for `plan`, with the key pipe, the log on stdout and stderr,
-/// the filtered environment and the signal reset (Wisp: a process keeps a
-/// blocked signal mask across `execve`, and the router then ignored SIGTERM).
-fn command(plan: &ServerPlan, key: &OwnedFd, log: &File) -> io::Result<Command> {
+/// the filtered environment with the key, and the signal reset (Wisp: a
+/// process keeps a blocked signal mask across `execve`, and the router then
+/// ignored SIGTERM).
+fn command(plan: &ServerPlan, key: &[u8], pipe: &OwnedFd, log: &File) -> io::Result<Command> {
     let mut command = Command::new(&plan.binary);
     command
-        .args(plan.arguments(key.as_raw_fd()))
+        .args(plan.arguments(pipe.as_raw_fd()))
         .env_clear()
-        .envs(environment(std::env::vars_os()))
+        .envs(environment(std::env::vars_os(), key)?)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log.try_clone()?));
@@ -153,7 +172,7 @@ pub fn exec(plan: &ServerPlan, key: &[u8], log: &File) -> io::Error {
         Ok(pipe) => pipe,
         Err(error) => return error,
     };
-    match command(plan, &pipe, log) {
+    match command(plan, key, &pipe, log) {
         Ok(mut command) => command.exec(),
         Err(error) => error,
     }
@@ -169,7 +188,7 @@ pub fn spawn_for_test(
     log: &File,
 ) -> io::Result<std::process::Child> {
     let pipe = key_pipe(key)?;
-    let mut command = command(plan, &pipe, log)?;
+    let mut command = command(plan, key, &pipe, log)?;
     command.process_group(0);
     let child = command.spawn();
     drop(pipe);

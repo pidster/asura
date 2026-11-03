@@ -354,7 +354,7 @@ to free space, and the next start compiles the model again.
 | Mode | Server |
 | --- | --- |
 | `off` | None; `llamacpp:` messages wait with `llamacpp_server_off`. The default |
-| `asura` | Asura's own server, on `127.0.0.1` port 8934, with a key Asura keeps in the Keychain |
+| `asura` | Asura's own server, on `127.0.0.1` port 8934, with a new key at every start that Asura keeps in the Keychain |
 | `llama-app` | Llama.app's server on `127.0.0.1` port 9931. It has no key, and any program on this Mac can use it |
 | `url` | A server you start, at `providers.llamacpp.endpoint` (a `127.0.0.1` or `::1` URL) |
 
@@ -380,9 +380,11 @@ Every mode except `off` gives the model project tools. A program that answers
 on the configured port sees the conversation and the tool results, so point
 `url` only at a server you trust.
 
-Asura's own server tells web browsers that no web page may read its replies.
-A web page can still make a loaded model run, without seeing the answer.
-Llama.app's server and a server you start keep their own browser settings.
+Asura's own server tells web browsers that no web page may read its replies,
+and each loaded model needs the server's key, so a web page cannot make a model
+run. Programs you run on this Mac can read the key from the server's
+environment while it runs. Llama.app's server and a server you start keep
+their own browser and key settings.
 
 To use Wisp's server, store its key with `/secrets store WISP_LLAMACPP`, then
 set `providers.llamacpp.server url`, `providers.llamacpp.endpoint
