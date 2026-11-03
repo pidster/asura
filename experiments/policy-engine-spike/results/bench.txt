@@ -1,0 +1,4 @@
+ 9:12  up 46 days, 22:03, 13 users, load averages: 6.28 6.95 5.54
+{"engine":"cedar-b","workers":8,"queue":64,"clients":64,"measured":640000,"eval_us":{"p50":345.38,"p95":723.92,"p99":983.96,"max":1875.46},"e2e_us":{"p50":3074.67,"p95":3682.29,"p99":3988.17,"max":6261.67},"throughput_per_s":20693,"allow_share":0.360}
+{"engine":"cedar-a","workers":8,"queue":64,"clients":64,"measured":640000,"eval_us":{"p50":344.29,"p95":714.25,"p99":970.75,"max":1722.21},"e2e_us":{"p50":3050.67,"p95":3624.17,"p99":3908.58,"max":4950.00},"throughput_per_s":20863,"allow_share":0.360}
+{"engine":"rego","workers":8,"queue":64,"clients":64,"measured":640000,"eval_us":{"p50":663.33,"p95":1203.33,"p99":1357.79,"max":1649.58},"e2e_us":{"p50":5826.46,"p95":6509.12,"p99":6783.67,"max":7644.92},"throughput_per_s":10946,"allow_share":0.360}

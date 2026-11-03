@@ -1,7 +1,8 @@
 # Policy engine spike: Cedar and Rego on one corpus
 
-Status: ready design for an executable evaluation spike, 2026-11-03. Budgets
-are set in this document **before** any measurement. The spike code lives in
+Status: ready design for an executable evaluation spike, 2026-11-03; spike
+run and [results](#results) recorded the same day. Budgets were set in this
+document **before** any measurement and were not changed afterwards. The spike code lives in
 [`experiments/policy-engine-spike/`](../../experiments/policy-engine-spike/).
 [Results](#results) record the measured outcome against these budgets.
 
@@ -1220,7 +1221,7 @@ to AE-07 where they apply.
 | AE-03 | Worker count 8, queue 64, clients 64, request bounds of W1, corpus counts fixed by the generator |
 | AE-04 | Benchmark loops end by iteration count. A cvc5 query ends by the solver's reply or by the operator's cancel. No wall-clock deadline exists in the spike |
 | AE-05 | No effects. Runs are repeatable from the committed corpus and seed |
-| AE-06 | Shutdown closes the queue and joins the workers. The cvc5 child is killed when the solver handle is dropped |
+| AE-06 | Shutdown closes the queue and joins the workers. The cvc5 child exits when its standard input closes at the end of the `admission` process ([deviation](#deviations-from-the-design)) |
 | AE-07 | The measurements themselves are the runtime evidence for the spike's scope. They are not evidence for a product component |
 
 Product implication, for D3: both engines need a bounded worker pool for
@@ -1355,5 +1356,137 @@ not resolve them.
 
 ## Results
 
-Not yet measured. This section is filled after the spike runs, without
-changing the budgets above.
+Verified behavior, 2026-11-03. Environment: Apple M4 Max, 16 cores, 48 GiB,
+macOS 27.0 (26A428), Rust 1.98.0. Versions: `cedar-policy` 4.14.1,
+`cedar-policy-symcc` 0.8.1, cvc5 1.3.1 (macOS arm64 static, digest checked),
+`regorus` 0.14.1 with `arc`, `std` and `net`. The budgets above were not
+changed. Raw outputs are in
+[`experiments/policy-engine-spike/results/`](../../experiments/policy-engine-spike/results/).
+
+Measurement limit: the host was shared. The load average was 5.5 to 8 during
+the latency runs. A single-threaded breakdown (below) gives the engine cost
+without the harness, and it agrees with the concurrent figures.
+
+### Budget results
+
+| ID | Cedar | Rego |
+| --- | --- | --- |
+| PES-M1 Expressive coverage | **Pass.** 8 of 8 families; 64 of 64 cases, in patterns A and B | **Pass.** 8 of 8 families; 64 of 64 cases |
+| PES-M2 Unenforced conventions | **Pass.** 0. Error denial is a wrapper rule; forbid-only lower scopes and classifier-only-in-forbid are admission lints with proofs | **Fail.** 2: deny rules must be written in fail-safe polarity, because missing data is undefined, not an error (FE7); and a mistyped field or literal silently disables a rule (PES-M6). The package-name check and the combiner's result shape are enforced |
+| PES-M3 Injected runtime errors | **Pass.** 4 of 4 deny with `policy_error` and the erroring policy ID. Cedar alone returned Allow in all 4 (the error-skip finding, confirmed) | **Fail.** 4 of 5: FE5, FE6 and FE8 deny with `engine_error`; FE9 is refused at load; FE7 allows, and no error reaches the wrapper |
+| PES-M4 Malformed-request fuzz | **Pass.** 0 allows in 1,000,000. Without the wrapper: 571,269 allows | **Pass.** 0 allows in 1,000,000. Without the wrapper: 679,054 allows |
+| PES-M5 Determinism | **Pass.** 0 mismatches in 331,968 evaluations (all three engines and patterns; 104 repetitions; 8 threads; fresh instances); the same digest in 2 processes; the language has no clock or random function | **Fail.** Decisions are deterministic (same evidence), but `rand.intn` is reachable with the designed feature set (`std` registers it). `time.now_ns`, `http.send`, `opa.runtime` and `uuid.rfc4122` are absent |
+| PES-M6 Schema validation | **Fail, 11 of 12.** The corpus is valid in strict mode. SD7 (a resource compared with an entity of another type) passes validation with the warning "policy is impossible"; 12 of 12 if Asura refuses on validator warnings | **Fail, 0 of 12.** Every defect loads. When a request reaches the rule, SD8 and SD12 deny with `engine_error`; the other 10 rules never fire, so the forbid is silently lost |
+| PES-M7 Explainability | **Pass.** Every decision carries the expected rule IDs and reason codes; errors name the erroring policies | **Pass.** Same codes as Cedar for every case. An `engine_error` names no rule |
+| PES-M8 Dependencies and licences | **Pass.** 67 crates besides the root; all permissive; no runtime or network crate. Admission tool (with `cedar-policy-symcc` and Tokio): 81 crates, all permissive | **Pass.** 45 crates besides the root; all permissive; no runtime or network crate |
+| PES-M9 Build size | **Fail.** +6.89 MiB stripped (+5.10 MiB with fat LTO on the build before the diagnostic variant) | **Pass.** +1.38 MiB stripped (+1.09 MiB with fat LTO) |
+| PES-M10 Startup | **Fail.** Median 136 ms (133 to 145); peak memory 116 to 121 MiB. Entities dominate: parsing, schema checking and closure of 10,325 entities took 95 ms; schema 1.5 ms, policies 5.7 ms, strict validation 3.1 ms | **Pass.** Median 20.3 ms (19.9 to 22.1); peak memory 42 to 43 MiB |
+| PES-M11 Evaluation latency | **Fail.** Pattern B: p50 345 µs, p95 724 µs, p99 984 µs. Pattern A: p50 344 µs, p95 714 µs, p99 971 µs. Only p99 meets its budget | **Fail.** p50 663 µs, p95 1,203 µs, p99 1,358 µs |
+| PES-M12 End-to-end latency | **Fail.** p99 3,988 µs (B), 3,909 µs (A); 20,693 decisions per second | **Fail.** p99 6,784 µs; 10,946 decisions per second |
+| PES-M13 Analysis time per query | **Pass.** 429 queries: median 2.1 ms, p95 61.9 ms; slowest 373.7 ms (AQ7, the widening change) | **Not measurable.** No analyser exists for Rego |
+| PES-M14 Analysis coverage | **Pass.** Every corpus feature analysed. Probes: `like`, `ipaddr`, `datetime`, `duration` with `offset`, `decimal`, enum entities, entity tags, set operators, `has` and `in` on entity sets all analysable; none unsupported | **Not measurable** |
+| PES-M15 Never-errors proofs | **Pass.** 206 of 206 queries (153 forbids, each in its applicable environments). Seeded overflow forbids (FE2 and FE4 shapes) are refuted. Limit: the FE1 shape (an attribute of an entity missing at run time) is proven never to error, because the analysis assumes a well-formed entity store. The runtime wrapper rule W3 stays necessary | **Not measurable** |
+| PES-M16 Classifier monotonicity | **Pass.** Lint: 0 violations; the seeded classifier permit is refused. AQ3 holds in 8 of 8 environments; the seeded permit gives a counterexample. The research's pitfall policy (`permit ... unless { context.risk == ... }`) is already refused by strict validation, because `risk` is optional and unguarded | **Not measurable** for the proof. A lint over the AST was not built |
+| PES-M17 Scope narrowing | **Pass.** AQ4 holds in 8 of 8 environments; the seeded repository permit is refused by the lint and shown by a counterexample; patterns A and B agree on 1,064 of 1,064 requests | **Partly measurable.** The package-name check refuses a lower-scope module that names another package; no proof exists |
+| PES-M18 Envelope containment | **Pass.** 26 of 26 envelopes contained (79 queries); 105 safety queries hold with each envelope; the seeded envelope without its task condition gives a counterexample. Per-envelope proof set: median 387 ms, slowest 402 ms | **Not measurable** |
+| PES-M19 Cross-engine agreement | **Pass.** 1,000 of 1,000 scale requests give the same decision and rule IDs in both engines (356 allowed) | Same result |
+
+### Latency diagnosis
+
+These are diagnostic variants, not designed measurements. They explain the
+PES-M11 and PES-M12 failures and show what D3 could change. They do not change
+any result above.
+
+| Variant | Evaluation p50 / p95 / p99 | End-to-end p99 | Decisions per second |
+| --- | --- | --- | --- |
+| Cedar pattern B, one shared engine (designed) | 345 / 724 / 984 µs | 3,988 µs | 20,693 |
+| Cedar, the merged set partitioned by action, shared | 153 / 507 / 640 µs | 2,320 µs | 38,487 |
+| Cedar pattern B, one engine per worker | 147 / 202 / 216 µs | 1,361 µs | 52,211 |
+| Cedar, partitioned by action, one engine per worker | 76 / 129 / 142 µs | 921 µs | 99,160 |
+| Rego, one engine per worker (designed: a clone per worker) | 426 / 716 / 757 µs | 4,371 µs | 17,018 |
+
+Single-threaded cost per decision, mean over 21,280 decisions: Cedar 127 µs.
+Of this, 103 µs is `is_authorized` over the 258 policies (18 µs over the 38
+core policies), 17.7 µs is context validation against the schema, and 2.5 µs
+is request validation. Rego costs 402 µs, of which 392 µs is evaluation.
+
+Findings:
+
+- Cedar evaluates every policy in the set for every request. Cost grows with
+  the policy count. Partitioning the set by action is exact (the conformance
+  and differential tests show identical decisions) and halves the work.
+- Sharing one Cedar `PolicySet` and `Entities` across 8 threads costs about
+  2.5 times the single-threaded time. Per-worker copies remove this. The cause
+  was not isolated; contention on shared reference counts is the likely
+  explanation (inference, not verified).
+- With both changes, Cedar meets the p95, p99 and end-to-end budgets but not
+  the p50 budget of 50 µs. No Rego variant came near the budgets.
+
+### Recommendation
+
+**Recommendation: Cedar for D3, with Rego not selected. Confidence: about 75 %
+(medium-high).** The owner decides (AD-13).
+
+Reasons:
+
+- The decisive differences are on the safety properties that the brief
+  requires, not on speed. With the same wrapper, Rego lost a forbid silently in
+  10 of 12 seeded typos and on missing data (FE7). Cedar refused 11 of 12 typos
+  at validation and flagged the twelfth. Its errors are visible to the wrapper,
+  so the wrapper can deny them.
+- Cedar's admission analysis worked on the whole corpus and was fast: CL-1,
+  scope narrowing, 26 envelope containments, 6 safety properties and change
+  differences, each with counterexamples, in milliseconds per query. DF1, DF3,
+  DF4 and DF6 depend on this evidence, and Rego has no equivalent.
+- Both engines fail closed through the wrapper on a million malformed
+  requests, and both carry the same reason codes.
+
+Costs that D3 must resolve if Cedar is selected:
+
+- **Latency (PES-M11, PES-M12).** As designed, Cedar fails. Partitioning by
+  action and per-worker engines bring p99 to 142 µs and end-to-end p99 to
+  921 µs; p50 stays at 76 µs against a 50 µs budget. D3 must either adopt
+  those mechanisms and remeasure, or the owner must revisit the budget.
+- **Startup and memory (PES-M10).** Loading 10,325 validated entities
+  dominates. D3 should load per-request entity slices or validate the store
+  once, and remeasure. The peak memory figure includes the corpus generator
+  (Rego's 42 MiB run carries the same generator).
+- **Size (PES-M9).** +6.9 MiB stripped, or +5.1 MiB with fat LTO. The owner
+  may accept it or revisit the budget.
+- **Trusted code outside the proof.** SymCC assumes a well-formed entity store,
+  so the entity loader, the canonicaliser and the command parser stay trusted
+  code; the wrapper must keep deny-on-error (W3).
+- **Validator warnings.** Asura should refuse a policy bundle with validator
+  warnings, so impossible policies (SD7) are refused.
+
+What lowers confidence: the latency gap on the designed configuration; the
+pre-1.0 status of `cedar-policy-symcc`; and a comparison limited to `regorus`
+(OPA itself, through Go or Wasm, was not measured). Rego remains better for
+startup and size and has a mature partial evaluation, which this spike did not
+use.
+
+### Owner decisions needed
+
+| Decision | Evidence from this spike |
+| --- | --- |
+| AD-13: engine | The budget results and recommendation above |
+| AD-14: scope composition | Patterns A and B gave identical decisions on 1,064 requests and the same latency (A's lower-scope sets are small). Both are provable: the forbid-only lint plus AQ4 for B; per-set evaluation for A. B needs one evaluation and one set; A names the denying scope directly. Neither changes the engine choice |
+| AD-17: cvc5 packaging | The analysis is fast enough for interactive envelope approval (387 ms per envelope). The binary is 21.1 MB (a 35.0 MB archive), not signed by Asura, BSD-3-Clause, and links GMP statically (LGPL-3.0); it links the system C++ library dynamically. Bundling it means signing it and meeting the LGPL obligations; a developer-only or remote option avoids that but removes DF1 and DF6 on the person's Mac |
+| Budgets | PES-M9 to PES-M12 failed for Cedar as designed. If Cedar is selected, the owner decides whether D3 must meet them with the mechanisms above or whether they change |
+
+### Deviations from the design
+
+- Versions: the research found 4.14.0, 0.8.0 and 0.14.0; the spike pinned the
+  current patch releases 4.14.1, 0.8.1 and 0.14.1 (recorded in
+  [versions](#versions) before measurement).
+- Diagnostic additions, not in the original method: the action-partitioned
+  Cedar variant (`Pattern::BSliced`), per-worker engine variants, and the
+  `breakdown` and `cedar-phases` timings. Tests show the partitioned variant
+  gives identical decisions.
+- FE9: `regorus` refuses an undefined decision rule when the bundle is
+  prepared, so FE9 is refused at load instead of `result_invalid`. Both are
+  fail-closed.
+- AE-06: `cedar-policy-symcc` does not kill cvc5 on drop. The solver exits
+  when its standard input closes at the end of the `admission` process.
+- AQ1 also runs three seeded forbids that can error, to show that the
+  never-errors query detects errors (the overflow shapes are refuted).

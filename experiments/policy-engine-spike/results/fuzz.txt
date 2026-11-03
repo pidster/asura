@@ -1,0 +1,4 @@
+{"engine":"cedar","bases":383,"variants":1000000,"wrapper_allows":0,"raw_allows":571269,"wrapper_outcomes":{"request_invalid":749883,"request_too_large":250117},"kind_count_raw_allows":{"0":[83618,74708],"1":[83411,74496],"2":[83555,83555],"3":[82907,82907],"4":[82950,77710],"5":[83433,0],"6":[83521,0],"7":[83071,4823],"8":[83417,0],"9":[83067,6020],"10":[82996,82996],"11":[84054,84054]},"first_wrapper_allow":None}
+exit 0
+{"engine":"rego","bases":383,"variants":1000000,"wrapper_allows":0,"raw_allows":679054,"wrapper_outcomes":{"request_invalid":749749,"request_too_large":250251},"kind_count_raw_allows":{"0":[83464,74529],"1":[83303,69127],"2":[83714,83714],"3":[82763,82763],"4":[83486,78264],"5":[83406,79705],"6":[83520,6658],"7":[83181,31278],"8":[82912,0],"9":[83167,5932],"10":[82977,82977],"11":[84107,84107]},"first_wrapper_allow":None}
+exit 0

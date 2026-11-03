@@ -1,0 +1,27 @@
+{"engine":"cedar","policies_sources":11,"entities":10325,"load_and_first_decision_ms":144.98,"first_allow":true} peak_rss_bytes=122306560
+{"engine":"cedar","policies_sources":11,"entities":10325,"load_and_first_decision_ms":138.80,"first_allow":true} peak_rss_bytes=121978880
+{"engine":"cedar","policies_sources":11,"entities":10325,"load_and_first_decision_ms":140.10,"first_allow":true} peak_rss_bytes=127107072
+{"engine":"cedar","policies_sources":11,"entities":10325,"load_and_first_decision_ms":134.09,"first_allow":true} peak_rss_bytes=121978880
+{"engine":"cedar","policies_sources":11,"entities":10325,"load_and_first_decision_ms":134.71,"first_allow":true} peak_rss_bytes=122093568
+{"engine":"cedar","policies_sources":11,"entities":10325,"load_and_first_decision_ms":132.76,"first_allow":true} peak_rss_bytes=122372096
+{"engine":"cedar","policies_sources":11,"entities":10325,"load_and_first_decision_ms":134.47,"first_allow":true} peak_rss_bytes=127090688
+{"engine":"cedar","policies_sources":11,"entities":10325,"load_and_first_decision_ms":133.34,"first_allow":true} peak_rss_bytes=125911040
+{"engine":"cedar","policies_sources":11,"entities":10325,"load_and_first_decision_ms":140.53,"first_allow":true} peak_rss_bytes=125960192
+{"engine":"cedar","policies_sources":11,"entities":10325,"load_and_first_decision_ms":137.40,"first_allow":true} peak_rss_bytes=122060800
+{"engine":"rego","policies_sources":11,"entities":10325,"load_and_first_decision_ms":22.13,"first_allow":true} peak_rss_bytes=44449792
+{"engine":"rego","policies_sources":11,"entities":10325,"load_and_first_decision_ms":20.65,"first_allow":true} peak_rss_bytes=44728320
+{"engine":"rego","policies_sources":11,"entities":10325,"load_and_first_decision_ms":20.44,"first_allow":true} peak_rss_bytes=44859392
+{"engine":"rego","policies_sources":11,"entities":10325,"load_and_first_decision_ms":20.42,"first_allow":true} peak_rss_bytes=44253184
+{"engine":"rego","policies_sources":11,"entities":10325,"load_and_first_decision_ms":20.29,"first_allow":true} peak_rss_bytes=44433408
+{"engine":"rego","policies_sources":11,"entities":10325,"load_and_first_decision_ms":19.89,"first_allow":true} peak_rss_bytes=45154304
+{"engine":"rego","policies_sources":11,"entities":10325,"load_and_first_decision_ms":20.30,"first_allow":true} peak_rss_bytes=44400640
+{"engine":"rego","policies_sources":11,"entities":10325,"load_and_first_decision_ms":20.29,"first_allow":true} peak_rss_bytes=44761088
+{"engine":"rego","policies_sources":11,"entities":10325,"load_and_first_decision_ms":20.11,"first_allow":true} peak_rss_bytes=44384256
+{"engine":"rego","policies_sources":11,"entities":10325,"load_and_first_decision_ms":20.17,"first_allow":true} peak_rss_bytes=44400640
+schema parse: 1.48 ms
+policy parse and re-id: 5.66 ms
+policy set build: 0.14 ms
+strict validation: 3.12 ms
+entity JSON encode: 12.32 ms
+entities parse, schema check and closure: 94.99 ms
+{"engine":"cedar-phases","policies_sources":11,"entities":10325,"load_and_first_decision_ms":123.18,"first_allow":true}

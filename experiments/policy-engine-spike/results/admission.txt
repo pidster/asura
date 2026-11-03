@@ -1,0 +1,35 @@
+request environments: 8
+note AQ1 forbid policies: 153
+note AQ2 corpus lint violations: 0
+note AQ5 envelopes: 26
+note AQ8 research pitfall (permit unless context.risk) strict validation errors: 1
+note AQ8 seeded classifier permit lint: ["seed.clf.permit reads context.risk but is not a @classifier forbid"]
+note AQ8 seeded repository permit lint: ["repository scope holds a permit: seed.repo.permit"]
+category AQ1 never_errors: queries=206 as_expected=206 solver_or_compile_failures=0 median_ms=0.0 p95_ms=0.0 max_ms=7.8
+category AQ1 seeded can-error: queries=3 as_expected=3 solver_or_compile_failures=0 median_ms=1.1 p95_ms=2.6 max_ms=2.6
+category AQ3 cl1 implies(P,P0): queries=8 as_expected=8 solver_or_compile_failures=0 median_ms=2.1 p95_ms=7.5 max_ms=7.5
+category AQ4 implies(P,P_upper): queries=8 as_expected=8 solver_or_compile_failures=0 median_ms=2.4 p95_ms=134.0 max_ms=134.0
+category AQ5 envelope containment: queries=79 as_expected=79 solver_or_compile_failures=0 median_ms=55.5 p95_ms=61.2 max_ms=62.6
+category AQ5 envelope safety: queries=105 as_expected=105 solver_or_compile_failures=0 median_ms=56.1 p95_ms=62.1 max_ms=65.3
+category AQ6 safety on P: queries=7 as_expected=7 solver_or_compile_failures=0 median_ms=47.4 p95_ms=150.0 max_ms=150.0
+category AQ6 safety on P0: queries=7 as_expected=7 solver_or_compile_failures=0 median_ms=46.1 p95_ms=145.0 max_ms=145.0
+category AQ7 change difference: queries=3 as_expected=3 solver_or_compile_failures=0 median_ms=56.3 p95_ms=373.7 max_ms=373.7
+category AQ8 seeded: queries=3 as_expected=3 solver_or_compile_failures=0 median_ms=188.1 p95_ms=352.3 max_ms=352.3
+detail AQ7 change difference [Asura::Job/Asura::Action::"write"/Asura::Path] widening change: holds=Some(false) expected=false 373.7 ms counterexample: Asura::Job::"" Asura::Action::"write" Asura::Path::"/Users/person/notes"
+detail AQ8 seeded [Asura::Job/Asura::Action::"exec"/Asura::Executable] seeded classifier permit: holds=Some(false) expected=false 78.9 ms counterexample: Asura::Job::"" Asura::Action::"exec" Asura::Executable::""
+detail AQ8 seeded [Asura::Job/Asura::Action::"write"/Asura::Path] seeded repository permit: holds=Some(false) expected=false 352.3 ms counterexample: Asura::Job::"" Asura::Action::"write" Asura::Path::"/etc"
+detail AQ8 seeded [Asura::Job/Asura::Action::"write"/Asura::Path] seeded envelope without task: holds=Some(false) expected=false 188.1 ms counterexample: Asura::Job::"" Asura::Action::"write" Asura::Path::"/Users/person/src/shared/out"
+all queries=429 median_ms=2.1 p95_ms=61.9 max_ms=373.7 slowest=AQ7 change difference widening change [Asura::Job/Asura::Action::"write"/Asura::Path]
+envelope proof sets=26 median_ms=386.8 max_ms=402.3
+coverage like: analysable; never_errors=true (0.0 ms)
+coverage ipaddr: analysable; never_errors=true (0.0 ms)
+coverage datetime: analysable; never_errors=true (0.0 ms)
+coverage duration and offset: analysable; never_errors=false (20.9 ms)
+coverage decimal: analysable; never_errors=true (0.1 ms)
+coverage enum entity: analysable; never_errors=true (0.0 ms)
+coverage entity tags: analysable; never_errors=true (2.4 ms)
+coverage set operators: analysable; never_errors=true (0.0 ms)
+coverage has on optional: analysable; never_errors=true (0.8 ms)
+coverage in entity set: analysable; never_errors=true (0.0 ms)
+unexpected results: 0
+exit 0
