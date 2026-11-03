@@ -41,7 +41,9 @@ distribution, installed by a Homebrew cask
 ([ADR-0008](../decisions/0008-homebrew-tap-distribution.md)). Packet SG6
 (2026-11-01) replaces the `.tar.gz` archive with `Asura-<version>.dmg` and the
 formula with the `asura` cask, with no migration
-([SG6](#sg6-dmg-and-cask)). The release itself stays on hold.
+([SG6](#sg6-dmg-and-cask)). On 2026-11-03 the owner authorised publication:
+release 0.0.1 is published and the `asura` cask is in `pidster/tap`
+([0.0.1 release](#001-release)). The clean-host install remains with the owner.
 On 2026-11-01 the owner also cancelled release 0.1.0 and named the first
 release **0.0.1**. No 0.1.0 tag or GitHub release was ever created. Records
 dated before 2026-11-01 name 0.1.0 because the product version was 0.1.0 when
@@ -71,7 +73,8 @@ What is open:
   which the owner runs ([NT-P1 results](#nt-p1-results-2026-10-27));
 - the owner decisions that SG4 and SG6 record in
   [SG4 open items](#sg4-open-items) and [SG6 open items](#sg6-open-items):
-  the first publication. SG6-O1, the cask `zap`, was decided by the owner on
+  the clean-host install of 0.0.1 and the offline first launch (SG6-O2,
+  deferred by the owner on 2026-11-03). SG6-O1, the cask `zap`, was decided by the owner on
   2026-11-02: `zap trash: "~/.asura"`. SG4-O1, embedded build-host paths, is resolved
   ([build-host paths](#build-host-paths-sg4-o1)); SG4-O2 is resolved
   (immutable releases enabled, 2026-11-01).
@@ -1035,10 +1038,12 @@ flowchart TD
   `{"enabled":false}`. The owner enabled them; on 2026-11-01 it returned
   `{"enabled":true,"enforced_by_owner":false}`. Preflight still checks it
   (HD12).
-- **Owner actions, not open design.** Publication (SGQ9); the offline
-  Gatekeeper check; and the clean-host install. The HTTPS quarantine record
-  (open point 6) is replaced by the SG6 cask measurement: Homebrew always
-  quarantines a cask download.
+- **Owner actions, not open design.** Publication (SGQ9), done for 0.0.1 on
+  2026-11-03; the offline Gatekeeper check, deferred by the owner; and the
+  clean-host install, pending. The HTTPS quarantine record (open point 6) is
+  replaced by the SG6 cask measurement: Homebrew always quarantines a cask
+  download. The 0.0.1 HTTPS install confirmed it
+  ([0.0.1 release](#001-release)).
 
 ### SG6 DMG and cask
 
@@ -1048,8 +1053,8 @@ decisions of 2026-10-31 and 2026-11-01 (RS12,
 `.tar.gz` archive with one signed, notarised DMG and the formula with a cask.
 The archive, the formula and their checks are removed, with no alias and no
 migration (RS7). It changes no runtime code: `Asura.app`, its signatures and
-its resource lookup are those of SG1 to SG4-O1. The first publication stays on
-hold with the owner.
+its resource lookup are those of SG1 to SG4-O1. The first publication, 0.0.1,
+was made on 2026-11-03 ([0.0.1 release](#001-release)).
 
 | Choice | Selected | Evidence (macOS 27.0 26A428, Xcode 27.1, Homebrew 7.0.11) |
 | --- | --- | --- |
@@ -1193,14 +1198,17 @@ flowchart TD
   carries `zap trash: "~/.asura"`. Until then the cask had no `zap` stanza and
   no Homebrew command removed `~/.asura`. Keychain items are not removed
   ([zap and `~/.asura`](release-distribution.md#zap-and-asura)).
-- **SG6-O2, offline first launch (owner).** The app inside the DMG carries no
+- **SG6-O2, offline first launch (owner; deferred by the owner on
+  2026-11-03, after the 0.0.1 release).** The app inside the DMG carries no
   stapled ticket. The first Gatekeeper assessment of a quarantined
   `/Applications/Asura.app` on a Mac without network is not proven. If it
   fails, the fix is a second, earlier submission of the app and a stapled app
   in the DMG (Wisp's order), at one more submission per release.
-- **SG6-O3, publication (owner, on hold).** `verify-release`, the HTTPS tap
-  test with `brew audit --cask --strict --online`, the tap commit and the
-  clean-host install (HD1, HD13) have not run.
+- **SG6-O3, publication (owner): done for 0.0.1 on 2026-11-03, except the
+  clean host.** `verify-release` (HD12, HD13), the HTTPS tap test with
+  `brew audit --cask --strict --online` and the tap commit passed
+  ([0.0.1 release](#001-release)). The clean-host install (HD1) is pending
+  with the owner.
 
 ## Service App Sandbox: no
 
@@ -2420,7 +2428,7 @@ signing packet.
 | SG4 | Delivered (2026-10-28) | — ([delivery](#sg4-delivery)); publication, the release-mode checks and the clean-host install are the owner's |
 | SG4-O1 | Delivered (2026-10-29) | — ([delivery](#sg4-o1-delivery)) |
 | SG5 | Delivered (2026-10-29) | — ([delivery](#sg5-delivery)); the keg's own service in `~/.asura`, publication and the clean host stay with the owner ([gates not run here](#sg5-gates-not-run-here)) |
-| SG6 | Delivered (2026-11-01) | — ([delivery](#sg6-delivery)); publication, the HTTPS tap test and the clean host stay with the owner ([SG6 open items](#sg6-open-items)) |
+| SG6 | Delivered (2026-11-01) | — ([delivery](#sg6-delivery)); 0.0.1 published on 2026-11-03 ([0.0.1 release](#001-release)); the clean host stays with the owner ([SG6 open items](#sg6-open-items)) |
 
 ### SG1 delivery
 
@@ -2742,7 +2750,8 @@ Proof limits:
 - HD13's remote digest comparison is exercised only through its shared
   `check` path and the `.sha256` refusal; no published release exists.
 - The HTTPS quarantine state (open point 6) and the NT-P1 offline Gatekeeper
-  check remain open.
+  check remain open. The 0.0.1 release recorded open point 6
+  ([0.0.1 release](#001-release)).
 - The formula test ran on an ad hoc keg; the notarised keg is NT-P1's
   (2026-10-27), which predates `--version`.
 - `asura --version` under Homebrew's own test sandbox ran for the ad hoc keg
@@ -2922,6 +2931,68 @@ Proof limits:
   a count line after the build-host rule check (exit 1); the cause was not
   captured. The planted-DMG steps now report a `FAIL` with the `hdiutil`
   output instead of exiting under `set -e`. Every later run passed.
+
+### 0.0.1 release
+
+Published 2026-11-03 on the owner's Mac (macOS 27.0 26A428, Apple silicon,
+rustc 1.98.0, Apple Swift 6.4, Homebrew 7.0.11-10-g20e162d), by a delegated
+agent with the owner's explicit authority of 2026-11-03 ("Publish 0.0.1"): one
+release build and notary submission, the GitHub release `v0.0.1`, and the
+`pidster/homebrew-tap` commit. The steps are those of `tools/release/README.md`
+(SG-F9, SG-F10). `security list-keychains -d user` listed only the login
+keychain before and after; no Keychain write was made. The Asura service was
+not started and `~/.asura` was not used: the only Asura process was
+`asura --version`. No `--zap` ran.
+
+| Item | Value |
+| --- | --- |
+| Source revision R | `fe1a5e3982f00dc45a0cb1a8dc75afd50aefcdcc` (`origin/main`), clean tree |
+| Release | <https://github.com/pidster/asura/releases/tag/v0.0.1>, tag `v0.0.1` at R, immutable |
+| Assets | `Asura-0.0.1.dmg` (41,825,918 bytes) and `Asura-0.0.1.dmg.sha256` |
+| DMG SHA-256 | `020a0d251a7d70ac470b86e25509a4d32fd0b02ca0ee3d5ac5c9d8aad62372ae` |
+| Notary submission | `62afb9ad-ed0a-4ace-a110-d6e2fa5833d4`, `Accepted` (one submission) |
+| Build ID | `76b8c91bd4db96ee03e68a4fde174a0b1225a71f4129d0527e88f9d3ad0cede4` |
+| Helper, `metallib`, Hub bundle SHA-256 | `3e7fecc5…b073927b`, `0214ad23…a61e2ada`, `9dc31226…cfb7a080` |
+| Signing | Developer ID Application, team `LFQFWCB8Y3`, secure timestamps on the app and the DMG |
+| Tap commit | `pidster/homebrew-tap` `e792f6d` ("asura 0.0.1"): `Casks/asura.rb`, byte-identical to the generated cask, and the README row; fast-forward push from `dc5e79a` |
+
+| Step | Gate | Result |
+| --- | --- | --- |
+| `asura-release preflight --version 0.0.1` | HD12 before the build | 7 passed, 0 failed (immutable releases enabled) |
+| `asura-bundle --release` | SG-F9 | `step=done`; DMG notarised, stapled, `spctl --assess --type open` accepted |
+| `asura-release check --release --team-id LFQFWCB8Y3` | HD9, SG4-O1 | 67 passed, 0 failed, including the host-paths rule |
+| `asura-release cask`, then `tap-test --dmg --release` | HD1 (local), HD5, HD8, HD9, HD15 (static) | 33 passed, 0 failed; Gatekeeper accepted the installed, quarantined app as `Notarized Developer ID`; cleanup complete |
+| `gh release create --draft --target R`, verify, publish | SG-F10 | The draft held exactly the two assets, with the GitHub digests equal to the local files; then published |
+| `asura-release verify-release --revision R` | HD12, HD13 | 75 passed, 0 failed: published, not a draft, immutable, exactly two assets, tag at R, the HTTPS download equals the local DMG and `.sha256`, and `check --release` passes on the download |
+| `asura-release tap-test --release` (HTTPS asset) | HD1 (on this host), HD5, HD8, open point 6 | 32 passed, 0 failed, including `brew audit --cask --strict --online` and Gatekeeper on the installed app |
+
+HD12 passed: preflight read immutable releases as enabled, and `verify-release`
+read the published release as immutable. HD13 passed: the HTTPS asset equals
+the local DMG byte for byte, and the published `.sha256` equals the local one;
+the tap changed only after this check. Open point 6, the HTTPS quarantine
+state: the cask install from the HTTPS asset carried `com.apple.quarantine`
+flag `0181` with an empty agent name (`0181;…;;…`), and Gatekeeper accepted
+the quarantined app as `Notarized Developer ID`. The `curl` download in
+`verify-release` carried no quarantine attribute, as expected for `curl`.
+
+Proof limits:
+
+- SG6-O2, the offline first launch, was deferred by the owner on 2026-11-03.
+  Every Gatekeeper assessment above ran with the network on.
+- The clean-host install (HD1 end to end) is pending with the owner. This Mac
+  is not a clean host, so the published cask was not installed from
+  `pidster/tap` here. The commands are in `tools/release/README.md`, step 9:
+
+  ```sh
+  HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask pidster/tap/asura
+  A=/Applications/Asura.app
+  codesign --verify --deep --strict "$A" && spctl --assess --type execute --verbose=2 "$A"
+  asura --version
+  ```
+
+  On a failure, the owner reverts the tap commit with a new commit, and a fix
+  needs a new version.
+- The release notes are not checked by any script.
 
 ## Design verification
 
