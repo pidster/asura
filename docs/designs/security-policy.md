@@ -291,7 +291,7 @@ namespace Asura {
     task: Task,
     scratch: Path,
     cache_roots: Set<Path>,
-    developer_dir: Path,
+    developer_dir?: Path,   // absent for model-1 (PL1 contract)
   };
 
   // Intent: what the proposer asked for. Tighten-only (SP-R3).
@@ -388,7 +388,7 @@ proposers or models, and only `forbid` policies may read them.
 | Attribute | Trusted source |
 | --- | --- |
 | Job origin, profile, project, task, scratch, cache roots | Job controller and the grant that created the job |
-| `developer_dir` | The validated developer directory of the exec_cmd baseline |
+| `developer_dir` | The validated developer directory of the exec_cmd baseline; absent for `model-1` jobs ([PL1 contract](#pl1-implementation-contract)) |
 | Canonical paths, `class`, `in_project`, `rel` | Canonicaliser and the path guard lists ([paths](#paths)) |
 | Program identity | Platform static code check ([programs](#programs)) |
 | Domain, address, IP, port, `via_proxy` | Network mediator (later) |
@@ -451,7 +451,7 @@ classDiagram
     Job "1" --> "1" Project : project
     Job "1" --> "1" Task : task
     Job "1" --> "1" Path : scratch
-    Job "1" --> "1" Path : developer_dir
+    Job "1" --> "0..1" Path : developer_dir
     Task "1" --> "1" Project : project
     Project "1" --> "1" Path : root
     Program "1" --> "1" Path : path
@@ -998,10 +998,11 @@ change in place). One record per decision that admits or refuses work:
 | `now` | The evaluation time used in the context |
 
 Size: at most 4 KiB. Order: kind 34 is appended immediately before the
-kind 14 of the same model call, in one outbox batch; for a person command,
-before its kind 26. Replay rejects a kind 34 that is not followed by its
-subject record in the same turn or input, and a kind 34 that names a revision
-with no earlier kind 35 `activated` (`Corrupt`).
+kind 14 of the same model call; for a person command, before its kind 26.
+The writer has no batch append, so the two are consecutive appends of the
+conversation owner; the [PL1 contract](#kinds-34-and-35-in-pl1) gives the
+replay rules R1 to R7. Replay rejects a kind 34 that names a revision with no
+earlier kind 35 `activated` (`Corrupt`).
 
 Kind 35 `PolicyRevision` records `activated`, `superseded`, `revoked` and
 `rejected` events with the manifest (at most 8 KiB). Kind 36 `PolicyGrant`
@@ -1397,10 +1398,12 @@ set for one principal shape: (revision, profile, project, task envelopes).
 
 | Template | File read regions | File write, create, delete regions | Exec regions | Network | Mach |
 | --- | --- | --- | --- | --- | --- |
-| `model-1` | `/bin`, `/usr/bin`, `/sbin`, `/usr/sbin`, `/usr/lib`, `/usr/share`, `/System`, `developer_dir`, project root, scratch, and the runtime set | Project root, scratch, `/dev/null` | `/bin`, `/usr/bin`, `/sbin`, `/usr/sbin`, `/usr/lib`, `/System`, `developer_dir`, project root, scratch | `none` unless a mediator exists | Runtime set only |
+| `model-1` | `/bin`, `/usr/bin`, `/sbin`, `/usr/sbin`, `/usr/lib`, `/usr/share`, `/System`, project root, scratch, and the runtime set | Project root, scratch, `/dev/null` | `/bin`, `/usr/bin`, `/sbin`, `/usr/sbin`, `/usr/lib`, `/usr/share`, `/System`, project root, scratch | `none` unless a mediator exists | Runtime set only |
 | `person-1` | The [person profile](person-command-mode.md#person-seatbelt-profile) read roots | Project root, `$TMPDIR`, existing cache roots, scratch | The person profile exec roots | `all` (AD-7) | The person profile set |
 | `person-outside-1` | No backend: everything the account can read | Everything the account can write | Everything | `all` | Everything |
 
+The `model-1` row is today's profile ([PL1 contract](#built-in-sets)); an
+earlier draft listed `developer_dir`, which today's profile does not have.
 The runtime set is the exec_cmd baseline's fixed support access: literal `/`,
 `/private/var/select/sh` with its ancestors' metadata, `/dev/null`,
 `/dev/random`, `/dev/urandom` and `sysctl-read`. The installation and default
@@ -1434,7 +1437,9 @@ start counts as confined.
 | Recorded | Profile digest and marker result in the job's kind 28 settlement | Replay compares them with kind 34 |
 
 A mismatch stops the job at once (`T`, reason `enforcement_mismatch`) and
-settles it. Effect evidence from violation reports is proposed
+settles it. PL1 checks the profile digest in the guardian before the command
+starts instead ([enforcement evidence in PL1](#enforcement-evidence-in-pl1)).
+Effect evidence from violation reports is proposed
 ([watching effects](#watching-effects)).
 
 ### What needs runtime mediation
@@ -1472,15 +1477,21 @@ sequenceDiagram
     O->>W: Entry request: process.exec of /bin/sh with intent
     W-->>O: Scope results
     O-->>C: job_decided: run or deny, revision, constraint set and digest
+    opt Replay's active revision differs from the decision's
+        C->>J: Kind 35 activated
+        J-->>C: Committed
+    end
+    C->>J: Kind 34
+    J-->>C: Committed
     alt Run
-        C->>J: Kind 34, kind 14 run, kind 26 (one outbox batch)
-        C->>K: submit with the decision
-        K->>K: Slot grant: decision revision is current
-        K->>G: Spawn with the constraint set
-        G-->>K: Spawned: profile digest, marker result
-        K->>K: Digest and marker match, or stop with enforcement_mismatch
+        C->>J: Kind 14 run
+        C->>K: submit with the decision, then the controller appends kind 26
+        K->>K: Slot grant
+        K->>G: Spawn with the constraint set and the expected profile digest
+        G->>G: Render the profile and compare digests before the command starts
+        G-->>K: Spawned, or setup failed with enforcement_mismatch
     else Deny
-        C->>J: Kind 34, kind 14 denied, reason policy_denied
+        C->>J: Kind 14 denied, reason policy_denied, policy refusal fields
         C-->>M: denied: policy: scope: reason
     end
 ```
@@ -1551,8 +1562,9 @@ Selected changes to the [tool job controller](tool-job-controller.md):
 | Start condition 0 `approval` | Before the existing conditions 1–8. Reason text `waiting: approval needed: <reason>`. Model jobs only, from PL7 |
 | Start condition 0b `policy_recheck` | A queued entry whose decision revision is older than the dispatch revision. Reason text `waiting: re-checking policy` |
 | Revocation trigger | Fills the existing row "Execution grant revoked for a project or principal": the policy owner revokes after a re-evaluation denies |
-| Job reasons (proposed numbers) | 21 `policy_revoked`, 22 `approval_denied`, 23 `policy_changed`, 24 `enforcement_mismatch`, 25 `classifier_revoked`; numbers are fixed in the packet that first writes them |
-| Kind 14 field 10 (proposed numbers) | `denied` 2 `policy_denied`, 3 `policy_unavailable`; `busy` 4 `policy_busy` |
+| Job reasons | 21 `enforcement_mismatch`, fixed by PL1, the packet that first writes it. Proposed, numbered by the packet that first writes each: `policy_revoked`, `approval_denied`, `policy_changed`, `classifier_revoked` |
+| Kind 14 field 10 | `denied` 2 `policy_denied`, 3 `policy_unavailable`; `busy` 4 `policy_busy` (fixed by PL1), with the [policy refusal field](#kind-14-additions) |
+| Guardian argv | `--asura-exec-cmd-guardian JOBHEX PROFILE CONSTRAINTS COMMAND` ([constraint set](#constraint-set)); notice kind 3 reason 10 `enforcement_mismatch` |
 | Order at a model call | Grant check, EX11 setting, secret refusals and rewrite (unchanged), then the policy decision, then job admission |
 
 The EX11 execution setting stays the person's switch for model execution and
@@ -1898,6 +1910,352 @@ without `--all-features`; `cargo test --workspace --locked`; the
 [CLI lifecycle gate](early-production-status-slice.md#mandatory-command-regression-execution);
 the PTY journeys of the packet; and the packet's bench, recorded with its
 environment.
+
+## PL1 implementation contract
+
+Selected, 2026-11-03. This section fixes the details that packet PL1 needs
+and that the sections above leave open. Where it narrows an earlier
+section, that section links here. PL1 changes no visible behavior for the
+shipped sets: every model `exec_cmd` call that ran before still runs, under
+a byte-equal Seatbelt profile.
+
+### What PL1 builds and what waits
+
+| Item | PL1 | Later |
+| --- | --- | --- |
+| Scope sources | The installation set and the default user set, both compiled into `asura` from `asura-policy/policies/installation.cedar` and `user-default.cedar`. Source identity `builtin` | PL3 creates and admits `~/.asura/policy/user.cedar`; PL5 adds workspace and repository |
+| Payload store | Not used: a built-in text is sealed by the code signature and named by its SHA-256 in kind 35 | PL3 pins admitted texts |
+| Admission | None. No solver, no lints, no proofs. The golden tests fix the compiled output of the built-in sets | PL3 |
+| Requests | Model `exec_cmd` job decisions only: the entry `process.exec` and the `model-1` region requests | PL2 person commands and `secret_use` |
+| Intent | `source = model_tool`, `name = "exec_cmd"`, `digest` = SHA-256 of the stored (rewritten) command. `command` is absent | PL2 adds the feature extractor and `command` |
+| Program identity | `/bin/sh` has `identity_known = false` and empty identity strings | PL2 adds the static code check |
+| Paths | Built from the fixed template literals, the registered project location, the runtime's Asura home and the job's scratch path. Parents are the lexical parent directories of these absolute paths | PL2 adds the descriptor-walk canonicaliser |
+| `developer_dir` | Absent: the schema attribute is optional (`developer_dir?: Path`), and `model-1` has no developer directory region today | A later confinement change adds the region, with its own byte-level review |
+| Tighten-only forbids | None, so no decision is `ask` | PL7 (AD-29) |
+| Revision changes while running | None: one revision per service run | PL3 rechecks at slot grant |
+| Audit events | None; worker failures are logged | PL3 adds the `policy.*` events |
+
+### Built-in sets
+
+The installation set holds, for `model-1` jobs: the ceiling permits of the
+`model-1` template regions and the runtime set (below); the hard forbids S1
+(no model write, creation or deletion of an `implicit_exec` path), S2 (no
+write, creation or deletion of an `asura_state` path outside the job's
+scratch, and for model jobs no read or execution of one either, EX16), S3
+(no model `network.connect` except through the mediator) and S4 (no model
+`secret_use`). It holds no tighten-only forbid. The default user set holds
+the same `model-1` region permits as the person's default regions. Neither
+set permits `process.exec.ask`, `process.exec.approved`, `mach.lookup` or
+`context.egress`.
+
+The `model-1` template is today's profile exactly (byte-equal rule):
+
+| Region class | Roots, in render order |
+| --- | --- |
+| Read, execute and map | `/bin`, `/usr/bin`, `/sbin`, `/usr/sbin`, `/usr/lib`, `/usr/share`, `/System`, project root, scratch |
+| Write, create and delete | Project root, scratch |
+| Runtime set (fixed rules) | Literal `/`, `/private/var/select/sh` and its ancestors' metadata, `/dev/null` (read and write), `/dev/random`, `/dev/urandom`, `process-fork`, `sysctl-read` |
+| Fixed deny rules (guardian) | The Asura home except the job's scratch (EX16); the path guard implicit-execution paths (EPG-R1) until PL6 |
+
+The [effect envelope template](#effect-envelope-of-a-job) row for `model-1`
+listed `developer_dir` and left `/usr/share` out of the exec regions. Both
+differ from today's profile, so PL1 uses the table above; the
+[execution threat model](execution-threat-model.md#threats-current-mitigations-and-gaps) keeps
+the known `git init` gap.
+
+Policies may use these shapes on compiled actions, in addition to the
+[compilable shapes](#effect-envelope-of-a-job): `resource in
+principal.project.root`, `resource in principal.scratch`, and
+`resource.path in ...` with any of the listed forms for a `Program`.
+
+### Constraint set
+
+A constraint set is the compiled effect envelope of one job shape. Its type
+belongs to the guardian contract in `asura-platform::exec_cmd` (the backend
+vocabulary); `asura-policy` computes the allowed regions; the service maps
+one to the other. For `model-1` it is three sets of roots over the closed
+list of nine template roots.
+
+| Field | Meaning | Guardian rule |
+| --- | --- | --- |
+| `read` | Roots the job may read (`file-read*`) | Must hold `/bin` and scratch |
+| `exec` | Roots the job may execute and map (`process-exec`, `file-map-executable`) | Must hold `/bin` and scratch |
+| `write` | Roots the job may write, create and delete (`file-write*`) | Project root and scratch only; must hold scratch |
+
+The compiler puts a root into a set only when every applicable scope allows
+every action of that set on the root: `file.read`; `process.exec` of a
+`Program` at the root with `identity_known = false`; and `file.write`,
+`file.create` and `file.delete`. It also evaluates each runtime set literal
+(`file.read`, and `file.write` for `/dev/null`). A denied runtime literal, or
+a missing base need (`/bin` and scratch in `read` and `exec`, scratch in
+`write`), denies the job with `cannot_enforce`. A root that is not allowed
+is left out; the guardian then renders the narrower profile. The fixed deny
+rules are always rendered, so `Enforced ⊆ Permitted` holds whatever the
+regions are.
+
+The guardian renders, in today's order: the combined rule for roots in both
+`read` and `exec`; a `file-read*` rule for roots only in `read`; a
+`process-exec file-map-executable` rule for roots only in `exec`; the
+ancestor metadata literals of every read or exec root; the write rule; the
+runtime set; the state rules; the implicit-execution deny rules. A rule
+with no roots is left out. For the template sets the output is today's
+profile byte for byte.
+
+**Encoding.** The service passes the set to the guardian in a new argv
+element before the command: `--asura-exec-cmd-guardian JOBHEX PROFILE
+CONSTRAINTS COMMAND`. `CONSTRAINTS` is `-` for the person profiles (PL6
+compiles them) and for `model-1` is
+`m1:<read>:<exec>:<write>:<profile digest>`. Each set is three lowercase hex
+digits: bit *i* is root *i* in the order of the table above (bit 0 `/bin`,
+bit 7 project root, bit 8 scratch). The profile digest is 64 lowercase hex
+digits. Any other form, an unknown bit, a write bit for a system root or a
+missing base need refuses the guardian before any effect (status 1, as an
+unknown profile token). The argv bound grows from 8,704 to 9,216 bytes to
+hold the token.
+
+**Digests.** The constraint digest in kind 34 is the SHA-256 of
+`m1:<read>:<exec>:<write>`; it does not depend on paths. The profile digest
+is the SHA-256 of the rendered SBPL text. The slot worker's setup computes
+it in the service process from the constraint set and the paths of the
+pinned descriptors (FDs 7, 9 and 10, read the same way as the guardian
+reads them), and passes it in the token.
+
+### Enforcement evidence in PL1
+
+The guardian renders the profile from its own pinned descriptors and the
+constraint set, computes its SHA-256 and compares it with the digest in the
+token before it starts `sandbox-exec`. A mismatch is a setup failure: notice
+kind 3 with the new reason 10 `enforcement_mismatch`. The job settles
+`not_started` with job reason 21 `enforcement_mismatch`, and the command
+never starts. This is stricter than the stop with `T` in
+[enforcement evidence](#enforcement-evidence): no effect can occur under a
+profile that differs from the decision. The job marker check is the
+existing EX5 attribution check (`sandbox_check`), unchanged. Kind 28 holds
+no profile digest in PL1: a job that started proves that the digests
+matched.
+
+### PL1-F1: guardian constraint check
+
+Selected design. Arrows show the order of checks in the guardian for one
+`model-1` start; every refusal happens before the command exists.
+
+```mermaid
+flowchart TD
+    Args["argv: JOBHEX, model-1, CONSTRAINTS, COMMAND"] --> Parse{"CONSTRAINTS is m1 form, known bits, base needs present?"}
+    Parse -->|"No"| Exit1["Exit status 1 before any effect or notice"]
+    Parse -->|"Yes"| Fds["Validate FDs 3 to 10; pin project, scratch and Asura home paths"]
+    Fds -->|"Fail"| Setup7["Notice kind 3 reason 7: denied"]
+    Fds -->|"Pass"| Render["Render SBPL from the constraint set and pinned paths"]
+    Render --> Digest{"SHA-256 equals the token digest?"}
+    Digest -->|"No"| Setup10["Notice kind 3 reason 10: enforcement_mismatch; job not_started, reason 21"]
+    Digest -->|"Yes"| Launch["sandbox-exec -p PROFILE /bin/sh -c SCRIPT"]
+    Launch --> Spawned["Notice kind 1: spawned"]
+```
+
+### PL1-D1: job decision data
+
+Selected design. Boxes are typed values; lines show ownership with
+cardinality. `JobDecision` is the reply of `decide_job`.
+
+```mermaid
+classDiagram
+    class JobRequest {
+        agent: conversation and agent 0
+        operation, generation, ordinal
+        project id and location
+        stored command digest
+        now
+    }
+    class JobDecision {
+        outcome: run or deny
+        revision: digest
+        scope results
+        primary scope, reason, rule, explanation
+        constraints: optional
+        constraint_digest: optional
+        request and resource digests
+    }
+    class ConstraintSet {
+        read: root set
+        exec: root set
+        write: root set
+    }
+    class ScopeResult {
+        scope
+        allow: bool
+        rule ids: at most 8
+        error class: optional
+    }
+    JobRequest "1" --> "1" JobDecision : decided as
+    JobDecision "1" --> "0..1" ConstraintSet : run only
+    JobDecision "1" --> "1..4" ScopeResult : one per applicable scope
+```
+
+### Policy owner
+
+`asura-service::policy` is one reactor component. It holds the built-in
+revision texts and their digest, the worker pool, one decision queue per
+agent (at most 8 entries; 512 in the service), the constraint set cache (at
+most 256 entries, keyed by revision, profile, project and location) and the
+ready replies.
+
+| Step | Rule |
+| --- | --- |
+| Start | The owner starts `clamp(available_parallelism() / 2, 2, 8)` worker threads. Each builds its own engine from the texts (parse, strict validation, per-group sets) and reports `installed` or a load error. Requests that arrive earlier wait in their agent queue (`waiting: policy starting`). If any worker reports a load error, the owner is `unavailable` and every request is decided as a refusal with `scope_unavailable` for the installation scope |
+| Dispatch | On each reactor step the owner moves queued requests, round-robin over agents, to workers with fewer than 2 in flight, over a bounded channel of 2 per worker |
+| Decide | A worker builds the constraint set (cached result supplied by the owner when present), then evaluates the entry `process.exec` of `/bin/sh` with the intent, in every scope. It replies with the `JobDecision`; the owner stores a new constraint set in the cache |
+| Reply | Workers send replies on one channel and wake the reactor. The owner keeps each reply until its requester takes it by ticket |
+| Cancel | The requester's cancel drops a queued request, or discards the reply of a request in flight |
+| Worker loss | A worker whose thread ended while requests were in flight (a panic) fails those requests as refusals with `policy_error`. The owner joins the finished thread and starts a replacement, which installs the revision before it receives work. Requests wait meanwhile (`waiting: policy workers restarting`) |
+| Shutdown | The owner closes ingress, drops the queues, closes the worker channels and joins each worker when its thread has finished; an evaluation is bounded by W1 |
+
+No call blocks the reactor: building engines, compiling and evaluating run
+on the workers; the reactor step only moves typed values.
+
+### PL1-S1: policy owner states
+
+Selected design. States belong to the owner for one service run. Arrows
+name the event; guards are in brackets.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Starting: Service start, workers spawned
+    Starting --> Active: Every worker reported installed
+    Starting --> Unavailable: A worker reported a load error
+    Active --> Active: Decision replied, or worker replaced after join
+    Active --> Restarting: Worker thread ended with requests in flight
+    Restarting --> Active: Replacement installed
+    Restarting --> Unavailable: Replacement reported a load error
+    Starting --> Closing: Shutdown
+    Active --> Closing: Shutdown
+    Restarting --> Closing: Shutdown
+    Unavailable --> Closing: Shutdown
+    Closing --> [*]: Every worker joined
+```
+
+### The model call step
+
+The conversation owner keeps the existing order (grant, EX11 setting,
+secret refusals and rewrite) and adds the policy decision before job
+admission, in the reactor step that would append kind 14:
+
+1. The EX11 setting is off: kind 14 `denied` `execution_off`, as today; no
+   policy request.
+2. No decision yet: `decide_job`. A full agent queue gives kind 14 `busy`
+   with field 10 reason 4 `policy_busy` and no kind 34. Otherwise the call
+   waits for the reply; a turn cancel during the wait cancels the ticket
+   and records kind 14 `cancelled` (TCR-D8).
+3. The owner is unavailable: kind 14 `denied`, reason 3
+   `policy_unavailable`, with the policy refusal fields; no kind 34.
+4. The replay's active policy revision differs from the decision's revision
+   digest: the owner appends kind 35 `activated` first (sequence = the last
+   kind 35 sequence + 1).
+5. The owner appends kind 34, then, after it commits, kind 14. A `run`
+   decision then submits the job with its constraint set (a full controller
+   queue still gives `busy`); a refusal gives kind 14 `denied`, reason 2
+   `policy_denied`, with the policy refusal fields.
+
+The writer appends one record per frame and has no batch. Kinds 34 and 14
+are therefore consecutive appends of the conversation owner, which appends
+nothing else for the turn between them. A stop between them leaves a
+kind 34 with no kind 14; restart recovery ends that turn `interrupted`.
+
+### Kind 14 additions
+
+Field 10 gains three reasons: `denied` 2 `policy_denied`, `denied` 3
+`policy_unavailable` and `busy` 4 `policy_busy`. A new last field, the
+policy refusal, is present exactly when field 10 is `policy_denied` or
+`policy_unavailable`:
+
+| Part | Rule |
+| --- | --- |
+| Scope | 0 none (for `request_invalid`, `request_too_large`, `cannot_enforce`), 1 installation, 2 user, 3 workspace, 4 repository |
+| Reason | `[a-z0-9_]{1,48}` |
+| Rule | Empty, or the global rule ID `<scope>:<id>` with `<id>` in `[a-z0-9_.-]{1,64}` |
+| Explanation | Empty, or the `@explain` text (at most 200 bytes of printable ASCII) of an installation or user policy |
+
+The model text is rendered from kind 14 alone, as today (TCR-D12), with the
+texts of the [reason table](#reason-codes-and-explanation): a forbid gives
+`denied: policy: <scope>: <reason>: <explanation>; do not retry`, where the
+explanation is the stored `@explain` text, or `a <scope> policy forbids
+this (rule <id>)` when it is empty.
+
+### Kinds 34 and 35 in PL1
+
+Kind 34 `PolicyDecision` (at most 4 KiB) holds: the subject (model call:
+operation, generation and ordinal); the action code; the principal's
+origin, profile, project and task (conversation and agent); the resource,
+request and intent digests; the revision sequence and digest; up to 4
+scope results (scope, allow or deny, error class, up to 8 rule IDs); the
+decision (`run` or `deny`; `ask` is refused by replay until PL7); the
+primary scope and reason; the constraint digest for `run`; and `now` in
+milliseconds since the Unix epoch.
+
+Kind 35 `PolicyRevision` (at most 8 KiB) holds: the sequence, the revision
+digest, the previous active sequence, the event, the schema digest, the
+Cedar language and SDK versions, the optional solver and admission digests
+(absent in PL1), and one entry per scope set (scope, optional project,
+text digest, source identity, policy IDs). PL1 writes only `activated`.
+
+Replay rules (each violation is `Corrupt`):
+
+| Rule | Check |
+| --- | --- |
+| R1 | A kind 35 sequence is the last kind 35 sequence + 1 (the first is 1), and its previous sequence is the active one (0 for the first) |
+| R2 | A kind 35 event other than `activated` is refused until the packet that writes it |
+| R3 | A kind 34 names the active revision: its sequence and digest equal the last `activated` kind 35 |
+| R4 | A kind 34 names an accepted, unterminated turn and an ordinal that has no kind 14 yet, and no other kind 34 is pending for that call |
+| R5 | A kind 14 with reason `policy_denied` follows a pending kind 34 `deny` for the same call |
+| R6 | A pending kind 34 `deny` is followed by a kind 14 that is not `run` |
+| R7 | A kind 14 for a call with a pending kind 34 clears it; a turn's terminal clears its pending kind 34 only when the terminal is `interrupted` |
+
+A model `exec_cmd` kind 14 `run` with no kind 34 stays valid in replay:
+journals written before PL1 keep replaying, and the check costs nothing at
+this layer. The service always writes the kind 34.
+
+### `/status` in PL1
+
+`ServiceObservation` field 10 is a new `PolicyStatus` message: owner state
+(1 starting, 2 active, 3 unavailable), the journaled revision sequence (0
+before the first activation), the installation and user scope states (1 ok,
+2 unavailable), the workspace and repository set counts, the count of
+changed repository sources, the solver state (1 none) and the count of
+waiting approvals. The TUI renders one line, for example:
+
+```text
+policy: revision 1 · installation ok · user ok · workspace 0 · repository 0 · solver: none · 0 approvals waiting
+```
+
+While the owner starts, the line is `policy: starting`; when it is
+unavailable, `policy: unavailable · installation unavailable · user
+unavailable`.
+
+### Test-only sets
+
+The `test-support` feature of `asura-policy` adds a denying installation
+set: the built-in text plus one forbid of model `process.exec` with reason
+`test_denied`. With the service's `test-support` feature, the owner uses it
+when the file `policy-test-deny` exists in the runtime's Asura home at
+start (read on a worker thread). Production builds have neither the text
+nor the check. PL-I3 and PL-E2 use it.
+
+### PL1 validation map
+
+| ID | PL1 evidence |
+| --- | --- |
+| PL-U1 to PL-U4, PL-U6, PL-U8 | `asura-policy` unit tests on the product schema and the built-in sets |
+| PL-U5 | Installation and user combinations; the primary reason names the first denying scope |
+| PL-U7 | The compiler on the built-in sets gives the template sets; a denied root drops out; a denied runtime literal or base need gives `cannot_enforce`; the guardian renders today's profile for the template sets (golden text frozen from `35cc82b`) |
+| PL-U13 | Kind 34 and 35 codecs, limits and replay rules R1 to R7 |
+| PL-I1 | Service: a model call is decided on a worker; kinds 35, 34 and 14 commit in that order; replay accepts the journal |
+| PL-I2 | The service compiles the built-in sets; the guardian renders byte-equal text to the frozen legacy generator for several path sets |
+| PL-I3 | The test-only denying set: kind 14 `denied` `policy_denied` with the installation scope; no kind 26; no spawn |
+| PL-I4 | A real guardian run: the digests match and the job runs; an injected digest mismatch settles the job `not_started`, reason `enforcement_mismatch`, and the command never runs |
+| PL-I10 | 64 concurrent requesters and full agent queues: `policy_busy` at the bound; the reactor stays responsive |
+| PL-I12 | A worker that panics is replaced after its join; its in-flight requests are refused with `policy_error` |
+| PL-E1 | PTY journey: a scripted model's `exec_cmd` runs as before; `/status` shows the policy line; the journal holds kinds 35 and 34 |
+| PL-E2 | PTY journey with the test-only denying set: the model receives the policy denial text, and the TUI shows it |
+| PL-B1 to PL-B5 | `policy-bench` in `asura-policy` (PL-B1, PL-B4, the PL-B5 fuzz and determinism parts), a service-level bench (PL-B2), stripped release sizes (PL-B3). PL-B5 proof budgets (PES-M15 to M18) need the solver and move to PL3 |
 
 ## Delivery packets
 

@@ -105,7 +105,7 @@ its classification under the principles above.
 | L9 | Pending tool calls and executors | 1 each | Keep | Model tools |
 | L10 | Ordinary tool deadline | 2 s | Removed (owner, 2026-10-17) | A non-exec tool call ends on completion, cancel, steering, shutdown or helper exit ([model tool execution](model-tool-execution.md#mt3-activation-completion)) |
 | L11 | Command and cwd | 8192 B and 1024 B | Keep | exec_cmd tool |
-| L12 | Private argv payload | 8704 B | Keep | exec_cmd tool |
+| L12 | Private argv payload | 9216 B (8704 B before the PL1 constraint set token) | Keep | exec_cmd tool |
 
 ### Capture and output
 
