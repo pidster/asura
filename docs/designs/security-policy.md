@@ -40,7 +40,7 @@ spike evidence only.
 | AD-14 | Pattern A: each scope is evaluated separately; allow only if every scope allows; a refusal names the denying scope | 2026-11-03 |
 | AD-17 | cvc5 built from source with a dynamic or replaceable GMP, signed and notarised inside `Asura.app`; proofs on the person's Mac, offline; a bounded admission tool with no default time limit. Refined by SBQ1 (GMP 6.3.0 as `@rpath/libgmp.10.dylib`) and SBQ2 (no LibPoly) | 2026-11-03 |
 | AD-27 | Effects are the authority. Commands, MCP tools and skills are intent: they may only tighten | 2026-11-03 |
-| Budgets | Decision p50 at most 100 µs; end-to-end p99 at most 1 ms at 64 concurrent requests; at most 8 MiB added to the `asura` executable (AD-31); startup at most 200 ms | 2026-11-03 |
+| Budgets | Decision p50 at most 150 µs; end-to-end p99 at most 1.5 ms at 64 concurrent requests; at most 8 MiB added to the `asura` executable (AD-31); startup at most 200 ms. Revised by the owner on 2026-11-03 after the PL1 measurements (AD-33), from p50 100 µs and p99 1 ms: pattern A evaluates four scopes over 258 policies, about 80 µs of the decision, and a model turn takes seconds | 2026-11-03 |
 | AD-24 | Envelope approval is an authorized policy change; envelopes end with their task or on revocation | 2026-11-02 |
 | AD-15, AD-16 | The classifier may stop a model job to ask; `unknown` asks; an unanswered job waits in its agent's queue with a short reason | 2026-11-02 |
 | AD-25 | Context egress is a policy decision over data classes, destinations and projects | 2026-10-31 |
@@ -1843,8 +1843,8 @@ They are acceptance criteria, never runtime closures (AE-04).
 
 | ID | Budget | Measurement |
 | --- | --- | --- |
-| PL-B1 | Decision p50 at most 100 µs | In the worker: request and entity slice construction, schema checks, every applicable scope, wrapper and reasons; on the product schema with the scale workload below |
-| PL-B2 | End-to-end p99 at most 1 ms at 64 concurrent requests | From `decide` on the reactor to the `decided` event, 64 closed-loop requesters, the product worker pool |
+| PL-B1 | Decision p50 at most 150 µs (owner revision of 2026-11-03, AD-33; was 100 µs) | In the worker: request and entity slice construction, schema checks, every applicable scope, wrapper and reasons; on the product schema with the scale workload below |
+| PL-B2 | End-to-end p99 at most 1.5 ms at 64 concurrent requests (owner revision of 2026-11-03, AD-33; was 1 ms) | From `decide` on the reactor to the `decided` event, 64 closed-loop requesters, the product worker pool |
 | PL-B3 | At most 8 MiB added size | Stripped release `asura` with the policy layer against the same build without it. The solver and GMP files are reported separately for each release, with no limit (AD-31, [OQ4](#open-owner-questions)) |
 | PL-B4 | Startup at most 200 ms | From the owner's start to the first decision: schema, every admitted scope of the workload, worker installation |
 | PL-B5 | Safety budgets kept from the spike | PES-M2 (0 unenforced conventions), M3 (100 % injected errors deny), M4 (0 allows in 1,000,000 malformed requests), M5 (determinism), M6 (12 of 12 seeded defects refused, warnings refuse), M7 (reasons), M15 to M18 (proofs) |
@@ -2282,26 +2282,6 @@ builds have neither the text nor the check. PL-I3 and PL-E2 use it.
 | PL-E2 | PTY journey with the test-only denying set: the model receives the policy denial text, and the TUI shows it |
 | PL-B1 to PL-B5 | `policy-bench` in `asura-policy` (PL-B1, PL-B4, the PL-B5 fuzz and determinism parts), a service-level bench (PL-B2), stripped release sizes (PL-B3). PL-B5 proof budgets (PES-M15 to M18) need the solver and move to PL3 |
 
-### Principal entity cache
-
-Selected, 2026-11-03 (owner decision on the PL-B1 and PL-B2 misses: cache,
-re-measure, then merge). Each worker's engine keeps a cache of the built
-entities of each principal: the `Job`, `Project` and `Task` entities, and
-the `Path` entities of the principal's paths (project root, scratch, cache
-roots, developer directory) with their ancestors. A request then builds only
-its own part: the resource entity, its path and the ancestors that the
-principal part lacks.
-
-| Item | Rule |
-| --- | --- |
-| Key | SHA-256 over the revision digest, the schema digest and every principal field (job, origin, profile, project, project root, task, scratch, cache roots, developer directory, each path with its attributes) |
-| Contents | The principal entities, schema-checked once when built (`Entities::from_entities` with the schema), and the principal path attributes |
-| Per request | The W1 bounds are computed over the whole request as before. The resource entities are added with `add_entities` and the schema, so every entity of the request is schema-checked (W2 unchanged). The context and the `Request` are built with the schema for every request. The context changes per request (`now`, intent), so no context part is cached |
-| Exactness | If a resource-side path names a principal path, or an ancestor of one, with other attributes, the request is built without the cache, exactly as before. A decision with the cache equals the decision without it |
-| Bounds | At most 64 entries per worker. An entry's size is bounded by W1 (at most 16 KiB of encoded request); the cache charges each entry its encoded size and holds at most 64 × 16 KiB = 1 MiB per worker. The oldest entry is evicted first |
-| Invalidation | The cache belongs to one engine, which is built for one revision and one schema: an activation, a revocation or a schema change installs a new engine on every worker, so the old cache is dropped with the old engine. The key also holds the revision and schema digests, and `Engine::invalidate_principal_cache` clears it explicitly |
-| Source of truth | The cache is derived from the revision texts and the request. It is rebuilt on restart and never journaled |
-
 ### PL1 delivery record
 
 Verified, 2026-11-03, on the reference Mac (Apple M4 Max, 16 cores,
@@ -2311,11 +2291,23 @@ the budget figures are recorded here because the budgets are this design's.
 
 | Budget | Measurement | Result |
 | --- | --- | --- |
-| PL-B1 decision p50 at most 100 µs | `policy-bench` (release): scale workload of 204 static policies and 54 grants over four scopes, 40 projects, 1,000 requests, 10,000 decisions, load 2.6 to 3.4 | **Fail**: p50 130.7 µs, p99 160.6 µs. Entity and context construction with schema checks takes p50 53.9 µs of it. The built-in sets alone (PL1 production) decide the exec entry at p50 88.9 µs, p99 112.5 µs. A region compile on a cache miss takes p50 2.6 ms |
-| PL-B2 end-to-end p99 at most 1 ms at 64 concurrent requesters | Service-level bench: `decide_job` on a reactor-like loop to the reply taken after the worker's wake, 8 workers, 64 closed-loop requesters, 20,000 decisions after 2,000 warm-up, built-in sets, three runs at load 3.4 to 11.6 | **Fail**: p99 1.044 to 1.126 ms (p50 966 to 993 µs). With 64 requests outstanding on 8 workers, queueing dominates: each decision waits for about 7 others on its worker |
+| PL-B1 decision p50 at most 100 µs (the budget before AD-33) | `policy-bench` (release): scale workload of 204 static policies and 54 grants over four scopes, 40 projects, 1,000 requests, 10,000 decisions, load 2.6 to 3.4 | **Fail**: p50 130.7 µs, p99 160.6 µs. Entity and context construction with schema checks takes p50 53.9 µs of it. The built-in sets alone (PL1 production) decide the exec entry at p50 88.9 µs, p99 112.5 µs. A region compile on a cache miss takes p50 2.6 ms |
+| PL-B2 end-to-end p99 at most 1 ms at 64 concurrent requesters (the budget before AD-33) | Service-level bench: `decide_job` on a reactor-like loop to the reply taken after the worker's wake, 8 workers, 64 closed-loop requesters, 20,000 decisions after 2,000 warm-up, built-in sets, three runs at load 3.4 to 11.6 | **Fail**: p99 1.044 to 1.126 ms (p50 966 to 993 µs). With 64 requests outstanding on 8 workers, queueing dominates: each decision waits for about 7 others on its worker |
 | PL-B3 at most 8 MiB added to `asura` (AD-31) | Stripped release `asura` (`cargo build --release -p asura-cli`, `strip`) at PL1 against the same build at `35cc82b` | **Pass**: +6,138,056 bytes (5.85 MiB), 58,018,520 to 64,156,576 bytes |
 | PL-B4 startup at most 200 ms | `policy-bench`: 8 workers, each building the schema and every scope, then the first decision, median of 10 | **Pass**: 37.2 ms (36.7 to 39.2) |
 | PL-B5 safety | `policy-bench` and the unit suites | PES-M4 **pass** (0 allows in 1,000,000 malformed requests); M5 **pass** (identical decisions on fresh engines; PL-U8 across 8 threads); M3 (injected errors deny) and M6 (12 seeded defects, warnings refuse) **pass** as PL-U3 and PL-U4; M7 reasons pass as PL-U5 and PL-U6. M15 to M18 need the solver: PL3 |
+
+A per-worker principal entity cache was then tried (owner decision,
+2026-11-03), measured and reverted. Each model call names a new job, so its
+principal misses on every call: PL-B1 improved only to p50 122.2 to 126.0
+µs (47 % hits on the bench workload; hits alone 109.0 to 114.3 µs), and
+PL-B2 slowed to p99 1.284 to 1.399 ms. Cached and uncached decisions were
+identical over 10,000 workload decisions and 1,000,000 malformed requests.
+
+The owner then revised PL-B1 to p50 at most 150 µs and PL-B2 to p99 at most
+1.5 ms (AD-33, 2026-11-03): pattern A evaluates four scopes over 258 policies, about 80 µs of the decision, and a model turn takes seconds. The figures above stay
+as the history against the earlier targets; the re-measurement against the
+revised budgets follows.
 
 Evidence item SP-P2 is answered: with per-request entity slices and the
 schema-checked wrapper (W2), PL-B1 does not hold on the product scale
