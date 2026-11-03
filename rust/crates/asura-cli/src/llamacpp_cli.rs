@@ -336,30 +336,18 @@ pub(crate) fn serve(runtime: &RuntimeDirectory) -> i32 {
     0
 }
 
-/// Reads the server key item, or adds a new one once (the key).
+/// Makes this start's key and stores it in the server key item, replacing
+/// the last start's key (LCD6), so the relay reads the key this server
+/// requires. A failed write refuses the start: the server never runs with a
+/// key the relay cannot read.
 fn server_key() -> Result<impl std::ops::Deref<Target = Vec<u8>>, String> {
-    use asura_platform::keychain::{Added, Found, Keychain, Target};
+    use asura_platform::keychain::{Keychain, Target};
     let keychain = Keychain::open(&Target::Default).map_err(|f| format!("{f:?}"))?;
-    let valid =
-        |key: &[u8]| key.len() == server::KEY_HEX_BYTES && key.iter().all(u8::is_ascii_hexdigit);
-    for _ in 0..2 {
-        match keychain.get_server_key().map_err(|f| format!("{f:?}"))? {
-            Found::Data(key) if valid(&key) => return Ok(key),
-            Found::Data(_) => return Err("invalid item".into()),
-            Found::Missing => {
-                let key = server::new_key();
-                match keychain
-                    .add_server_key(&key)
-                    .map_err(|f| format!("{f:?}"))?
-                {
-                    Added::Stored => return Ok(key),
-                    // Another start added one first: read it.
-                    Added::Duplicate => continue,
-                }
-            }
-        }
-    }
-    Err("the item could not be read".into())
+    let key = server::new_key();
+    keychain
+        .put_server_key(&key)
+        .map_err(|f| format!("{f:?}"))?;
+    Ok(key)
 }
 
 #[cfg(test)]

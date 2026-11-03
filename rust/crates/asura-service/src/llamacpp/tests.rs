@@ -473,10 +473,24 @@ fn native_server_plan_and_relay() {
         .output()
         .unwrap();
     let args = String::from_utf8_lossy(&args.stdout);
+    let key_text = std::str::from_utf8(&key).unwrap();
     assert!(
-        args.contains("--api-key-file /dev/fd/")
-            && !args.contains(std::str::from_utf8(&key).unwrap()),
+        args.contains("--api-key-file /dev/fd/") && !args.contains(key_text),
         "{args}"
+    );
+    // LCD6: the start's key is in the router's environment (P24), the one
+    // way llama.cpp 0.7.0 passes a key to its model processes.
+    let environment = |pid: &str| {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["eww", "-o", "command=", "-p", pid])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let expected_variable = format!("{}={key_text}", asura_platform::llamacpp::KEY_VARIABLE);
+    assert!(
+        environment(&child.id().to_string()).contains(&expected_variable),
+        "the router's environment lacks the start's key"
     );
     // LC-I6: through the relay with the token; the relay adds the key.
     let relay = Relay::start(port).unwrap();
@@ -498,9 +512,10 @@ fn native_server_plan_and_relay() {
         "{chat}"
     );
     relay.join();
-    // LC-I7 (LCD16): the chat loaded the model; its process inherits the
-    // CORS arguments, not the key, and no browser origin may read a reply
-    // from the router or from it.
+    // LC-I7 (LCD6, LCD16): the chat loaded the model; its process inherits
+    // the CORS arguments and `--no-webui` (P25), has the key in its
+    // environment and in no argument, refuses every request without the
+    // key, and no browser origin may read a reply from the router or from it.
     let model_pid = String::from_utf8(
         std::process::Command::new("/usr/bin/pgrep")
             .args(["-P", &child.id().to_string()])
@@ -527,9 +542,14 @@ fn native_server_plan_and_relay() {
             && model_args.contains("--no-cors-credentials")
             && model_args.contains("--cors-methods GET")
             && model_args.contains("--cors-headers Content-Type")
+            && model_args.contains("--no-webui")
             && !model_args.contains("api-key")
-            && !model_args.contains(std::str::from_utf8(&key).unwrap()),
+            && !model_args.contains(key_text),
         "{model_args}"
+    );
+    assert!(
+        environment(model_pid).contains(&expected_variable),
+        "the model process's environment lacks the start's key"
     );
     let listening = String::from_utf8(
         std::process::Command::new("/usr/sbin/lsof")
@@ -573,15 +593,38 @@ fn native_server_plan_and_relay() {
                 "port {port}: {head}"
             );
         }
-        if port == model_port {
-            // The LCQ3 gap (LT3, LT4): a model process has no key and answers.
-            // A llama.cpp change that closes it fails here, so the threat
-            // model is revised with it.
-            assert!(simple.starts_with("HTTP/1.1 200"), "{simple}");
-        } else {
-            assert!(simple.starts_with("HTTP/1.1 401"), "{simple}");
-        }
+        // Without the key, the router and the model process both refuse.
+        assert!(simple.starts_with("HTTP/1.1 401"), "port {port}: {simple}");
     }
+    // LCQ3 (LT3, LT4, P23): the model process refuses a wrong key and the
+    // P17 blind request, a keyless `text/plain` chat POST, and answers the
+    // start's key. Before LCQ3 it answered every keyless request.
+    let wrong = format!("{:064x}", u128::from_ne_bytes(asura_platform::random_id()));
+    let models_with = |bearer: &str| {
+        ask(
+            model_port,
+            format!(
+                "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{model_port}\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+    };
+    let refused = models_with(&wrong);
+    assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+    let blind_body =
+        format!(r#"{{"model":"{name}","messages":[{{"role":"user","content":"Say hi."}}]}}"#);
+    let blind = ask(
+        model_port,
+        format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{model_port}\r\nOrigin: http://evil.example\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{blind_body}",
+            blind_body.len()
+        ),
+    );
+    assert!(blind.starts_with("HTTP/1.1 401"), "{blind}");
+    let accepted = models_with(key_text);
+    assert!(
+        accepted.starts_with("HTTP/1.1 200") && accepted.contains(&name),
+        "{accepted}"
+    );
     // SIGTERM stops the router and the model process it started.
     on_failure.0 = None;
     // SAFETY: signals the child's own process group, made by spawn_for_test.

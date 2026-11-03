@@ -1227,3 +1227,111 @@ mod scratch_keychain {
         );
     }
 }
+
+/// LC-U15 (llamacpp-backend.md, LCD6): the server key item is replaced at
+/// every start. A scripted data-protection fixture (no pre-check) answers
+/// each item call in order.
+mod server_key_replacement {
+    use super::*;
+
+    #[derive(Default)]
+    struct Script {
+        log: RefCell<Vec<&'static str>>,
+        answers: RefCell<VecDeque<Result<(), i32>>>,
+    }
+    impl Script {
+        fn new(answers: &[Result<(), i32>]) -> Self {
+            let script = Self::default();
+            script.answers.borrow_mut().extend(answers.iter().copied());
+            script
+        }
+        fn answer(&self, call: &'static str, service: &str, account: &str) -> Result<(), i32> {
+            assert_eq!((service, account), (SERVER_KEY_SERVICE, SERVER_KEY_ACCOUNT));
+            self.log.borrow_mut().push(call);
+            self.answers
+                .borrow_mut()
+                .pop_front()
+                .expect("unscripted call")
+        }
+    }
+    impl Calls for Script {
+        fn classify(&self, code: i32) -> Failure {
+            data_protection::classify(code)
+        }
+        fn add(&self, service: &str, account: &str, _: &[u8]) -> Result<(), i32> {
+            self.answer("add", service, account)
+        }
+        fn copy(&self, _: &str, _: &str) -> Result<Zeroizing<Vec<u8>>, i32> {
+            unreachable!("a replacement never reads the item")
+        }
+        fn update(&self, service: &str, account: &str, _: &[u8]) -> Result<(), i32> {
+            self.answer("update", service, account)
+        }
+        fn delete(&self, _: &str, _: &str) -> Result<(), i32> {
+            unreachable!("a replacement never deletes the item")
+        }
+        fn accounts(&self, _: &str, _: usize) -> Result<Vec<String>, i32> {
+            unreachable!("a replacement never lists")
+        }
+    }
+    fn put(script: &Script, data: &[u8]) -> Result<(), Failure> {
+        put_raw_with(script, SERVER_KEY_SERVICE, SERVER_KEY_ACCOUNT, data)
+    }
+
+    #[test]
+    fn a_present_item_is_updated_in_place() {
+        let s = Script::new(&[Ok(())]);
+        assert_eq!(put(&s, b"k"), Ok(()));
+        assert_eq!(*s.log.borrow(), ["update"]);
+    }
+
+    #[test]
+    fn an_absent_item_is_added() {
+        let s = Script::new(&[Err(ERR_SEC_ITEM_NOT_FOUND), Ok(())]);
+        assert_eq!(put(&s, b"k"), Ok(()));
+        assert_eq!(*s.log.borrow(), ["update", "add"]);
+    }
+
+    #[test]
+    fn a_racing_add_is_followed_by_one_more_update() {
+        let s = Script::new(&[
+            Err(ERR_SEC_ITEM_NOT_FOUND),
+            Err(ERR_SEC_DUPLICATE_ITEM),
+            Ok(()),
+        ]);
+        assert_eq!(put(&s, b"k"), Ok(()));
+        assert_eq!(*s.log.borrow(), ["update", "add", "update"]);
+        let s = Script::new(&[
+            Err(ERR_SEC_ITEM_NOT_FOUND),
+            Err(ERR_SEC_DUPLICATE_ITEM),
+            Err(ERR_SEC_ITEM_NOT_FOUND),
+        ]);
+        assert_eq!(
+            put(&s, b"k"),
+            Err(Failure::Unavailable {
+                status: ERR_SEC_ITEM_NOT_FOUND,
+                item_call: true
+            }),
+            "an item that vanishes twice is never reported stored"
+        );
+    }
+
+    #[test]
+    fn failures_are_mapped_and_end_the_replacement() {
+        let s = Script::new(&[Err(MISSING_ENTITLEMENT)]);
+        assert_eq!(put(&s, b"k"), Err(Failure::NotSigned { item_call: true }));
+        assert_eq!(*s.log.borrow(), ["update"]);
+        let s = Script::new(&[Err(ERR_SEC_ITEM_NOT_FOUND), Err(-25_308)]);
+        assert_eq!(put(&s, b"k"), Err(Failure::Locked { status: -25_308 }));
+        assert_eq!(*s.log.borrow(), ["update", "add"]);
+    }
+
+    #[test]
+    fn bounds_make_no_call() {
+        for size in [0, MAX_ITEM_BYTES + 1] {
+            let s = Script::default();
+            assert_eq!(put(&s, &vec![b'a'; size]), Err(Failure::Invalid));
+            assert!(s.log.borrow().is_empty());
+        }
+    }
+}
