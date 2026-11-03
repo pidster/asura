@@ -1,0 +1,1741 @@
+[
+ {
+  "id": "PW1",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "write",
+   "resource": {
+    "type": "Path",
+    "id": "/Users/person/src/studio/src/main.rs"
+   },
+   "context": {
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.model.write"
+  ]
+ },
+ {
+  "id": "PW2",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "write",
+   "resource": {
+    "type": "Path",
+    "id": "/Users/person/.asura/scratch/j-studio-model/out.txt"
+   },
+   "context": {
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.model.write"
+  ]
+ },
+ {
+  "id": "PW3",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "write",
+   "resource": {
+    "type": "Path",
+    "id": "/etc/hosts"
+   },
+   "context": {
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": []
+ },
+ {
+  "id": "PW4",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "write",
+   "resource": {
+    "type": "Path",
+    "id": "/Users/person/src/studio/.git/hooks/pre-commit"
+   },
+   "context": {
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.hard.implicit_exec"
+  ]
+ },
+ {
+  "id": "PW5",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "write",
+   "resource": {
+    "type": "Path",
+    "id": "/Users/person/.asura/config.yaml"
+   },
+   "context": {
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.hard.asura_state"
+  ]
+ },
+ {
+  "id": "PW6",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-person"
+   },
+   "action": "write",
+   "resource": {
+    "type": "Path",
+    "id": "/Users/person/src/studio/.git/hooks/pre-commit"
+   },
+   "context": {
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.person.write"
+  ]
+ },
+ {
+  "id": "PW7",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-person"
+   },
+   "action": "write",
+   "resource": {
+    "type": "Path",
+    "id": "/Users/person/.cargo/registry/index"
+   },
+   "context": {
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.person.write"
+  ]
+ },
+ {
+  "id": "PW8",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "write",
+   "resource": {
+    "type": "Path",
+    "id": "/Users/person/src/studio/vendor/lib.rs"
+   },
+   "context": {
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "ws.studio.vendor"
+  ]
+ },
+ {
+  "id": "PW9",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-person"
+   },
+   "action": "write",
+   "resource": {
+    "type": "Path",
+    "id": "/Users/person/src/studio/vendor/lib.rs"
+   },
+   "context": {
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.person.write"
+  ]
+ },
+ {
+  "id": "PW10",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "write",
+   "resource": {
+    "type": "Path",
+    "id": "/Users/person/src/shared/out/report.md"
+   },
+   "context": {
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "env.t-studio-1.write"
+  ]
+ },
+ {
+  "id": "PW11",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model-2"
+   },
+   "action": "write",
+   "resource": {
+    "type": "Path",
+    "id": "/Users/person/src/shared/out/report.md"
+   },
+   "context": {
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": []
+ },
+ {
+  "id": "PW12",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-person"
+   },
+   "action": "write",
+   "resource": {
+    "type": "Path",
+    "id": "/Users/person/.ssh/config"
+   },
+   "context": {
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "user.forbid.ssh_dir"
+  ]
+ },
+ {
+  "id": "PW13",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "write",
+   "resource": {
+    "type": "Path",
+    "id": "/Users/person/src/studio/src/missing.rs"
+   },
+   "context": {
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [],
+  "cedar_rules": [
+   "inst.hard.asura_state",
+   "inst.hard.implicit_exec"
+  ],
+  "cedar_error": "policy_error"
+ },
+ {
+  "id": "PW14",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "write",
+   "resource": {
+    "type": "Path",
+    "id": "/Users/person/src/shared/out/report.md"
+   },
+   "context": {
+    "now_ms": 1793750400000
+   }
+  },
+  "allow": false,
+  "rules": []
+ },
+ {
+  "id": "PC1",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "status",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "safe",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.model.exec"
+  ]
+ },
+ {
+  "id": "PC2",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "push",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "safe",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.model.git_push"
+  ]
+ },
+ {
+  "id": "PC3",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec_request_approval",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "push",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "safe",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.model.exec_approval"
+  ]
+ },
+ {
+  "id": "PC4",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "push",
+     "flags": [
+      "--force"
+     ],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "safe",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.model.git_force",
+   "inst.model.git_push"
+  ]
+ },
+ {
+  "id": "PC5",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/sudo"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "safe",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.hard.model_privilege"
+  ]
+ },
+ {
+  "id": "PC6",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec_request_approval",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/sudo"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "safe",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.hard.model_privilege"
+  ]
+ },
+ {
+  "id": "PC7",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/bin/sh"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "compound",
+     "subcommand": "",
+     "flags": [],
+     "shell_features": [
+      "eval"
+     ],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "safe",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.model.shell_features"
+  ]
+ },
+ {
+  "id": "PC8",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/bin/sh"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "unparsed",
+     "subcommand": "",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "safe",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.model.shell_features"
+  ]
+ },
+ {
+  "id": "PC9",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/Users/person/.cargo/bin/cargo"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "publish",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "safe",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.model.publish"
+  ]
+ },
+ {
+  "id": "PC10",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "status",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": true
+    },
+    "outside_switch": false,
+    "risk": "safe",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.hard.model_secret_reference"
+  ]
+ },
+ {
+  "id": "PC11",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "status",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [
+      "PATH"
+     ],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "safe",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.model.env_clean"
+  ]
+ },
+ {
+  "id": "PC12",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-person"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "push",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [
+      "LANG",
+      "PATH",
+      "SSH_AUTH_SOCK"
+     ],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.person.exec"
+  ]
+ },
+ {
+  "id": "PC13",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-person"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "status",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [
+      "AWS_SECRET_ACCESS_KEY",
+      "PATH"
+     ],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.person.env_terminal"
+  ]
+ },
+ {
+  "id": "PC14",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-person"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "status",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [
+      "RUST_LOG"
+     ],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.person.exec"
+  ]
+ },
+ {
+  "id": "PC15",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-person"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "status",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [
+      "DATABASE_URL"
+     ],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.person.env_declared"
+  ]
+ },
+ {
+  "id": "PC16",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-outside"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "status",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": true,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.person.exec_outside"
+  ]
+ },
+ {
+  "id": "PC17",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-outside"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "status",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": []
+ },
+ {
+  "id": "PC18",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec_approved",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:4f1c0d2a",
+    "command": {
+     "parse": "simple",
+     "subcommand": "push",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "safe",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "grant.a1"
+  ]
+ },
+ {
+  "id": "PC19",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec_approved",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:99",
+    "command": {
+     "parse": "simple",
+     "subcommand": "push",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "safe",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": []
+ },
+ {
+  "id": "PC20",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-person"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/sudo"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.person.exec"
+  ]
+ },
+ {
+  "id": "PC21",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-person"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "status",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 1,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.person.exec"
+  ]
+ },
+ {
+  "id": "PK1",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "status",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "dangerous",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "clf.dangerous"
+  ]
+ },
+ {
+  "id": "PK2",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "status",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "unknown",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "clf.unknown"
+  ]
+ },
+ {
+  "id": "PK3",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "status",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "clf.absent"
+  ]
+ },
+ {
+  "id": "PK4",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec_request_approval",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "status",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "dangerous",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.model.exec_approval"
+  ]
+ },
+ {
+  "id": "PK5",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-person"
+   },
+   "action": "exec",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:0",
+    "command": {
+     "parse": "simple",
+     "subcommand": "status",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.person.exec"
+  ]
+ },
+ {
+  "id": "PK6",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "exec_approved",
+   "resource": {
+    "type": "Executable",
+    "id": "/usr/bin/git"
+   },
+   "context": {
+    "request_digest": "sha256:4f1c0d2a",
+    "command": {
+     "parse": "simple",
+     "subcommand": "push",
+     "flags": [],
+     "shell_features": [],
+     "env_terminal": [],
+     "env_declared": [],
+     "secret_vars": 0,
+     "secret_reference": false
+    },
+    "outside_switch": false,
+    "risk": "dangerous",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "grant.a1"
+  ]
+ },
+ {
+  "id": "PN1",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "connect",
+   "resource": {
+    "type": "Domain",
+    "id": "github.com"
+   },
+   "context": {
+    "ip": "140.82.113.4",
+    "port": 443,
+    "via_proxy": true,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "env.t-studio-1.net"
+  ]
+ },
+ {
+  "id": "PN2",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "connect",
+   "resource": {
+    "type": "Domain",
+    "id": "github.com"
+   },
+   "context": {
+    "ip": "140.82.113.4",
+    "port": 443,
+    "via_proxy": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.hard.model_unmediated_net"
+  ]
+ },
+ {
+  "id": "PN3",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "connect",
+   "resource": {
+    "type": "Domain",
+    "id": "api.github.com"
+   },
+   "context": {
+    "ip": "140.82.113.6",
+    "port": 443,
+    "via_proxy": true,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "env.t-studio-1.net"
+  ]
+ },
+ {
+  "id": "PN4",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "connect",
+   "resource": {
+    "type": "Domain",
+    "id": "evil.com"
+   },
+   "context": {
+    "ip": "203.0.113.9",
+    "port": 443,
+    "via_proxy": true,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "repo.studio.net"
+  ]
+ },
+ {
+  "id": "PN5",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "connect",
+   "resource": {
+    "type": "Address",
+    "id": "140.82.113.3"
+   },
+   "context": {
+    "ip": "140.82.113.3",
+    "port": 22,
+    "via_proxy": true,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "env.t-studio-1.net"
+  ]
+ },
+ {
+  "id": "PN6",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "connect",
+   "resource": {
+    "type": "Address",
+    "id": "10.0.0.5"
+   },
+   "context": {
+    "ip": "10.0.0.5",
+    "port": 22,
+    "via_proxy": true,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "repo.studio.net"
+  ]
+ },
+ {
+  "id": "PN7",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "connect",
+   "resource": {
+    "type": "Domain",
+    "id": "github.com"
+   },
+   "context": {
+    "ip": "127.0.0.1",
+    "port": 443,
+    "via_proxy": true,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.hard.model_local_address"
+  ]
+ },
+ {
+  "id": "PN8",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-person"
+   },
+   "action": "connect",
+   "resource": {
+    "type": "Domain",
+    "id": "evil.com"
+   },
+   "context": {
+    "ip": "203.0.113.9",
+    "port": 80,
+    "via_proxy": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.person.net"
+  ]
+ },
+ {
+  "id": "PN9",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model-2"
+   },
+   "action": "connect",
+   "resource": {
+    "type": "Domain",
+    "id": "github.com"
+   },
+   "context": {
+    "ip": "140.82.113.4",
+    "port": 443,
+    "via_proxy": true,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": []
+ },
+ {
+  "id": "PN10",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-obs-model"
+   },
+   "action": "connect",
+   "resource": {
+    "type": "Domain",
+    "id": "github.com"
+   },
+   "context": {
+    "ip": "140.82.113.4",
+    "port": 443,
+    "via_proxy": true,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": []
+ },
+ {
+  "id": "PS1",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "secret_use",
+   "resource": {
+    "type": "Secret",
+    "id": "gh_token"
+   },
+   "context": {
+    "delivery": "brokered",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "env.t-studio-1.secret"
+  ]
+ },
+ {
+  "id": "PS2",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model"
+   },
+   "action": "secret_use",
+   "resource": {
+    "type": "Secret",
+    "id": "gh_token"
+   },
+   "context": {
+    "delivery": "raw",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.hard.model_raw_secret"
+  ]
+ },
+ {
+  "id": "PS3",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-person"
+   },
+   "action": "secret_use",
+   "resource": {
+    "type": "Secret",
+    "id": "gh_token"
+   },
+   "context": {
+    "delivery": "raw",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.person.secret"
+  ]
+ },
+ {
+  "id": "PS4",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-person"
+   },
+   "action": "secret_use",
+   "resource": {
+    "type": "Secret",
+    "id": "obs_key"
+   },
+   "context": {
+    "delivery": "raw",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.hard.secret_other_project"
+  ]
+ },
+ {
+  "id": "PS5",
+  "request": {
+   "principal": {
+    "type": "Job",
+    "id": "j-studio-model-2"
+   },
+   "action": "secret_use",
+   "resource": {
+    "type": "Secret",
+    "id": "gh_token"
+   },
+   "context": {
+    "delivery": "brokered",
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": []
+ },
+ {
+  "id": "PE1",
+  "request": {
+   "principal": {
+    "type": "Task",
+    "id": "t-studio-1"
+   },
+   "action": "egress",
+   "resource": {
+    "type": "Destination",
+    "id": "anthropic"
+   },
+   "context": {
+    "data_class": "prompt",
+    "tainted": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "user.egress.studio.anthropic"
+  ]
+ },
+ {
+  "id": "PE2",
+  "request": {
+   "principal": {
+    "type": "Task",
+    "id": "t-studio-1"
+   },
+   "action": "egress",
+   "resource": {
+    "type": "Destination",
+    "id": "anthropic"
+   },
+   "context": {
+    "data_class": "file_page",
+    "tainted": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": []
+ },
+ {
+  "id": "PE3",
+  "request": {
+   "principal": {
+    "type": "Task",
+    "id": "t-studio-1"
+   },
+   "action": "egress",
+   "resource": {
+    "type": "Destination",
+    "id": "anthropic"
+   },
+   "context": {
+    "data_class": "prompt",
+    "tainted": true,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.hard.egress_tainted"
+  ]
+ },
+ {
+  "id": "PE4",
+  "request": {
+   "principal": {
+    "type": "Task",
+    "id": "t-studio-1"
+   },
+   "action": "egress",
+   "resource": {
+    "type": "Destination",
+    "id": "local-mlx"
+   },
+   "context": {
+    "data_class": "tool_result",
+    "tainted": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.egress.local"
+  ]
+ },
+ {
+  "id": "PE5",
+  "request": {
+   "principal": {
+    "type": "Task",
+    "id": "t-obs-1"
+   },
+   "action": "egress",
+   "resource": {
+    "type": "Destination",
+    "id": "anthropic"
+   },
+   "context": {
+    "data_class": "prompt",
+    "tainted": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "user.egress.observatory.anthropic"
+  ]
+ },
+ {
+  "id": "PE6",
+  "request": {
+   "principal": {
+    "type": "Task",
+    "id": "t-obs-1"
+   },
+   "action": "egress",
+   "resource": {
+    "type": "Destination",
+    "id": "local-mlx"
+   },
+   "context": {
+    "data_class": "history",
+    "tainted": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": true,
+  "rules": [
+   "inst.egress.local"
+  ]
+ },
+ {
+  "id": "PE7",
+  "request": {
+   "principal": {
+    "type": "Task",
+    "id": "t-studio-1"
+   },
+   "action": "egress",
+   "resource": {
+    "type": "Destination",
+    "id": "local-mlx"
+   },
+   "context": {
+    "data_class": "tool_result",
+    "tainted": true,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "inst.hard.egress_tainted"
+  ]
+ },
+ {
+  "id": "PE8",
+  "request": {
+   "principal": {
+    "type": "Task",
+    "id": "t-obs-1"
+   },
+   "action": "egress",
+   "resource": {
+    "type": "Destination",
+    "id": "anthropic"
+   },
+   "context": {
+    "data_class": "history",
+    "tainted": false,
+    "now_ms": 1793707200000
+   }
+  },
+  "allow": false,
+  "rules": [
+   "ws.observatory.no_remote_history"
+  ]
+ }
+]

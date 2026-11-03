@@ -1,0 +1,58 @@
+namespace Asura {
+  // Closed vocabularies
+  entity Origin enum ["model", "person_typed"];
+  entity Profile enum ["model-1", "person-1", "person-outside-1"];
+  entity PathClass enum ["ordinary", "implicit_exec", "build_test", "asura_state"];
+  entity Parse enum ["simple", "compound", "unparsed"];
+  entity Risk enum ["safe", "moderate", "dangerous", "unknown"];
+  entity Delivery enum ["raw", "brokered"];
+  entity DataClass enum ["prompt", "history", "notice", "file_page", "tool_result"];
+
+  // Principals and resources
+  entity Path in [Path] = { class: PathClass };
+  entity Project = { root: Path, declared_env: Set<String> };
+  entity Task = { project: Project };
+  entity Job = {
+    origin: Origin,
+    profile: Profile,
+    project: Project,
+    task: Task,
+    scratch: Path,
+    cache_roots: Set<Path>,
+  };
+  entity Executable = { tool: String };
+  entity Domain in [Domain];
+  entity Address;
+  entity Secret = { project: Project };
+  entity Destination = { remote: Bool };
+
+  type Command = {
+    parse: Parse,
+    subcommand: String,
+    flags: Set<String>,
+    shell_features: Set<String>,
+    env_terminal: Set<String>,
+    env_declared: Set<String>,
+    secret_vars: Long,
+    secret_reference: Bool,
+  };
+  type ExecContext = {
+    now: datetime,
+    request_digest: String,
+    command: Command,
+    outside_switch: Bool,
+    risk?: Risk,
+  };
+  type WriteContext = { now: datetime };
+  type ConnectContext = { now: datetime, ip: ipaddr, port: Long, via_proxy: Bool };
+  type SecretContext = { now: datetime, delivery: Delivery };
+  type EgressContext = { now: datetime, data_class: DataClass, tainted: Bool };
+
+  action exec_any;
+  action exec, exec_request_approval, exec_approved in [exec_any]
+    appliesTo { principal: [Job], resource: [Executable], context: ExecContext };
+  action write appliesTo { principal: [Job], resource: [Path], context: WriteContext };
+  action connect appliesTo { principal: [Job], resource: [Domain, Address], context: ConnectContext };
+  action secret_use appliesTo { principal: [Job], resource: [Secret], context: SecretContext };
+  action egress appliesTo { principal: [Task], resource: [Destination], context: EgressContext };
+}
