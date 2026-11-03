@@ -6,9 +6,13 @@ by the owner on 2026-11-02: [task envelopes](#owner-revision-of-2026-11-02-task-
 [engine, composition, solver, policy level and budgets](#owner-decisions-of-2026-11-03)
 (AD-13, AD-14, AD-17, AD-27).
 
-Decided on 2026-11-03: the policy format and evaluator (Cedar). Open in this
-brief until its design resolves them: the macOS enforcement mechanisms.
-No policy format or evaluator is implemented. The [exec_cmd tool](exec-cmd-tool.md)
+Decided on 2026-11-03: the policy format and evaluator (Cedar). The
+[security policy design](security-policy.md) resolves this brief's open
+decisions for the policy layer: the effect schema, the wrapper, scope
+composition, the lifecycle, compilation to per-job Seatbelt profiles and the
+solver package. Live enforcement (Endpoint Security, Network Extension)
+stays proposed there. The brief keeps the requirements; the design is the
+canonical contract. No policy format or evaluator is implemented. The [exec_cmd tool](exec-cmd-tool.md)
 and Git observer apply fixed `sandbox-exec` profiles; those profiles are not a
 policy format or a selected general mechanism. Terms are defined in the
 [glossary](../glossary.md).

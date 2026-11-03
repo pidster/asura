@@ -288,7 +288,9 @@ invocation, sandbox access control, and other security controls. One canonical
 authorization contract must apply across all clients and agent hosts, with host
 enforcement of the resulting limits. Policy evaluation and OS enforcement are
 distinct responsibilities. The [security policy brief](designs/security-policy-brief.md)
-defines the required scope and evaluation work; the format and engine remain open.
+defines the required scope. The owner selected Cedar on 2026-11-03, with
+policies written over effects (AD-27); the [security policy design](designs/security-policy.md)
+is the canonical contract.
 
 ## User experience
 

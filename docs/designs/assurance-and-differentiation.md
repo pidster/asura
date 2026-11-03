@@ -11,7 +11,11 @@ Revision of 2026-11-03: the owner decided AD-13 (Cedar), AD-14 (per-scope
 evaluation, pattern A), AD-17 (cvc5 built from source and bundled) and AD-27
 (effects are the policy subject; commands are intent). The owner also revised
 the policy budgets; the [policy engine spike](policy-engine-spike.md#owner-revision-of-2026-11-03-budgets)
-keeps the original targets beside the revised ones.
+keeps the original targets beside the revised ones. The
+[security policy design](security-policy.md) applies these decisions; where
+this document describes command-level rules (the decision flow, DF4 and the
+trusted-code table), AD-27 revises them: commands are intent, and effects are
+decided.
 
 Revision of 2026-11-02: the owner decided AD-11, AD-15, AD-18, AD-21 and AD-24.
 AD-12, AD-16 and AD-23 are now decided by earlier owner rules and these
@@ -417,7 +421,9 @@ broker and the taint gate are trusted code ([R-SEC] section 11.3).
 ### DF4. Every step watched
 
 **What it is.** An on-device classifier labels every structured action before
-policy evaluation. Its output enters Cedar only as context attributes that only
+policy evaluation, and, under AD-27, watches the effects a job causes (Seatbelt
+violation reports today, Endpoint Security later); on effects it may only
+revoke a job or pause it and ask ([watching effects](security-policy.md#watching-effects)). Its output enters Cedar only as context attributes that only
 `forbid` policies read. It can add a denial or an approval requirement. It can
 never permit.
 
@@ -596,7 +602,7 @@ outside the proof. Each needs its own unit, integration and end-to-end tests:
 | Trusted component | What it must get right | Main test evidence |
 | --- | --- | --- |
 | Path canonicaliser | Canonical paths through retained directory descriptors; symlinks, hard links, firmlinks, case and Unicode forms | Unit fixtures; race and substitution integration tests |
-| Command parser | Named features (tool, subcommand, flags, paths, hosts, shell features); `unparsed` for what it cannot resolve | Parser fuzzing; differential cases against `/bin/sh` |
+| Command parser (intent extractor under AD-27) | Named intent features (tool, subcommand, flags, shell features); `unparsed` for what it cannot resolve. Its output can only tighten | Parser fuzzing; differential cases against `/bin/sh` |
 | Entity loader and origin labelling | The `origin` and project attributes that policies trust | Integration tests from the job controller |
 | Backend compiler | `Enforced ⊆ Permitted` for every effect it cannot mediate at run time | Compiled profiles compared with the existing `model-1` and `person-1` profiles; enforcement tests |
 | Brokers (proxy, SSH and signing agent) | Injection rules, destination checks, response reflection removal | Probes PX-1 to PX-6, SSH-1, SSH-2; request parser fuzzing |
@@ -646,11 +652,13 @@ from top to bottom. Arrows show data or control flow; labels on decision arrows
 name the guard. Each "Deny" outcome and each failed check goes to the journal
 record with its reason code. The [security policy brief](security-policy-brief.md#decision-and-enforcement-boundary)
 remains the canonical decision and enforcement boundary; this view adds the
-parser, classifier, compiler and evidence steps.
+parser, classifier, compiler and evidence steps. Revised by AD-27
+(2026-11-03): the evaluation decides effects, and the parser's output is
+intent context; the selected flow is [SP-F5](security-policy.md#sp-f5-one-model-job-start).
 
 ```mermaid
 flowchart TB
-    Prop["Structured action proposal"] --> Parse["Deterministic parser: tool, subcommand, flags, paths, hosts, shell features"]
+    Prop["Structured action proposal"] --> Parse["Deterministic parser: intent features, tighten-only (AD-27)"]
     Parse --> Bind["Bind trusted attributes: principal, origin, canonical paths, executable identity"]
     Bind --> Clf["On-device classifier over redacted, untainted input"]
     Clf -->|"label, confidence, version"| Ctx["Forbid-only context: risk attributes"]
