@@ -42,6 +42,23 @@ over a command line cannot be the authority for what a job does.
    200 ms; with one policy set per action group and one engine copy per
    worker.
 
+## Follow-up owner decisions (2026-11-03)
+
+The owner answered the design's five open questions on 2026-11-03 (AD-28 to
+AD-32 in the [owner decisions table](../designs/assurance-and-differentiation.md#owner-decisions)):
+
+1. **Task envelopes wait for a task design** (AD-28). Packet PL8 depends on a
+   new design that defines the task entity.
+2. **The default "ask first" intent list** (AD-29): `git push` with its force
+   flags, publish commands, privilege tools, hard-to-undo Git commands and
+   unparsed text. Packet PL7 ships it as tighten-only rules.
+3. **An LGPL-free cvc5 build is probed first** (AD-30). The solver packaging
+   in decision item 5 waits on that probe and may change after it.
+4. **The 8 MiB size budget covers the `asura` executable only** (AD-31). The
+   solver's size is reported for each release, with no limit.
+5. **No replacement solver for now** (AD-32). Only the bundled, signed solver
+   runs.
+
 ## Consequences
 
 - A repository policy can only narrow, by construction of the AND.

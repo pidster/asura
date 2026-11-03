@@ -3,7 +3,8 @@
 Status: **ready for implementation, 2026-11-03**, for delivery packet
 [PL1](#delivery-packets). Later packets are ready where their row in the
 [packet table](#delivery-packets) says so; the others wait for the named
-[owner questions](#open-owner-questions) or [evidence](#evidence-still-missing).
+designs, probes or [evidence](#evidence-still-missing). The owner answered
+the [owner questions](#open-owner-questions) on 2026-11-03.
 Nothing in this design is implemented. Protocol numbering stays `0.1` and the
 journal format stays `1` until release 1.0.0; schemas change in place.
 
@@ -25,11 +26,16 @@ spike evidence only.
 
 | ID | Decision | Date |
 | --- | --- | --- |
+| AD-28 | Task envelopes (PL8) wait for a task design (OQ1) | 2026-11-03 |
+| AD-29 | The full default "ask first" intent list for PL7 (OQ2) | 2026-11-03 |
+| AD-30 | Probe an LGPL-free cvc5 build before the solver packaging (OQ3) | 2026-11-03 |
+| AD-31 | The 8 MiB budget covers the `asura` executable only; the solver's size is reported each release with no limit (OQ4) | 2026-11-03 |
+| AD-32 | No replacement solver for now; only the bundled, signed solver (OQ5) | 2026-11-03 |
 | AD-13 | Cedar is the policy language and decision engine. It decides; it does not enforce | 2026-11-03 |
 | AD-14 | Pattern A: each scope is evaluated separately; allow only if every scope allows; a refusal names the denying scope | 2026-11-03 |
 | AD-17 | cvc5 built from source with a dynamic or replaceable GMP, signed and notarised inside `Asura.app`; proofs on the person's Mac, offline; a bounded admission tool with no default time limit | 2026-11-03 |
 | AD-27 | Effects are the authority. Commands, MCP tools and skills are intent: they may only tighten | 2026-11-03 |
-| Budgets | Decision p50 at most 100 µs; end-to-end p99 at most 1 ms at 64 concurrent requests; at most 8 MiB added; startup at most 200 ms | 2026-11-03 |
+| Budgets | Decision p50 at most 100 µs; end-to-end p99 at most 1 ms at 64 concurrent requests; at most 8 MiB added to the `asura` executable (AD-31); startup at most 200 ms | 2026-11-03 |
 | AD-24 | Envelope approval is an authorized policy change; envelopes end with their task or on revocation | 2026-11-02 |
 | AD-15, AD-16 | The classifier may stop a model job to ask; `unknown` asks; an unanswered job waits in its agent's queue with a short reason | 2026-11-02 |
 | AD-25 | Context egress is a policy decision over data classes, destinations and projects | 2026-10-31 |
@@ -348,8 +354,9 @@ Rules that the schema cannot state, and that the entity loader enforces:
   which is in `com`.
 
 Until Asura has a task entity, a `Task` is one conversation's main agent
-(agent key: conversation ID, agent 0). [OQ1](#open-owner-questions) asks the
-owner what ends a task envelope before tasks exist.
+(agent key: conversation ID, agent 0), for decisions and records only. The
+owner decided (AD-28, [OQ1](#open-owner-questions)) that task envelopes wait
+for a task design; no envelope binds to this interim `Task`.
 
 ### Actions and what they decide
 
@@ -1092,7 +1099,9 @@ stateDiagram-v2
 Required behavior: [DF1-S1](assurance-and-differentiation.md#df1-s1-envelope-lifecycle)
 and the brief's [envelope rules](security-policy-brief.md#owner-revision-of-2026-11-02-task-envelopes).
 Selected mechanism below. Under AD-27 an envelope is an **effect set**.
-Packet PL8 waits for [OQ1](#open-owner-questions).
+Packet PL8 is blocked until a new task design defines the task entity
+(AD-28, [OQ1](#open-owner-questions)). The task field, the end causes and
+SP-S3 below are proposed until that design; they bind to its task entity.
 
 ### Grant shape
 
@@ -1215,8 +1224,29 @@ Selected. For each job start the owner evaluates, all scopes each time:
 Model jobs had no approval step before AD-15. Packet PL7 adds it; until then
 an `ask` outcome is impossible, because the shipped installation set has no
 tighten-only forbid (PL1 has none, by design). The default intent rules that
-would ask for approval, for example a model `git push`, are
-[OQ2](#open-owner-questions).
+ask for approval are the owner's list below (AD-29).
+
+### Default intent rules (AD-29)
+
+Required behavior (owner, 2026-11-03, [OQ2](#open-owner-questions)). Packet
+PL7 ships one tighten-only `forbid` on `process.exec` for model-origin jobs
+per group below, so each matching model command asks the person first. PL1
+ships none of them.
+
+| Group | Intent that asks first |
+| --- | --- |
+| Git push | `git push`, including its force flags |
+| Publish | `cargo publish`, `npm publish`, `gem push`, `twine upload`, `swift package-registry publish` and similar publish commands |
+| Privilege | `sudo`, `su`, `doas`, `osascript` with administrator privileges, and `launchctl` changes |
+| Hard-to-undo Git | `git reset --hard`, `git clean -fdx` and similar Git commands that discard work |
+| Unparsed text | Every command whose `parse` is `unparsed` |
+
+The rules read the intent features of the [intent extractor](#commands-and-other-intent)
+(PL2): `tools`, `first_tool`, `subcommand` and `flags`. PL7 fixes the
+complete tool, subcommand and flag lists of each group ("and similar") in its
+rule text and tests. Those lists are an engineering choice inside the owner's
+groups. The person may narrow or remove the rules in the user scope after PL3
+admission.
 
 ### The approval step and the per-agent queue
 
@@ -1648,15 +1678,18 @@ Asura.app/Contents/
 ### Licence obligations and notice
 
 Required: meet LGPL-3.0 for GMP (and LibPoly if linked) and the notice
-conditions of cvc5 (BSD-3-Clause), CaDiCaL, SymFPU and MiniSat. Selected
-mechanism; legal confirmation is [OQ3](#open-owner-questions).
+conditions of cvc5 (BSD-3-Clause), CaDiCaL, SymFPU and MiniSat. Proposed
+mechanism: the owner decided (AD-30, [OQ3](#open-owner-questions)) to probe
+an LGPL-free cvc5 build first. The probe records its results in
+`docs/designs/solver-build-probes.md`. The solver packaging (this section,
+PL4a and PL4b) waits on that probe and is revised from its result.
 
 | Obligation | How Asura meets it |
 | --- | --- |
 | LGPL-3.0 §4(d)(1): a shared library mechanism that works with a modified, interface-compatible GMP | GMP is a separate `@rpath` dylib. A person can build a modified GMP, put it into a copy of `cvc5` and `Frameworks/`, sign both ad hoc (`codesign -f -s -`), and run that cvc5. Asura's service uses only the shipped, digest-checked files |
 | LGPL-3.0 §4(a), (b): notice and licence texts | `Resources/licenses/solver/` holds `NOTICE.txt`, the GMP `COPYING.LESSERv3` and `COPYINGv3` texts, cvc5 `COPYING`, and the CaDiCaL, SymFPU and MiniSat licence texts; the DMG `LICENSE` file points to them |
 | GPL-3.0 §6(d) through LGPL §4(d): corresponding source of GMP | The exact GMP source archive, the cvc5 source archive and the build script are published as assets of the same GitHub release as the DMG, for as long as that DMG is offered |
-| Installation Information (GPL-3.0 §6) | Not required: Asura is not conveyed with the sale of a User Product. Stated in OQ3 for legal confirmation |
+| Installation Information (GPL-3.0 §6) | Not required: Asura is not conveyed with the sale of a User Product. Needs legal confirmation if the LGPL route remains after the AD-30 probe |
 | BSD-3-Clause and MIT notices | Reproduced in the licence folder |
 
 Notice text (`NOTICE.txt`), fixed:
@@ -1780,7 +1813,7 @@ They are acceptance criteria, never runtime closures (AE-04).
 | --- | --- | --- |
 | PL-B1 | Decision p50 at most 100 µs | In the worker: request and entity slice construction, schema checks, every applicable scope, wrapper and reasons; on the product schema with the scale workload below |
 | PL-B2 | End-to-end p99 at most 1 ms at 64 concurrent requests | From `decide` on the reactor to the `decided` event, 64 closed-loop requesters, the product worker pool |
-| PL-B3 | At most 8 MiB added size | Stripped release `asura` with the policy layer against the same build without it. The solver and GMP files are recorded separately ([OQ4](#open-owner-questions)) |
+| PL-B3 | At most 8 MiB added size | Stripped release `asura` with the policy layer against the same build without it. The solver and GMP files are reported separately for each release, with no limit (AD-31, [OQ4](#open-owner-questions)) |
 | PL-B4 | Startup at most 200 ms | From the owner's start to the first decision: schema, every admitted scope of the workload, worker installation |
 | PL-B5 | Safety budgets kept from the spike | PES-M2 (0 unenforced conventions), M3 (100 % injected errors deny), M4 (0 allows in 1,000,000 malformed requests), M5 (determinism), M6 (12 of 12 seeded defects refused, warnings refuse), M7 (reasons), M15 to M18 (proofs) |
 
@@ -1875,13 +1908,13 @@ needs a change. Owned paths are exclusive while a packet runs.
 | --- | --- | --- | --- | --- |
 | PL1 | The policy owner; schema v1; built-in installation and default user sets; deny-on-any-error wrapper; installation and user scopes; region compiler for `model-1`; model exec_cmd job decisions by effect envelope with the command as intent; constraint set to the guardian (byte-equal profile); kinds 34 and 35; `/status` line; denial text | `rust/crates/asura-policy/**` (new, with `AGENTS.md`), `rust/crates/asura-service/src/policy.rs` and `policy/**`, the exec_cmd decision point in `conversation.rs` and `tools.rs`, the guardian profile input in `asura-platform/src/exec_cmd/guardian.rs`, kinds 34–35 in `asura-storage/src/authority/**`, `Cargo.toml`, `Cargo.lock` | This design | PL-U1–U8, U13; PL-I1–I4, I10, I12; PL-E1, E2; PL-B1–B5 recorded |
 | PL2 | Canonicaliser, program identity, intent extractor; person command decisions; named secret `secret_use` | `asura-platform/src/project_identity.rs`, new `asura-platform/src/code_identity.rs`, `exec_cmd/split.rs`, person dispatch in `conversation.rs`, `asura-policy` request types | PL1 | PL-U9, U10; PL-I15; PL-N1 |
-| PL4a | Solver build script and lock file; unsigned package for tests | `tools/release/solver/**` | This design; probes SV-B1, SV-B2, SV-P1 | Script builds offline; SV probes recorded |
+| PL4a | Solver build script and lock file; unsigned package for tests | `tools/release/solver/**` | The AD-30 LGPL-free build probe, then this design revised; probes SV-B1, SV-B2, SV-P1 | Script builds offline; SV probes recorded |
 | PL3 | Admission worker, SymCC solver adapter, platform solver process, lints, proofs, change difference, lifecycle with user-scope admission, rollback, restart reproving, control messages, audit | `rust/crates/asura-policy-admission/**` (new), `asura-platform/src/solver.rs`, `asura-service/src/policy/admission*`, control messages in `asura-control`, kind 35 events | PL1, PL4a | PL-U11; PL-I5–I8, I11, I13; PL-E3 |
 | PL4b | Bundle placement, signing, notice, licence folder, release checks | `tools/release/asura-bundle`, `tools/release/asura-release`, `tools/release/host-paths`, `docs/designs/release-signing.md` (first), DMG `LICENSE` | PL4a, PL3 | PL-N2; release proof gate |
 | PL5 | Workspace and repository scopes, forbid-only lint, baseline permit, `rel` literals | `asura-service/src/policy/scopes*`, `asura-policy` lints, repository source read | PL3 | PL-U5, U6; PL-I7; PL-E4 |
 | PL6 | Compiler for `person-1` and lower-scope narrowings; EPG deny rules moved into the compiler; SP-AQ7 soundness proofs | `asura-policy` compiler, `guardian.rs`, `path_guard` interface | PL5 | PL-I9; EV-E |
-| PL7 | Approval step: `process.exec.ask`, start condition `approval`, kind 36, control messages, TUI commands | `asura-service/src/policy/approval*`, job controller start conditions, TUI packet files | PL3; [OQ2](#open-owner-questions) for default intent rules | PL-I14; PL-E6 |
-| PL8 | Task envelopes | `asura-service/src/policy/envelope*`, rendering in `asura-policy` | PL6, PL7; [OQ1](#open-owner-questions) | PL-U12; PL-E5 |
+| PL7 | Approval step: `process.exec.ask`, start condition `approval`, kind 36, control messages, TUI commands; the [default intent rules](#default-intent-rules-ad-29) (AD-29) | `asura-service/src/policy/approval*`, job controller start conditions, TUI packet files | PL2, PL3 | PL-I14; PL-E6 |
+| PL8 | Task envelopes | `asura-service/src/policy/envelope*`, rendering in `asura-policy` | PL6, PL7; a new task design (AD-28) | PL-U12; PL-E5 |
 | PL9 | Classifier context and effect watching | Classifier design first | DF4 design; ER-1 to ER-3 | Its own design |
 | PL10 | Network connect through a proxy; context egress | Broker and remote provider designs first | AD-4, AD-6, EX13, EX14 | Their designs |
 
@@ -1893,7 +1926,8 @@ that point to it pass their gates.
 ```mermaid
 flowchart TD
     D["This design and ADR-0013"] --> PL1["PL1: owner, schema, exec_cmd effect decisions, kinds 34-35"]
-    D --> PL4a["PL4a: solver build script; probes SV-B1, SV-B2, SV-P1"]
+    Probe["AD-30: LGPL-free cvc5 build probe"] --> PL4a["PL4a: solver build script; probes SV-B1, SV-B2, SV-P1"]
+    D --> PL4a
     PL1 --> PL2["PL2: canonicaliser, identity, intent, person commands"]
     PL1 --> PL3["PL3: admission, proofs, lifecycle, rollback"]
     PL4a --> PL3
@@ -1901,16 +1935,17 @@ flowchart TD
     PL4a --> PL4b
     PL3 --> PL5["PL5: workspace and repository scopes"]
     PL5 --> PL6["PL6: person-1 compiler, EPG rules, soundness proofs"]
-    PL3 --> PL7["PL7: approval step"]
-    OQ2["OQ2: default intent rules"] -.-> PL7
+    PL3 --> PL7["PL7: approval step and AD-29 default intent rules"]
+    PL2 --> PL7
     PL6 --> PL8["PL8: task envelopes"]
     PL7 --> PL8
-    OQ1["OQ1: what ends a task envelope"] -.-> PL8
+    Task["New task design (AD-28)"] --> PL8
     PL7 --> PL9["PL9: classifier and effect watching (own design)"]
     PL6 --> PL10["PL10: proxy and egress (own designs)"]
 ```
 
-Dashed arrows are owner answers the packet needs.
+Every arrow is a dependency. The AD-30 probe and the task design are
+prerequisites outside this design.
 
 ## Decisions and alternatives
 
@@ -1929,15 +1964,17 @@ Dashed arrows are owner answers the packet needs.
 
 ## Open owner questions
 
-These need the owner. Engineering choices above are not listed.
+The owner answered OQ1 to OQ5 on 2026-11-03. The canonical records are
+AD-28 to AD-32 in the [owner decisions table](assurance-and-differentiation.md#owner-decisions).
+The question and the recommendation stay as asked.
 
-| ID | Question | Recommendation | Blocks |
-| --- | --- | --- | --- |
-| OQ1 | Asura has no task entity yet. What ends a task envelope? | Bind it to one conversation's main agent; end it on the person's `/envelope end`, on an optional person-set expiry, on revocation, and when the person starts `/new` from that conversation | PL8 |
-| OQ2 | Which model command intents ask for approval by default (for example `git push`, force flags, `cargo publish`, privilege tools, `unparsed` text)? | Ship the spike corpus's set as default user-scope intent forbids, editable by the person | PL7 default rules |
-| OQ3 | Legal confirmation of the LGPL-3.0 mechanism, the notice text and the source offer as release assets | Ask for legal review before PL4b ships a release | PL4b release |
-| OQ4 | Does the 8 MiB size budget cover the `asura` executable only, with cvc5 and GMP (about 20 MiB or more) recorded separately? | Yes: apply it to `asura`; record the solver files separately | PL1 and PL3 budget verdicts |
-| OQ5 | Should a person be able to approve a replacement solver binary? | Not now; the LGPL route does not need it | Nothing |
+| ID | Question | Recommendation | Owner decision, 2026-11-03 | Effect |
+| --- | --- | --- | --- | --- |
+| OQ1 | Asura has no task entity yet. What ends a task envelope? | Bind it to one conversation's main agent; end it on the person's `/envelope end`, on an optional person-set expiry, on revocation, and when the person starts `/new` from that conversation | **Wait for a task design** (AD-28). No interim binding is selected | PL8 is blocked until a new task design defines the task entity; PL8 depends on that design |
+| OQ2 | Which model command intents ask for approval by default (for example `git push`, force flags, `cargo publish`, privilege tools, `unparsed` text)? | Ship the spike corpus's set as default user-scope intent forbids, editable by the person | **The full default "ask first" list** (AD-29): `git push`, including force flags; publish commands (`cargo publish`, `npm publish`, `gem push`, `twine upload`, `swift package-registry publish` and similar); privilege tools (`sudo`, `su`, `doas`, admin `osascript`, `launchctl` changes); hard-to-undo Git commands (`git reset --hard`, `git clean -fdx` and similar); unparsed text | The [default intent rules](#default-intent-rules-ad-29) of PL7. PL1 ships none of them |
+| OQ3 | Legal confirmation of the LGPL-3.0 mechanism, the notice text and the source offer as release assets | Ask for legal review before PL4b ships a release | **Probe an LGPL-free cvc5 build first** (AD-30). A separate probe records its results in `docs/designs/solver-build-probes.md` | The [solver package](#solver-package-ad-17) and packets PL4a and PL4b wait on that probe; this design changes after it |
+| OQ4 | Does the 8 MiB size budget cover the `asura` executable only, with cvc5 and GMP (about 20 MiB or more) recorded separately? | Yes: apply it to `asura`; record the solver files separately | **The `asura` executable only** (AD-31). The solver's size is reported for each release, with no limit | PL-B3 measures `asura` only |
+| OQ5 | Should a person be able to approve a replacement solver binary? | Not now; the LGPL route does not need it | **No replacement solver for now** (AD-32). Only the bundled, signed solver runs | The solver lifecycle runs only the shipped, digest-checked files |
 
 Existing open owner decisions that this design depends on but does not
 decide: AD-4 (raw delivery to model jobs, brokers), AD-6 (provider keys
