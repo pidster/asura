@@ -1091,3 +1091,24 @@ The threat model's [LT2, LT3, LT4 and LT7](execution-threat-model.md#llamacpp-se
 and [ADR-0012](../decisions/0012-llamacpp-server-launchagent.md) are revised with
 it. Its evidence follows in [LCQ3 evidence](#lcq3-evidence-2026-11-03).
 
+#### LCQ3 evidence, 2026-11-03
+
+Same host and tools as the [implementation evidence](#implementation-evidence-2026-11-02);
+helper from an ad hoc `asura-bundle` package built from this revision.
+
+| Case | Evidence | Result |
+| --- | --- | --- |
+| LC-U9 | `asura-platform` `llamacpp::tests::llama_variables_never_reach_the_server_except_the_start_key`, `a_malformed_key_never_reaches_the_environment`, `the_plan_keeps_the_ui_off_and_the_key_out_of_the_arguments`, and the earlier plan, CORS and pipe tests | Pass |
+| LC-U15 | `asura-platform` `keychain::tests::server_key_replacement` (five tests: update in place, absent then added, racing duplicate then updated, a second absence reported unavailable, mapped failures, no call outside the bounds) | Pass |
+| LC-I5 to LC-I7 | `native_server_plan_and_relay` with the real `llama-server` 0.7.0 and the 2B model: router 401 without the key; the key in no argument and in the router's and the model process's environment; `--no-webui` and the four CORS arguments on the model process; a chat through the relay with the start's key reaches the keyed model process; the model process refuses a keyless `GET`, a wrong key and the keyless `text/plain` chat `POST` with 401 and answers the key with 200; no CORS reply for `http://evil.example` | Pass, 1.2 s. With a forced assertion failure after the model loaded, no scratch process was left |
+| LC-E1 | `conversation_flow --native-llamacpp` (`url` mode against a keyless test router): capacity 8,192, 1,812 measured input tokens | Pass |
+| LC-E3 | `conversation_flow --native-llamacpp-tools` with `Ternary-Bonsai-2-2B-Q2_0`: one pass in two recorded runs. The failure was the model's: 22 requests of tool calls, then an empty answer. A third attempt's output was not captured | Path verified; 2B tool quality is unreliable, as before |
+
+Not verified: `asura` mode end to end through the service, the key write in a
+team-signed build's data-protection keychain, and the LaunchAgent under the
+person's launchd (no test may use either); the Chromium page of P17 against a
+keyed model process (the 401 was measured with the same request from `curl`
+and in LC-I7); a Rust relay over a Unix socket (not needed, P20, P21). The
+native journeys run in `url` mode against a router the journey starts without
+the serve plan, so they do not exercise the key; LC-I5 to LC-I7 do.
+
