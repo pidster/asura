@@ -619,3 +619,186 @@ fn test_deny_set_refuses_the_model_entry_in_the_installation_scope() {
         Ok(Regions::template())
     );
 }
+
+// ----- Principal entity cache (security-policy.md, principal entity cache) -----
+
+fn principal_n(n: usize) -> JobPrincipal {
+    model1_principal(
+        &format!("{n:032x}"),
+        &format!("p{n}"),
+        &format!("/Users/person/src/project-{n}"),
+        &format!("c{n}:0"),
+        HOME,
+    )
+}
+/// A mixed request set over several principals: entry, region reads,
+/// writes and paths that collide with principal paths and ancestors.
+fn mixed() -> Vec<Request> {
+    let mut out = Vec::new();
+    for n in 0..6 {
+        let p = principal_n(n);
+        out.push(entry(p.clone(), Some(intent())));
+        out.push(entry(p.clone(), None));
+        for path in [
+            "/bin",
+            "/usr/share",
+            "/",
+            "/dev/null",
+            "/private/etc/hosts",
+            "/Users/person",
+            "/Users/person/.asura",
+        ] {
+            let mut r = read(path);
+            r.principal = p.clone();
+            out.push(r);
+        }
+        // The project root and scratch themselves, with their own
+        // attributes, and with conflicting ones (uncached path).
+        for resource in [p.project_root.clone(), p.scratch.clone()] {
+            let mut r = read("/");
+            r.principal = p.clone();
+            r.resource = Resource::Path(resource.clone());
+            out.push(r.clone());
+            let mut conflicting = resource;
+            conflicting.in_project = !conflicting.in_project;
+            r.resource = Resource::Path(conflicting);
+            out.push(r);
+        }
+        let mut write = read(&format!("/Users/person/src/project-{n}/src/main.rs"));
+        write.principal = p.clone();
+        write.action = Action::FileWrite;
+        if let Resource::Path(path) = &mut write.resource {
+            path.in_project = true;
+            path.rel = "src/main.rs".into();
+        }
+        out.push(write);
+    }
+    out
+}
+
+#[test]
+fn principal_cache_hit_miss_and_invalidation() {
+    let engine = builtin();
+    let request = entry(principal(), Some(intent()));
+    let first = engine.decide(&request);
+    assert_eq!(
+        engine.principal_cache_stats(),
+        PrincipalCacheStats {
+            entries: 1,
+            bytes: engine.principal_cache_stats().bytes,
+            hits: 0,
+            misses: 1
+        }
+    );
+    assert!(engine.principal_cache_stats().bytes > 0);
+    // A second request of the same principal hits.
+    assert_eq!(engine.decide(&request), first);
+    let mut other = read("/bin");
+    other.principal = principal();
+    engine.decide(&other);
+    let stats = engine.principal_cache_stats();
+    assert_eq!((stats.entries, stats.hits, stats.misses), (1, 2, 1));
+    // Another principal misses.
+    engine.decide(&entry(principal_n(9), Some(intent())));
+    assert_eq!(engine.principal_cache_stats().entries, 2);
+    assert_eq!(engine.principal_cache_stats().misses, 2);
+    // Invalidation (activation, revocation, schema change) empties it.
+    engine.invalidate_principal_cache();
+    assert_eq!(
+        engine.principal_cache_stats(),
+        PrincipalCacheStats::default()
+    );
+    assert_eq!(engine.decide(&request), first);
+    assert_eq!(engine.principal_cache_stats().misses, 1);
+}
+
+/// An activation installs a new engine for the new revision: its cache
+/// starts empty and its decisions follow the new texts, never an entry
+/// built under the old revision.
+#[test]
+fn principal_cache_does_not_survive_activation() {
+    let old = builtin();
+    let request = entry(principal(), Some(intent()));
+    assert!(old.decide(&request).allow);
+    assert_eq!(old.principal_cache_stats().entries, 1);
+    let texts = with(
+        Scope::User,
+        "@id(\"no_model_exec\") @reason(\"no_exec\") forbid (principal is Asura::Job, action == Asura::Action::\"process.exec\", resource) when { principal.origin == Asura::Origin::\"model\" };",
+    );
+    assert_ne!(texts.digest(), RevisionTexts::builtin().digest());
+    let new = Engine::build(&texts).expect("loads");
+    assert_eq!(new.principal_cache_stats(), PrincipalCacheStats::default());
+    let decision = new.decide(&request);
+    assert!(!decision.allow);
+    assert_eq!(reason(&decision), "no_exec");
+    assert_eq!(new.principal_cache_stats().misses, 1);
+}
+
+/// A decision with the cache equals the decision without it, over mixed
+/// requests, repeated (hits), and over malformed variants (the bench
+/// repeats this over the PL-B5 corpus and 1,000,000 malformed requests).
+#[test]
+fn principal_cache_changes_no_decision() {
+    let engine = builtin();
+    let requests = mixed();
+    for _ in 0..3 {
+        for r in &requests {
+            assert_eq!(
+                engine.decide(r),
+                engine.decide_uncached(r),
+                "{:?}",
+                r.resource
+            );
+        }
+    }
+    assert!(engine.principal_cache_stats().hits > 0);
+    // Malformed variants: a bad principal path, an over-long string, a
+    // non-canonical resource.
+    for r in &requests {
+        let mut bad = r.clone();
+        bad.principal.scratch.path = "relative/scratch".into();
+        assert_eq!(engine.decide(&bad), engine.decide_uncached(&bad));
+        let mut long = r.clone();
+        long.principal.task = "t".repeat(MAX_STRING_BYTES + 1);
+        assert_eq!(engine.decide(&long), engine.decide_uncached(&long));
+        let mut dotted = r.clone();
+        dotted.resource = Resource::Path(PathRef::ordinary("/bin/../etc"));
+        assert_eq!(engine.decide(&dotted), engine.decide_uncached(&dotted));
+        assert!(!engine.decide(&dotted).allow);
+    }
+}
+
+/// The memory bound: at most 64 entries and 64 × 16 KiB of charged bytes;
+/// the oldest entry goes first.
+#[test]
+fn principal_cache_is_bounded() {
+    let engine = builtin();
+    for n in 0..(PRINCIPAL_CACHE_ENTRIES + 36) {
+        engine.decide(&entry(principal_n(n), Some(intent())));
+        let stats = engine.principal_cache_stats();
+        assert!(stats.entries <= PRINCIPAL_CACHE_ENTRIES);
+        assert!(stats.bytes <= PRINCIPAL_CACHE_BYTES);
+    }
+    let stats = engine.principal_cache_stats();
+    assert_eq!(stats.entries, PRINCIPAL_CACHE_ENTRIES);
+    assert_eq!(PRINCIPAL_CACHE_BYTES, 64 * MAX_REQUEST_BYTES);
+    // The newest principal is cached; the oldest was evicted.
+    engine.decide(&entry(
+        principal_n(PRINCIPAL_CACHE_ENTRIES + 35),
+        Some(intent()),
+    ));
+    assert_eq!(engine.principal_cache_stats().hits, stats.hits + 1);
+    engine.decide(&entry(principal_n(0), Some(intent())));
+    assert_eq!(engine.principal_cache_stats().misses, stats.misses + 1);
+    // Large principals (many cache roots near the string limit) are
+    // charged their size, and the byte bound still holds.
+    let engine = builtin();
+    for n in 0..80 {
+        let mut p = principal_n(n);
+        p.cache_roots = (0..MAX_SET_ELEMENTS)
+            .map(|i| PathRef::ordinary(&format!("/Users/person/c/{n}/{i}/{}", "x".repeat(100))))
+            .collect();
+        engine.decide(&entry(p, Some(intent())));
+        assert!(engine.principal_cache_stats().bytes <= PRINCIPAL_CACHE_BYTES);
+    }
+}

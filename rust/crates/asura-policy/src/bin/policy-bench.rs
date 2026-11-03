@@ -359,6 +359,47 @@ fn main() {
             "FAIL"
         }
     );
+    let stats = engine.principal_cache_stats();
+    println!(
+        "principal cache after PL-B1: {} entries, {} bytes, {} hits, {} misses",
+        stats.entries, stats.bytes, stats.hits, stats.misses
+    );
+    // The same decisions without the principal cache (the PL1 build).
+    let mut uncached = Vec::with_capacity(REQUESTS * PASSES);
+    for _ in 0..PASSES {
+        for r in &requests {
+            let start = Instant::now();
+            let d = engine.decide_uncached(r);
+            uncached.push(start.elapsed());
+            std::hint::black_box(d);
+        }
+    }
+    uncached.sort();
+    println!(
+        "without the principal cache: p50 {:.1} µs, p99 {:.1} µs",
+        micros(percentile(&uncached, 0.5)),
+        micros(percentile(&uncached, 0.99))
+    );
+    // Hits only: each request decided twice, the second timed.
+    let mut hits = Vec::with_capacity(REQUESTS);
+    let mut hit_build = Vec::with_capacity(REQUESTS);
+    for r in &requests {
+        std::hint::black_box(engine.decide(r));
+        let start = Instant::now();
+        std::hint::black_box(engine.decide(r));
+        hits.push(start.elapsed());
+        let start = Instant::now();
+        std::hint::black_box(engine.build_only(r));
+        hit_build.push(start.elapsed());
+    }
+    hits.sort();
+    hit_build.sort();
+    println!(
+        "principal cache hits only: decision p50 {:.1} µs, p99 {:.1} µs; construction with schema checks p50 {:.1} µs",
+        micros(percentile(&hits, 0.5)),
+        micros(percentile(&hits, 0.99)),
+        micros(percentile(&hit_build, 0.5))
+    );
     // Breakdown: W1 and W2 (entity slice, context, request) alone.
     let mut build = Vec::with_capacity(REQUESTS);
     for r in &requests {
@@ -447,15 +488,35 @@ fn main() {
         requests.len()
     );
 
-    // PL-B5, PES-M4: malformed requests never allow.
+    // The principal cache changes no decision: cached against uncached
+    // over the workload, on a fresh engine.
+    let fresh = Engine::build(&texts).expect("loads");
+    let equal = (0..PASSES)
+        .flat_map(|_| requests.iter())
+        .all(|r| fresh.decide(r) == fresh.decide_uncached(r));
+    println!(
+        "principal cache equivalence over {} decisions: {}",
+        requests.len() * PASSES,
+        if equal { "PASS, identical" } else { "FAIL" }
+    );
+
+    // PL-B5, PES-M4: malformed requests never allow, and the cached
+    // decision equals the uncached one for every malformed request.
     let mut rng = Lcg(0xf022);
     let mut fuzz_allows = 0;
+    let mut fuzz_differ = 0;
     let start = Instant::now();
     for i in 0..FUZZ {
         let base = &requests[i % requests.len()];
         let r = malformed(base, rng.below(10), &mut rng);
-        fuzz_allows += usize::from(engine.decide(&r).allow);
+        let cached = engine.decide(&r);
+        fuzz_allows += usize::from(cached.allow);
+        fuzz_differ += usize::from(cached != engine.decide_uncached(&r));
     }
+    println!(
+        "principal cache equivalence over {FUZZ} malformed requests: {fuzz_differ} differ: {}",
+        if fuzz_differ == 0 { "PASS" } else { "FAIL" }
+    );
     println!(
         "PL-B5 fuzz (PES-M4): {fuzz_allows} allows in {FUZZ} malformed requests ({:.1} s); budget 0: {}",
         start.elapsed().as_secs_f64(),

@@ -2317,6 +2317,18 @@ the budget figures are recorded here because the budgets are this design's.
 | PL-B4 startup at most 200 ms | `policy-bench`: 8 workers, each building the schema and every scope, then the first decision, median of 10 | **Pass**: 37.2 ms (36.7 to 39.2) |
 | PL-B5 safety | `policy-bench` and the unit suites | PES-M4 **pass** (0 allows in 1,000,000 malformed requests); M5 **pass** (identical decisions on fresh engines; PL-U8 across 8 threads); M3 (injected errors deny) and M6 (12 seeded defects, warnings refuse) **pass** as PL-U3 and PL-U4; M7 reasons pass as PL-U5 and PL-U6. M15 to M18 need the solver: PL3 |
 
+Re-measurement with the [principal entity cache](#principal-entity-cache),
+2026-11-03, three runs each, release builds, 1-minute load 2.3 to 3.9:
+
+| Budget | Runs | Result |
+| --- | --- | --- |
+| PL-B1 | p50 126.0, 122.2, 124.8 µs (without the cache in the same runs: 141.1, 137.2, 137.8 µs); hit rate 47 % (5,127 hits, 5,873 misses: the workload's 160 principals exceed the 64 entries); hits alone p50 109.0 to 114.3 µs, with construction p50 32.6 to 33.8 µs; built-in sets' exec entry p50 93.3 to 98.2 µs | **Fail** |
+| PL-B2 | p99 1.298, 1.399, 1.284 ms (p50 1.136 to 1.248 ms) | **Fail**, and slower than without the cache (p99 1.044 to 1.126 ms): every PL-B2 entry decision names a new job, so each one misses and pays the key and the separate principal build |
+
+The cache changes no decision: cached and uncached decisions were
+identical over 10,000 workload decisions and 1,000,000 malformed requests
+in each run. The budgets are unchanged; the owner decides the next step.
+
 Evidence item SP-P2 is answered: with per-request entity slices and the
 schema-checked wrapper (W2), PL-B1 does not hold on the product scale
 workload. Under the [budget rule](#performance-budgets) these failures go to

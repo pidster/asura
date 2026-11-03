@@ -12,8 +12,17 @@ use cedar_policy::{
     Request as CedarRequest, RestrictedExpression, Schema,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
+
+/// Principal cache entries per worker engine (security-policy.md,
+/// principal entity cache).
+pub const PRINCIPAL_CACHE_ENTRIES: usize = 64;
+/// Encoded bytes the principal cache may hold per worker: 64 entries of
+/// at most one W1-bounded request each.
+pub const PRINCIPAL_CACHE_BYTES: usize = PRINCIPAL_CACHE_ENTRIES * MAX_REQUEST_BYTES;
 
 /// Rule IDs kept per scope result.
 const MAX_RULES: usize = 8;
@@ -81,6 +90,64 @@ pub struct Engine {
     actions: Vec<EntityUid>,
     types: Types,
     authorizer: Authorizer,
+    /// The revision and schema digests that key the principal cache.
+    revision: [u8; 32],
+    principals: RefCell<PrincipalCache>,
+}
+
+/// One principal's built entities: schema-checked once when built.
+struct PrincipalEntry {
+    key: [u8; 32],
+    entities: Entities,
+    paths: BTreeMap<String, Attrs>,
+    bytes: usize,
+}
+/// The per-worker principal entity cache: derived, bounded, never shared
+/// between threads and never journaled.
+#[derive(Default)]
+struct PrincipalCache {
+    entries: VecDeque<PrincipalEntry>,
+    bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+impl PrincipalCache {
+    fn get(&mut self, key: &[u8; 32]) -> Option<&PrincipalEntry> {
+        let found = self.entries.iter().position(|e| &e.key == key);
+        match found {
+            Some(at) => {
+                self.hits += 1;
+                self.entries.get(at)
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+    fn insert(&mut self, entry: PrincipalEntry) {
+        if entry.bytes > PRINCIPAL_CACHE_BYTES {
+            return;
+        }
+        while self.entries.len() >= PRINCIPAL_CACHE_ENTRIES
+            || self.bytes + entry.bytes > PRINCIPAL_CACHE_BYTES
+        {
+            match self.entries.pop_front() {
+                Some(old) => self.bytes -= old.bytes,
+                None => break,
+            }
+        }
+        self.bytes += entry.bytes;
+        self.entries.push_back(entry);
+    }
+}
+/// The principal cache's counters, for tests and the bench.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrincipalCacheStats {
+    pub entries: usize,
+    pub bytes: usize,
+    pub hits: u64,
+    pub misses: u64,
 }
 
 fn type_name(name: &str) -> EntityTypeName {
@@ -239,7 +306,40 @@ impl Engine {
                 class: type_name("Asura::PathClass"),
             },
             authorizer: Authorizer::new(),
+            revision: {
+                let mut h = Sha256::new();
+                h.update(texts.digest());
+                h.update(crate::schema_digest());
+                h.finalize().into()
+            },
+            principals: RefCell::default(),
         })
+    }
+
+    /// Drop every cached principal (activation, revocation or a schema
+    /// change also replace the engine, which drops the cache with it).
+    pub fn invalidate_principal_cache(&self) {
+        *self.principals.borrow_mut() = PrincipalCache::default();
+    }
+    /// The principal cache's size and counters.
+    pub fn principal_cache_stats(&self) -> PrincipalCacheStats {
+        let cache = self.principals.borrow();
+        PrincipalCacheStats {
+            entries: cache.entries.len(),
+            bytes: cache.bytes,
+            hits: cache.hits,
+            misses: cache.misses,
+        }
+    }
+    /// Decide without the principal cache: the reference for the
+    /// equivalence tests and the bench.
+    #[doc(hidden)]
+    pub fn decide_uncached(&self, request: &Request) -> Decision {
+        let built = match self.build_request_with(request, None, false) {
+            Ok(built) => built,
+            Err(class) => return Decision::request_error(class, &self.applicable),
+        };
+        self.decide_built(request, built)
     }
 
     /// The global policy IDs of one scope, sorted; baseline permits included.
@@ -276,6 +376,9 @@ impl Engine {
             Ok(built) => built,
             Err(class) => return Decision::request_error(class, &self.applicable),
         };
+        self.decide_built(request, built)
+    }
+    fn decide_built(&self, request: &Request, built: (CedarRequest, Entities)) -> Decision {
         let (cedar, entities) = built;
         let index = usize::from(request.action.code()) - 1;
         let results: Vec<ScopeResult> = self
@@ -389,13 +492,25 @@ impl Engine {
         request: &Request,
         context: Option<Value>,
     ) -> Result<(CedarRequest, Entities), ErrorClass> {
+        self.build_request_with(request, context, true)
+    }
+    fn build_request_with(
+        &self,
+        request: &Request,
+        context: Option<Value>,
+        cached: bool,
+    ) -> Result<(CedarRequest, Entities), ErrorClass> {
         let slice = Slice::of(request)?;
         let context = context.unwrap_or_else(|| context_json(&request.context));
         let bytes = slice.bytes + serde_json::to_vec(&context).map_or(usize::MAX, |v| v.len());
         if bytes > MAX_REQUEST_BYTES {
             return Err(ErrorClass::RequestTooLarge);
         }
-        let entities = self.entities(request, &slice)?;
+        let entities = if cached {
+            self.cached_entities(request, &slice)?
+        } else {
+            self.entities(request, &slice)?
+        };
         let action = &self.actions[usize::from(request.action.code()) - 1];
         let context = CedarContext::from_json_value(context, Some((&self.schema, action)))
             .map_err(|_| ErrorClass::RequestInvalid)?;
@@ -415,33 +530,34 @@ impl Engine {
         Ok((cedar, entities))
     }
 
-    fn entities(&self, request: &Request, slice: &Slice) -> Result<Entities, ErrorClass> {
+    fn path_entity(&self, path: &str, attrs: &Attrs) -> Result<Entity, ErrorClass> {
         let t = &self.types;
-        let p = &request.principal;
-        let s = RestrictedExpression::new_string;
-        let mut list = Vec::with_capacity(slice.count);
-        for (path, attrs) in &slice.paths {
-            let parents = lexical_parent(path)
-                .map(|parent| HashSet::from([uid(&t.path, parent)]))
-                .unwrap_or_default();
-            let entity = Entity::new(
-                uid(&t.path, path),
-                HashMap::from([
-                    (
-                        "class".to_owned(),
-                        RestrictedExpression::new_entity_uid(uid(&t.class, attrs.class.as_str())),
-                    ),
-                    (
-                        "in_project".to_owned(),
-                        RestrictedExpression::new_bool(attrs.in_project),
-                    ),
-                    ("rel".to_owned(), s(attrs.rel.clone())),
-                ]),
-                parents,
-            )
-            .map_err(|_| ErrorClass::RequestInvalid)?;
-            list.push(entity);
-        }
+        let parents = lexical_parent(path)
+            .map(|parent| HashSet::from([uid(&t.path, parent)]))
+            .unwrap_or_default();
+        Entity::new(
+            uid(&t.path, path),
+            HashMap::from([
+                (
+                    "class".to_owned(),
+                    RestrictedExpression::new_entity_uid(uid(&t.class, attrs.class.as_str())),
+                ),
+                (
+                    "in_project".to_owned(),
+                    RestrictedExpression::new_bool(attrs.in_project),
+                ),
+                (
+                    "rel".to_owned(),
+                    RestrictedExpression::new_string(attrs.rel.clone()),
+                ),
+            ]),
+            parents,
+        )
+        .map_err(|_| ErrorClass::RequestInvalid)
+    }
+    /// The `Job`, `Project` and `Task` entities of the principal.
+    fn principal_entities(&self, p: &JobPrincipal) -> Result<Vec<Entity>, ErrorClass> {
+        let t = &self.types;
         let mut job = HashMap::from([
             (
                 "origin".to_owned(),
@@ -479,53 +595,194 @@ impl Engine {
             );
         }
         let wrap = |r: Result<Entity, _>| r.map_err(|_| ErrorClass::RequestInvalid);
-        list.push(wrap(Entity::new(uid(&t.job, &p.job), job, HashSet::new()))?);
-        list.push(wrap(Entity::new(
-            uid(&t.project, &p.project),
-            HashMap::from([
-                (
-                    "root".to_owned(),
-                    RestrictedExpression::new_entity_uid(uid(&t.path, &p.project_root.path)),
-                ),
-                (
-                    "declared_env".to_owned(),
-                    RestrictedExpression::new_set(std::iter::empty()),
-                ),
-            ]),
-            HashSet::new(),
-        ))?);
-        list.push(wrap(Entity::new(
-            uid(&t.task, &p.task),
-            HashMap::from([(
-                "project".to_owned(),
-                RestrictedExpression::new_entity_uid(uid(&t.project, &p.project)),
-            )]),
-            HashSet::new(),
-        ))?);
-        if let Resource::Program(program) = &request.resource {
-            list.push(wrap(Entity::new(
-                uid(&t.program, &program.path.path),
+        Ok(vec![
+            wrap(Entity::new(uid(&t.job, &p.job), job, HashSet::new()))?,
+            wrap(Entity::new(
+                uid(&t.project, &p.project),
                 HashMap::from([
                     (
-                        "path".to_owned(),
-                        RestrictedExpression::new_entity_uid(uid(&t.path, &program.path.path)),
+                        "root".to_owned(),
+                        RestrictedExpression::new_entity_uid(uid(&t.path, &p.project_root.path)),
                     ),
                     (
-                        "identity_known".to_owned(),
-                        RestrictedExpression::new_bool(program.identity_known),
+                        "declared_env".to_owned(),
+                        RestrictedExpression::new_set(std::iter::empty()),
                     ),
-                    (
-                        "platform".to_owned(),
-                        RestrictedExpression::new_bool(program.platform),
-                    ),
-                    ("team_id".to_owned(), s(program.team_id.clone())),
-                    ("signing_id".to_owned(), s(program.signing_id.clone())),
-                    ("cdhash".to_owned(), s(program.cdhash.clone())),
                 ]),
                 HashSet::new(),
-            ))?);
+            ))?,
+            wrap(Entity::new(
+                uid(&t.task, &p.task),
+                HashMap::from([(
+                    "project".to_owned(),
+                    RestrictedExpression::new_entity_uid(uid(&t.project, &p.project)),
+                )]),
+                HashSet::new(),
+            ))?,
+        ])
+    }
+    fn program_entity(&self, request: &Request) -> Result<Option<Entity>, ErrorClass> {
+        let t = &self.types;
+        let s = RestrictedExpression::new_string;
+        let Resource::Program(program) = &request.resource else {
+            return Ok(None);
+        };
+        Entity::new(
+            uid(&t.program, &program.path.path),
+            HashMap::from([
+                (
+                    "path".to_owned(),
+                    RestrictedExpression::new_entity_uid(uid(&t.path, &program.path.path)),
+                ),
+                (
+                    "identity_known".to_owned(),
+                    RestrictedExpression::new_bool(program.identity_known),
+                ),
+                (
+                    "platform".to_owned(),
+                    RestrictedExpression::new_bool(program.platform),
+                ),
+                ("team_id".to_owned(), s(program.team_id.clone())),
+                ("signing_id".to_owned(), s(program.signing_id.clone())),
+                ("cdhash".to_owned(), s(program.cdhash.clone())),
+            ]),
+            HashSet::new(),
+        )
+        .map(Some)
+        .map_err(|_| ErrorClass::RequestInvalid)
+    }
+    /// Every entity of the request, built and schema-checked together.
+    fn entities(&self, request: &Request, slice: &Slice) -> Result<Entities, ErrorClass> {
+        let mut list = Vec::with_capacity(slice.count);
+        for (path, attrs) in &slice.paths {
+            list.push(self.path_entity(path, attrs)?);
         }
+        list.extend(self.principal_entities(&request.principal)?);
+        list.extend(self.program_entity(request)?);
         Entities::from_entities(list, Some(&self.schema)).map_err(|_| ErrorClass::RequestInvalid)
+    }
+    /// The principal cache key: revision and schema, then every principal
+    /// field with its attributes.
+    fn principal_key(&self, p: &JobPrincipal) -> [u8; 32] {
+        let mut h = Sha256::new();
+        let mut field = |bytes: &[u8]| {
+            h.update((bytes.len() as u64).to_be_bytes());
+            h.update(bytes);
+        };
+        field(&self.revision);
+        field(p.job.as_bytes());
+        field(p.origin.as_str().as_bytes());
+        field(p.profile.as_str().as_bytes());
+        field(p.project.as_bytes());
+        field(p.task.as_bytes());
+        let mut path = |r: &PathRef| {
+            field(r.path.as_bytes());
+            field(r.class.as_str().as_bytes());
+            field(&[u8::from(r.in_project)]);
+            field(r.rel.as_bytes());
+        };
+        path(&p.project_root);
+        path(&p.scratch);
+        for root in &p.cache_roots {
+            path(root);
+        }
+        if let Some(dir) = &p.developer_dir {
+            path(dir);
+        }
+        field(&(p.cache_roots.len() as u64).to_be_bytes());
+        field(&[u8::from(p.developer_dir.is_some())]);
+        h.finalize().into()
+    }
+    /// The principal's own paths and their ancestors, with the same
+    /// insertion rule as the request slice.
+    fn principal_paths(p: &JobPrincipal) -> BTreeMap<String, Attrs> {
+        let mut explicit: Vec<&PathRef> = vec![&p.project_root, &p.scratch];
+        explicit.extend(p.cache_roots.iter());
+        explicit.extend(p.developer_dir.iter());
+        let mut paths = BTreeMap::new();
+        for path in &explicit {
+            paths.entry(path.path.clone()).or_insert(Attrs {
+                class: path.class,
+                in_project: path.in_project,
+                rel: path.rel.clone(),
+            });
+        }
+        for path in &explicit {
+            let mut cursor = lexical_parent(&path.path);
+            while let Some(parent) = cursor {
+                paths.entry(parent.to_owned()).or_insert(Attrs {
+                    class: crate::request::PathClass::Ordinary,
+                    in_project: false,
+                    rel: String::new(),
+                });
+                cursor = lexical_parent(parent);
+            }
+        }
+        paths
+    }
+    /// The request's entities with the principal part from the cache
+    /// (security-policy.md, principal entity cache). The principal part was
+    /// schema-checked when built; the request's own entities are
+    /// schema-checked here. A slice whose attributes for a principal path
+    /// differ from the principal part is built without the cache.
+    fn cached_entities(&self, request: &Request, slice: &Slice) -> Result<Entities, ErrorClass> {
+        let key = self.principal_key(&request.principal);
+        let mut cache = self.principals.borrow_mut();
+        if cache.get(&key).is_none() {
+            let paths = Self::principal_paths(&request.principal);
+            if paths
+                .iter()
+                .any(|(path, attrs)| slice.paths.get(path).is_some_and(|a| a != attrs))
+            {
+                drop(cache);
+                return self.entities(request, slice);
+            }
+            let mut list = Vec::with_capacity(paths.len() + 3);
+            for (path, attrs) in &paths {
+                list.push(self.path_entity(path, attrs)?);
+            }
+            list.extend(self.principal_entities(&request.principal)?);
+            let entities = Entities::from_entities(list, Some(&self.schema))
+                .map_err(|_| ErrorClass::RequestInvalid)?;
+            let bytes = paths
+                .iter()
+                .map(|(path, attrs)| 2 * path.len() + attrs.rel.len() + 64)
+                .sum::<usize>()
+                + request.principal.job.len()
+                + request.principal.project.len()
+                + request.principal.task.len()
+                + 64 * 3;
+            cache.insert(PrincipalEntry {
+                key,
+                entities,
+                paths,
+                bytes,
+            });
+        }
+        let Some(entry) = cache.entries.iter().find(|e| e.key == key) else {
+            // An entry larger than the cache bound is never kept.
+            drop(cache);
+            return self.entities(request, slice);
+        };
+        if entry
+            .paths
+            .iter()
+            .any(|(path, attrs)| slice.paths.get(path).is_some_and(|a| a != attrs))
+        {
+            drop(cache);
+            return self.entities(request, slice);
+        }
+        let mut list = Vec::new();
+        for (path, attrs) in &slice.paths {
+            if !entry.paths.contains_key(path) {
+                list.push(self.path_entity(path, attrs)?);
+            }
+        }
+        list.extend(self.program_entity(request)?);
+        let base = entry.entities.clone();
+        drop(cache);
+        base.add_entities(list, Some(&self.schema))
+            .map_err(|_| ErrorClass::RequestInvalid)
     }
 }
 
