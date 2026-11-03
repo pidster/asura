@@ -102,6 +102,7 @@ mod tests {
             command_cut: false,
             whole_command: false,
             refusal: None,
+            policy: None,
         }
     }
 

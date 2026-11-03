@@ -61,6 +61,7 @@ fn job(home: &Path, command: &str, fault: Option<&str>) -> (JobGuard, [u8; 16]) 
         cwd: None,
         secrets: Vec::new(),
         secret_command: None,
+        constraints: Some(asura_platform::exec_cmd::template_for_test()),
     };
     let mut prepared = PreparedExecCmd::prepare(runtime, &project, request, &cancel)
         .unwrap_or_else(|e| panic!("prepare: {:?}", e.reason));

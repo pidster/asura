@@ -14,6 +14,7 @@ mod job_text;
 mod llamacpp;
 mod path_guard;
 mod payload_owner;
+mod policy;
 mod secret_rules;
 pub mod secret_store;
 // Real service fixtures share the canonical process-wide writer owner.
@@ -555,6 +556,7 @@ where
                 }
             }
             service_observer.set_secret_store(conversations.secret_store_status());
+            service_observer.set_policy(conversations.policy_status());
             for reply in contexts
                 .poll(&attachments, now)
                 .into_iter()

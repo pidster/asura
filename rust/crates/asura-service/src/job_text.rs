@@ -582,7 +582,7 @@ fn reason_text(facts: &JobSettled, origin: Origin) -> String {
     }
 }
 
-/// The reason texts 6-20 (model result text, reason texts).
+/// The reason texts 6-21 (model result text, reason texts).
 pub(crate) fn stop_reason_text(reason: JobReason) -> &'static str {
     match reason {
         JobReason::IdentityChanged => "project directory changed",
@@ -600,6 +600,7 @@ pub(crate) fn stop_reason_text(reason: JobReason) -> &'static str {
         JobReason::SetupFailed => "setup failed",
         JobReason::ExecutionOff => "the person turned execution off",
         JobReason::OutsideSandboxOff => "running outside the sandbox is turned off",
+        JobReason::EnforcementMismatch => "the sandbox profile did not match the policy decision",
         // Reasons 0-5 have no reason text of their own.
         JobReason::None
         | JobReason::ModelCancel

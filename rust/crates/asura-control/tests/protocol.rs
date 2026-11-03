@@ -535,6 +535,7 @@ fn stored_memory_status_is_bounded_truthful_and_paired_with_service_uptime() {
     let observation = pb::ServiceObservation {
         secret_store: None,
         llamacpp: None,
+        policy: None,
         revision: Some(1),
         pending: Some(false),
         status: Some(pb::InspectReply {

@@ -72,6 +72,7 @@ impl Home {
             secret_command: None,
             capture: self.capture(job),
             person: None,
+            constraints: Some(asura_platform::exec_cmd::template_for_test()),
         }
     }
 }
@@ -756,12 +757,13 @@ fn factory_slots_follow_the_port_event_order() {
 // (`exec_cmd_process.rs`, EC-I9, OD2).
 
 /// The scripted guardian peer. Argv is the guardian's: flag, job hex,
-/// profile token, command; the command is `MODE DIR`. It never signals
+/// profile token, constraint set (`-` for a person profile), command; the command is `MODE DIR`. It never signals
 /// any process. Survivors keep only FD 5, ignore SIGPIPE, record their pid
 /// and how they ended, and live at most 30 s.
 const PERSON_GUARDIAN: &str = r#"#!/usr/bin/perl
 use strict; use warnings; use POSIX ();
-my (undef, $hex, $profile, $command) = @ARGV;
+my (undef, $hex, $profile, $constraints, $command) = @ARGV;
+die "constraints" unless $constraints eq '-';
 my ($mode, $dir) = split(/ /, $command, 2);
 $SIG{PIPE} = 'IGNORE';
 sub record { my ($name, $text) = @_; open(my $f, '>', "$dir/$name.tmp") or POSIX::_exit(3); print $f $text; close $f; rename("$dir/$name.tmp", "$dir/$name") or POSIX::_exit(3); }
@@ -861,6 +863,7 @@ fn launch_outside() -> PersonLaunch {
 fn person_start(home: &Home, profile: Profile, mode: &str, marks: &std::path::Path) -> SlotStart {
     let mut start = home.start(asura_platform::random_id(), home.scope());
     start.profile = profile;
+    start.constraints = None;
     start.command = format!("{mode} {}", marks.display());
     start
 }

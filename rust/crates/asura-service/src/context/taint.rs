@@ -148,6 +148,7 @@ mod tests {
                 command_cut: false,
                 whole_command: whole,
                 refusal: None,
+                policy: None,
             }))
         };
         let model = Taint::Tainted(TaintSource::ModelSecretValues);

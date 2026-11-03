@@ -37,10 +37,36 @@ over a command line cannot be the authority for what a job does.
    from source with a dynamic or replaceable GMP, signs and notarises inside
    `Asura.app` (AD-17). The solver has no default time limit; it ends when its
    input closes or on cancel.
-6. **Revised budgets**: decision p50 at most 100 µs; end-to-end p99 at most
-   1 ms at 64 concurrent requests; at most 8 MiB added size; startup at most
+6. **Revised budgets**: decision p50 at most 100 µs, then 150 µs; end-to-end
+   p99 at most 1 ms, then 1.5 ms, at 64 concurrent requests (second revision
+   AD-33, 2026-11-03, after the PL1 measurements); at most 8 MiB added size; startup at most
    200 ms; with one policy set per action group and one engine copy per
    worker.
+
+## Follow-up owner decisions (2026-11-03)
+
+The owner answered the design's five open questions on 2026-11-03 (AD-28 to
+AD-32 in the [owner decisions table](../designs/assurance-and-differentiation.md#owner-decisions)):
+
+1. **Task envelopes wait for a task design** (AD-28). Packet PL8 depends on a
+   new design that defines the task entity.
+2. **The default "ask first" intent list** (AD-29): `git push` with its force
+   flags, publish commands, privilege tools, hard-to-undo Git commands and
+   unparsed text. Packet PL7 ships it as tighten-only rules.
+3. **An LGPL-free cvc5 build is probed first** (AD-30). After the
+   [probe](../designs/solver-build-probes.md), the owner reversed that choice
+   the same day (SBQ1): cvc5 ships with GMP 6.3.0 as a replaceable
+   `@rpath/libgmp.10.dylib` under LGPL-3.0, with the GMP source, the build
+   script, the licence texts and a notice in each release; the fork prototype
+   was stopped. LibPoly is dropped (SBQ2). The licence question is closed by
+   the owner's position: Asura is open source (MIT), so anyone can rebuild
+   it with another GMP and sign it with their own identity; Asura complies
+   with the licence terms by the replaceable dylib, the published GMP source
+   and build script, and the shipped licence texts and notice.
+4. **The 8 MiB size budget covers the `asura` executable only** (AD-31). The
+   solver's size is reported for each release, with no limit.
+5. **No replacement solver for now** (AD-32). Only the bundled, signed solver
+   runs.
 
 ## Consequences
 

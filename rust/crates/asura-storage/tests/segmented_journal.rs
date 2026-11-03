@@ -529,6 +529,7 @@ fn sj28_two_hundred_large_tool_calls_span_segment_files() {
                 command_cut: false,
                 whole_command: false,
                 refusal: None,
+                policy: None,
             })))
             .unwrap();
     }
@@ -1435,6 +1436,7 @@ fn j2_job_command(
             command_cut: false,
             whole_command: false,
             refusal: None,
+            policy: None,
         })))
         .unwrap();
     let origin = JobOrigin::Model {
@@ -1762,6 +1764,7 @@ fn j4t_03_twenty_jobs_over_three_rolls_listed_by_scope_and_page() {
             command_cut: false,
             whole_command: false,
             refusal: None,
+            policy: None,
         })))
         .unwrap();
     session

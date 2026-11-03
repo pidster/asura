@@ -136,6 +136,8 @@ impl Fixture {
                 rules: Default::default(),
                 persons: Default::default(),
                 paths: Default::default(),
+                policy: None,
+                policy_test_deny: false,
                 #[cfg(feature = "test-support")]
                 fixture: None,
                 #[cfg(feature = "test-support")]
@@ -995,7 +997,7 @@ fn tcr_u10_rule_set_unavailable_retains_nothing_and_refuses() {
             encodes(record);
             if expected == journal::ToolDecision::Refused {
                 assert_eq!(
-                    tools::not_run_result(record.decision, None, None, None),
+                    tools::not_run_result(record.decision, None, None, None, None),
                     Some((3, "refused: secret_detection_unavailable".into()))
                 );
             }
@@ -1373,6 +1375,7 @@ fn tool_record(name: &str, decision: journal::ToolDecision) -> journal::ToolReco
         fault: None,
         reason: None,
         refusal: None,
+        policy: None,
         whole_command: false,
         form: journal::ArgumentForm::Verbatim,
         arguments_bytes: 19,

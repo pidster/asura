@@ -3070,8 +3070,8 @@ fn main() {
         .is_some_and(|a| a == "--asura-exec-cmd-guardian")
     {
         let code = match args.as_slice() {
-            [_, _, job, profile, command] => {
-                asura_platform::exec_cmd::run_guardian(job, profile, command)
+            [_, _, job, profile, constraints, command] => {
+                asura_platform::exec_cmd::run_guardian(job, profile, constraints, command)
             }
             _ => 2,
         };

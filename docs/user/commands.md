@@ -95,11 +95,16 @@ before you remove Asura, because the LaunchAgent file stays otherwise.
 | --- | --- |
 | `/tools` | List the model tools and their descriptions |
 | `/audit [LIMIT]` | Show recent audit records for this project; LIMIT is 1 to 16, default 16 |
-| `/status` | Show the service status and its Keychain notices |
+| `/status` | Show the service status, its Keychain notices and the policy line (the active policy revision and the state of each policy scope) |
 
 `/help`, `/quit`, `/exit`, `/init`, `/new`, `/cancel`, `/retry`, `/models`,
 `/tools` and `/status` take no arguments. Results open in a panel above the
 input box; Escape closes it.
+
+Asura decides every model `exec_cmd` command with its built-in security
+policy before the command runs. A command the policy refuses does not run;
+the model receives a `denied: policy: ...` reason that names the policy
+scope.
 
 ## Job commands
 

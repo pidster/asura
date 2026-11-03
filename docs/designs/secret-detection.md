@@ -1596,7 +1596,8 @@ Refinements made during SL2:
   `ASURA_SECRET_+1` are refused. Numbers need not be contiguous.
 - **Preamble and the command limit.** The preamble does not count against the
   8192-byte command limit. The setup worker checks the command (8192 bytes)
-  and the private argument vector (8704 bytes) as before; the guardian checks
+  and the private argument vector (9216 bytes since the PL1 constraint set
+  token; 8704 bytes before) as before; the guardian checks
   the received command again (8192 bytes) and adds the preamble after that
   check. The preamble for all 16 numbers is 1,254 bytes, so the guardian
   refuses a script above 8192 + 1280 bytes as a defensive check. The

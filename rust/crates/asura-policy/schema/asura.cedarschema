@@ -1,0 +1,85 @@
+namespace Asura {
+  // Closed vocabularies
+  entity Origin enum ["model", "person_typed", "system"];
+  entity Profile enum ["model-1", "person-1", "person-outside-1"];
+  entity PathClass enum ["ordinary", "implicit_exec", "build_test", "asura_state"];
+  entity Delivery enum ["raw", "brokered"];
+  entity Parse enum ["simple", "compound", "unparsed"];
+  entity IntentSource enum ["model_tool", "person_command", "mcp_tool", "skill"];
+  entity Risk enum ["safe", "moderate", "dangerous", "unknown"];
+  entity DataClass enum ["prompt", "history", "notice", "file_page", "tool_result"];
+
+  // Resources
+  entity Path in [Path] = { class: PathClass, in_project: Bool, rel: String };
+  entity Program = {
+    path: Path,
+    identity_known: Bool,   // false: a program Seatbelt may start but Asura cannot identify
+    platform: Bool,         // Apple platform binary
+    team_id: String,        // "" when unknown or platform
+    signing_id: String,     // "" when unknown
+    cdhash: String,         // "" when unknown
+  };
+  entity Domain in [Domain];
+  entity Address;
+  entity Secret;
+  entity MachService;
+  entity Destination = { remote: Bool };
+
+  // Principals
+  entity Project = { root: Path, declared_env: Set<String> };
+  entity Task = { project: Project };
+  entity Job = {
+    origin: Origin,
+    profile: Profile,
+    project: Project,
+    task: Task,
+    scratch: Path,
+    cache_roots: Set<Path>,
+    developer_dir?: Path,   // absent for model-1 (PL1 contract)
+  };
+
+  // Intent: what the proposer asked for. Tighten-only (SP-R3).
+  type Command = {
+    parse: Parse,
+    tools: Set<String>,
+    first_tool: String,
+    subcommand: String,
+    flags: Set<String>,
+    shell_features: Set<String>,
+    bytes: Long,
+    secret_vars: Long,
+    secret_reference: Bool,
+    whole_command: Bool,
+  };
+  type Intent = { source: IntentSource, name: String, digest: String, command?: Command };
+
+  type FileContext = { now: datetime, intent?: Intent, risk?: Risk };
+  type ExecContext = {
+    now: datetime,
+    request_digest: String,
+    env_terminal: Set<String>,
+    env_declared: Set<String>,
+    outside_switch: Bool,
+    intent?: Intent,
+    risk?: Risk,
+  };
+  type ConnectContext = { now: datetime, ip: ipaddr, port: Long, via_proxy: Bool, intent?: Intent, risk?: Risk };
+  type SecretContext = { now: datetime, delivery: Delivery, intent?: Intent, risk?: Risk };
+  type MachContext = { now: datetime };
+  type EgressContext = { now: datetime, data_class: DataClass, tainted: Bool };
+
+  action "file.any";
+  action "file.read", "file.write", "file.create", "file.delete" in ["file.any"]
+    appliesTo { principal: [Job], resource: [Path], context: FileContext };
+  action "process.exec.any";
+  action "process.exec", "process.exec.ask", "process.exec.approved" in ["process.exec.any"]
+    appliesTo { principal: [Job], resource: [Program], context: ExecContext };
+  action "network.connect"
+    appliesTo { principal: [Job], resource: [Domain, Address], context: ConnectContext };
+  action "secret_use"
+    appliesTo { principal: [Job], resource: [Secret], context: SecretContext };
+  action "mach.lookup"
+    appliesTo { principal: [Job], resource: [MachService], context: MachContext };
+  action "context.egress"
+    appliesTo { principal: [Task], resource: [Destination], context: EgressContext };
+}

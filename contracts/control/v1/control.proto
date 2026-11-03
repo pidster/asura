@@ -97,6 +97,19 @@ message ServiceObservation {
   optional SecretStoreStatus secret_store = 8;
   // Asura's llama.cpp server and backend (llamacpp-backend.md, status).
   optional LlamaCppStatus llamacpp = 9;
+  // The policy owner (security-policy.md, /status in PL1).
+  optional PolicyStatus policy = 10;
+}
+message PolicyStatus {
+  optional uint32 state = 1;              // 1 starting, 2 active, 3 unavailable
+  optional uint64 revision = 2;           // journaled kind 35 sequence; 0 before the first activation
+  optional uint32 installation = 3;       // scope state: 1 ok, 2 unavailable
+  optional uint32 user = 4;               // scope state: 1 ok, 2 unavailable
+  optional uint32 workspace_sets = 5;     // admitted workspace sets, 0-1024
+  optional uint32 repository_sets = 6;    // admitted repository sets, 0-1024
+  optional uint32 repository_changed = 7; // repository sources changed since admission
+  optional uint32 solver = 8;             // 1 none, 2 available, 3 unavailable
+  optional uint32 approvals_waiting = 9;  // open approval requests
 }
 message LlamaCppStatus {
   optional uint32 mode = 1;        // 1 off, 2 asura, 3 llama-app, 4 url

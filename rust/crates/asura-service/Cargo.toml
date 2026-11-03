@@ -8,7 +8,7 @@ publish = false
 
 [features]
 # Test-only capture gates (J1, G18) and platform/storage hooks; never in production builds.
-test-support = ["asura-platform/test-support", "asura-storage/test-support"]
+test-support = ["asura-platform/test-support", "asura-storage/test-support", "asura-policy/test-support"]
 
 [dependencies]
 sha2 = "=0.10.9"
@@ -17,6 +17,7 @@ asura-storage = { path = "../asura-storage", features = ["embedded-memory"] }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 asura-platform = { path = "../asura-platform" }
 asura-control = { path = "../asura-control" }
+asura-policy = { path = "../asura-policy" }
 
 [dev-dependencies]
 asura-storage = { path = "../asura-storage", features = ["embedded-memory", "test-support"] }

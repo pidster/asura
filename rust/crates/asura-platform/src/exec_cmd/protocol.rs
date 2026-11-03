@@ -50,7 +50,11 @@ impl Notice {
         let shape = match n.kind {
             1 => n.reason == 0 && n.exit_kind == 0 && !n.cleanup,
             2 => SETTLED_REASONS.contains(&n.reason) && n.exit_kind != 0 && n.cleanup,
-            3 => (5..=9).contains(&n.reason) && n.exit_kind == 0 && n.cleanup,
+            3 => {
+                (5..=REASON_ENFORCEMENT_MISMATCH).contains(&n.reason)
+                    && n.exit_kind == 0
+                    && n.cleanup
+            }
             4 => {
                 (n.reason == REASON_CLEANUP_FAILED || n.reason == REASON_ESCAPEE_UNTERMINATED)
                     && n.exit_kind == 0
@@ -67,6 +71,9 @@ impl Notice {
         }
     }
 }
+/// Kind 3 reason 10: the rendered `model-1` profile's digest differs from
+/// the decision's (security-policy.md, enforcement evidence in PL1).
+pub(super) const REASON_ENFORCEMENT_MISMATCH: u8 = 10;
 /// Kind 5: the leader exited; exit kind and value are its `waitid` facts
 /// (tool-job-controller.md, guardian contract additions).
 pub(super) const KIND_LEADER_EXITED: u8 = 5;

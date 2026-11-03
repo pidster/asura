@@ -263,6 +263,7 @@ fn pending_projection() -> Arc<journal::Replay> {
                 fault: None,
                 reason: None,
                 refusal: None,
+                policy: None,
                 whole_command: false,
                 form: journal::ArgumentForm::Verbatim,
                 arguments_bytes: 0,

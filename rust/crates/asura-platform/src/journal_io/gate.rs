@@ -162,8 +162,36 @@ pub mod support {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+    /// `HOME/journal-hold-appends-pass` holding a decimal count lets that
+    /// many appends pass a held `journal-hold-appends` before the hold
+    /// applies; each pass decrements the count. It lets a child-process
+    /// journey hold one exact later append (security-policy.md, PL1: the
+    /// kind 35 and kind 34 appends precede a call's kind 14).
+    fn pass_held_append(runtime: &RuntimeDirectory) -> bool {
+        let gates = GATES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(home) = gates
+            .iter()
+            .find(|entry| entry.run == runtime.run_path() && entry.appends.held())
+            .and_then(|entry| entry.home.clone())
+        else {
+            return false;
+        };
+        let path = home.join("journal-hold-appends-pass");
+        let Some(count) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        else {
+            return false;
+        };
+        if count == 0 {
+            return false;
+        }
+        std::fs::write(&path, (count - 1).to_string()).is_ok()
+    }
     pub(crate) fn append_point(runtime: &RuntimeDirectory) -> Option<Fault> {
-        wait(runtime, Wait::Append, None);
+        if !pass_held_append(runtime) {
+            wait(runtime, Wait::Append, None);
+        }
         let gates = GATES.lock().unwrap_or_else(|e| e.into_inner());
         gates
             .iter()
@@ -357,7 +385,9 @@ pub mod support {
         }
     }
 
-    /// Child-process gate for a scratch home: named points wait while
+    /// Child-process gate for a scratch home (`journal-hold-appends-pass`
+    /// lets a counted number of appends pass a held append gate first):
+    /// named points wait while
     /// `HOME/<Point::file_name>` exists and write `<name>.reached` when
     /// reached; `HOME/journal-free-bytes` overrides free disk bytes. Appends wait while
     /// `HOME/journal-hold-appends` exists and reads wait while

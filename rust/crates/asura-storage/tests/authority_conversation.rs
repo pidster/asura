@@ -1033,6 +1033,7 @@ fn run14(ordinal: u32, op: ToolOperation) -> ToolCall {
         command_cut: false,
         whole_command: false,
         refusal: None,
+        policy: None,
     }
 }
 /// A kind 14 exec_cmd call with `decision` and its consistent codes.

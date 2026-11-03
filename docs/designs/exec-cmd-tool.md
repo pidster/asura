@@ -292,8 +292,10 @@ recognizes only the fixed private marker `--asura-exec-cmd-guardian` followed by
 and command as separate argv elements (the deadline argument was removed on 2026-10-17).
 J2 inserts a profile token, `model-1`, between them
 ([guardian contract additions](tool-job-controller.md#guardian-contract-additions)).
+Packet PL1 inserts the constraint set token before the command
+([security policy, constraint set](security-policy.md#constraint-set)).
 The parser never joins/reinterprets argv. Command size remains 8192 bytes; the total
-private argv payload is at most 8704 bytes. No user-supplied executable/profile/env
+private argv payload is at most 9216 bytes (8704 before PL1). No user-supplied executable/profile/env
 is accepted. The validated inherited descriptors, not the marker or argv, authorize
 this entrypoint. A normal invocation without all private descriptors fails closed.
 

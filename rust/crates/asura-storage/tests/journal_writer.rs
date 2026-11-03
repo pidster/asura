@@ -1029,6 +1029,7 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
                     command_cut: false,
                     whole_command: false,
                     refusal: None,
+                    policy: None,
                 })),
                 admission: None,
             })
@@ -1714,6 +1715,7 @@ fn j1_call(ordinal: u32, decision: ToolDecision) -> ToolCall {
             kind: Some(SecretKind::GithubToken),
             word: None,
         }),
+        policy: None,
     }
 }
 /// A `run` service status call, or the same call with another decision; both

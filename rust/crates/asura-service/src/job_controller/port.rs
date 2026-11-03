@@ -52,6 +52,8 @@ pub(crate) struct SlotStart {
     /// profile, absent for `model-1` (`exec_cmd_worker::start_job` passes
     /// them to `start_job_with`).
     pub person: Option<PersonLaunch>,
+    /// The `model-1` constraint set of the job's policy decision (PL1).
+    pub constraints: Option<asura_platform::exec_cmd::Constraints>,
 }
 
 /// Why a slot refused a start. The job settles `not_started` with no

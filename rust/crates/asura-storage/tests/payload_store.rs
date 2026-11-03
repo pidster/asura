@@ -806,6 +806,7 @@ impl Journal {
             command_cut: false,
             whole_command: false,
             refusal: None,
+            policy: None,
         })))
     }
     fn failed(&mut self) {

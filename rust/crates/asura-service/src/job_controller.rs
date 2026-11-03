@@ -159,6 +159,9 @@ pub(crate) struct StartRequest {
     /// secret store item. `None` for a model job. They move through the
     /// queue and the held start into the slot unchanged.
     pub person: Option<PersonLaunch>,
+    /// The policy decision's constraint set for `model-1` (PL1); `None`
+    /// for the person profiles.
+    pub constraints: Option<asura_platform::exec_cmd::Constraints>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -315,6 +318,7 @@ struct Body {
     secret_command: Option<SecretCommand>,
     redaction: JobRedaction,
     person: Option<PersonLaunch>,
+    constraints: Option<asura_platform::exec_cmd::Constraints>,
 }
 impl Body {
     fn from_start(start: SlotStart) -> Self {
@@ -327,6 +331,7 @@ impl Body {
             secret_command,
             capture,
             person,
+            constraints,
             ..
         } = start;
         Self {
@@ -338,6 +343,7 @@ impl Body {
             secret_command,
             redaction: capture.redaction,
             person,
+            constraints,
         }
     }
 }
@@ -741,6 +747,7 @@ impl JobController {
             duplicate_digest,
             stored_command,
             person,
+            constraints,
         } = request;
         let mut job = Job::new(
             id,
@@ -761,6 +768,7 @@ impl JobController {
             secret_command,
             redaction,
             person,
+            constraints,
         });
         if !origin.is_person() {
             // J2-E7: a model start is durable when it is queued; its kind 26
@@ -1934,6 +1942,7 @@ impl JobController {
                 gate_home,
             },
             person: body.person,
+            constraints: body.constraints,
         };
         let person_intent = job.origin.is_person() && job.intent != Intent::Committed;
         if person_intent {

@@ -1509,6 +1509,16 @@ product budgets and their measurement.
 | --- | --- | --- |
 | PES-M11 Evaluation latency | p50 at most 50 µs, p95 at most 200 µs, p99 at most 1 ms, 64 concurrent requests on 8 workers | p50 at most 100 µs. The p95 and p99 values are not revised |
 | PES-M12 End-to-end latency | p99 at most 1 ms with 64 closed-loop clients on 8 workers | p99 at most 1 ms at 64 concurrent requests (value restated, unchanged) |
+
+A second owner revision on 2026-11-03 (AD-33), after the product PL1
+measurements, set PL-B1 (from PES-M11) to p50 at most 150 µs and PL-B2 (from
+PES-M12) to p99 at most 1.5 ms: pattern A evaluates four scopes over 258 policies, about 80 µs of the decision, and a model turn takes seconds. The values in the
+table above stay as the history.
+
+| ID | First revision (owner, 2026-11-03) | Second revision (owner, 2026-11-03, AD-33) |
+| --- | --- | --- |
+| PES-M11 / PL-B1 Evaluation latency | p50 at most 100 µs | p50 at most 150 µs |
+| PES-M12 / PL-B2 End-to-end latency | p99 at most 1 ms at 64 concurrent requests | p99 at most 1.5 ms at 64 concurrent requests |
 | PES-M9 Build size | At most 4 MiB added to a stripped release binary | At most 8 MiB added |
 | PES-M10 Startup | Median at most 100 ms; peak resident memory at most 64 MiB | At most 200 ms. The memory value is not revised |
 

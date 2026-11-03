@@ -570,9 +570,12 @@ const MAX_CAPTURE_SPANS: u64 = 64;
 const MAX_CAPTURE_NUMBER: u16 = 16_384;
 const MAX_CAPTURE_NUMBERS: usize = 256;
 const MIB: u64 = 1024 * 1024;
-/// Kind 14: 98 bytes of fixed fields, a 512-byte name, 256 number kinds and
-/// 64,000 bytes of arguments (tool-call-records.md, TCR-U03).
-pub(crate) const MAX_TOOL_CALL_PAYLOAD: usize = 64_866;
+/// Kind 14: 98 bytes of fixed fields, a 512-byte name, 256 number kinds,
+/// 64,000 bytes of arguments (tool-call-records.md, TCR-U03) and the
+/// largest PL1 policy refusal field (337 bytes).
+pub(crate) const MAX_TOOL_CALL_PAYLOAD: usize = 64_866 + MAX_POLICY_REFUSAL_FIELD;
+const _: () = assert!(MAX_TOOL_CALL_PAYLOAD == 65_203);
+const _: () = assert!(MAX_TOOL_CALL_PAYLOAD <= MAX_FRAME - HEADER - TRAILER);
 
 fn source_code(source: ToolCallSource) -> u8 {
     source as u8
@@ -713,7 +716,15 @@ impl ToolCall {
             }
             ArgumentForm::NotRetained(R::Oversized) => decision != D::Run,
             _ => true,
-        } && match self.reason {
+        } && self.policy.as_ref().is_none_or(|p| p.validate().is_ok())
+            // PL1: the policy refusal field is present exactly with
+            // `policy_denied` and `policy_unavailable`.
+            && self.policy.is_some()
+                == matches!(
+                    self.reason,
+                    Some(ToolDecisionReason::PolicyDenied | ToolDecisionReason::PolicyUnavailable)
+                )
+            && match self.reason {
             // J3-E3: every `busy` names its reason; `denied` names
             // `execution_off` only for a parsed exec_cmd call. The codec
             // pairs each code with its decision.
@@ -814,6 +825,7 @@ fn tool_call_fields(w: &mut Writer, p: &ToolCall) {
     w.byte(p.refusal.map_or(0, |r| refusal_code(r.code)));
     w.byte(p.refusal.and_then(|r| r.kind).map_or(0, kind_code));
     w.u16(p.refusal.and_then(|r| r.word).unwrap_or(0));
+    super::policy::policy_refusal_fields(w, p.policy.as_ref());
 }
 fn read_tool_call(r: &mut Reader<'_>) -> Result<ToolCall> {
     let operation = r.array()?;
@@ -858,6 +870,7 @@ fn read_tool_call(r: &mut Reader<'_>) -> Result<ToolCall> {
         0 => None,
         word => Some(word),
     };
+    let policy = super::policy::read_policy_refusal(r)?;
     let refusal = if code == 0 {
         require(kind.is_none() && word.is_none())?;
         None
@@ -889,6 +902,7 @@ fn read_tool_call(r: &mut Reader<'_>) -> Result<ToolCall> {
         command_cut,
         whole_command,
         refusal,
+        policy,
     };
     value.validate()?;
     Ok(value)
@@ -2114,6 +2128,8 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             job_retention_fields(&mut w, p);
         }
         Record::ExecutionPath(p) => super::execution_path::write_execution_path(&mut w, p)?,
+        Record::PolicyDecision(p) => super::policy::write_policy_decision(&mut w, p)?,
+        Record::PolicyRevision(p) => super::policy::write_policy_revision(&mut w, p)?,
         Record::ResponseText(p) | Record::ThinkingText(p) => {
             require(!p.text.is_empty() || p.offset > 0)?;
             w.bytes(&p.operation);
@@ -2421,6 +2437,18 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
                 &mut r,
             )?))
         }
+        34 => {
+            if payload.len() > MAX_POLICY_DECISION_PAYLOAD {
+                return Err(ReplayError::Limit);
+            }
+            Record::PolicyDecision(Box::new(super::policy::read_policy_decision(&mut r)?))
+        }
+        35 => {
+            if payload.len() > MAX_POLICY_REVISION_PAYLOAD {
+                return Err(ReplayError::Limit);
+            }
+            Record::PolicyRevision(Box::new(super::policy::read_policy_revision(&mut r)?))
+        }
 
         _ => return Err(ReplayError::UnsupportedFormat),
     };
@@ -2613,6 +2641,424 @@ mod tests {
         }
     }
 
+    // PL-U13: the kind 14 policy refusal field and kinds 34 and 35.
+    fn policy_refusal() -> PolicyRefusal {
+        PolicyRefusal {
+            scope: 1,
+            reason: "test_denied".into(),
+            rule: "installation:test_deny_model_exec".into(),
+            explain: "the test policy denies model commands".into(),
+        }
+    }
+    fn denied14(policy: PolicyRefusal) -> ToolCall {
+        ToolCall {
+            decision: ToolDecision::Denied,
+            reason: Some(ToolDecisionReason::PolicyDenied),
+            policy: Some(policy),
+            ..run14()
+        }
+    }
+    #[test]
+    fn pl_u13_kind_14_policy_refusal_field() {
+        // Round trips: the largest field, an empty rule and explanation,
+        // `policy_unavailable` without a scope.
+        let largest = PolicyRefusal {
+            scope: 2,
+            reason: "r".repeat(MAX_POLICY_REASON),
+            rule: format!("repository:{}", "i".repeat(MAX_POLICY_ID)),
+            explain: "~".repeat(MAX_POLICY_EXPLAIN),
+        };
+        let base = round14(run14()).len();
+        assert_eq!(
+            round14(denied14(largest.clone())).len(),
+            base + MAX_POLICY_REFUSAL_FIELD - 1
+        );
+        round14(denied14(PolicyRefusal {
+            scope: 0,
+            reason: "cannot_enforce".into(),
+            rule: String::new(),
+            explain: String::new(),
+        }));
+        round14(ToolCall {
+            reason: Some(ToolDecisionReason::PolicyUnavailable),
+            ..denied14(PolicyRefusal {
+                scope: 1,
+                reason: "scope_unavailable".into(),
+                rule: String::new(),
+                explain: String::new(),
+            })
+        });
+        // Present exactly with `policy_denied` and `policy_unavailable`.
+        let encode = |call: ToolCall| payload(&Record::ToolCall(Box::new(call)));
+        assert_eq!(
+            encode(ToolCall {
+                policy: Some(policy_refusal()),
+                ..run14()
+            }),
+            Err(ReplayError::Corrupt)
+        );
+        assert_eq!(
+            encode(ToolCall {
+                policy: None,
+                ..denied14(policy_refusal())
+            }),
+            Err(ReplayError::Corrupt)
+        );
+        assert_eq!(
+            encode(ToolCall {
+                decision: ToolDecision::Busy,
+                reason: Some(ToolDecisionReason::PolicyBusy),
+                ..denied14(policy_refusal())
+            }),
+            Err(ReplayError::Corrupt)
+        );
+        // Each invalid part.
+        for bad in [
+            PolicyRefusal {
+                scope: 5,
+                ..policy_refusal()
+            },
+            PolicyRefusal {
+                reason: String::new(),
+                ..policy_refusal()
+            },
+            PolicyRefusal {
+                reason: "Upper".into(),
+                ..policy_refusal()
+            },
+            PolicyRefusal {
+                reason: "r".repeat(MAX_POLICY_REASON + 1),
+                ..policy_refusal()
+            },
+            PolicyRefusal {
+                rule: "test_deny_model_exec".into(),
+                ..policy_refusal()
+            },
+            PolicyRefusal {
+                rule: "task:x".into(),
+                ..policy_refusal()
+            },
+            PolicyRefusal {
+                rule: "user:a b".into(),
+                ..policy_refusal()
+            },
+            PolicyRefusal {
+                explain: "line\nbreak".into(),
+                ..policy_refusal()
+            },
+            PolicyRefusal {
+                explain: "é".into(),
+                ..policy_refusal()
+            },
+            PolicyRefusal {
+                explain: "~".repeat(MAX_POLICY_EXPLAIN + 1),
+                ..policy_refusal()
+            },
+            // A workspace or repository explanation never reaches a model.
+            PolicyRefusal {
+                scope: 3,
+                ..policy_refusal()
+            },
+        ] {
+            let call = denied14(bad.clone());
+            assert!(encode(call.clone()).is_err(), "{bad:?}");
+            let mut w = Writer(Vec::new());
+            tool_call_fields(&mut w, &call);
+            assert!(decode_record(14, &w.0).is_err(), "{bad:?}");
+        }
+        // The flag byte is 0 or 1.
+        let mut bytes = round14(run14());
+        *bytes.last_mut().unwrap() = 2;
+        assert_eq!(decode_record(14, &bytes), Err(ReplayError::Corrupt));
+        // The bound still fits one frame (also a compile-time assertion).
+        const { assert!(MAX_TOOL_CALL_PAYLOAD + HEADER + TRAILER <= MAX_FRAME) };
+    }
+    fn decision34() -> PolicyDecision {
+        PolicyDecision {
+            subject: PolicySubject::ModelCall {
+                operation: [1; 16],
+                generation: 1,
+                ordinal: 1,
+            },
+            action: 5,
+            origin: 1,
+            profile: 1,
+            project: [2; 16],
+            task_conversation: [3; 16],
+            task_agent: 0,
+            resource_digest: [4; 32],
+            request_digest: [5; 32],
+            intent_digest: Some([6; 32]),
+            revision_seq: 1,
+            revision_digest: [7; 32],
+            scopes: vec![
+                PolicyScopeResult {
+                    scope: 1,
+                    allow: true,
+                    error: 0,
+                    rules: vec!["installation:model1_exec".into()],
+                },
+                PolicyScopeResult {
+                    scope: 2,
+                    allow: true,
+                    error: 0,
+                    rules: vec!["user:model1_exec".into()],
+                },
+            ],
+            outcome: PolicyOutcome::Run,
+            primary_scope: 0,
+            reason: "model1_region".into(),
+            constraint_digest: Some([8; 32]),
+            now_ms: 1_762_000_000_000,
+        }
+    }
+    fn deny34() -> PolicyDecision {
+        let mut d = decision34();
+        d.outcome = PolicyOutcome::Deny;
+        d.scopes[0].allow = false;
+        d.primary_scope = 1;
+        d.reason = "test_denied".into();
+        d.constraint_digest = None;
+        d
+    }
+    fn round34(p: PolicyDecision) -> Vec<u8> {
+        let record = Record::PolicyDecision(Box::new(p));
+        let bytes = payload(&record).unwrap();
+        assert_eq!(decode_record(34, &bytes).unwrap(), record);
+        bytes
+    }
+    #[test]
+    fn pl_u13_kind_34_round_trips_bounds_and_rejects_each_invalid_field() {
+        round34(decision34());
+        round34(deny34());
+        round34(PolicyDecision {
+            intent_digest: None,
+            primary_scope: 0,
+            reason: "cannot_enforce".into(),
+            ..deny34()
+        });
+        // An error class with a deny.
+        let mut errored = deny34();
+        errored.scopes[0].error = 1;
+        errored.reason = "policy_error".into();
+        round34(errored);
+        // The largest record: four scopes of eight longest rules.
+        let rule = format!("repository:{}", "i".repeat(MAX_POLICY_ID));
+        let mut largest = deny34();
+        largest.reason = "r".repeat(MAX_POLICY_REASON);
+        largest.scopes = (1..=4)
+            .map(|scope| PolicyScopeResult {
+                scope,
+                allow: scope != 1,
+                error: 0,
+                rules: vec![rule.clone(); MAX_POLICY_RULES],
+            })
+            .collect();
+        assert!(round34(largest).len() <= MAX_POLICY_DECISION_PAYLOAD);
+        let encode = |p: PolicyDecision| payload(&Record::PolicyDecision(Box::new(p)));
+        let mut cases: Vec<PolicyDecision> = Vec::new();
+        let mut push = |f: &dyn Fn(&mut PolicyDecision)| {
+            let mut d = decision34();
+            f(&mut d);
+            cases.push(d);
+        };
+        push(&|d| {
+            d.subject = PolicySubject::ModelCall {
+                operation: [0; 16],
+                generation: 1,
+                ordinal: 1,
+            }
+        });
+        push(&|d| {
+            d.subject = PolicySubject::ModelCall {
+                operation: [1; 16],
+                generation: 0,
+                ordinal: 1,
+            }
+        });
+        push(&|d| {
+            d.subject = PolicySubject::ModelCall {
+                operation: [1; 16],
+                generation: 1,
+                ordinal: 0,
+            }
+        });
+        push(&|d| d.action = 0);
+        push(&|d| d.action = 12);
+        push(&|d| d.origin = 4);
+        push(&|d| d.profile = 0);
+        push(&|d| d.project = [0; 16]);
+        push(&|d| d.task_conversation = [0; 16]);
+        push(&|d| d.revision_seq = 0);
+        push(&|d| d.scopes.clear());
+        push(&|d| d.scopes.reverse());
+        push(&|d| d.scopes[1].scope = 1);
+        push(&|d| d.scopes[0].scope = 5);
+        push(&|d| d.scopes[0].error = 5);
+        push(&|d| d.scopes[0].error = 1);
+        push(&|d| d.scopes[0].rules = vec!["installation:a".into(); 9]);
+        push(&|d| d.scopes[0].rules = vec!["nope".into()]);
+        push(&|d| d.reason = String::new());
+        push(&|d| d.reason = "Bad".into());
+        push(&|d| d.constraint_digest = None);
+        push(&|d| d.primary_scope = 1);
+        push(&|d| d.scopes[0].allow = false);
+        push(&|d| d.primary_scope = 5);
+        for case in cases {
+            assert_eq!(encode(case.clone()), Err(ReplayError::Corrupt), "{case:?}");
+        }
+        // A deny: no constraint digest; the primary scope denied.
+        let mut d = deny34();
+        d.constraint_digest = Some([1; 32]);
+        assert_eq!(encode(d), Err(ReplayError::Corrupt));
+        let mut d = deny34();
+        d.primary_scope = 2;
+        assert_eq!(encode(d), Err(ReplayError::Corrupt));
+        // Byte-level: unknown subject, outcome and flag codes, trailing bytes.
+        let base = round34(decision34());
+        for (offset, value) in [(0, 2), (0, 0)] {
+            let mut bytes = base.clone();
+            bytes[offset] = value;
+            assert_eq!(decode_record(34, &bytes), Err(ReplayError::Corrupt));
+        }
+        let mut bytes = base.clone();
+        bytes.push(0);
+        assert_eq!(decode_record(34, &bytes), Err(ReplayError::Corrupt));
+        bytes.truncate(base.len() - 1);
+        assert_eq!(decode_record(34, &bytes), Err(ReplayError::Corrupt));
+        // Over the payload bound.
+        assert_eq!(
+            decode_record(34, &vec![0; MAX_POLICY_DECISION_PAYLOAD + 1]),
+            Err(ReplayError::Limit)
+        );
+        // `ask` decodes; replay refuses it (R4 table, PL7).
+        let mut ask = deny34();
+        ask.outcome = PolicyOutcome::Ask;
+        round34(ask);
+        assert_eq!(PolicyOutcome::from_code(4), None);
+        assert_eq!(PolicyOutcome::from_code(0), None);
+    }
+    fn revision35() -> PolicyRevision {
+        PolicyRevision {
+            seq: 1,
+            digest: [1; 32],
+            previous_seq: 0,
+            event: PolicyRevisionEvent::Activated,
+            schema_digest: [2; 32],
+            cedar_lang: "4.5".into(),
+            cedar_sdk: "4.14.1".into(),
+            solver_digest: None,
+            admission_digest: None,
+            scopes: vec![
+                PolicyScopeSet {
+                    scope: 1,
+                    project: None,
+                    text_digest: [3; 32],
+                    source: "builtin".into(),
+                    policy_ids: vec!["model1_read".into(), "s1_implicit_exec".into()],
+                },
+                PolicyScopeSet {
+                    scope: 2,
+                    project: None,
+                    text_digest: [4; 32],
+                    source: "builtin".into(),
+                    policy_ids: vec!["model1_read".into()],
+                },
+            ],
+        }
+    }
+    fn round35(p: PolicyRevision) -> Vec<u8> {
+        let record = Record::PolicyRevision(Box::new(p));
+        let bytes = payload(&record).unwrap();
+        assert_eq!(decode_record(35, &bytes).unwrap(), record);
+        bytes
+    }
+    #[test]
+    fn pl_u13_kind_35_round_trips_bounds_and_rejects_each_invalid_field() {
+        round35(revision35());
+        for event in [
+            PolicyRevisionEvent::Superseded,
+            PolicyRevisionEvent::Revoked,
+            PolicyRevisionEvent::Rejected,
+        ] {
+            round35(PolicyRevision {
+                event,
+                ..revision35()
+            });
+        }
+        let mut lower = revision35();
+        lower.solver_digest = Some([5; 32]);
+        lower.admission_digest = Some([6; 32]);
+        lower.scopes.push(PolicyScopeSet {
+            scope: 3,
+            project: Some([7; 16]),
+            text_digest: [8; 32],
+            source: "workspace".into(),
+            policy_ids: vec![],
+        });
+        lower.scopes.push(PolicyScopeSet {
+            scope: 4,
+            project: Some([7; 16]),
+            text_digest: [9; 32],
+            source: "repository".into(),
+            policy_ids: vec![],
+        });
+        round35(lower);
+        let encode = |p: PolicyRevision| payload(&Record::PolicyRevision(Box::new(p)));
+        let mut cases: Vec<PolicyRevision> = Vec::new();
+        let mut push = |f: &dyn Fn(&mut PolicyRevision)| {
+            let mut r = revision35();
+            f(&mut r);
+            cases.push(r);
+        };
+        push(&|r| r.seq = 0);
+        push(&|r| r.previous_seq = 1);
+        push(&|r| r.cedar_lang = String::new());
+        push(&|r| r.cedar_lang = "4.x".into());
+        push(&|r| r.cedar_sdk = "1".repeat(MAX_POLICY_VERSION + 1));
+        push(&|r| r.scopes.clear());
+        push(&|r| r.scopes.reverse());
+        push(&|r| r.scopes[1].scope = 1);
+        push(&|r| r.scopes[0].scope = 0);
+        push(&|r| r.scopes[0].project = Some([1; 16]));
+        push(&|r| {
+            r.scopes[1].scope = 3;
+            r.scopes[1].project = None;
+        });
+        push(&|r| {
+            r.scopes[1].scope = 3;
+            r.scopes[1].project = Some([0; 16]);
+        });
+        push(&|r| r.scopes[0].source = String::new());
+        push(&|r| r.scopes[0].source = "Built In".into());
+        push(&|r| r.scopes[0].policy_ids = vec!["a:b".into()]);
+        push(&|r| r.scopes[0].policy_ids = vec!["i".repeat(MAX_POLICY_ID + 1)]);
+        for case in cases {
+            assert_eq!(encode(case.clone()), Err(ReplayError::Corrupt), "{case:?}");
+        }
+        // Over the 8 KiB bound.
+        let mut big = revision35();
+        big.scopes[0].policy_ids = (0..MAX_POLICY_IDS).map(|n| format!("{n:0>64}")).collect();
+        assert_eq!(encode(big), Err(ReplayError::Limit));
+        assert_eq!(
+            decode_record(35, &vec![0; MAX_POLICY_REVISION_PAYLOAD + 1]),
+            Err(ReplayError::Limit)
+        );
+        // Unknown event code and trailing bytes.
+        let base = round35(revision35());
+        let mut bytes = base.clone();
+        bytes[48] = 5;
+        assert_eq!(decode_record(35, &bytes), Err(ReplayError::Corrupt));
+        let mut bytes = base.clone();
+        bytes.push(0);
+        assert_eq!(decode_record(35, &bytes), Err(ReplayError::Corrupt));
+        // Kind 36 is not yet a record.
+        assert_eq!(
+            decode_record(36, &base),
+            Err(ReplayError::UnsupportedFormat)
+        );
+    }
+
     // TCR-U01..U03: kind 14 ToolCall.
     fn run14() -> ToolCall {
         ToolCall {
@@ -2636,6 +3082,7 @@ mod tests {
             command_cut: false,
             whole_command: false,
             refusal: None,
+            policy: None,
         }
     }
     fn refused14() -> ToolCall {
@@ -2746,7 +3193,7 @@ mod tests {
         round14(refused14());
         round14(invalid14());
         let bytes = round14(whole14());
-        assert_eq!(bytes[bytes.len() - 5], 2, "field 20 bit 1");
+        assert_eq!(bytes[bytes.len() - 6], 2, "field 20 bit 1");
         // Every recorded ordinal round trips with any decision (owner, 2026-10-18).
         for ordinal in 1..=MAX_RECORDED_CALLS {
             round14(ToolCall { ordinal, ..run14() });
@@ -2818,10 +3265,23 @@ mod tests {
             (ToolDecision::Busy, ToolDecisionReason::JobsFull, 2),
             (ToolDecision::Busy, ToolDecisionReason::Closed, 3),
             (ToolDecision::Denied, ToolDecisionReason::ExecutionOff, 1),
+            (ToolDecision::Denied, ToolDecisionReason::PolicyDenied, 2),
+            (
+                ToolDecision::Denied,
+                ToolDecisionReason::PolicyUnavailable,
+                3,
+            ),
+            (ToolDecision::Busy, ToolDecisionReason::PolicyBusy, 4),
         ] {
+            let policy = matches!(
+                reason,
+                ToolDecisionReason::PolicyDenied | ToolDecisionReason::PolicyUnavailable
+            )
+            .then(policy_refusal);
             let bytes = round14(ToolCall {
                 decision,
                 reason: Some(reason),
+                policy,
                 ..run14()
             });
             assert_eq!(bytes[48], code);
@@ -2917,7 +3377,7 @@ mod tests {
             }),
             ..whole14()
         });
-        assert_eq!(bytes[bytes.len() - 5], 3, "field 20 bits 0 and 1");
+        assert_eq!(bytes[bytes.len() - 6], 3, "field 20 bits 0 and 1");
         // A whole-command run may hold more than 16 numbers (SO5).
         round14(ToolCall {
             arguments: format!("{{\"command\":\"{}\"}}", tokens(17)),
@@ -3253,9 +3713,9 @@ mod tests {
         for (offset, value) in [
             (kinds, 0),
             (kinds, 34),
-            (base.len() - 5, 2),
-            (base.len() - 5, 4),
-            (base.len() - 5, 255),
+            (base.len() - 6, 2),
+            (base.len() - 6, 4),
+            (base.len() - 6, 255),
         ] {
             let mut bytes = base.clone();
             bytes[offset] = value;
@@ -3312,7 +3772,7 @@ mod tests {
             );
         }
     }
-    /// TCR-U03: the largest legal record is a 65,050-byte frame; one more
+    /// TCR-U03: the largest legal record is a 65,051-byte frame; one more
     /// argument byte is refused by the encoder.
     #[test]
     fn tcr_u03_largest_kind_14_fits_one_frame() {
@@ -3333,10 +3793,15 @@ mod tests {
             ..run14()
         };
         let bytes = round14(largest.clone());
-        assert_eq!(bytes.len(), MAX_TOOL_CALL_PAYLOAD);
-        assert_eq!(bytes.len(), 64_866);
+        // One byte more since PL1: the absent policy refusal flag. The
+        // payload bound adds the largest refusal (PL-U13).
+        assert_eq!(bytes.len(), 64_867);
+        assert_eq!(
+            bytes.len() + MAX_POLICY_REFUSAL_FIELD - 1,
+            MAX_TOOL_CALL_PAYLOAD
+        );
         let frame = encode_frame(&context(), &Record::ToolCall(Box::new(largest.clone()))).unwrap();
-        assert_eq!(frame.len(), 65_050);
+        assert_eq!(frame.len(), 65_051);
         assert!(frame.len() <= MAX_FRAME);
         let mut over = largest;
         over.arguments.insert(9, 'a');
@@ -4099,7 +4564,8 @@ mod tests {
                     (whole14(), refused14())
                 };
                 let bytes = round14(ToolCall { refusal, ..record });
-                assert_eq!(bytes[bytes.len() - 4], code);
+                // Field 21, before field 23 (2 bytes) and the PL1 flag.
+                assert_eq!(bytes[bytes.len() - 5], code);
                 invalid14_record(ToolCall { refusal, ..wrong });
             }
         }
@@ -4261,6 +4727,9 @@ mod tests {
             (ToolDecision::Busy, 2, "jobs_full"),
             (ToolDecision::Busy, 3, "closed"),
             (ToolDecision::Denied, 1, "execution_off"),
+            (ToolDecision::Denied, 2, "policy_denied"),
+            (ToolDecision::Denied, 3, "policy_unavailable"),
+            (ToolDecision::Busy, 4, "policy_busy"),
         ] {
             let r = ToolDecisionReason::from_code(decision, code)
                 .unwrap()
@@ -4274,9 +4743,9 @@ mod tests {
             assert_eq!(ToolDecisionReason::from_code(decision, 0), Some(None));
         }
         for (decision, code) in [
-            (ToolDecision::Busy, 4),
+            (ToolDecision::Busy, 5),
             (ToolDecision::Busy, 0xff),
-            (ToolDecision::Denied, 2),
+            (ToolDecision::Denied, 4),
             (ToolDecision::Run, 1),
             (ToolDecision::Refused, 1),
             (ToolDecision::Cancelled, 1),
@@ -4321,7 +4790,8 @@ mod tests {
                 ..run14()
             };
             let bytes = round14(p);
-            assert_eq!(bytes.len(), 98 + 8 + text.len() + count);
+            // 98 fixed bytes, the PL1 policy flag, two lengths.
+            assert_eq!(bytes.len(), 98 + 1 + 8 + text.len() + count);
             assert_eq!(&bytes[59..59 + text.len()], text.as_bytes());
             let kinds = 59 + text.len() + 2;
             assert!(bytes[kinds..kinds + count].iter().all(|k| *k == 26));
@@ -4583,9 +5053,9 @@ mod tests {
                 pairs += 1;
             }
         }
-        // Reasons 0 to 18, then 19 `execution_off` (ESCN) and 20
-        // `outside_sandbox_off` (N).
-        assert_eq!(pairs, 2 + 7 * 4 + 3 + 2 * 2 + 1 + 7 + 4 + 1);
+        // Reasons 0 to 18, then 19 `execution_off` (ESCN), 20
+        // `outside_sandbox_off` (N) and 21 `enforcement_mismatch` (N).
+        assert_eq!(pairs, 2 + 7 * 4 + 3 + 2 * 2 + 1 + 7 + 4 + 1 + 1);
         // Exit and cleanup bounds.
         for (exit_kind, exit_value) in [(1, 0), (1, 255)] {
             round_job(r28(JobSettled {
@@ -5011,12 +5481,13 @@ mod tests {
             "setup_failed",
             "execution_off",
             "outside_sandbox_off",
+            "enforcement_mismatch",
         ];
         for (code, name) in names.iter().enumerate() {
             let reason = JobReason::from_code(code as u8).unwrap();
             assert_eq!((reason as u8, reason.as_str()), (code as u8, *name));
         }
-        assert_eq!(JobReason::from_code(21), None);
+        assert_eq!(JobReason::from_code(22), None);
         use JobRequester::*;
         let requesters = [
             None,
@@ -5039,6 +5510,7 @@ mod tests {
             None,
             None,
             Some(Service),
+            None,
             None,
         ];
         assert_eq!(requesters.len(), JobReason::ALL.len());

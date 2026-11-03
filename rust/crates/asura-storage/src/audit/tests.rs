@@ -659,6 +659,7 @@ fn j2t_20_job_enum_names_and_codes() {
         (JobReason::SetupFailed, "setup_failed"),
         (JobReason::ExecutionOff, "execution_off"),
         (JobReason::OutsideSandboxOff, "outside_sandbox_off"),
+        (JobReason::EnforcementMismatch, "enforcement_mismatch"),
     ];
     for (code, (reason, text)) in reasons.iter().enumerate() {
         assert_eq!(*reason as u8, code as u8);

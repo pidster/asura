@@ -2719,13 +2719,19 @@ notice stays an internal native primitive, not a versioned wire protocol
 ([escapee control](escapee-control.md#guardian-status-notice-extensions)).
 
 **Argument vector.** The private route becomes
-`--asura-exec-cmd-guardian JOBHEX PROFILE COMMAND`, plus the test-support fault
-argument after the command when that feature is built. `PROFILE` is an ASCII
-token. J2 accepts `model-1`; packet P1 adds `person-1` and `person-outside-1`.
-An unknown token makes the guardian exit with status 1 before any effect and
-before any notice; the service then sees status EOF with no notice and settles
-the job `not_started` with reason `protocol_fault`. The total argv bound stays
-8,704 bytes. The token replaces the removed deadline argument.
+`--asura-exec-cmd-guardian JOBHEX PROFILE CONSTRAINTS COMMAND`, plus the
+test-support fault argument after the command when that feature is built.
+`PROFILE` is an ASCII token. J2 accepts `model-1`; packet P1 adds `person-1`
+and `person-outside-1`. `CONSTRAINTS` is the compiled constraint set of the
+policy decision with its expected profile digest for `model-1`, and `-` for
+the person profiles ([security policy, constraint set](security-policy.md#constraint-set),
+packet PL1). An unknown token or a malformed constraint set makes the
+guardian exit with status 1 before any effect and before any notice; the
+service then sees status EOF with no notice and settles the job
+`not_started` with reason `protocol_fault`. A profile digest mismatch is
+notice kind 3 reason 10, job reason 21 `enforcement_mismatch`. The total
+argv bound is 9,216 bytes (8,704 before PL1). The token replaces the removed
+deadline argument.
 
 | Profile token | Sandbox | TERM-to-KILL grace | Packet |
 | --- | --- | --- | --- |

@@ -16,16 +16,20 @@ use std::time::{Duration, Instant};
 mod escapees;
 fn main() {
     let args: Vec<_> = std::env::args().collect();
-    if let [_, flag, id, profile, command] = args.as_slice()
+    if let [_, flag, id, profile, constraints, command] = args.as_slice()
         && flag == "--asura-exec-cmd-guardian"
     {
-        std::process::exit(run_guardian(id, profile, command));
+        std::process::exit(run_guardian(id, profile, constraints, command));
     }
-    if let [_, flag, id, profile, command, fault] = args.as_slice()
+    if let [_, flag, id, profile, constraints, command, fault] = args.as_slice()
         && flag == "--asura-exec-cmd-guardian"
     {
         std::process::exit(asura_platform::exec_cmd::run_guardian_for_test(
-            id, profile, command, fault,
+            id,
+            profile,
+            constraints,
+            command,
+            fault,
         ));
     }
     if let [_, flag, home] = args.as_slice()
@@ -172,6 +176,7 @@ fn prepare_with(
             cwd: None,
             secrets,
             secret_command: None,
+            constraints: Some(asura_platform::exec_cmd::template_for_test()),
         },
     )
 }
@@ -276,6 +281,7 @@ fn qualification() {
     state_isolation(&f.0);
     escapees::escapees(&f.0);
     guardian_refusals(&f.0);
+    pl_i4_enforcement_evidence(&f.0);
     j2t_05_lease_bytes(&f.0);
     j2t_06_leader_exit_notice(&f.0);
     secret_environment_refusals(&f.0);
@@ -455,6 +461,7 @@ fn guardian_refusals(home: &Path) {
                 cwd: None,
                 secrets: Vec::new(),
                 secret_command: None,
+                constraints: Some(asura_platform::exec_cmd::template_for_test()),
             },
             &cancel,
         )
@@ -493,6 +500,96 @@ fn guardian_refusals(home: &Path) {
                 .unwrap();
         }
     }
+}
+/// PL-I4 (platform part): the real guardian renders the profile from the
+/// constraint set and its pinned descriptors. Matching digests run the
+/// command; an injected digest mismatch is setup reason 10
+/// `enforcement_mismatch` and the command never starts. A narrower
+/// constraint set is enforced by Seatbelt: with the project left out of the
+/// write roots, a project write fails while a scratch write succeeds.
+fn pl_i4_enforcement_evidence(home: &Path) {
+    use asura_platform::exec_cmd::{Constraints, Root};
+    let request = |command: &str, constraints: Constraints| ExecCmdRequest {
+        job_id: asura_platform::random_id(),
+        profile: Profile::Model1,
+        command: command.into(),
+        cwd: None,
+        secrets: Vec::new(),
+        secret_command: None,
+        constraints: Some(constraints),
+    };
+    let template = asura_platform::exec_cmd::template_for_test();
+    let result = settle(
+        prepare_request(home, request("printf matched > pl-i4-matched", template)),
+        Duration::from_secs(5),
+        false,
+    );
+    assert_eq!(result.result.exit_code, Some(0), "{result:?}");
+    assert_eq!(
+        fs::read(home.join("project/pl-i4-matched")).unwrap(),
+        b"matched"
+    );
+    // Mismatch: refused before the command exists.
+    let runtime = RuntimeDirectory::scratch(home, true).unwrap();
+    let project = ProjectIdentity::open(
+        home.join("project").to_str().unwrap(),
+        &runtime.state_boundary(),
+    )
+    .unwrap();
+    let cancel = AtomicBool::new(false);
+    let mut prepared = PreparedExecCmd::prepare(
+        runtime,
+        &project,
+        request("printf ran > pl-i4-mismatch", template),
+        &cancel,
+    )
+    .unwrap_or_else(|e| panic!("prepare: {:?}", e.reason));
+    prepared.corrupt_profile_digest_for_test();
+    let collected = Collected::default();
+    let mut job = JobGuard(
+        prepared
+            .spawn(
+                &std::env::current_exe().unwrap(),
+                &cancel,
+                Box::new(collected.clone()),
+            )
+            .unwrap_or_else(|e| panic!("spawn: {:?}", e.reason)),
+        collected,
+    );
+    pump_job(&mut job, "mismatch settles", |_| false);
+    let outcome = job.result().unwrap();
+    assert_eq!(outcome.failure, Some(ExecCmdError::EnforcementMismatch));
+    assert_eq!(outcome.setup_reason, 10);
+    assert!(!job.spawned());
+    assert!(!home.join("project/pl-i4-mismatch").exists());
+    job.take_cleanup()
+        .unwrap()
+        .run(
+            Instant::now() + Duration::from_secs(2),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    // A narrower set: no project write root.
+    let narrow =
+        Constraints::model1(template.read(), template.exec(), Root::Scratch.bit()).unwrap();
+    let result = settle(
+        prepare_request(
+            home,
+            request(
+                "printf s > \"$TMPDIR/pl-i4-scratch\" && cat \"$TMPDIR/pl-i4-scratch\"; printf p > pl-i4-narrow; printf \" $?\"",
+                narrow,
+            ),
+        ),
+        Duration::from_secs(5),
+        false,
+    );
+    assert_eq!(result.result.exit_code, Some(0), "{result:?}");
+    assert!(result.stdout.starts_with("s "), "{result:?}");
+    assert_ne!(result.stdout, "s 0", "{result:?}");
+    assert!(!home.join("project/pl-i4-narrow").exists());
+    println!(
+        "PASS PL-I4 profile digest match runs, mismatch refuses before launch, narrower constraint set enforced"
+    );
 }
 /// Pump a job until `done` or settlement; the limit bounds only this test.
 fn pump_job(job: &mut JobGuard, what: &str, mut done: impl FnMut(&JobGuard) -> bool) {
@@ -542,6 +639,7 @@ fn j2t_05_lease_bytes(home: &Path) {
             cwd: None,
             secrets: Vec::new(),
             secret_command: None,
+            constraints: Some(asura_platform::exec_cmd::template_for_test()),
         },
         &cancel,
     )
@@ -923,6 +1021,7 @@ fn secret_environment_refusals(home: &Path) {
                 cwd: None,
                 secrets: Vec::new(),
                 secret_command: None,
+                constraints: Some(asura_platform::exec_cmd::template_for_test()),
             },
             &cancel,
         )
@@ -1033,6 +1132,7 @@ fn secret_variables(home: &Path) {
                 cwd: None,
                 secrets: Vec::new(),
                 secret_command: Some(whole.command),
+                constraints: Some(asura_platform::exec_cmd::template_for_test()),
             },
         ),
         Duration::from_secs(5),
@@ -1473,6 +1573,7 @@ fn person_job_with_id(
         cwd: None,
         secrets: Vec::new(),
         secret_command: None,
+        constraints: (profile == Profile::Model1).then(asura_platform::exec_cmd::template_for_test),
     };
     let mut prepared = PreparedExecCmd::prepare_person(runtime, &project, request, setup, &cancel)
         .unwrap_or_else(|e| panic!("prepare: {:?}", e.reason));

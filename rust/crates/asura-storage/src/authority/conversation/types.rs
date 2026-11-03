@@ -374,6 +374,10 @@ pub enum Record {
     /// Kind 32 (P5): a model change, acknowledgement, approval or
     /// revocation of execution paths (execution-path-guard.md).
     ExecutionPath(Box<super::ExecutionPathRecord>),
+    /// Kind 34 (PL1): one policy decision that admits or refuses work.
+    PolicyDecision(Box<super::PolicyDecision>),
+    /// Kind 35 (PL1): one policy revision event with its manifest.
+    PolicyRevision(Box<super::PolicyRevision>),
 }
 impl Record {
     pub fn kind(&self) -> u16 {
@@ -404,6 +408,8 @@ impl Record {
             Self::JobResult(_) => 29,
             Self::JobRetention(_) => 30,
             Self::ExecutionPath(_) => 32,
+            Self::PolicyDecision(_) => 34,
+            Self::PolicyRevision(_) => 35,
         }
     }
 }
@@ -1148,6 +1154,10 @@ pub struct ToolCall {
     /// Fields 21-23: an exec_cmd secret refusal, or with `whole_command` the
     /// fallback reason. Never holds a value.
     pub refusal: Option<ExecCmdRefusal>,
+    /// The last field (PL1): the policy refusal, present exactly with field
+    /// 10 `policy_denied` or `policy_unavailable`. The model text is
+    /// rendered from it (TCR-D12).
+    pub policy: Option<super::PolicyRefusal>,
 }
 impl ToolCall {
     /// The taint rule for a model job (context-composer.md, taint exclusion
@@ -1173,7 +1183,9 @@ pub struct ToolResult {
 /// Kind 14 field 10, the decision reason (J3-E3). The stored code depends
 /// on the decision: `busy` 1 `queue_full`, 2 `jobs_full`, 3 `closed`;
 /// `denied` 1 `execution_off` (EX11). Every other decision stores 0. The J1
-/// busy codes are retired with the J1 path.
+/// busy codes are retired with the J1 path. Packet PL1 adds `denied` 2
+/// `policy_denied`, 3 `policy_unavailable` and `busy` 4 `policy_busy`
+/// (security-policy.md, kind 14 additions).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolDecisionReason {
     /// `busy`: the agent's job queue is full.
@@ -1184,27 +1196,41 @@ pub enum ToolDecisionReason {
     Closed,
     /// `denied`: the project's execution setting is off.
     ExecutionOff,
+    /// `denied`: the policy owner refused the call (kind 34 `deny`).
+    PolicyDenied,
+    /// `denied`: the policy owner could not decide; no kind 34.
+    PolicyUnavailable,
+    /// `busy`: the agent's policy decision queue is full; no kind 34.
+    PolicyBusy,
 }
 impl ToolDecisionReason {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 7] = [
         Self::QueueFull,
         Self::JobsFull,
         Self::Closed,
         Self::ExecutionOff,
+        Self::PolicyDenied,
+        Self::PolicyUnavailable,
+        Self::PolicyBusy,
     ];
     /// The decision this reason belongs to.
     pub fn decision(self) -> ToolDecision {
         match self {
-            Self::QueueFull | Self::JobsFull | Self::Closed => ToolDecision::Busy,
-            Self::ExecutionOff => ToolDecision::Denied,
+            Self::QueueFull | Self::JobsFull | Self::Closed | Self::PolicyBusy => {
+                ToolDecision::Busy
+            }
+            Self::ExecutionOff | Self::PolicyDenied | Self::PolicyUnavailable => {
+                ToolDecision::Denied
+            }
         }
     }
     /// The stored field 10 code.
     pub fn code(self) -> u8 {
         match self {
             Self::QueueFull | Self::ExecutionOff => 1,
-            Self::JobsFull => 2,
-            Self::Closed => 3,
+            Self::JobsFull | Self::PolicyDenied => 2,
+            Self::Closed | Self::PolicyUnavailable => 3,
+            Self::PolicyBusy => 4,
         }
     }
     /// The reason that `code` names under `decision`: `Some(None)` for code
@@ -1224,6 +1250,9 @@ impl ToolDecisionReason {
             Self::JobsFull => "jobs_full",
             Self::Closed => "closed",
             Self::ExecutionOff => "execution_off",
+            Self::PolicyDenied => "policy_denied",
+            Self::PolicyUnavailable => "policy_unavailable",
+            Self::PolicyBusy => "policy_busy",
         }
     }
 }
@@ -1352,6 +1381,9 @@ pub struct ToolRecord {
     /// Kind 14 field 10, the decision reason.
     pub reason: Option<ToolDecisionReason>,
     pub refusal: Option<ExecCmdRefusal>,
+    /// The kind 14 policy refusal (PL1), from which the model text of a
+    /// policy refusal is rendered.
+    pub policy: Option<super::PolicyRefusal>,
     /// Field 20 bit 1 (SL7): the command ran from a secret variable; the
     /// arguments show its display text.
     pub whole_command: bool,
@@ -1547,9 +1579,13 @@ pub enum JobReason {
     /// The person `!!` switch was off at slot grant (P2). Only a person
     /// job of profile `person-outside-1` may record it.
     OutsideSandboxOff = 20,
+    /// The guardian's rendered profile digest differed from the decision's
+    /// (security-policy.md, enforcement evidence in PL1): the command never
+    /// started. Only a model-origin job may record it.
+    EnforcementMismatch = 21,
 }
 impl JobReason {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::None,
         Self::ModelCancel,
         Self::TurnEnded,
@@ -1571,6 +1607,7 @@ impl JobReason {
         Self::SetupFailed,
         Self::ExecutionOff,
         Self::OutsideSandboxOff,
+        Self::EnforcementMismatch,
     ];
     pub fn from_code(code: u8) -> Option<Self> {
         Self::ALL.get(usize::from(code)).copied()
@@ -1598,6 +1635,7 @@ impl JobReason {
             Self::SetupFailed => "setup_failed",
             Self::ExecutionOff => "execution_off",
             Self::OutsideSandboxOff => "outside_sandbox_off",
+            Self::EnforcementMismatch => "enforcement_mismatch",
         }
     }
     /// The kind 27 requester of a cancel reason; `None` for a reason that
@@ -1612,7 +1650,8 @@ impl JobReason {
                 JobRequester::Service
             }
             None | Restart | CwdUnavailable | ProjectChanged | SandboxUnavailable | SpawnFailed
-            | CaptureUnavailable | ProtocolFault | SetupFailed | OutsideSandboxOff => {
+            | CaptureUnavailable | ProtocolFault | SetupFailed | OutsideSandboxOff
+            | EnforcementMismatch => {
                 return Option::None;
             }
         })
@@ -1632,9 +1671,8 @@ impl JobReason {
             Quota | Enospc => matches!(outcome, O::Exited | O::Signalled),
             Restart => outcome == O::Interrupted,
             CwdUnavailable | ProjectChanged | SandboxUnavailable | SpawnFailed
-            | CaptureUnavailable | ProtocolFault | SetupFailed | OutsideSandboxOff => {
-                outcome == O::NotStarted
-            }
+            | CaptureUnavailable | ProtocolFault | SetupFailed | OutsideSandboxOff
+            | EnforcementMismatch => outcome == O::NotStarted,
         }
     }
 }

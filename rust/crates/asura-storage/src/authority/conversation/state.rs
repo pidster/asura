@@ -121,6 +121,9 @@ pub struct Replay {
     pub reserved_frames: usize,
     /// Requests committed since the checkpoint.
     pub requests: BTreeMap<Id, RequestResult>,
+    /// Kinds 34 and 35 (PL1): the active policy revision and the kind 34
+    /// records that wait for their kind 14 (R1 to R7).
+    pub policy: PolicyReplay,
     /// The checkpoint sequence this state was replayed from (0: genesis).
     pub base: u64,
     /// The newest frame's activity.
@@ -254,6 +257,7 @@ impl Replay {
             claimed: BTreeSet::new(),
             delta_charge: 0,
             piece_limit: MAX_RESPONSE_PIECES,
+            policy: PolicyReplay::default(),
         }
     }
     /// Memory charged by the delta since the checkpoint.
@@ -1171,7 +1175,10 @@ impl Replay {
                     &record,
                     Record::JobRetention(p)
                         if matches!(p.author, RetentionAuthor::Person { .. })
-                ) || matches!(&record, Record::ExecutionPath(_));
+                ) || matches!(
+                    &record,
+                    Record::ExecutionPath(_) | Record::PolicyRevision(_)
+                );
                 require(
                     reconciliation
                         || independent
@@ -1459,6 +1466,23 @@ impl Replay {
             }
             Record::JobRetention(p) => self.job_retention(*p, frame, index)?,
             Record::ExecutionPath(p) => self.execution_path(*p, frame, index)?,
+            // Kind 35 (R1, R2): independent of any operation.
+            Record::PolicyRevision(p) => self.policy.revision(&p)?,
+            // Kind 34 (R3, R4): the active revision, an accepted open turn of
+            // this owner generation, and an ordinal with no kind 14 yet.
+            Record::PolicyDecision(p) => {
+                let (operation, generation, ordinal) = p.call();
+                let owner = self.owner_generation;
+                let op = self.operation_mut(operation, generation)?;
+                require(
+                    op.owner_generation == owner
+                        && op.helper.is_some()
+                        && ordinal as usize == op.tools.len() + 1
+                        && op.tools.iter().all(|t| !t.unresolved()),
+                )?;
+                self.policy.decision(&p)?;
+                self.active_activity(sequence);
+            }
             Record::ToolResult(p) => {
                 self.tool_result(p, frame)?;
                 self.active_activity(sequence);
@@ -1543,6 +1567,8 @@ impl Replay {
     /// validated the record alone; replay adds the operation, ordinal and cancel
     /// rules and recomputes the derived identities (TCR-O5).
     fn tool_call(&mut self, p: ToolCall, frame: Locator) -> Result<()> {
+        // R5 to R7: the call's pending kind 34, if any, is consumed.
+        self.policy.tool_call(&p)?;
         let run = p.decision == ToolDecision::Run;
         let create = if run && p.tool_operation == Some(ToolOperation::CreateNote) {
             if self.unresolved_creates().count() >= 32 {
@@ -2249,6 +2275,12 @@ impl Replay {
         self.emit(Key::new(Tag::Input, id, 0), entry)
     }
     fn terminal(&mut self, p: TurnTerminal, frame: Locator) -> Result<()> {
+        // R7: a kind 34 left without its kind 14 by a stop.
+        self.policy.terminal(
+            p.operation,
+            p.generation,
+            p.kind == TerminalKind::Interrupted,
+        )?;
         let owner = self.owner_generation;
         let piece_limit = self.piece_limit;
         let op = self.operation_mut(p.operation, p.generation)?;
@@ -2557,6 +2589,12 @@ impl Replay {
             outside
                 || (p.reason != JobReason::OutsideSandboxOff
                     && p.capture_reason != CaptureReason::ClosedAfterCancel),
+        )?;
+        // PL1: only a model job carries a constraint set, so only it can
+        // record `enforcement_mismatch`.
+        require(
+            p.reason != JobReason::EnforcementMismatch
+                || matches!(job.origin, JobOrigin::Model { .. }),
         )?;
         let job = self.jobs.remove(&p.job).ok_or(ReplayError::Corrupt)?;
         if let JobOrigin::Person { input } = job.origin {
@@ -3428,6 +3466,7 @@ pub(crate) fn tool_record(
         fault: p.fault,
         reason: p.reason,
         refusal: p.refusal,
+        policy: p.policy,
         whole_command: p.whole_command,
         form: p.form,
         arguments_bytes: p.arguments_bytes,
