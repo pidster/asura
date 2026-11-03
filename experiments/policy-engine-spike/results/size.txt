@@ -1,0 +1,8 @@
+profile size: release + strip=symbols (no LTO)
+size_baseline 680848
+size_cedar 7900528
+size_rego 2124720
+profile size with CARGO_PROFILE_SIZE_LTO=fat, codegen-units=1 (diagnostic)
+size_baseline 550976
+size_cedar 5895840
+size_rego 1692912
