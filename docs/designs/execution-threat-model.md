@@ -780,24 +780,28 @@ What changes:
   the person, kept alive by a LaunchAgent, and parses GGUF files the person adds.
 - A loopback port (8934 by default) serves inference to anyone with the key.
   Each loaded model runs in its own `llama-server` process on an ephemeral
-  loopback port **without** a key (probe P2, 2026-11-02).
+  loopback TCP port. Since the owner decision LCQ3 (2026-11-03) it needs the
+  key too (probes P22, P23); before, it had none (P2). No setting moves it to a
+  Unix socket (P19 to P21).
 - The router and its model processes run with CORS closed (LCD16, probes P13
   to P17, 2026-11-02): no web page can read their replies.
 - Every mode with a server offers project tools (owner decision LCQ1,
   2026-11-02), not only Asura's own server.
-- A key: 32 random bytes in one team Keychain item, passed to the router through
-  a pipe, and added to requests by a relay in the service.
+- A key: 32 random bytes, new at every server start, in one team Keychain item;
+  passed to the router through a pipe and in its environment as
+  `LLAMA_API_KEY`, which the router passes to its model processes; added to
+  requests by a relay in the service.
 - The helper (class B) talks to the relay with a per-helper token, not the key.
 
 | ID | Threat | Mitigation | Gap or accepted exposure |
 | --- | --- | --- | --- |
 | LT1 | A changed or planted `llama-server` runs at every login | Only the approved path starts, and only while its real path, size and SHA-256 match the record written by `asura llamacpp approve`. A mismatch refuses to start and names both digests | The libraries `llama-server` loads from its Cellar are not checked. A same-user process can rewrite the approval record or the agent file. Same-UID is one principal under D1. Accepted |
-| LT2 | The key leaks | Team Keychain item; pipe to the router (`/dev/fd/<n>`), never a file, argument, environment variable or log; the relay holds it in zeroizing memory; no class B or C process receives it | Any team-signed Asura build with the group can read the item (as SG-T1). The router holds it in memory. Accepted under D1 |
-| LT3 | A same-user process uses the model processes behind the router without the key | Loopback only; model jobs have no network ([exec_cmd](exec-cmd-tool.md)) | Measured 2026-11-02: the router passes its key to no model process, neither from `--api-key-file` nor from a `--models-preset` (P2, P14). Any same-user process can use a model process on its ephemeral port while the process lives; a sleeping process keeps its port (P18). The key protects the router port only. Accepted under D1; recorded so no claim says otherwise. llama.cpp 0.7.0 passes a key on only through `LLAMA_API_KEY` in the environment, which LCD6 forbids: owner question LCQ3 |
-| LT4 | A web page in the person's browser uses the server | The router needs the key; `--no-ui`. The serve plan passes `--cors-origins asura-no-browser-origin --no-cors-credentials --cors-methods GET --cors-headers Content-Type` (LCD16), and the router passes these to each model process (P13). Every reply names an allowed origin that no page has, without credentials (P15). Measured in Chromium 131: a page can read no reply from the router or a model process, and cannot send a JSON `POST` (P17). With llama.cpp's defaults, the same page read both (P12, P17) | A page can still send a simple request that it cannot read. The router refuses it with 401. A model process runs it: **any local web page that finds a model process's ephemeral port can make it run inference** and disturb its prompt cache, but cannot read the output (P17). The port lives from the model's first load until the router unloads it or stops (P18). Mitigations: no reply is readable, the port is ephemeral and loopback only, and only loaded models have one. Closing it needs a key on the model processes: owner question LCQ3. Llama.app's server and a person's `url` server keep their own CORS settings |
+| LT2 | The key leaks | A new key at every start (LCQ3, 2026-11-03), so a leaked key ends with the server it was made for. Team Keychain item; pipe and `LLAMA_API_KEY` to the router, never a file, argument or log (P24: the router logs arguments, not its environment); the relay holds it in zeroizing memory; no class B or C Asura process receives it | Any team-signed Asura build with the group can read the item (as SG-T1). The router and every model process hold it in memory and in their environment, which any same-user process can read while they run (`ps eww`, P24). Accepted under D1: the same processes could use the keyless model processes before LCQ3 (LT3) |
+| LT3 | A same-user process uses the model processes behind the router without the key | Since LCQ3 (2026-11-03) every model process has the start's key in its environment and refuses a request without it (P23). Loopback only; model jobs have no network ([exec_cmd](exec-cmd-tool.md)) | Measured 2026-11-03: a same-user process can read the key from the router's or a model process's environment (P24) and then use either, as it could use the keyless model processes before (P2). This exposes nothing new; the key changes at every start. `GET /health` answers without the key and runs nothing. Unix sockets do not close this: the model processes stay on TCP (P20, P21). Accepted under D1 |
+| LT4 | A web page in the person's browser uses the server | The router and every model process need the key (LCQ3, P23); `--no-ui`, which the router passes on as `--no-webui` (P25). The serve plan passes `--cors-origins asura-no-browser-origin --no-cors-credentials --cors-methods GET --cors-headers Content-Type` (LCD16), and the router passes these to each model process (P13). Every reply names an allowed origin that no page has, without credentials (P15). Measured in Chromium 131 (2026-11-02): a page can read no reply from the router or a model process, and cannot send a JSON `POST` (P17). Measured 2026-11-03 with `curl`: the P17 blind request, a keyless `text/plain` `POST` to a model process, now gets 401 (P23) | A page cannot read an environment, so it has no key. It can still send `GET /health` to a model process it finds, which answers without the key and runs no inference. The browser page of P17 was not re-run against the keyed model process; the 401 was measured with the same request from `curl`. Llama.app's server and a person's `url` server keep their own CORS and key settings |
 | LT5 | A GGUF file exploits `llama-server`'s parser | Files are added only by the person (`asura llamacpp add`); the name rule and the `GGUF` magic are checked; Asura never downloads one | `llama-server` parses the file unsandboxed as the person. A malicious file runs with the person's rights. Accepted as the person's choice, as for any program they run |
 | LT6 | The relay becomes an open door to the router | It listens on `127.0.0.1` only, for the life of one helper; each request must carry the 32-byte token (constant-time compare); four methods and paths only; 4 connections; the token is random, not derived from the key (F2) | A same-user process that reads the helper's memory can use the relay while it lives. Accepted under D1 |
-| LT7 | Another process takes the port first and impersonates the server | The relay sends the key only to `127.0.0.1:<port>`. Every route is loopback, and tools need the helper's attestation and a loopback endpoint. Every tool call the server returns is an untrusted proposal that passes the service's admission | A same-user squatter on the port receives the key, the conversation and its tool results, and can propose tool calls. Owner decision LCQ1 (2026-11-02) gives project tools to `asura`, `llama-app` and `url`. Accepted under D1 |
+| LT7 | Another process takes the port first and impersonates the server | The relay sends the key only to `127.0.0.1:<port>`. Every route is loopback, and tools need the helper's attestation and a loopback endpoint. Every tool call the server returns is an untrusted proposal that passes the service's admission. Since LCQ3 a key a squatter receives is the last start's key, which the next real router does not accept | A same-user squatter on the port receives that key, the conversation and its tool results, and can propose tool calls. A squatter that starts while the real router runs cannot bind its port; the router's model processes keep their ports and need the key. Owner decision LCQ1 (2026-11-02) gives project tools to `asura`, `llama-app` and `url`. Accepted under D1 |
 | LT8 | The LaunchAgent persists after the person stops using it | `asura llamacpp stop` boots it out and removes its file; a refusal to start exits 0 and launchd does not loop | Uninstalling `Asura.app` leaves the file in `~/Library/LaunchAgents`, which then names a missing program. The person runs `stop` first; the cask `zap` does not cover it yet |
 | LT9 | A model changes the server | The model has no tool that runs `asura llamacpp` or sets configuration; model jobs cannot write `~/.asura` or `~/Library/LaunchAgents` and have no network | `!` and `!!` are the person's commands and may run them |
 
@@ -805,9 +809,10 @@ Validation: LC-U7, LC-U10, LC-I4, LC-I5 and LC-I6 in the
 [backend design](llamacpp-backend.md#validation) cover LT1, LT2 and LT6. LC-U9
 and LC-I7 cover the LT4 mitigation: the CORS arguments in the plan, on the
 model process, and in the replies of a real router. LC-I7 also asserts the LT3
-and LT4 gap (a keyless model process answers). The browser result (P17) is a
-recorded probe, not an automated test. LT7 is a stated exposure, not a tested
-claim.
+and LT4 closure: a model process refuses a keyless request, a wrong key and the
+P17 `text/plain` chat request, and answers the start's key. LC-U15 covers the
+key replacement at every start. The browser results (P17) are recorded probes,
+not automated tests. LT7 is a stated exposure, not a tested claim.
 
 ## Design verification
 
@@ -906,4 +911,8 @@ diagram in this document changed.
 
 Recorded on 2026-11-02, later: LT3, LT4 and LT7 were revised with the CORS
 probes P13 to P18 and the owner decisions LCQ1 and LCQ2. No diagram in this
+document changed.
+
+Recorded on 2026-11-03: LT2, LT3, LT4 and LT7 were revised with the owner
+decision LCQ3 and the socket and key probes P19 to P25. No diagram in this
 document changed.

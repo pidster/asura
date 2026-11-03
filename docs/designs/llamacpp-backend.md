@@ -4,7 +4,10 @@ Status: selected design, 2026-11-02, under the owner decision below;
 **implemented 2026-11-02** (packets LC1 to LC5), with the evidence and gaps in
 [implementation evidence](#implementation-evidence-2026-11-02). **Revised
 2026-11-02** under the owner decisions LCQ1 and LCQ2 and the CORS defect fix
-([revision](#revision-2026-11-02-lcq1-lcq2-and-cors)). Protocol
+([revision](#revision-2026-11-02-lcq1-lcq2-and-cors)). **Revised 2026-11-03**
+under the owner decision LCQ3: a fresh key for every server start, in the
+router's environment, so its model processes need it too
+([revision](#revision-2026-11-03-lcq3-a-key-for-every-start)). Protocol
 numbering remains `0.1`; journal format remains `1`. The design adds a fifth
 provider, `llamacpp`, to the Swift model helper, and a `llama-server` router that
 Asura starts through a LaunchAgent. It records the probes that settled the
@@ -27,14 +30,20 @@ LaunchAgents file plus `launchctl`": Asura does not use `SMAppService`.
 What is fixed: the endpoint and request shape, the window source, the error
 mapping, the four server modes, project tools in every mode that has a server,
 the LaunchAgent file and `launchctl` as the server's supervisor, the approved
-binary, the model folder, the key path through a service-owned relay, the CORS
-settings of Asura's server, the commands and the `/status` lines.
+binary, the model folder, the key path through a service-owned relay, the key
+for every start ([LCD6](#decisions)), the TCP listener ([LCD17](#decisions)),
+the CORS settings of Asura's server, the commands and the `/status` lines.
 
-What is open: owner question LCQ3 in [owner questions](#owner-questions): pass
-the key to the router in its environment, so that its model processes need it
-too. It does not block this scope. Until it is answered, the model processes
-behind Asura's router answer without a key
-([LT3, LT4](execution-threat-model.md#llamacpp-server)).
+Owner decision (2026-11-03), LCQ3: "probe sockets first, else a throwaway key".
+If `llama-server` 0.7.0 can put the router and its model processes on Unix
+sockets, use sockets and no key in any environment. Otherwise make a fresh
+random key at each serve start, give it to the router as `LLAMA_API_KEY` so its
+model processes require it, and let the relay know it without a file, an
+argument or a log. The probes ([P19 to P25](#socket-and-key-probes-2026-11-03))
+show that the model processes always listen on TCP, so the second branch
+applies.
+
+Nothing is open in this scope.
 
 ## Scope
 
@@ -150,6 +159,34 @@ requests. Wisp's router and Llama.app were not contacted.
 | P17 | A browser page against the P15 settings | Chromium: a `fetch` of a model process's `/v1/models` and a JSON `POST` both fail (CORS); the router's `/v1/models` fails too. A `mode: "no-cors"` `text/plain` `POST` to the model process is sent and **runs inference** (the log shows one processed task, 16 prompt tokens); the page cannot read the reply. With the default settings, the same page reads the model list (200) and the JSON `POST` reply (200) |
 | P18 | Does a sleeping model process keep its port? | Yes. With `--sleep-idle-seconds 3`, the process entered its sleeping state, fell from 797 MB to 154 MB resident, and still listened on its port |
 
+#### Socket and key probes, 2026-11-03
+
+Scratch routers ran from `/private/tmp/asura-sock-*` and
+`/private/tmp/asura-envkey-probe` with the 2B model linked into a scratch
+folder, `--models-max 1 --ctx-size 4096 --parallel 1 --no-ui`, the four CORS
+arguments (LCD16) and a scratch key file, with an empty environment except
+`HOME`, `PATH` and the variable under test. Each was stopped with SIGTERM, and
+`pgrep` then found no process under its folder. The socket routers listened on
+`<root>/run/router.sock`, in a 0700 folder. `curl --unix-socket` sent the
+socket requests; `lsof -p` and `ps` inspected the router and its model
+processes. Wisp's router and Llama.app were not contacted; Wisp's processes
+were read with `ps` only.
+
+| ID | Question | Result |
+| --- | --- | --- |
+| P19 | Does the router listen on a Unix socket? | Yes. With `--host <root>/run/router.sock` the router has no TCP socket, logs `listening on unix://…/router.sock`, and answers HTTP over the socket: `GET /v1/models` 401 without the key, `GET /props?model=` 200 with it. The socket file is `srwxr-xr-x` (the umask); the 0700 folder keeps other accounts out, but not the same user |
+| P20 | Do its model processes use sockets too? | No. The model process is started with `--host 127.0.0.1 --port <ephemeral>`, listens on that TCP port, and answers `GET /v1/models` with 200 without a key. It also holds an inherited descriptor of the router's socket |
+| P21 | Can configuration move the model processes to a socket? | No. `host = <path>.sock` in a `--models-preset` `[*]` section is dropped, and `LLAMA_ARG_HOST=<path>.sock` in the router's environment is overridden by the `--host 127.0.0.1` argument the router gives each model process. Both still listen on TCP |
+| P22 | Which key does the router accept when it has a key file (K1) and `LLAMA_API_KEY` (K2)? | Both, on its own routes: `GET /v1/models` 200 with K1 or K2, 401 without a key. On the routes it passes to a model process, it passes the client's `Authorization` header on: `GET /props?model=` and `POST /v1/chat/completions` get 401 with K1 and 200 with K2. With K2 alone (no key file), the router accepts K2 only. So the relay must send the environment key |
+| P23 | Does a model process then refuse requests without the key? | Yes. Its environment holds `LLAMA_API_KEY` (P14). `GET /v1/models`: 401 without a key, 401 with K1, 200 with K2. The P17 request, a `text/plain` `POST /v1/chat/completions` without a key, gets 401 and runs nothing. `GET /health` answers 200 without a key; it runs no inference |
+| P24 | Who can read the environment key? | `ps eww` run as the same user shows `LLAMA_API_KEY=` in the router's and the model process's environment. The router's log holds neither key; it logs each model process's arguments, not its environment |
+| P25 | Does `--no-ui` reach the model processes? | Yes. The router logs "The UI is disabled", starts each model process with `--no-webui`, and the model process logs "The UI is disabled" too. Wisp's model process (read with `ps` only) shows the same `--no-webui`. The serve plan has passed `--no-ui` since LC3 |
+
+The relay was not run over a socket. HTTP over the socket worked with `curl`
+(P19), and a Rust `UnixStream` is a stream socket like TCP, but no Rust code
+was measured. The question did not decide anything: the model processes stay
+on TCP whatever the router uses (P20, P21).
+
 ## Decisions
 
 | ID | Decision | Evidence or reason |
@@ -159,7 +196,7 @@ requests. Wisp's router and Llama.app were not contacted.
 | LCD3 | Tool call IDs in requests are positional: `call` and five digits, numbered over the whole message list (`call00001` first). Each tool message names the ID of its call. Earlier messages stay byte-stable, so the prefix cache holds (CC4 Q5). The provider's own ID never leaves the helper | P4, P8; Wisp: Mistral templates need nine letters and digits |
 | LCD4 | Thinking: a template that names `enable_thinking` gives the controls off and on; `supports_reasoning_effort` adds low, medium and high. Off sends `enable_thinking: false`; on sends `true`; a level sends `true` and `reasoning_effort`. Thinking text is never sent back (CC4 Q3) | P6 |
 | LCD5 | Asura's server is a LaunchAgent, `org.pidster.asura.llamacpp`, not a child of the per-user service | [Server owner](#server-owner) |
-| LCD6 | The key is 32 random bytes as 64 hex digits in one team Keychain item. The serve step passes it to `llama-server` through a pipe, `--api-key-file /dev/fd/<n>`. It is never in a file, an argument or the environment | P1; [key](#the-key) |
+| LCD6 | A fresh key for every server start: 32 random bytes as 64 hex digits. The serve step writes it into the one team Keychain item, replacing the last start's key, then gives it to `llama-server` in the environment as `LLAMA_API_KEY`, so the router and every model process require it, and through a pipe, `--api-key-file /dev/fd/<n>`, so the router stays keyed if a later llama.cpp stops reading the variable. The relay reads the item for each turn. The key is never in a file, an argument or a log. Same-user processes can read it from the environment while the server runs | Owner decision LCQ3, 2026-11-03; P1, P14, P22–P24; [key](#the-key) |
 | LCD7 | A service-owned loopback relay adds the key. The helper sends a per-helper relay token, never the key | [key path](#key-path-to-requests) |
 | LCD8 | The binary is a path the person approves with `asura llamacpp approve PATH`; the record holds the path, its real path, size and SHA-256. The serve step checks it before every start. The first `llama-server` on `PATH` is never used | Wisp ADR 0082 decision 5 |
 | LCD9 | The model folder is `~/.asura/data/models/llamacpp/`, holding links `<name>.gguf` to GGUF files the person adds | Wisp; [model folder](#model-folder) |
@@ -170,6 +207,7 @@ requests. Wisp's router and Llama.app were not contacted.
 | LCD14 | `KeepAlive` is `{SuccessfulExit: false}` with `RunAtLoad` and a `ThrottleInterval` of 30 s. A refusal to start exits 0, so launchd does not loop on it | Wisp trial |
 | LCD15 | `asura llamacpp start` writes `~/Library/LaunchAgents/org.pidster.asura.llamacpp.plist` and loads it with `launchctl bootstrap gui/<uid>`; `stop` boots it out and removes the file. Setting the mode does not register anything. `SMAppService` is not used | Explicit person action; owner decision LCQ2, 2026-11-02 |
 | LCD16 | The serve plan closes CORS: `--cors-origins asura-no-browser-origin --no-cors-credentials --cors-methods GET --cors-headers Content-Type`. The origin value is not a valid serialised origin, so no page's origin can equal it and no browser can read a reply. The relay sends no `Origin` and needs no CORS | P13, P15–P17; [CORS settings](#cors-settings) |
+| LCD17 | The router listens on TCP `127.0.0.1:<port>`, not on a Unix socket. A socket would move the router only: its model processes listen on TCP whatever the router uses, and no setting moves them (P19–P21). The key on the model processes (LCD6) closes the gap instead | Owner decision LCQ3, 2026-11-03; P19–P21 |
 
 ## Ownership
 
@@ -180,9 +218,9 @@ requests. Wisp's router and Llama.app were not contacted.
 | Hello field `endpoint_token`, context source 5 | Model schema, `asura-control::model`, `Wire.swift` | Schema change within `0.1` |
 | Configuration keys `providers.llamacpp.*` | `asura-storage::config` | New keys and snapshot fields |
 | Approval record, model folder links, GGUF and name rules, log rotation | New `asura-storage::llamacpp` | New |
-| Server plan (arguments), pipe key, signal reset, `execve` | New `asura-platform::llamacpp` | New; the platform owns process start and signals |
+| Server plan (arguments, environment key), pipe key, signal reset, `execve` | New `asura-platform::llamacpp` | New; the platform owns process start and signals |
 | LaunchAgent file and `launchctl` calls | `asura-platform::llamacpp` | New; behind a runner the tests replace |
-| Server key item | `asura-platform::keychain` | New item kind beside input and named items |
+| Server key item, replaced at every start | `asura-platform::keychain` | New item kind beside input and named items |
 | Server key reads in the service | Secret store worker | New request `GetServerKey` |
 | Turn preparation by mode; relay lifetime | Conversation owner and `ModelOwner` | New branch |
 | Relay | New `asura-service::llamacpp` | New thread per conversation helper |
@@ -222,15 +260,16 @@ flowchart TB
     KC[("Team Keychain item")]
     CLI -->|"plist, bootstrap"| LD
     LD -->|"start at load and after a crash"| Serve
-    Serve -->|"read"| KC
-    Serve -->|"execve with key pipe"| Router
-    Router -->|"spawn per model, CORS arguments passed on"| ModelP
+    Serve -->|"write a fresh key"| KC
+    Serve -->|"execve: key pipe and LLAMA_API_KEY"| Router
+    Router -->|"spawn per model: CORS arguments and LLAMA_API_KEY passed on"| ModelP
     ModelP -.->|"read GGUF"| Files
     Conv -->|"Hello: relay URL and token"| Back
     Back -->|"HTTP with token"| Relay
     Conv -->|"GetServerKey"| Store
     Store -.->|"key"| Relay
     Relay -->|"HTTP with key"| Router
+    Router -->|"request with the client's key"| ModelP
     Obs -.->|"health, folder, approval"| Router
     TUI -->|"control socket"| Conv
 ```
@@ -397,7 +436,7 @@ stateDiagram-v2
     Loaded --> Checking: launchd runs asura llamacpp serve
     Checking --> Refused: mode not asura, approval missing or changed, no models, key unavailable
     Refused --> Loaded: serve exits 0, launchd waits
-    Checking --> Running: execve llama-server with key pipe
+    Checking --> Running: fresh key stored, execve llama-server with the key
     Running --> Sleeping: no request for idle seconds
     Sleeping --> Running: request wakes the model
     Running --> Checking: crash, SIGKILL or nonzero exit, after ThrottleInterval
@@ -429,12 +468,12 @@ flowchart TD
     Bin -->|No| R3["Refuse: server_changed, both digests' first 12 digits"]
     Bin -->|Yes| Models{"Folder holds at least one valid link?"}
     Models -->|No| R4["Refuse: no_models"]
-    Models -->|Yes| Key{"Keychain item: read, or add once"}
+    Models -->|Yes| Key{"Make a fresh key; replace the Keychain item (update, or add)"}
     Key -->|"not_signed or unavailable"| R5["Refuse: key_unavailable"]
-    Key -->|Ready| Log["Open the log; rotate past 8 MiB"]
+    Key -->|Stored| Log["Open the log; rotate past 8 MiB"]
     Log --> Pipe["Write the key to a pipe; close the write end"]
     Pipe --> Sig["Unblock every signal; default dispositions"]
-    Sig --> Exec["execve llama-server: CORS closed, LLAMA_* removed"]
+    Sig --> Exec["execve llama-server: LLAMA_* removed, then LLAMA_API_KEY set; CORS closed"]
 ```
 
 ### Server settings
@@ -452,7 +491,10 @@ llama-server --models-dir <home>/.asura/data/models/llamacpp
 
 `idleSeconds` 0 omits `--sleep-idle-seconds` (never sleeps). Every environment
 variable whose name starts with `LLAMA_` is removed, so none can change the host,
-port or key.
+port or key. Then `LLAMA_API_KEY` is set to the start's key ([LCD6](#decisions)),
+the only `LLAMA_*` variable the server receives. The router passes its
+environment to each model process (P14), and passes `--no-ui` on as
+`--no-webui` (P25).
 
 | Key | Default | Range | Cost (Wisp measurements, 9B Bonsai) |
 | --- | --- | --- | --- |
@@ -480,23 +522,24 @@ values llama.cpp 0.7.0 accepts:
 The router passes these four arguments to each model process it starts (P13),
 so the model processes on their ephemeral ports withhold replies from pages too.
 The values are fixed in the plan; configuration cannot change them. Every
-`LLAMA_*` variable, including `LLAMA_ARG_CORS_*` and `LLAMA_API_KEY`, is removed
-from the environment.
+inherited `LLAMA_*` variable, including `LLAMA_ARG_CORS_*` and an inherited
+`LLAMA_API_KEY`, is removed from the environment; the serve step then sets
+`LLAMA_API_KEY` to the start's own key (LCD6).
 
-What CORS does not close (P17, P18):
+What CORS does not close (P17, P18), and how the key closes it (P23):
 
 - A page can still send a simple request (`GET`, or `POST` with a `text/plain`
-  body) without reading its reply. The router refuses it with 401. A model
-  process has no key and runs it. The page can make the Mac run inference and
-  can disturb the model's prompt cache, but it cannot read the output. To reach
-  a model process, the page must find its ephemeral port, for example by trying
-  ports. A model process keeps its port from its first load until the router
-  unloads it or stops, asleep or not.
-- Same-user processes can use the model processes without the key (LT3).
-
-Both gaps need a key on the model processes. llama.cpp 0.7.0 passes a key to
-them only through the environment (P14), which [LCD6](#decisions) forbids. That
-is owner question LCQ3.
+  body) without reading its reply. Before 2026-11-03 a model process had no key
+  and ran it (P17). Since LCQ3 every model process has the start's key in its
+  environment and refuses the request with 401, as the router does (P23). The
+  page can still reach `GET /health` on a model process, which runs no
+  inference. To reach a model process at all, the page must find its ephemeral
+  port; a model process keeps its port from its first load until the router
+  unloads it or stops, asleep or not (P18).
+- Same-user processes can read the key from the router's or a model process's
+  environment while the server runs (P24), and then use either. Before LCQ3 they
+  could use the model processes without any key, so this exposes nothing new
+  (LT3). The key changes at every start.
 
 The serve plan does not change servers that Asura does not start. Llama.app's
 server and a person's `url` server keep their own CORS settings.
@@ -541,21 +584,61 @@ folder is not read by the backend.
 
 ### The key
 
-The serve step reads one team Keychain item: service `org.pidster.asura.llamacpp`,
+Selected (LCD6, owner decision LCQ3, 2026-11-03): a fresh key for every server
+start.
+
+The key lives in one team Keychain item: service `org.pidster.asura.llamacpp`,
 account `server-key`, data-protection keychain, Asura access group,
 `AfterFirstUnlockThisDeviceOnly`, not synchronizable, user interaction off — the
 [team Keychain store](release-signing.md#item-contract-changes) contract with
-its own service name. If the item is absent, the serve step creates 32 random
-bytes, encodes them as 64 lower-case hex digits and adds the item once; a
-duplicate from a race is read again. An unsigned or ad hoc build reports
-`not_signed` and refuses to start (`key_unavailable`), so Asura's own server
-needs a signed build.
+its own service name. The item holds the key of the latest start. At every
+start the serve step makes 32 new random bytes, encodes them as 64 lower-case
+hex digits and replaces the item's data with `SecItemUpdate`; if the item is
+absent it adds it, and if an add races with another and finds a duplicate, it
+updates once more. An unsigned or ad hoc build reports `not_signed` and refuses
+to start (`key_unavailable`), so Asura's own server needs a signed build. A
+failed write refuses to start too: the server never runs with a key the relay
+cannot read.
 
-The key reaches `llama-server` through a pipe (P1). The serve step writes the
-65 bytes (key and newline) into the pipe, which is below `PIPE_BUF`, so the
-write cannot block; closes the write end; clears close-on-exec on the read end;
-and passes `--api-key-file /dev/fd/<n>`. The key never appears in a file, an
-argument, the environment or a log.
+The key then reaches `llama-server` in two ways:
+
+1. **The environment.** `LLAMA_API_KEY=<key>`, after every inherited `LLAMA_*`
+   variable is removed. The router passes its environment to each model
+   process it starts, so every model process requires the key (P14, P23).
+   llama.cpp 0.7.0 has no other way to give a model process a key (P14), and
+   no way to move a model process off TCP (P20, P21).
+2. **A pipe**, as before (P1). The serve step writes the 65 bytes (key and
+   newline) into the pipe, which is below `PIPE_BUF`, so the write cannot
+   block; closes the write end; clears close-on-exec on the read end; and
+   passes `--api-key-file /dev/fd/<n>`. The router reads the same key from
+   both; the pipe keeps the router keyed if a later llama.cpp stops reading
+   the variable.
+
+The key never appears in a file, an argument or a log (P24: the router logs a
+model process's arguments, not its environment).
+
+How the serve step and the service share it. launchd runs the serve step; the
+service never starts, stops or talks to it (LCD5). The owner's example, "the
+service generates it and passes it to serve through the same pipe as today",
+assumes a channel that does not exist, so the existing channel is kept: the
+serve step writes the item, and the secret store worker reads it
+(`GetServerKey`) when a turn prepares its relay. No file, argument or log is
+added.
+
+What the environment exposes. Any process of the same user can read another
+process's environment while it runs (`ps eww`, P24), so a same-user process can
+read the key from the router or a model process and then use either. This
+exposes nothing new: before LCQ3 the same process could use the model
+processes with no key at all (LT3). What it closes: a web page cannot read an
+environment, so the blind requests of P17 now get 401 (LT4). A key read from an
+environment is useless after the next start, and a key a squatter on the port
+receives from the relay (LT7) is useless to the next real router.
+
+A turn reads the item when it prepares its relay. If the router restarts after
+that read, the next request through the relay gets 401 and the turn fails as
+for a refused key (`model_unavailable` at Hello, `internal_error` during a
+request). The next turn reads the new key. A turn in flight when the router
+restarts fails the same way already.
 
 #### Key path to requests
 
@@ -794,7 +877,9 @@ llama.cpp binary: approved; 3 models; LaunchAgent file present
 | Key unavailable (unsigned build, locked before first unlock) | Serve refuses; turns fail `llamacpp_key_unavailable` |
 | Relay port bind fails | Turn held with `model_unavailable` |
 | Model process killed | The router restarts it on the next request |
-| Router killed | launchd restarts it after at most 30 s; a request in flight fails `internal_error` |
+| Router killed | launchd restarts it after at most 30 s with a new key; a request in flight fails `internal_error` |
+| Router restarted after a turn read the key | The relay's requests get 401: `model_unavailable` at Hello, `internal_error` during a request. The next turn reads the new key |
+| Keychain item cannot be written at start | Serve refuses with `key_unavailable`; the server does not start |
 | Model load slow | The request waits until reply, cancel, helper exit or shutdown |
 | Window full or prompt above it | `context_limit` |
 
@@ -809,15 +894,18 @@ Summary:
 
 - The server is a program Asura did not build, outside every sandbox, kept
   alive by launchd. Only an approved binary with the recorded digest starts.
-- The key is in the team Keychain, reaches the server through a pipe and
-  reaches requests through the class A relay. No class B or C process holds it.
+- The key is new at every start (LCQ3). It is in the team Keychain, reaches the
+  router through a pipe and its environment, and reaches requests through the
+  class A relay. No class B or C Asura process holds it. The router and its
+  model processes hold it in their environment, where same-user processes can
+  read it (P24); before LCQ3 those processes could use the model processes
+  without any key.
 - The router port is loopback only and needs the key. Model processes behind it
-  listen on ephemeral loopback ports without a key (P2): any same-user process
-  can use them. Under D1 same-user processes are one principal; model jobs have
-  no network.
+  listen on ephemeral loopback ports and need the key too (P23). Under D1
+  same-user processes are one principal; model jobs have no network.
 - The serve plan closes CORS on the router and its model processes (LCD16), so
-  no web page can read a reply. A page can still make a model process run
-  inference blind (P17). LCQ3 asks whether to close that with an environment key.
+  no web page can read a reply, and the key refuses a page's blind requests
+  (P23). Unix sockets would not help: the model processes stay on TCP (LCD17).
 - Every mode with a server offers project tools (LCQ1). A same-user process that
   serves the configured port receives the conversation and its tool results
   (LT7, accepted under D1). Its tool calls still pass the service's admission.
@@ -829,7 +917,7 @@ Summary:
 | Rule | Application |
 | --- | --- |
 | AE-01 | The relay runs on its own thread; the reactor only binds it and passes the key. The status sample runs on the sampler thread. Discovery and requests are cancellable `URLSession` tasks in the helper |
-| AE-02 | Blocking calls: the relay's sockets (nonblocking, `poll`), the Keychain read (secret store worker; in the serve step, the one-shot CLI process), file hashing (CLI command, sampler thread), `launchctl` (CLI child process) |
+| AE-02 | Blocking calls: the relay's sockets (nonblocking, `poll`), the Keychain read (secret store worker), the Keychain write at start (the one-shot serve process, before `execve`), file hashing (CLI command, sampler thread), `launchctl` (CLI child process) |
 | AE-03 | Relay: 4 connections, 16 KiB head, 64 KiB per direction, one per helper. Helper: 65,536-byte SSE line, 1 MiB discovery, 65,536-byte call arguments, 201 calls. Folder: 64 links. Secret store queue: 16 |
 | AE-04 | Every wait ends on its reply, error, cancel, helper exit or shutdown. The relay's key wait ends on the key, the refusal or stop. Stop, the key and the refusal wake the relay's `poll` through a wake pair; its 60 s interval is pacing and ends nothing. No timeout is added |
 | AE-05 | No retry. A relay connection carries one request (`Connection: close`). Requests are idempotent reads except chat, whose outcome on a cut connection is unknown and is never retried |
@@ -850,12 +938,13 @@ Summary:
 | LC-U6 | Config keys: values, ranges, unset, YAML, snapshot | Rust storage |
 | LC-U7 | Approval: Mach-O magic, size, changed digest, missing path | Rust storage |
 | LC-U8 | Folder: name rule, GGUF magic, clash, 64-link bound, broken link listing | Rust storage |
-| LC-U9 | Server plan: arguments from settings, idle 0, the four fixed CORS arguments (LCD16), `LLAMA_*` removal including `LLAMA_ARG_CORS_*` and `LLAMA_API_KEY`; plist text | Rust platform |
+| LC-U9 | Server plan: arguments from settings, idle 0, `--no-ui`, the four fixed CORS arguments (LCD16), `LLAMA_*` removal including `LLAMA_ARG_CORS_*` and an inherited `LLAMA_API_KEY`, then `LLAMA_API_KEY` set to the start's key only (LCD6), a malformed key refused; plist text | Rust platform |
 | LC-U10 | Relay head parsing: token compare, paths, header rewrite, refusals | Rust service |
 | LC-U11 | Mode resolution at preparation: each hold reason. Tool permission for `llamacpp:` in every mode needs the helper's attestation and a loopback endpoint (LCD12) | Rust service |
 | LC-U12 | Hello validation: source 5 only for `llamacpp:`, token only from the service, 32 bytes | Rust control, Swift wire |
 | LC-U13 | `/status` lines for each field | Rust TUI |
 | LC-U14 | CLI argument parsing for every subcommand | Rust CLI |
+| LC-U15 | Server key replacement (LCD6): update in place; absent then added; a racing duplicate then updated; failures mapped; no call for an empty or oversized key | Rust platform, recording fixture |
 
 ### Integration
 
@@ -865,8 +954,8 @@ Summary:
 | LC-I2 | Stage B through the helper: request 1 returns calls with positional IDs; request 2 carries the continuation; earlier messages byte-stable | Swift, loopback fixture |
 | LC-I3 | Token header sent when Hello carries one | Swift, loopback fixture |
 | LC-I4 | Relay against a fake upstream: key injected, token refused, path refused, key pending then ready, key refused (503), connection bound, stop closes connections, a stalled upstream leaves the stop path responsive | Rust, loopback fixture |
-| LC-I5 | Serve plan through the test-only launch path: the real `llama-server` in a scratch home with a pipe key; 401 without the key; SIGTERM stops router and model | Rust, real `llama-server`, scratch home |
-| LC-I7 | CORS on the real router (LCD16). After a model loads, the model process command line holds the four CORS arguments and no key. On the router and on the model process, a preflight and a simple `GET` from `Origin: http://evil.example` get no `Access-Control-Allow-Origin` equal to that origin and no `Access-Control-Allow-Credentials: true`. The model process still answers a keyless `GET` with 200: the LCQ3 gap, asserted so that a llama.cpp change shows up | Rust, real `llama-server`, scratch home |
+| LC-I5 | Serve plan through the test-only launch path: the real `llama-server` in a scratch home with a fresh key; 401 without the key; the key in no argument, and in the environment as `LLAMA_API_KEY`; SIGTERM stops router and model | Rust, real `llama-server`, scratch home |
+| LC-I7 | CORS and the key on the real router (LCD6, LCD16). After a model loads, the model process command line holds the four CORS arguments and `--no-webui`, and no key; its environment holds `LLAMA_API_KEY`. On the router and on the model process, a preflight and a simple `GET` from `Origin: http://evil.example` get no `Access-Control-Allow-Origin` equal to that origin and no `Access-Control-Allow-Credentials: true`. The model process refuses a keyless `GET /v1/models`, a wrong key and a keyless `text/plain` chat `POST` (the P17 request) with 401, and answers the start's key with 200 | Rust, real `llama-server`, scratch home |
 | LC-I6 | Relay against the real router: a chat request through the relay succeeds with the key the relay holds | Rust, real `llama-server` |
 
 ### Native and end-to-end
@@ -889,9 +978,13 @@ across login. These are owner checks on a signed build.
 
 ## Owner questions
 
-| ID | Question | Default until answered |
+None open in this scope.
+
+Answered by the owner on 2026-11-03:
+
+| ID | Question | Decision |
 | --- | --- | --- |
-| LCQ3 | Pass the server key to the router in `LLAMA_API_KEY`, so that its model processes need it too (P14)? This closes blind web-page inference (P17) and same-user use of the model processes (LT3). It breaks LCD6: any same-user process can read a process environment (`ps eww`), whereas the Keychain item is limited to Asura's access group | No. The key stays in the pipe, the model processes answer without a key, and the gap is recorded in LT3 and LT4 |
+| LCQ3 | Pass a key to the router in `LLAMA_API_KEY`, so that its model processes need it too (P14)? | "Probe sockets first, else a throwaway key": sockets if the router and its model processes can all use them; otherwise a fresh key at every start in the router's environment, known to the relay without a file, an argument or a log. The model processes stay on TCP (P20, P21), so the key applies ([LCD6](#decisions), [LCD17](#decisions)) |
 
 Answered by the owner on 2026-11-02:
 
@@ -980,3 +1073,21 @@ team-signed build's Keychain item, as before); the LaunchAgent under the
 person's launchd; Safari and other browsers against the CORS settings; and
 Chrome's local network access prompts for public pages, which Asura does not
 rely on.
+
+### Revision, 2026-11-03: LCQ3, a key for every start
+
+Selected design changes under the owner decision LCQ3, in the order they are
+delivered:
+
+| Change | Design | Code owner |
+| --- | --- | --- |
+| Probes P19 to P25: sockets move the router only; the environment key closes the model processes | [Socket and key probes](#socket-and-key-probes-2026-11-03) | None |
+| A fresh key at every start, written to the Keychain item, given to the router in `LLAMA_API_KEY` and the pipe | [LCD6](#decisions), [the key](#the-key), [LC-F3](#lc-f3-serve-start-checks) | `asura-platform::keychain::Keychain::put_server_key`; `asura-platform::llamacpp` `environment` and the launch command; `asura-cli::llamacpp_cli::serve` |
+| The router stays on TCP | [LCD17](#decisions) | No code change |
+| `--no-ui` reaches the model processes | P25 | No code change; LC-I7 asserts `--no-webui` |
+| The relay and the service's key read | [Key path to requests](#key-path-to-requests) | No code change: the relay already reads the item for each turn |
+
+The threat model's [LT2, LT3, LT4 and LT7](execution-threat-model.md#llamacpp-server)
+and [ADR-0012](../decisions/0012-llamacpp-server-launchagent.md) are revised with
+it. Its evidence follows in [LCQ3 evidence](#lcq3-evidence-2026-11-03).
+
