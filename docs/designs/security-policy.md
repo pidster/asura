@@ -2282,6 +2282,26 @@ builds have neither the text nor the check. PL-I3 and PL-E2 use it.
 | PL-E2 | PTY journey with the test-only denying set: the model receives the policy denial text, and the TUI shows it |
 | PL-B1 to PL-B5 | `policy-bench` in `asura-policy` (PL-B1, PL-B4, the PL-B5 fuzz and determinism parts), a service-level bench (PL-B2), stripped release sizes (PL-B3). PL-B5 proof budgets (PES-M15 to M18) need the solver and move to PL3 |
 
+### Principal entity cache
+
+Selected, 2026-11-03 (owner decision on the PL-B1 and PL-B2 misses: cache,
+re-measure, then merge). Each worker's engine keeps a cache of the built
+entities of each principal: the `Job`, `Project` and `Task` entities, and
+the `Path` entities of the principal's paths (project root, scratch, cache
+roots, developer directory) with their ancestors. A request then builds only
+its own part: the resource entity, its path and the ancestors that the
+principal part lacks.
+
+| Item | Rule |
+| --- | --- |
+| Key | SHA-256 over the revision digest, the schema digest and every principal field (job, origin, profile, project, project root, task, scratch, cache roots, developer directory, each path with its attributes) |
+| Contents | The principal entities, schema-checked once when built (`Entities::from_entities` with the schema), and the principal path attributes |
+| Per request | The W1 bounds are computed over the whole request as before. The resource entities are added with `add_entities` and the schema, so every entity of the request is schema-checked (W2 unchanged). The context and the `Request` are built with the schema for every request. The context changes per request (`now`, intent), so no context part is cached |
+| Exactness | If a resource-side path names a principal path, or an ancestor of one, with other attributes, the request is built without the cache, exactly as before. A decision with the cache equals the decision without it |
+| Bounds | At most 64 entries per worker. An entry's size is bounded by W1 (at most 16 KiB of encoded request); the cache charges each entry its encoded size and holds at most 64 × 16 KiB = 1 MiB per worker. The oldest entry is evicted first |
+| Invalidation | The cache belongs to one engine, which is built for one revision and one schema: an activation, a revocation or a schema change installs a new engine on every worker, so the old cache is dropped with the old engine. The key also holds the revision and schema digests, and `Engine::invalidate_principal_cache` clears it explicitly |
+| Source of truth | The cache is derived from the revision texts and the request. It is rebuilt on restart and never journaled |
+
 ### PL1 delivery record
 
 Verified, 2026-11-03, on the reference Mac (Apple M4 Max, 16 cores,
