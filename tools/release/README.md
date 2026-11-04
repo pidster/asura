@@ -15,7 +15,7 @@ profile.
 | --- | --- |
 | `asura-bundle` | The package script: `--ad-hoc` (dry run), `--development` or `--release` |
 | `asura-release` | Release promotion checks and the cask (SG4, SG6): `preflight`, `check` (the DMG), `cask`, `tap-test` (a local cask tap), `verify-release`. It never publishes |
-| `host-paths` | The SG4-O1 scanner: reports any file that holds the account home, the repository path or the user name as a path component. `asura-bundle` and `asura-release check` run it |
+| `host-paths` | The SG4-O1 scanner: reports any file that holds the account home, the repository path, the user name as a path component or the Mac's host name (F6). `asura-bundle`, `asura-release check` and the solver build run it |
 | `asura.rb.in` | The Homebrew cask template for `pidster/homebrew-tap` (`Casks/asura.rb`) |
 | `dmg-readme.txt.in` | `README.txt` on the DMG volume; `@VERSION@` is the `asura-cli` version |
 | `test-asura-bundle` | Checks: `--static` (tracked files and refusals), `--bundle APP` (an ad hoc bundle), `--sandbox APP` (the helper App Sandbox with an ad hoc bundle, SG-V5) |
@@ -116,6 +116,10 @@ to fixed names for its own two builds
 - `swift build`: `-ffile-prefix-map` (C and C++) and `-file-prefix-map`
   (Swift) map the repository to `/asura`, and a `--swift-scratch` outside it
   to `/swiftpm`; `-Xlinker -S` leaves out the debug map.
+
+The scanner also counts the Mac's host names (`scutil --get LocalHostName`,
+`scutil --get ComputerName` and `uname -n`, in any ASCII case). A Mac whose
+name is a common word fails every scan; rename the Mac.
 
 After assembly, and before any signature, `host-paths` scans every file of
 `Asura.app`; a hit stops the script at `assembly`. It scans the DMG staging

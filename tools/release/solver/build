@@ -9,7 +9,9 @@
 # sandbox-exec with (deny network*): GMP 6.3.0 shared, then cvc5 1.3.1
 # --static --no-poly against it. The package is DIR/solver: MacOS/cvc5,
 # Frameworks/libgmp.10.dylib, licenses/ and manifest.json, signed ad hoc.
-# Exit 0: package built and checks BC1 to BC9 passed. Exit 1: a stage failed
+# F6: every step runs with SOURCE_DATE_EPOCH from the lock, and the locked
+# patches in patches/ make CaDiCaL record a fixed host value.
+# Exit 0: package built and checks BC1 to BC10 passed. Exit 1: a stage failed
 # (one "solver-build: STAGE: reason" line). Exit 2: a usage error, before any
 # file is written. No step has a time limit; the operator's interrupt ends a
 # run, and the next run removes DIR/work and starts again.
@@ -63,13 +65,14 @@ preflight() {
     [ "$(uname -m)" = arm64 ] || fail 'arm64 is required'
     major=$(sw_vers -productVersion | cut -d. -f1)
     [ "$major" -ge 27 ] || fail "macOS 27 or later is required (found $(sw_vers -productVersion))"
-    for tool in clang clang++ make m4 curl shasum tar unzip otool install_name_tool codesign sandbox-exec python3; do
+    for tool in clang clang++ make m4 curl shasum tar unzip otool install_name_tool codesign sandbox-exec python3 patch; do
         [ -x "/usr/bin/$tool" ] || fail "/usr/bin/$tool is missing"
     done
     [ -x /usr/sbin/sysctl ] || fail '/usr/sbin/sysctl is missing'
     [ -x "$root/tools/release/host-paths" ] || fail 'tools/release/host-paths is missing'
     [ -f "$lock" ] || fail "no lock file: $lock"
     "$helper" validate "$lock" || fail 'the lock file is invalid'
+    "$helper" verify-patches "$lock" "$here/patches" || fail 'a patch does not match the lock'
     [ ! -e "$out" ] || fail "$out exists; remove it or choose another scratch directory"
 }
 
@@ -106,7 +109,7 @@ fetch() {
 # ---------------------------------------------------------------- offline stages
 benv() {
     env -i PATH="$work/venv/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$work/home" TMPDIR="$work/tmp" \
-        LANG=C LC_ALL=C MACOSX_DEPLOYMENT_TARGET="$target" "$@"
+        LANG=C LC_ALL=C MACOSX_DEPLOYMENT_TARGET="$target" SOURCE_DATE_EPOCH="$epoch" "$@"
 }
 logged() {
     log=$work/logs/$1.log
@@ -122,6 +125,10 @@ verify_cache() {
     "$helper" entries "$lock" source dependency build-tool | while IFS='	' read -r name file url bytes sha top version; do
         "$helper" verify "$cache/$file" "$bytes" "$sha" || fail "$file does not match the lock"
     done
+    "$helper" verify-patches "$lock" "$here/patches" || fail 'a patch does not match the lock'
+}
+patch_file() { # ENTRY -> the copied patch for that entry, verified in unpack
+    "$helper" patches "$lock" | awk -F '	' -v e="$1" -v d="$work/patches" '$2 == e { print d "/" $1 }'
 }
 
 unpack() {
@@ -132,6 +139,19 @@ unpack() {
         tar -xf "$cache/$file" -C "$work/src/$name" || fail "$file: extraction failed"
         [ -d "$work/src/$name/$top" ] || fail "$file: no $top"
     done
+    # F6: the source date is the cvc5 archive's own newest member time.
+    newest=$("$helper" newest-mtime "$cache/$(entry_field cvc5 2)") || fail 'cannot read the cvc5 member times'
+    [ "$newest" = "$epoch" ] || fail "F6: the cvc5 archive's newest member time is $newest, the lock says $epoch"
+    # The build uses copies of the patches, verified after the copy.
+    mkdir "$work/patches"
+    "$helper" patches "$lock" | while IFS='	' read -r pfile pentry psha; do
+        cp "$here/patches/$pfile" "$work/patches/$pfile"
+    done
+    "$helper" verify-patches "$lock" "$work/patches" || fail 'a copied patch does not match the lock'
+    p=$(patch_file cvc5)
+    [ -n "$p" ] || fail 'the lock names no cvc5 patch'
+    (cd "$work/src/cvc5/$(entry_field cvc5 6)" && logged cvc5-patch /usr/bin/patch -p1 -t -N -F 0 -V none -i "$p")
+    note "F6: source date $epoch; cvc5 patched ($(basename -- "$p"))"
 }
 
 tools() {
@@ -198,15 +218,26 @@ cvc5() {
     # and accept them by their own URL_HASH; the sandbox denies any download.
     mkdir -p "$build/deps/src/CaDiCaL-EP" "$build/deps/src/SymFPU-EP"
     cp "$cache/$(entry_field cadical 2)" "$cache/$(entry_field symfpu 2)" "$build/deps/src/"
+    # F6: the patched FindCaDiCaL.cmake applies this as CaDiCaL's PATCH_COMMAND.
+    cadical_patch=$(patch_file cadical)
+    [ -n "$cadical_patch" ] || fail 'the lock names no cadical patch'
+    cadical_date="$(date -u -r "$epoch" | sed -e 's,  *, ,g') $(uname -s) asura-build $(uname -rm)"
     maps="-ffile-prefix-map=$dir=/solver -fdebug-prefix-map=$dir=/solver"
     (cd "$src" && logged cvc5-configure benv CC=/usr/bin/clang CXX=/usr/bin/clang++ \
         CFLAGS="$maps" CXXFLAGS="$maps" LDFLAGS="-Wl,-S -Wl,-rpath,@executable_path/../Frameworks" \
         ./configure.sh production --static --no-poly --no-pyvenv --no-auto-download \
         --dep-path="$gmp" --prefix="$prefix" --name="$build" \
         -DGMP_LIBRARIES="$gmp/lib/libgmp.10.dylib" -DGMPXX_LIBRARIES="$gmp/lib/libgmpxx.4.dylib" \
+        -DASURA_CADICAL_PATCH="$cadical_patch" \
         '-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local;/opt/local')
     logged cvc5-make benv make -C "$build" -j "$jobs"
     logged cvc5-install benv make -C "$build" install
+    # F6: CaDiCaL's build header records the locked date and the fixed host.
+    header=$build/deps/src/CaDiCaL-EP/build/build.hpp
+    [ -f "$header" ] || fail "F6: no CaDiCaL build header at $header"
+    got=$(sed -n 's/^#define DATE "\(.*\)"$/\1/p' "$header")
+    [ "$got" = "$cadical_date" ] || fail "F6: CaDiCaL records DATE '$got', expected '$cadical_date'"
+    note "F6: CaDiCaL DATE '$got'"
     for ep in CaDiCaL SymFPU; do
         grep -q 'hash match (skip download)' "$build/deps/src/$ep-EP-stamp/$ep-EP-download.log" ||
             fail "$ep: cvc5 did not take the cached archive"
@@ -289,10 +320,21 @@ checks() {
     note 'BC8 licences match the lock; manifest verifies'
     set -- $(cat "$work/gmp-check.counts")
     note "BC9 GMP test suite: $1 passed, $2 skipped, $3 failed"
+    # BC10 (F6): the locked compile time, CaDiCaL's fixed DATE once, and no
+    # trace of the days on which this build ran.
+    compiled=$(date -u -r "$epoch" '+%b %e %Y %H:%M:%S')
+    "$bin" --version > "$work/version.txt" || fail 'BC10: --version failed'
+    grep -Fqx "on $compiled" "$work/version.txt" ||
+        fail "BC10: cvc5 --version does not name the compile time $compiled"
+    "$helper" check-identity "$pkg" "$epoch" "$cadical_date" "$started" "$(date +%s)" ||
+        fail 'BC10: the package holds the build date'
+    note "BC10 compiled on $compiled; CaDiCaL DATE once; no build-day date in the package"
 }
 
 offline_build() {
+    started=$(date +%s)
     target=$("$helper" get "$lock" deployment_target)
+    epoch=$("$helper" get "$lock" source_date_epoch)
     verify_cache
     stage=work
     rm -rf -- "$work"

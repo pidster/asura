@@ -5,15 +5,20 @@ docs/designs/release-signing.md#build-host-paths-sg4-o1).
     host-paths --repository ROOT PATH...
 
 Reads every regular file under each PATH as raw bytes (never through
-`strings`, which skips the symbol string table) and counts three needles:
+`strings`, which skips the symbol string table) and counts four needles:
 
 - home: $HOME and the account home from the user database;
 - repository: ROOT, the repository's absolute path;
-- user: /<user name> as a path component.
+- user: /<user name> as a path component;
+- host: the Mac's host names (scutil LocalHostName and ComputerName,
+  uname -n, and the first label of a dotted name), in any ASCII case.
 
-A needle matches only when the next byte cannot continue a file name (an
+A path needle matches only when the next byte cannot continue a file name (an
 ASCII letter, digit, '.', '_' or '-'), so /Users/pidster2 is not the home
-/Users/pidster. A symbolic link's target text is scanned as well.
+/Users/pidster. A host name matches only when neither the byte before nor
+the byte after is an ASCII letter, digit, '_' or '-', so <host>.local
+matches and <host>2 does not. A symbolic link's target text is scanned as
+well.
 
 Prints one line for each file that holds a needle and exits 1; exits 0 when
 no file holds one; exits 2 on an unusable input, before reading any file.
@@ -22,14 +27,39 @@ It prints counts only, never the bytes around a match.
 import os
 import pwd
 import re
+import subprocess
 import sys
 
 NAME_BYTE = rb"(?![A-Za-z0-9._-])"
+HOST_BEFORE = rb"(?<![A-Za-z0-9_-])"
+HOST_AFTER = rb"(?![A-Za-z0-9_-])"
 
 
 def refuse(message):
     print("host-paths: " + message, file=sys.stderr)
     sys.exit(2)
+
+
+def host_names():
+    """The build Mac's names (F6). A name that scutil cannot report is left
+    out; uname -n must be set. Longest first, so a longer name wins."""
+    node = os.uname().nodename.strip()
+    if not node:
+        refuse("uname -n is empty")
+    names = [node]
+    for key in ("LocalHostName", "ComputerName"):
+        try:
+            result = subprocess.run(["/usr/sbin/scutil", "--get", key], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError:
+            continue
+        value = result.stdout.decode("utf-8", "replace").strip()
+        if result.returncode == 0 and value:
+            names.append(value)
+    for name in list(names):
+        if "." in name.strip("."):
+            names.append(name.strip(".").split(".")[0])
+    return sorted({n.encode("utf-8").lower() for n in names if n}, key=lambda n: (-len(n), n))
 
 
 def main(argv):
@@ -52,6 +82,8 @@ def main(argv):
         ("home", re.compile(b"|".join(re.escape(h.encode()) for h in sorted(homes)) + NAME_BYTE)),
         ("repository", re.compile(re.escape(repository.rstrip("/").encode()) + NAME_BYTE)),
         ("user", re.compile(b"/" + re.escape(user.encode()) + NAME_BYTE)),
+        ("host", re.compile(HOST_BEFORE + b"(?:" + b"|".join(re.escape(h) for h in host_names()) + b")"
+                            + HOST_AFTER, re.IGNORECASE)),
     ]
 
     def files(path):

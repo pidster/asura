@@ -8,6 +8,19 @@
   },
   "gmp_version": "6.3.0",
   "cvc5_version": "1.3.1",
+  "source_date_epoch": 1758724984,
+  "patches": [
+    {
+      "file": "cvc5-cadical-patch-step.patch",
+      "entry": "cvc5",
+      "sha256": "e3bd5ad1124a916e39a65f7c0e461db43995ae54a6014a84f1196889df69cdeb"
+    },
+    {
+      "file": "cadical-build-header.patch",
+      "entry": "cadical",
+      "sha256": "34ff4fc746c437d8222cac490be57fef57e17818981d801981e10fe1362f89c3"
+    }
+  ],
   "entries": [
     {
       "name": "cvc5",

@@ -186,9 +186,9 @@ check_dmg() { # DMG VERSION KIND TEAM
     # SG4-O1 (owner, 2026-10-29), RS11: no file may name the build host
     # (release-signing.md#build-host-paths-sg4-o1).
     if report=$(/usr/bin/python3 -I "$release/host-paths" --repository "$root" "$volume" 2>&1); then
-        pass 'no file holds the account home, the repository path or the user name (SG4-O1)'
+        pass 'no file holds the account home, the repository path, the user name or the host name (SG4-O1)'
     else
-        bad 'no file holds the account home, the repository path or the user name (SG4-O1)'
+        bad 'no file holds the account home, the repository path, the user name or the host name (SG4-O1)'
         printf '%s\n' "$report" | sed "s|^volume/|  |; s|^\([^ ]\)|  \1|"
     fi
     required='Asura.app/Contents/Info.plist Asura.app/Contents/_CodeSignature/CodeResources Asura.app/Contents/MacOS/asura Asura.app/Contents/MacOS/asura-model Asura.app/Contents/Resources/mlx.metallib Asura.app/Contents/Resources/model-package.json Asura.app/Contents/Resources/swift-transformers_Hub.bundle/Contents/Info.plist LICENSE README.txt'
