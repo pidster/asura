@@ -1460,7 +1460,8 @@ mod tests {
     /// a reactor-like loop to the reply taken in the loop after the
     /// worker's wake, 64 closed-loop requesters on the product worker
     /// pool, 20,000 decisions after 2,000 warm-up decisions. The p99 must
-    /// be at most 1.5 ms (security-policy.md, PL-B2, revised by AD-33).
+    /// be at most 2.5 ms (security-policy.md, PL-B2, revised by AD-34; was
+    /// 1.5 ms under AD-33).
     #[test]
     #[ignore = "bench: cargo test --release ... pl_b2 -- --ignored --nocapture"]
     fn pl_b2_end_to_end_p99_at_64_concurrent_requesters() {
@@ -1538,13 +1539,15 @@ mod tests {
         }
         samples.sort();
         let pct = |p: f64| samples[((samples.len() as f64 * p) as usize).min(samples.len() - 1)];
+        let budget = Duration::from_micros(2_500);
         println!(
-            "PL-B2 workers={workers} requesters=64 decisions={} p50={:?} p99={:?} max={:?} owner_startup={:?}",
+            "PL-B2 workers={workers} requesters=64 decisions={} p50={:?} p99={:?} max={:?} owner_startup={:?}; budget p99 <= 2.5 ms (AD-34): {}",
             samples.len(),
             pct(0.50),
             pct(0.99),
             samples[samples.len() - 1],
-            startup
+            startup,
+            if pct(0.99) <= budget { "PASS" } else { "FAIL" }
         );
         close(owner);
     }

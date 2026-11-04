@@ -9,9 +9,10 @@ Packet PL1 is implemented (2026-11-03). Against the owner's revised budgets
 (AD-33), PL-B1 passes and the single PL-B2 run missed by 28 µs, reported to
 the owner ([PL1 delivery record](#pl1-delivery-record)).
 Packet PL2 is implemented (2026-11-04) under its
-[implementation contract](#pl2-implementation-contract). PL-B1 passes;
-PL-B2 fails by 0.45 ms on the median of three runs and is reported to the
-owner ([PL2 delivery record](#pl2-delivery-record)). Later packets are not
+[implementation contract](#pl2-implementation-contract). PL-B1 passes.
+PL-B2 failed its 1.5 ms target; the owner revised it to p99 at most 2.5 ms
+(AD-34, 2026-11-04), and the quiet-machine runs pass it
+([PL2 delivery record](#pl2-delivery-record)). Later packets are not
 implemented. Protocol numbering stays `0.1` and the
 journal format stays `1` until release 1.0.0; schemas change in place.
 
@@ -45,7 +46,7 @@ spike evidence only.
 | AD-14 | Pattern A: each scope is evaluated separately; allow only if every scope allows; a refusal names the denying scope | 2026-11-03 |
 | AD-17 | cvc5 built from source with a dynamic or replaceable GMP, signed and notarised inside `Asura.app`; proofs on the person's Mac, offline; a bounded admission tool with no default time limit. Refined by SBQ1 (GMP 6.3.0 as `@rpath/libgmp.10.dylib`) and SBQ2 (no LibPoly) | 2026-11-03 |
 | AD-27 | Effects are the authority. Commands, MCP tools and skills are intent: they may only tighten | 2026-11-03 |
-| Budgets | Decision p50 at most 150 µs; end-to-end p99 at most 1.5 ms at 64 concurrent requests; at most 8 MiB added to the `asura` executable (AD-31); startup at most 200 ms. Revised by the owner on 2026-11-03 after the PL1 measurements (AD-33), from p50 100 µs and p99 1 ms: pattern A evaluates four scopes over 258 policies, about 80 µs of the decision, and a model turn takes seconds | 2026-11-03 |
+| Budgets | Decision p50 at most 150 µs; end-to-end p99 at most 2.5 ms at 64 concurrent requests (AD-34, 2026-11-04, after the PL2 measurements; was 1.5 ms under AD-33); at most 8 MiB added to the `asura` executable (AD-31); startup at most 200 ms. Revised by the owner on 2026-11-03 after the PL1 measurements (AD-33), from p50 100 µs and p99 1 ms: pattern A evaluates four scopes over 258 policies, about 80 µs of the decision, and a model turn takes seconds | 2026-11-03 |
 | AD-24 | Envelope approval is an authorized policy change; envelopes end with their task or on revocation | 2026-11-02 |
 | AD-15, AD-16 | The classifier may stop a model job to ask; `unknown` asks; an unanswered job waits in its agent's queue with a short reason | 2026-11-02 |
 | AD-25 | Context egress is a policy decision over data classes, destinations and projects | 2026-10-31 |
@@ -1851,7 +1852,7 @@ They are acceptance criteria, never runtime closures (AE-04).
 | ID | Budget | Measurement |
 | --- | --- | --- |
 | PL-B1 | Decision p50 at most 150 µs (owner revision of 2026-11-03, AD-33; was 100 µs) | In the worker: request and entity slice construction, schema checks, every applicable scope, wrapper and reasons; on the product schema with the scale workload below |
-| PL-B2 | End-to-end p99 at most 1.5 ms at 64 concurrent requests (owner revision of 2026-11-03, AD-33; was 1 ms) | From `decide` on the reactor to the `decided` event, 64 closed-loop requesters, the product worker pool |
+| PL-B2 | End-to-end p99 at most 2.5 ms at 64 concurrent requests (owner revision of 2026-11-04, AD-34; was 1.5 ms under AD-33 of 2026-11-03, and 1 ms before) | From `decide` on the reactor to the `decided` event, 64 closed-loop requesters, the product worker pool |
 | PL-B3 | At most 8 MiB added size | Stripped release `asura` with the policy layer against the same build without it. The solver and GMP files are reported separately for each release, with no limit (AD-31, [OQ4](#open-owner-questions)) |
 | PL-B4 | Startup at most 200 ms | From the owner's start to the first decision: schema, every admitted scope of the workload, worker installation |
 | PL-B5 | Safety budgets kept from the spike | PES-M2 (0 unenforced conventions), M3 (100 % injected errors deny), M4 (0 allows in 1,000,000 malformed requests), M5 (determinism), M6 (12 of 12 seeded defects refused, warnings refuse), M7 (reasons), M15 to M18 (proofs) |
@@ -2770,8 +2771,21 @@ when the 1-minute load average was below 3 (2.29 to 2.81 at the starts).
 
 The breakdown is unchanged: the built-in entry decides at p50 157 to 159 µs
 with the command features and 96.5 to 97.6 µs without them. The load was
-not the cause. The failure is reported to the owner; W2 and the budgets
-are unchanged.
+not the cause. W2 is unchanged.
+
+Owner revision of 2026-11-04 (AD-34): PL-B2 becomes end-to-end p99 at most
+2.5 ms at 64 requesters; PL-B1 stays at p50 at most 150 µs. Reason: the PL2 command features add about 62 µs per request under W2, which queueing at 64 requesters on 8 workers multiplies about eight times, and a model turn takes seconds.
+The earlier targets (1 ms, then 1.5 ms under AD-33) and every measurement
+above stay as the history. The verdict against the revised target is taken
+from the quiet-machine runs, with no new measurement:
+
+| Budget | Median of three | Worst run | Verdict |
+| --- | --- | --- | --- |
+| PL-B1 p50 at most 150 µs | 144.0 µs | 144.5 µs | **Pass** |
+| PL-B2 p99 at most 2.5 ms (AD-34) | 2.024 ms | 2.080 ms | **Pass** |
+
+The service bench (`pl_b2_end_to_end_p99_at_64_concurrent_requesters`)
+prints its verdict against 2.5 ms.
 
 SP-P1 is answered ([SP-P1 result](#sp-p1-result)).
 

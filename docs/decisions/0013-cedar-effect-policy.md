@@ -38,8 +38,9 @@ over a command line cannot be the authority for what a job does.
    `Asura.app` (AD-17). The solver has no default time limit; it ends when its
    input closes or on cancel.
 6. **Revised budgets**: decision p50 at most 100 µs, then 150 µs; end-to-end
-   p99 at most 1 ms, then 1.5 ms, at 64 concurrent requests (second revision
-   AD-33, 2026-11-03, after the PL1 measurements); at most 8 MiB added size; startup at most
+   p99 at most 1 ms, then 1.5 ms, then 2.5 ms, at 64 concurrent requests
+   (second revision AD-33, 2026-11-03, after the PL1 measurements; third
+   revision AD-34, 2026-11-04, after the PL2 measurements); at most 8 MiB added size; startup at most
    200 ms; with one policy set per action group and one engine copy per
    worker.
 
