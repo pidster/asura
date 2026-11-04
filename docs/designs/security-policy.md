@@ -2127,6 +2127,88 @@ one at a time, and are never part of the service.
 | Integration | `build` on the release Mac: every stage and BC1 to BC9 |
 | End to end | `probe`: SV-P1 on the product and spike corpora through the package's `cvc5`; SV-P2 under the profile from a copy; SV-P3, SV-P5 and SV-P6; the spike's admission test with the package's `cvc5` |
 
+### PL4a delivery record
+
+Verified, 2026-11-04, on the reference Mac: macOS 27.0 (26A428), Apple M4
+Max, 16 cores, Apple clang 21.0.0 (clang-2100.3.34.2), Apple
+`/usr/bin/python3` 3.9.6, CMake 4.4.4 from the locked wheel, Rust 1.98.0.
+Packet PL4a is delivered for its scope; the items marked pending belong to
+PL4b. Owner decisions applied: SBQ1, SBQ2, the OQ3 legal position (no legal
+gate), AD-31 (OQ4) and AD-32 (OQ5).
+
+**Build** (`build --scratch DIR`, one complete run after the last script
+change; earlier runs found and fixed a locale-dependent sort in BC1 and the
+LGPL list parser in BC4):
+
+| Check | Result |
+| --- | --- |
+| `fetch` | The seven build entries were fetched once and matched the lock. Every later run reused the verified cache |
+| `offline` (SV-B2) | Every stage after `fetch` ran under `(deny network*)`. cvc5's external-project logs read "File already exists and hash match (skip download)" for CaDiCaL and SymFPU; no download line |
+| BC9, GMP | `make check`: 199 passed, 1 skipped, 0 failed. F2: header and library both report 6.3.0 |
+| BC1 (F1) | `otool -L MacOS/cvc5`: `@rpath/libgmp.10.dylib` (compatibility 16.0.0, current 16.0.0), `/usr/lib/libc++.1.dylib`, `/usr/lib/libSystem.B.dylib`, nothing else |
+| BC2 | One `LC_RPATH`, `@executable_path/../Frameworks`; platform macOS, minimum 27.0 |
+| BC3 | GMP install name `@rpath/libgmp.10.dylib`; its only dependency is `libSystem` |
+| BC4 | cvc5 1.3.1; `gmp` yes; `poly`, `cln`, `glpk`, `cocoa`, `editline`, `kissat`, `cryptominisat` no; the LGPL list names GMP only |
+| BC5 | Both files verify with `codesign --verify --strict`; ad hoc, identifiers `org.pidster.asura.cvc5` and `org.pidster.asura.gmp` |
+| BC6 (SV-P5) | `host-paths` finds nothing; no file holds the scratch path |
+| BC7, BC8 | Smoke query `sat`; six licence files as locked; the manifest verifies |
+| Size (AD-31, reported, no limit) | `MacOS/cvc5` 24,291,744 bytes; `Frameworks/libgmp.10.dylib` 450,288 bytes |
+
+**Probes** (`probe --package DIR/solver --scratch DIR2`: 15 passed, 0
+failed, 2 pending):
+
+| Probe | Result |
+| --- | --- |
+| SV-B1 | **Pass.** Static cvc5 libraries with the shared GMP only (BC1 to BC4) |
+| SV-B2 | **Pass.** The lock lists every download: cvc5, GMP, CaDiCaL, SymFPU and three build-tool wheels. The build runs offline after `fetch` |
+| SV-P1, product corpus | **Pass.** 55 queries over 12 request environments; each result equals the upstream 1.3.1 binary's (downloaded to scratch, SHA-256 `a0e7f5b0…7581215` checked); both solvers answered 7 `sat`, 4 `unsat`, 0 `unknown`; every result is the expected one. SymCC decides 44 of the 55 queries without the solver, so the product corpus exercises 11 solver answers |
+| SV-P1, spike corpus | **Pass.** 216 solver queries, the same set for both solvers (matched by the digest of sorted lines); 216 of 216 answers equal (7 `sat`, 209 `unsat`, 0 `unknown`); both harness runs 0 unexpected; the spike's `admission` test passes with the package's cvc5 |
+| SBQ2 | Satisfied: `--no-poly` gives the upstream answers on the product corpus, so LibPoly stays out |
+| SV-P2 | **Pass** for the ad hoc copy. The product corpus under `solver.sb` from a copy directory gives the unsandboxed results. Under the profile, cvc5 cannot open an output file (`Cannot open file … unknown reason`; no file appears) and `/bin/sh` cannot start. The minimal rules are in [SV-P2 candidate profile](#sv-p2-candidate-profile) |
+| SV-P3 (ad hoc analogue) | **Pass.** With the Hardened Runtime, dyld refuses an ad hoc GMP by library validation ("mapping process and mapped file (non-platform) have different Team IDs"), in the bundle layout, from a copy and for a replaced GMP. Without the runtime flag, the package and a replaced, ad hoc-signed GMP load from a copy, and `lsof` shows the copy's own GMP. An unsigned GMP never loads ("missing code signature"). **Pending (PL4b):** the team-signed case |
+| SV-P4 | **Pending (PL4b).** Not submitted: the notary service has no offline mode |
+| SV-P5 | **Pass** (BC6, and again by `probe`) |
+| SV-P6 | **Answered: no resource limit is usable.** On macOS 27, `setrlimit` of `RLIMIT_AS`, `RLIMIT_DATA` or `RLIMIT_RSS` returns `EINVAL` at 256 MiB and at 64 GiB (soft and hard set together; the shell's `ulimit -S` at 256 MiB fails the same way). The child's footprint is observable: `proc_pid_rusage` reported 513 MiB for 8 touched 64 MiB blocks, and `wait4` gave the same `ru_maxrss`. cvc5 on the product corpus peaked at 8,585,600 bytes of footprint (20,611,072 bytes RSS) |
+
+**Effects on later packets** (not applied here):
+
+- PL3, solver memory. A usable bound must be supervised: the platform owner
+  would read the child's `ri_phys_footprint` and kill it above a bound. This
+  is a size closure, not a time bound. The lifecycle's Memory row stays "no
+  bound selected" until PL3 decides.
+- PL3, profile. cvc5 reads the root directory at start-up; without that rule
+  it aborts with no message. The platform's rendered profile needs it.
+- PL4b, signing. The Hardened Runtime `cvc5` loads GMP only when both carry
+  the same team ID; PL-N2 must show this. The notice's ad hoc route works
+  because an ad hoc signature without `-o runtime` has no library
+  validation; the notice text needs no change.
+- PL4b, host identity (finding F6, new). The package names the build host:
+  CaDiCaL's build header embeds `uname -srmn` (the host name, once in
+  `cvc5`), and cvc5's `--version` prints the build date. Neither is an
+  SG4-O1 needle, so `host-paths` passes. CaDiCaL takes no operator flags,
+  so removing it needs a change to how cvc5 builds CaDiCaL; PL4b decides
+  whether the release needs it.
+- cvc5's `--show-config` says "statically linked against these libraries"
+  for GMP. That is cvc5's fixed text; the binary links GMP dynamically
+  (BC1).
+
+**Pending for PL4b:** Developer ID signing of the dylib and `cvc5` (Hardened
+Runtime, secure timestamp) and their placement (the
+[release signing design](release-signing.md) first); SV-P3 with team
+signatures, from the bundle and from the pinned copy; SV-P4 notarisation;
+the rendered `NOTICE.txt` and the licence folder; the release assets of the
+[publication list](#source-publication-and-notice); the digests compiled
+into `asura`; the DMG manifest change; and the F6 decision.
+
+**Checks run:** `test-build --static` (42 passed); `build` (BC1 to BC9);
+`probe` (15 passed, 2 pending); `cargo fmt --check` and `cargo clippy
+--offline --locked --all-targets -- -D warnings` on `admission-probe`;
+`test-asura-bundle --static` with `ASURA_PROTOC` and
+`ASURA_PROTOC_GEN_SWIFT` set (147 passed, because `tools/release` changed).
+No product Rust changed, so the workspace format and clippy passes were not
+needed. F4 has a test design only ([F4](#f4-stalled-solver-tests-for-pl3));
+the adapter is PL3's.
+
 ## Failure handling
 
 | Failure | Result |
@@ -2782,13 +2864,13 @@ Probes to run in the named packet, before the code that depends on them.
 
 | ID | Question | Packet |
 | --- | --- | --- |
-| SV-B1 | Does cvc5 1.3.1 build with static cvc5 libraries and a shared GMP on macOS 27 arm64? | PL4a |
-| SV-B2 | What does the cvc5 build download, and can every dependency be pinned and built offline? | PL4a |
-| SV-P1 | Do SP-AQ1 to SP-AQ8 give the same answers with a LibPoly-free build as with the upstream binary? The probe answered it on the spike corpus; PL4a re-runs it on the product corpus (SBQ2) | PL4a |
-| SV-P2 | Does cvc5 run under the deny-default solver profile? | PL4a, PL4b |
-| SV-P3 | Does the Hardened Runtime cvc5 load the team-signed GMP through `@rpath`, from the bundle and from the pinned copy? | PL4b |
+| SV-B1 | Does cvc5 1.3.1 build with static cvc5 libraries and a shared GMP on macOS 27 arm64? | PL4a: yes ([delivery record](#pl4a-delivery-record)) |
+| SV-B2 | What does the cvc5 build download, and can every dependency be pinned and built offline? | PL4a: yes, the lock lists all seven build downloads ([delivery record](#pl4a-delivery-record)) |
+| SV-P1 | Do SP-AQ1 to SP-AQ8 give the same answers with a LibPoly-free build as with the upstream binary? The probe answered it on the spike corpus; PL4a re-runs it on the product corpus (SBQ2) | PL4a: yes, on both corpora ([delivery record](#pl4a-delivery-record)) |
+| SV-P2 | Does cvc5 run under the deny-default solver profile? | PL4a: yes, from an ad hoc copy; PL4b: from the installed app |
+| SV-P3 | Does the Hardened Runtime cvc5 load the team-signed GMP through `@rpath`, from the bundle and from the pinned copy? | PL4b (PL4a showed that library validation refuses an ad hoc GMP) |
 | SV-P4 | Does notarisation accept the bundle with no issue for cvc5 and the dylibs? | PL4b |
-| SV-P5 | Is the host-paths scan clean for the solver files? | PL4b |
+| SV-P5 | Is the host-paths scan clean for the solver files? | PL4a: yes for the package; PL4b: in the bundle |
 | SV-P6 | Is there a usable memory bound for a child process on macOS 27? | PL3 |
 | SP-P1 | Which spelling does a path walk give across firmlinks, `/private` aliases and case-insensitive volumes? | PL2 |
 | SP-P2 | Per-request entity slices: does PL-B1 hold on the product schema? Answered by PL1: no ([delivery record](#pl1-delivery-record)) | PL1 |
