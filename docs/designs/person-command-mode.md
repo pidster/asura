@@ -749,6 +749,13 @@ recall records only text the person submitted. After a person job exists, the
 model may list, inspect, read and wait on it, but not cancel it (PC10). This
 holds for `!!` jobs too.
 
+Since packet PL2 the policy owner also decides each start, after the path
+check and before the job controller's submit: the entry `process.exec` with
+the environment names and the outside switch, and one `secret_use` per
+named reference. A denial holds the input with `policy_denied`. The
+[security policy design](security-policy.md#pl2-person-command-decision)
+owns that contract; nothing in this section changes.
+
 #### Outside switch check
 
 Selected (engineering, 2026-10-22), replacing "read at launch only". The
