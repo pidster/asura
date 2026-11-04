@@ -69,6 +69,9 @@ struct Types {
     origin: EntityTypeName,
     profile: EntityTypeName,
     class: EntityTypeName,
+    secret: EntityTypeName,
+    domain: EntityTypeName,
+    address: EntityTypeName,
 }
 
 /// One worker's engine: its own schema, its own copy of each scope set,
@@ -237,9 +240,66 @@ impl Engine {
                 origin: type_name("Asura::Origin"),
                 profile: type_name("Asura::Profile"),
                 class: type_name("Asura::PathClass"),
+                secret: type_name("Asura::Secret"),
+                domain: type_name("Asura::Domain"),
+                address: type_name("Asura::Address"),
             },
             authorizer: Authorizer::new(),
         })
+        .and_then(|engine| engine.check_person_network().map(|()| engine))
+    }
+
+    /// The AD-7 load check (security-policy.md, PL2 AD-7 load check): a
+    /// `person_typed` job of each person profile may connect to a sample
+    /// address and domain, with and without the proxy, in every scope.
+    fn check_person_network(&self) -> Result<(), LoadError> {
+        use crate::request::{Origin, PathClass, ProfileKind};
+        for profile in [ProfileKind::Person1, ProfileKind::PersonOutside1] {
+            let principal = JobPrincipal {
+                job: "ad7-check".into(),
+                origin: Origin::PersonTyped,
+                profile,
+                project: "ad7-check".into(),
+                project_root: PathRef {
+                    path: "/ad7-check/project".into(),
+                    class: PathClass::Ordinary,
+                    in_project: true,
+                    rel: String::new(),
+                },
+                task: "ad7-check:0".into(),
+                scratch: PathRef::ordinary("/ad7-check/scratch"),
+                cache_roots: Vec::new(),
+                developer_dir: None,
+                declared_env: Vec::new(),
+            };
+            for resource in [
+                Resource::Address("192.0.2.1".into()),
+                Resource::Domain("example.com".into()),
+            ] {
+                for via_proxy in [false, true] {
+                    let request = Request {
+                        principal: principal.clone(),
+                        action: Action::NetworkConnect,
+                        resource: resource.clone(),
+                        context: Context::Connect {
+                            now_ms: 0,
+                            ip: "192.0.2.1".into(),
+                            port: 443,
+                            via_proxy,
+                            intent: None,
+                        },
+                    };
+                    let decision = self.decide(&request);
+                    if !decision.allow {
+                        return Err(LoadError {
+                            scope: decision.primary.and_then(|p| p.scope),
+                            messages: vec!["person network forbidden (AD-7)".into()],
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The global policy IDs of one scope, sorted; baseline permits included.
@@ -403,6 +463,9 @@ impl Engine {
         let resource = match &request.resource {
             Resource::Path(path) => uid(&self.types.path, &path.path),
             Resource::Program(program) => uid(&self.types.program, &program.path.path),
+            Resource::Secret(name) => uid(&self.types.secret, name),
+            Resource::Domain(name) => uid(&self.types.domain, name),
+            Resource::Address(ip) => uid(&self.types.address, ip),
         };
         let cedar = CedarRequest::new(
             principal,
@@ -489,7 +552,7 @@ impl Engine {
                 ),
                 (
                     "declared_env".to_owned(),
-                    RestrictedExpression::new_set(std::iter::empty()),
+                    RestrictedExpression::new_set(p.declared_env.iter().map(|n| s(n.clone()))),
                 ),
             ]),
             HashSet::new(),
@@ -524,6 +587,41 @@ impl Engine {
                 ]),
                 HashSet::new(),
             ))?);
+        }
+        match &request.resource {
+            Resource::Secret(name) => {
+                list.push(wrap(Entity::new(
+                    uid(&t.secret, name),
+                    HashMap::new(),
+                    HashSet::new(),
+                ))?);
+            }
+            Resource::Address(ip) => {
+                list.push(wrap(Entity::new(
+                    uid(&t.address, ip),
+                    HashMap::new(),
+                    HashSet::new(),
+                ))?);
+            }
+            Resource::Domain(name) => {
+                // Each label suffix is the parent of the longer name.
+                let mut cursor = name.as_str();
+                loop {
+                    let parent = cursor.split_once('.').map(|(_, rest)| rest);
+                    list.push(wrap(Entity::new(
+                        uid(&t.domain, cursor),
+                        HashMap::new(),
+                        parent
+                            .map(|p| HashSet::from([uid(&t.domain, p)]))
+                            .unwrap_or_default(),
+                    ))?);
+                    match parent {
+                        Some(p) => cursor = p,
+                        None => break,
+                    }
+                }
+            }
+            Resource::Path(_) | Resource::Program(_) => {}
         }
         Entities::from_entities(list, Some(&self.schema)).map_err(|_| ErrorClass::RequestInvalid)
     }
@@ -582,6 +680,26 @@ fn canonical(path: &str) -> bool {
             .split('/')
             .all(|c| !c.is_empty() && c != "." && c != "..")
 }
+/// A secret name (named-secrets.md, naming rules).
+fn secret_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    (1..=48).contains(&b.len())
+        && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        && name != "COMMAND"
+}
+/// A canonical host name (security-policy.md, hosts and IPs).
+fn host_name(name: &str) -> bool {
+    name.len() <= 253
+        && name.split('.').all(|label| {
+            let b = label.as_bytes();
+            (1..=63).contains(&b.len())
+                && b.iter()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+                && b[0] != b'-'
+                && b[b.len() - 1] != b'-'
+        })
+}
 fn components(path: &str) -> usize {
     if path == "/" {
         0
@@ -615,10 +733,18 @@ impl Slice {
         }
         explicit.extend(p.cache_roots.iter());
         explicit.extend(p.developer_dir.iter());
+        if p.declared_env.len() > MAX_SET_ELEMENTS {
+            return Err(ErrorClass::RequestTooLarge);
+        }
+        strings.extend(p.declared_env.iter().map(String::as_str));
+        let entity_strings = 3 + p.declared_env.len();
+        // Entities beyond the paths and the principal's three.
+        let mut extra = 0;
         match &request.resource {
             Resource::Path(path) => explicit.push(path),
             Resource::Program(program) => {
                 program_strings = 3;
+                extra = 1;
                 explicit.push(&program.path);
                 strings.extend([
                     program.team_id.as_str(),
@@ -626,9 +752,43 @@ impl Slice {
                     program.cdhash.as_str(),
                 ]);
             }
+            Resource::Secret(name) => {
+                if !secret_name(name) {
+                    return Err(ErrorClass::RequestInvalid);
+                }
+                program_strings = 1;
+                extra = 1;
+                strings.push(name);
+            }
+            Resource::Address(ip) => {
+                if ip.parse::<std::net::IpAddr>().is_err() {
+                    return Err(ErrorClass::RequestInvalid);
+                }
+                program_strings = 1;
+                extra = 1;
+                strings.push(ip);
+            }
+            Resource::Domain(name) => {
+                if !host_name(name) {
+                    return Err(ErrorClass::RequestInvalid);
+                }
+                program_strings = 1;
+                extra = name.split('.').count();
+                strings.push(name);
+            }
         }
+        let program_strings = program_strings + entity_strings - 3;
         let (intent, sets): (Option<&Intent>, Vec<&Vec<String>>) = match &request.context {
-            Context::File { intent, .. } => (intent.as_ref(), Vec::new()),
+            Context::File { intent, .. } | Context::Secret { intent, .. } => {
+                (intent.as_ref(), Vec::new())
+            }
+            Context::Connect { intent, ip, .. } => {
+                if ip.parse::<std::net::IpAddr>().is_err() {
+                    return Err(ErrorClass::RequestInvalid);
+                }
+                strings.push(ip);
+                (intent.as_ref(), Vec::new())
+            }
             Context::Exec {
                 request_digest,
                 env_terminal,
@@ -640,6 +800,11 @@ impl Slice {
                 (intent.as_ref(), vec![env_terminal, env_declared])
             }
         };
+        let mut sets = sets;
+        if let Some(command) = intent.and_then(|i| i.command.as_ref()) {
+            sets.extend([&command.tools, &command.flags, &command.shell_features]);
+            strings.extend([command.first_tool.as_str(), command.subcommand.as_str()]);
+        }
         for set in sets {
             if set.len() > MAX_SET_ELEMENTS {
                 return Err(ErrorClass::RequestTooLarge);
@@ -700,7 +865,7 @@ impl Slice {
                 cursor = lexical_parent(parent);
             }
         }
-        let count = paths.len() + 3 + usize::from(matches!(request.resource, Resource::Program(_)));
+        let count = paths.len() + 3 + extra;
         if count > MAX_ENTITIES {
             return Err(ErrorClass::RequestTooLarge);
         }
@@ -752,11 +917,26 @@ pub(crate) fn rfc3339(ms: i64) -> String {
 }
 
 fn intent_json(intent: &Intent) -> Value {
-    json!({
+    let mut v = json!({
         "source": {"__entity": {"type": "Asura::IntentSource", "id": intent.source.as_str()}},
         "name": intent.name,
         "digest": intent.digest,
-    })
+    });
+    if let Some(c) = &intent.command {
+        v["command"] = json!({
+            "parse": {"__entity": {"type": "Asura::Parse", "id": c.parse.as_str()}},
+            "tools": c.tools,
+            "first_tool": c.first_tool,
+            "subcommand": c.subcommand,
+            "flags": c.flags,
+            "shell_features": c.shell_features,
+            "bytes": i64::try_from(c.bytes).unwrap_or(i64::MAX),
+            "secret_vars": i64::from(c.secret_vars),
+            "secret_reference": c.secret_reference,
+            "whole_command": c.whole_command,
+        });
+    }
+    v
 }
 
 pub(crate) fn context_json(context: &Context) -> Value {
@@ -783,6 +963,38 @@ pub(crate) fn context_json(context: &Context) -> Value {
                 "env_terminal": env_terminal,
                 "env_declared": env_declared,
                 "outside_switch": outside_switch,
+            });
+            if let Some(intent) = intent {
+                v["intent"] = intent_json(intent);
+            }
+            v
+        }
+        Context::Secret {
+            now_ms,
+            delivery,
+            intent,
+        } => {
+            let mut v = json!({
+                "now": now(*now_ms),
+                "delivery": {"__entity": {"type": "Asura::Delivery", "id": delivery.as_str()}},
+            });
+            if let Some(intent) = intent {
+                v["intent"] = intent_json(intent);
+            }
+            v
+        }
+        Context::Connect {
+            now_ms,
+            ip,
+            port,
+            via_proxy,
+            intent,
+        } => {
+            let mut v = json!({
+                "now": now(*now_ms),
+                "ip": {"__extn": {"fn": "ip", "arg": ip}},
+                "port": i64::from(*port),
+                "via_proxy": via_proxy,
             });
             if let Some(intent) = intent {
                 v["intent"] = intent_json(intent);

@@ -618,6 +618,12 @@ never the value. The owner then repeats steps 1 to 4 on the restored text and
 requires the same command, the same numbers and kinds, and the same names.
 Any difference is `mismatch`, held with `secrets_lost`.
 
+Since packet PL2 each named reference of a person command is also one
+`secret_use` policy decision with delivery `raw`, made at dispatch; a
+model command never reaches it, because the refusal below comes first. The
+[security policy design](security-policy.md#pl2-person-command-decision)
+owns that contract.
+
 ### Kind 31 field 24
 
 Schemas change in place within format `1`.

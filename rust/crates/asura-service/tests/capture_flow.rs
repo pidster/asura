@@ -834,6 +834,15 @@ fn secret_reference_turn() -> Result<()> {
         !directory.join("leaked.txt").exists(),
         "a refused command ran"
     );
+    // PL-I15 (security-policy.md, PL2): the refusal keeps its owner and
+    // order; no named reference reaches the policy owner, so no kind 34.
+    let bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)?;
+    assert!(
+        !records(&bytes)?
+            .iter()
+            .any(|r| matches!(r, journal::Record::PolicyDecision(_))),
+        "no kind 34 for a refused model command"
+    );
     let text = "Command refused: it names an Asura secret variable ($ASURA_SECRET_...). Model \
                 commands cannot use stored secrets, so nothing ran. The person can run this \
                 command as a ! command.";

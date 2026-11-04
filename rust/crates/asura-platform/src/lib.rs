@@ -25,8 +25,10 @@ pub mod journal_gate {
     pub use crate::journal_io::gate::{Fault, Point};
 }
 pub use project_identity::{
-    ProjectIdentity, ProjectListing, ProjectPage, ProjectReadError, StateBoundary,
+    CanonicalPath, PathRefusal, ProjectIdentity, ProjectListing, ProjectPage, ProjectReadError,
+    StateBoundary, WalkMode, canonical_path, canonical_root, lexically_canonical,
 };
+pub mod code_identity;
 mod config;
 pub use authority::{
     AuthorityError, AuthorityReader, AuthorityScan, AuthoritySource, AuthorityWitness,

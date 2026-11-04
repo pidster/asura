@@ -101,7 +101,7 @@ const RUNTIME_READ: [&str; 5] = [
 ];
 const RUNTIME_WRITE: [&str; 1] = ["/dev/null"];
 /// The entry program of every job today.
-const ENTRY: &str = "/bin/sh";
+pub const ENTRY: &str = "/bin/sh";
 
 fn path_of(principal: &JobPrincipal, root: Root) -> PathRef {
     match root {
@@ -262,9 +262,6 @@ pub struct JobOutcome {
     pub intent_digest: Option<[u8; 32]>,
 }
 
-fn entry_program() -> ProgramRef {
-    ProgramRef::unidentified(PathRef::ordinary(ENTRY))
-}
 fn program_digest(program: &ProgramRef) -> [u8; 32] {
     let p = &program.path;
     sha256(
@@ -284,15 +281,33 @@ fn program_digest(program: &ProgramRef) -> [u8; 32] {
     )
 }
 fn intent_digest(intent: &Intent) -> [u8; 32] {
-    sha256(
-        format!(
-            "asura-policy-intent/1\0{}\0{}\0{}",
-            intent.source.as_str(),
-            intent.name,
-            intent.digest
-        )
-        .as_bytes(),
-    )
+    let mut text = format!(
+        "asura-policy-intent/1\0{}\0{}\0{}",
+        intent.source.as_str(),
+        intent.name,
+        intent.digest
+    );
+    // The command features in a fixed order (PL2 intent extractor).
+    if let Some(c) = &intent.command {
+        text.push_str(&format!(
+            "\0command\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            c.parse.as_str(),
+            c.tools.len(),
+            c.tools.join("\u{1f}"),
+            c.first_tool,
+            c.subcommand,
+            c.flags.join("\u{1f}"),
+            c.shell_features.join("\u{1f}"),
+            c.bytes,
+            c.secret_vars,
+            u8::from(c.secret_reference),
+            u8::from(c.whole_command)
+        ));
+    }
+    sha256(text.as_bytes())
+}
+fn secret_digest(name: &str) -> [u8; 32] {
+    sha256(format!("asura-policy-resource/1\0secret\0{name}").as_bytes())
 }
 
 /// Decide one `model-1` job. `cached` is the principal shape's regions
@@ -300,11 +315,12 @@ fn intent_digest(intent: &Intent) -> [u8; 32] {
 pub fn decide_model1_job(
     engine: &Engine,
     principal: &JobPrincipal,
+    entry: &ProgramRef,
     intent: Option<&Intent>,
     now_ms: i64,
     cached: Option<Regions>,
 ) -> JobOutcome {
-    let program = entry_program();
+    let program = entry.clone();
     let resource_digest = program_digest(&program);
     let intent_digest = intent.map(intent_digest);
     let request_digest = sha256(
@@ -383,5 +399,123 @@ pub fn model1_principal(
         },
         cache_roots: Vec::new(),
         developer_dir: None,
+        declared_env: Vec::new(),
+    }
+}
+
+/// The principal of a person (`!` or `!!`) job (PL2 person command
+/// decision): the model principal's shape with origin `person_typed`, the
+/// person profile and the project's declared variable names.
+pub fn person_principal(
+    job_hex: &str,
+    project_hex: &str,
+    project_root: &str,
+    task: &str,
+    asura_home: &str,
+    outside: bool,
+    declared_env: Vec<String>,
+) -> JobPrincipal {
+    let mut p = model1_principal(job_hex, project_hex, project_root, task, asura_home);
+    p.origin = Origin::PersonTyped;
+    p.profile = if outside {
+        ProfileKind::PersonOutside1
+    } else {
+        ProfileKind::Person1
+    };
+    p.declared_env = declared_env;
+    p
+}
+
+/// The person facts of one entry request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonEntry {
+    pub env_terminal: Vec<String>,
+    pub env_declared: Vec<String>,
+    pub outside_switch: bool,
+    /// The named secrets, in reference order.
+    pub secrets: Vec<String>,
+}
+
+/// The decision of one person job: the entry `process.exec` and one
+/// `secret_use` per named secret, every request in every scope. `action`
+/// and `resource_digest` name the deciding request: the first denying one
+/// (entry, then secrets), else the entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonOutcome {
+    pub decision: Decision,
+    pub action: Action,
+    pub resource_digest: [u8; 32],
+    pub request_digest: [u8; 32],
+    pub intent_digest: Option<[u8; 32]>,
+}
+
+/// Decide one person job (security-policy.md, PL2 person command decision).
+pub fn decide_person_job(
+    engine: &Engine,
+    principal: &JobPrincipal,
+    entry: &ProgramRef,
+    facts: &PersonEntry,
+    intent: Option<&Intent>,
+    now_ms: i64,
+) -> PersonOutcome {
+    let entry_digest = program_digest(entry);
+    let intent_digest = intent.map(intent_digest);
+    let request_digest = sha256(
+        format!(
+            "asura-policy-request/1\0person\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            principal.job,
+            principal.origin.as_str(),
+            principal.profile.as_str(),
+            principal.project,
+            principal.project_root.path,
+            principal.task,
+            principal.scratch.path,
+            hex(&entry_digest),
+            facts.env_terminal.join("\u{1f}"),
+            facts.env_declared.join("\u{1f}"),
+            u8::from(facts.outside_switch),
+            facts.secrets.join("\u{1f}"),
+            intent_digest.map(|d| hex(&d)).unwrap_or_default()
+        )
+        .as_bytes(),
+    );
+    let exec = engine.decide(&Request {
+        principal: principal.clone(),
+        action: Action::ProcessExec,
+        resource: Resource::Program(entry.clone()),
+        context: Context::Exec {
+            now_ms,
+            request_digest: hex(&request_digest),
+            env_terminal: facts.env_terminal.clone(),
+            env_declared: facts.env_declared.clone(),
+            outside_switch: facts.outside_switch,
+            intent: intent.cloned(),
+        },
+    });
+    let mut deciding: Option<(Decision, Action, [u8; 32])> =
+        (!exec.allow).then(|| (exec.clone(), Action::ProcessExec, entry_digest));
+    for name in &facts.secrets {
+        let decision = engine.decide(&Request {
+            principal: principal.clone(),
+            action: Action::SecretUse,
+            resource: Resource::Secret(name.clone()),
+            context: Context::Secret {
+                now_ms,
+                delivery: crate::request::Delivery::Raw,
+                intent: intent.cloned(),
+            },
+        });
+        if !decision.allow && deciding.is_none() {
+            deciding = Some((decision, Action::SecretUse, secret_digest(name)));
+        }
+    }
+    let (decision, action, resource_digest) =
+        deciding.unwrap_or((exec, Action::ProcessExec, entry_digest));
+    PersonOutcome {
+        decision,
+        action,
+        resource_digest,
+        request_digest,
+        intent_digest,
     }
 }

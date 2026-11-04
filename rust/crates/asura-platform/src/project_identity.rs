@@ -397,6 +397,305 @@ impl ProjectIdentity {
     }
 }
 
+// ----- Canonical paths (security-policy.md, PL2 canonical paths) -----
+
+/// Why a path has no canonical form (PL2 canonical paths, reason codes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathRefusal {
+    NotCanonical,
+    Symlink,
+    OutsideRoot,
+    HardLink,
+    Unavailable,
+}
+impl PathRefusal {
+    /// The stable reason code.
+    pub fn reason(self) -> &'static str {
+        match self {
+            PathRefusal::NotCanonical => "path_not_canonical",
+            PathRefusal::Symlink => "path_symlink",
+            PathRefusal::OutsideRoot => "path_outside_root",
+            PathRefusal::HardLink => "path_hard_link",
+            PathRefusal::Unavailable => "path_unavailable",
+        }
+    }
+}
+/// What the caller will do with the path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkMode {
+    /// Every component must exist.
+    Read,
+    /// The final component may be missing; its parent must exist.
+    Create,
+    /// Every component must exist, and a regular file must have one link.
+    MediatedWrite,
+}
+/// A canonical path: the stored spelling, walked again and compared by
+/// identity. `rel` is set for a walk under a root (empty never: the root
+/// itself is not a `rel` path). `device` and `inode` are the final object's,
+/// or the parent's when the final component is missing (`exists` false).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalPath {
+    pub path: String,
+    pub rel: Option<String>,
+    pub exists: bool,
+    pub nlink: u64,
+    pub device: u64,
+    pub inode: u64,
+    /// A walked directory, or the final object, is the Asura home.
+    pub in_asura_home: bool,
+}
+
+/// W1 bounds of an input path.
+const MAX_PATH_BYTES: usize = 1024;
+const MAX_COMPONENTS: usize = 64;
+/// The fixed `/private` aliases of the sealed system volume (step 2).
+const ALIASES: [&str; 3] = ["tmp", "var", "etc"];
+
+/// Step 1 for the components of a path (without its leading `/`).
+fn lexical_components(text: &str) -> std::result::Result<Vec<CString>, PathRefusal> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parts: Vec<&str> = text.split('/').collect();
+    if parts.len() > MAX_COMPONENTS {
+        return Err(PathRefusal::NotCanonical);
+    }
+    parts
+        .into_iter()
+        .map(|part| {
+            if part.is_empty() || part == "." || part == ".." {
+                return Err(PathRefusal::NotCanonical);
+            }
+            CString::new(part).map_err(|_| PathRefusal::NotCanonical)
+        })
+        .collect()
+}
+fn lexical_input(text: &str) -> std::result::Result<(), PathRefusal> {
+    if text.len() > MAX_PATH_BYTES || text.chars().any(char::is_control) {
+        return Err(PathRefusal::NotCanonical);
+    }
+    Ok(())
+}
+/// Whether `path` is an absolute path in lexically canonical form.
+pub fn lexically_canonical(path: &str) -> bool {
+    lexical_input(path).is_ok()
+        && (path == "/" || (path.starts_with('/') && lexical_components(&path[1..]).is_ok()))
+}
+
+/// Opens one component with `O_NOFOLLOW`. A symbolic link gives `Symlink`;
+/// a missing component `Unavailable` with `missing` set.
+fn open_component(
+    dir: &OwnedFd,
+    name: &CString,
+    directory: bool,
+) -> std::result::Result<OwnedFd, (PathRefusal, bool)> {
+    let flags = libc::O_RDONLY | if directory { libc::O_DIRECTORY } else { 0 };
+    match open_at(dir.as_raw_fd(), name, flags, 0) {
+        Ok(fd) => Ok(fd),
+        // The kind of the entry, without following it: a symbolic link, an
+        // entry that cannot be opened, or no entry at all.
+        Err(_) => match stat_at(dir.as_raw_fd(), name) {
+            Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFLNK => {
+                Err((PathRefusal::Symlink, false))
+            }
+            Ok(_) => Err((PathRefusal::Unavailable, false)),
+            Err(_) => Err((PathRefusal::Unavailable, true)),
+        },
+    }
+}
+
+/// `fcntl(F_GETPATH)`: the kernel's spelling of an open descriptor.
+fn descriptor_path(fd: &OwnedFd) -> std::result::Result<String, PathRefusal> {
+    let mut buffer = vec![0u8; libc::PATH_MAX as usize + 1];
+    // SAFETY: F_GETPATH writes at most MAXPATHLEN (PATH_MAX) bytes and a NUL
+    // into the buffer, which holds PATH_MAX + 1 bytes; fd is borrowed open.
+    let result = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) };
+    if result < 0 {
+        return Err(PathRefusal::Unavailable);
+    }
+    let end = buffer
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or(PathRefusal::Unavailable)?;
+    buffer.truncate(end);
+    String::from_utf8(buffer).map_err(|_| PathRefusal::Unavailable)
+}
+
+/// One walk's result: the final (or parent) descriptor's stat and spelling.
+struct Walked {
+    spelling: String,
+    stat: libc::stat,
+    exists: bool,
+    in_home: bool,
+}
+
+/// Steps 3 and 4 below `start` (a directory descriptor) through `parts`.
+fn walk(
+    start: OwnedFd,
+    parts: &[CString],
+    mode: WalkMode,
+    boundary: Option<&StateBoundary>,
+) -> std::result::Result<Walked, PathRefusal> {
+    let home =
+        |stat: &libc::stat| boundary.is_some_and(|b| b.is_home(crate::runtime::identity(stat)));
+    let mut held = start;
+    let mut stat = stat_fd(held.as_raw_fd()).map_err(|_| PathRefusal::Unavailable)?;
+    let mut in_home = home(&stat);
+    for (index, part) in parts.iter().enumerate() {
+        let last = index + 1 == parts.len();
+        match open_component(&held, part, !last) {
+            Ok(next) => {
+                held = next;
+                stat = stat_fd(held.as_raw_fd()).map_err(|_| PathRefusal::Unavailable)?;
+                in_home |= home(&stat);
+            }
+            Err((PathRefusal::Unavailable, true)) if last && mode == WalkMode::Create => {
+                let parent = descriptor_path(&held)?;
+                let name = part.to_str().map_err(|_| PathRefusal::NotCanonical)?;
+                let spelling = if parent == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{parent}/{name}")
+                };
+                return Ok(Walked {
+                    spelling,
+                    stat,
+                    exists: false,
+                    in_home,
+                });
+            }
+            Err((refusal, _)) => return Err(refusal),
+        }
+    }
+    Ok(Walked {
+        spelling: descriptor_path(&held)?,
+        stat,
+        exists: true,
+        in_home,
+    })
+}
+fn open_root() -> std::result::Result<OwnedFd, PathRefusal> {
+    open_at(libc::AT_FDCWD, c"/", libc::O_RDONLY | libc::O_DIRECTORY, 0)
+        .map_err(|_| PathRefusal::Unavailable)
+}
+/// The components of an absolute path after the step 2 alias.
+fn absolute_parts(path: &str) -> std::result::Result<Vec<CString>, PathRefusal> {
+    lexical_input(path)?;
+    if !path.starts_with('/') {
+        return Err(PathRefusal::NotCanonical);
+    }
+    let mut parts = lexical_components(&path[1..])?;
+    if parts
+        .first()
+        .is_some_and(|first| ALIASES.iter().any(|a| first.as_bytes() == a.as_bytes()))
+    {
+        parts.insert(0, c"private".to_owned());
+    }
+    Ok(parts)
+}
+/// Step 4: the spelling walked again from `/` gives the same identity.
+fn confirm(walked: &Walked, mode: WalkMode) -> std::result::Result<(), PathRefusal> {
+    let parts = absolute_parts(&walked.spelling).map_err(|_| PathRefusal::Unavailable)?;
+    let again = walk(open_root()?, &parts, mode, None).map_err(|_| PathRefusal::Unavailable)?;
+    if again.exists != walked.exists
+        || again.stat.st_dev != walked.stat.st_dev
+        || again.stat.st_ino != walked.stat.st_ino
+        || again.spelling != walked.spelling
+    {
+        return Err(PathRefusal::Unavailable);
+    }
+    Ok(())
+}
+fn finish(
+    walked: Walked,
+    rel: Option<String>,
+    mode: WalkMode,
+) -> std::result::Result<CanonicalPath, PathRefusal> {
+    let regular = walked.stat.st_mode & libc::S_IFMT == libc::S_IFREG;
+    if mode == WalkMode::MediatedWrite && walked.exists && regular && walked.stat.st_nlink > 1 {
+        return Err(PathRefusal::HardLink);
+    }
+    Ok(CanonicalPath {
+        path: walked.spelling,
+        rel,
+        exists: walked.exists,
+        nlink: u64::from(walked.stat.st_nlink),
+        device: walked.stat.st_dev as u64,
+        inode: walked.stat.st_ino,
+        in_asura_home: walked.in_home,
+    })
+}
+
+/// The canonical form of an absolute path (PL2-F1). Blocking file system
+/// calls: platform worker threads only.
+pub fn canonical_path(
+    path: &str,
+    mode: WalkMode,
+    boundary: Option<&StateBoundary>,
+) -> std::result::Result<CanonicalPath, PathRefusal> {
+    let parts = absolute_parts(path)?;
+    let walked = walk(open_root()?, &parts, mode, boundary)?;
+    confirm(&walked, mode)?;
+    finish(walked, None, mode)
+}
+/// The canonical spelling of a registered root whose identity must equal
+/// `(device, inode)`; another identity is `OutsideRoot`. Blocking.
+pub fn canonical_root(
+    location: &str,
+    device: u64,
+    inode: u64,
+) -> std::result::Result<String, PathRefusal> {
+    let root = canonical_path(location, WalkMode::Read, None)?;
+    if root.device != device || root.inode != inode {
+        return Err(PathRefusal::OutsideRoot);
+    }
+    Ok(root.path)
+}
+impl ProjectIdentity {
+    /// The canonical form of `rel` under this retained root (PL2-F1, step
+    /// 5). Blocking file system calls: platform worker threads only.
+    pub fn canonical_under(
+        &self,
+        rel: &str,
+        mode: WalkMode,
+    ) -> std::result::Result<CanonicalPath, PathRefusal> {
+        lexical_input(rel)?;
+        if rel.starts_with('/') {
+            return Err(PathRefusal::NotCanonical);
+        }
+        let parts = lexical_components(rel)?;
+        if parts.is_empty() {
+            return Err(PathRefusal::NotCanonical);
+        }
+        // The root's current spelling and identity.
+        let held = self
+            .held
+            .try_clone()
+            .map_err(|_| PathRefusal::Unavailable)?;
+        let root_spelling = descriptor_path(&held)?;
+        let root = canonical_path(&root_spelling, WalkMode::Read, None)
+            .map_err(|_| PathRefusal::OutsideRoot)?;
+        if root.device != self.device || root.inode != self.inode {
+            return Err(PathRefusal::OutsideRoot);
+        }
+        let walked = walk(held, &parts, mode, Some(&self.boundary))?;
+        confirm(&walked, mode)?;
+        let prefix = if root.path == "/" {
+            "/".to_owned()
+        } else {
+            format!("{}/", root.path)
+        };
+        let rest = walked
+            .spelling
+            .strip_prefix(&prefix)
+            .filter(|rest| !rest.is_empty())
+            .ok_or(PathRefusal::OutsideRoot)?
+            .to_owned();
+        finish(walked, Some(rest), mode)
+    }
+}
+
 /// Project reads have no time bound; only the owner's cancel stops them.
 fn project_check(
     cancelled: &std::sync::atomic::AtomicBool,
@@ -732,5 +1031,194 @@ mod boundary_tests {
         std::fs::remove_dir(&project).unwrap();
         std::os::unix::fs::symlink(home.0.join(".asura"), &project).unwrap();
         assert!(held.validate().is_err());
+    }
+}
+
+/// PL-U9 (security-policy.md, PL2 validation map): the canonicaliser in
+/// scratch directories under `/private/tmp`; never the Asura home.
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+    use crate::runtime::Identity;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    struct Scratch(String);
+    impl Scratch {
+        fn new() -> Self {
+            let path = format!(
+                "/private/tmp/asura-canonical-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn at(&self, rel: &str) -> String {
+            format!("{}/{rel}", self.0)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn read(path: &str) -> std::result::Result<CanonicalPath, PathRefusal> {
+        canonical_path(path, WalkMode::Read, None)
+    }
+
+    #[test]
+    fn lexical_forms_are_refused() {
+        let s = Scratch::new();
+        std::fs::create_dir(s.at("a")).unwrap();
+        for bad in [
+            s.at("a/../a"),
+            s.at("a/./x"),
+            s.at("a//x"),
+            s.at("a/"),
+            "relative/a".into(),
+            s.at("a\u{7}"),
+            format!("/{}", "x".repeat(1025)),
+            format!("/{}", vec!["d"; 65].join("/")),
+        ] {
+            assert_eq!(read(&bad), Err(PathRefusal::NotCanonical), "{bad:?}");
+        }
+        assert!(lexically_canonical("/"));
+        assert!(!lexically_canonical("/a/../b"));
+        assert_eq!(PathRefusal::NotCanonical.reason(), "path_not_canonical");
+        assert_eq!(PathRefusal::HardLink.reason(), "path_hard_link");
+    }
+
+    #[test]
+    fn symlink_components_are_refused() {
+        let s = Scratch::new();
+        std::fs::create_dir(s.at("real")).unwrap();
+        std::fs::write(s.at("real/f"), b"x").unwrap();
+        std::os::unix::fs::symlink("real", s.at("link")).unwrap();
+        std::os::unix::fs::symlink("f", s.at("real/flink")).unwrap();
+        assert_eq!(read(&s.at("link/f")), Err(PathRefusal::Symlink));
+        assert_eq!(read(&s.at("link")), Err(PathRefusal::Symlink));
+        assert_eq!(read(&s.at("real/flink")), Err(PathRefusal::Symlink));
+        assert_eq!(read(&s.at("real/missing")), Err(PathRefusal::Unavailable));
+        assert_eq!(read(&s.at("real/f")).unwrap().path, s.at("real/f"));
+    }
+
+    #[test]
+    fn aliases_and_firmlinks_give_the_stored_spelling() {
+        assert_eq!(read("/tmp").unwrap().path, "/private/tmp");
+        assert_eq!(read("/var").unwrap().path, "/private/var");
+        assert_eq!(read("/etc").unwrap().path, "/private/etc");
+        let users = read("/Users").unwrap();
+        let firm = read("/System/Volumes/Data/Users").unwrap();
+        assert_eq!(firm.path, "/Users");
+        assert_eq!((firm.device, firm.inode), (users.device, users.inode));
+        assert_eq!(read("/").unwrap().path, "/");
+        assert_eq!(read("/bin/sh").unwrap().path, "/bin/sh");
+    }
+
+    #[test]
+    fn case_and_normalization_give_the_stored_spelling() {
+        let s = Scratch::new();
+        let nfc = "Caf\u{e9}";
+        std::fs::create_dir(s.at(nfc)).unwrap();
+        std::fs::write(s.at(&format!("{nfc}/File.txt")), b"x").unwrap();
+        let stored = s.at(&format!("{nfc}/File.txt"));
+        for spelling in [
+            stored.clone(),
+            s.at("CAF\u{c9}/file.TXT"),
+            s.at("Cafe\u{301}/File.txt"),
+            stored.replacen("/private/tmp", "/tmp", 1),
+        ] {
+            assert_eq!(read(&spelling).unwrap().path, stored, "{spelling:?}");
+        }
+    }
+
+    #[test]
+    fn hard_links_are_refused_only_for_mediated_writes() {
+        let s = Scratch::new();
+        std::fs::write(s.at("one"), b"x").unwrap();
+        std::fs::hard_link(s.at("one"), s.at("two")).unwrap();
+        let path = s.at("two");
+        let found = canonical_path(&path, WalkMode::Read, None).unwrap();
+        assert_eq!((found.nlink, found.path.as_str()), (2, path.as_str()));
+        assert_eq!(
+            canonical_path(&path, WalkMode::MediatedWrite, None),
+            Err(PathRefusal::HardLink)
+        );
+        std::fs::write(s.at("single"), b"x").unwrap();
+        assert!(canonical_path(&s.at("single"), WalkMode::MediatedWrite, None).is_ok());
+    }
+
+    #[test]
+    fn create_mode_allows_a_missing_final_component() {
+        let s = Scratch::new();
+        std::fs::create_dir(s.at("Dir")).unwrap();
+        let created = canonical_path(&s.at("dir/New"), WalkMode::Create, None).unwrap();
+        assert_eq!(created.path, s.at("Dir/New"));
+        assert!(!created.exists);
+        assert_eq!(
+            canonical_path(&s.at("nodir/New"), WalkMode::Create, None),
+            Err(PathRefusal::Unavailable)
+        );
+        assert_eq!(read(&s.at("Dir/New")), Err(PathRefusal::Unavailable));
+    }
+
+    #[test]
+    fn under_root_gives_rel_and_refuses_outside() {
+        let s = Scratch::new();
+        std::fs::create_dir_all(s.at("proj/src")).unwrap();
+        std::fs::write(s.at("proj/src/Main.rs"), b"x").unwrap();
+        std::fs::create_dir(s.at("other")).unwrap();
+        std::os::unix::fs::symlink("../other", s.at("proj/out")).unwrap();
+        let root =
+            ProjectIdentity::open(&s.at("proj"), &StateBoundary::detached_for_test()).unwrap();
+        let file = root.canonical_under("SRC/main.rs", WalkMode::Read).unwrap();
+        assert_eq!(file.path, s.at("proj/src/Main.rs"));
+        assert_eq!(file.rel.as_deref(), Some("src/Main.rs"));
+        assert_eq!(
+            root.canonical_under("out/x", WalkMode::Read),
+            Err(PathRefusal::Symlink)
+        );
+        assert_eq!(
+            root.canonical_under("../other", WalkMode::Read),
+            Err(PathRefusal::NotCanonical)
+        );
+        assert_eq!(
+            root.canonical_under("/etc", WalkMode::Read),
+            Err(PathRefusal::NotCanonical)
+        );
+        // Another directory under the root's registered spelling.
+        std::fs::rename(s.at("proj"), s.at("moved")).unwrap();
+        std::fs::create_dir(s.at("proj")).unwrap();
+        assert_eq!(
+            canonical_root(&s.at("proj"), root.device, root.inode),
+            Err(PathRefusal::OutsideRoot)
+        );
+        assert_eq!(
+            canonical_root(&s.at("moved"), root.device, root.inode).unwrap(),
+            s.at("moved")
+        );
+        // The retained root moved: its new spelling is the prefix.
+        let moved = root.canonical_under("src/Main.rs", WalkMode::Read).unwrap();
+        assert_eq!(moved.path, s.at("moved/src/Main.rs"));
+    }
+
+    #[test]
+    fn asura_home_identity_is_flagged() {
+        use std::os::unix::fs::MetadataExt;
+        let s = Scratch::new();
+        std::fs::create_dir_all(s.at("home/.asura/tmp")).unwrap();
+        let stat = std::fs::metadata(s.at("home/.asura")).unwrap();
+        let boundary = StateBoundary::new(
+            Identity {
+                device: stat.dev() as libc::dev_t,
+                inode: stat.ino(),
+            },
+            [],
+        );
+        let inside =
+            canonical_path(&s.at("home/.asura/tmp"), WalkMode::Read, Some(&boundary)).unwrap();
+        assert!(inside.in_asura_home);
+        let outside = canonical_path(&s.at("home"), WalkMode::Read, Some(&boundary)).unwrap();
+        assert!(!outside.in_asura_home);
     }
 }

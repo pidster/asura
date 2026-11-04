@@ -467,6 +467,24 @@ fn basic() -> Result<()> {
     let s = position(&|r| matches!(r, Record::JobSettled(s) if s.job == job_of(input)))
         .ok_or("kind 28")?;
     assert!(q < i && i < s, "order {q} {i} {s}");
+    // PL-I15 (security-policy.md, PL2): the start's kind 34 (subject: the
+    // input, `run`, person profile, no constraint digest) immediately
+    // precedes its kind 26.
+    let d = position(&|r| {
+        matches!(r, Record::PolicyDecision(d)
+            if d.subject == journal::PolicySubject::PersonInput { input })
+    })
+    .ok_or("kind 34")?;
+    assert_eq!(d + 1, i, "kind 34 immediately before kind 26");
+    let Record::PolicyDecision(decision) = &all[d] else {
+        unreachable!()
+    };
+    assert_eq!(decision.outcome, journal::PolicyOutcome::Run);
+    assert_eq!(
+        (decision.origin, decision.profile, decision.action),
+        (2, 2, 5)
+    );
+    assert!(decision.constraint_digest.is_none() && decision.intent_digest.is_some());
     // PC-I17: the exact retry returns the original input; nothing new.
     let (again, _) = queued(&env, &submit)?;
     assert_eq!(again, input);

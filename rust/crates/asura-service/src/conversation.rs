@@ -870,6 +870,8 @@ enum Job {
     PersonCheck(journal::Id),
     /// A dispatch hold of a person command (`secrets_lost` and others).
     PersonHold(journal::Id),
+    /// A person start's kind 35 (`false`) or kind 34 (`true`) (PL2).
+    PersonPolicy(journal::Id, bool),
     /// A person dispatch's path guard read or acknowledgement (P5).
     PathDispatch(journal::Id),
     /// A `/paths` request's read or append, by request key (P5).
@@ -2691,6 +2693,7 @@ impl Owner {
                         | Job::PersonRead(_)
                         | Job::PersonCheck(_)
                         | Job::PersonHold(_)
+                        | Job::PersonPolicy(..)
                 ) {
                     self.person_job_failed(job, cause);
                     return;
@@ -2924,6 +2927,7 @@ impl Owner {
             Job::PersonRead(input) => self.person_read(input, value, now),
             Job::PersonCheck(input) => self.person_checked(input, value),
             Job::PersonHold(input) => self.person_held(input),
+            Job::PersonPolicy(input, decision) => self.person_policy_recorded(input, decision),
             Job::Controller(job) => {
                 let sequence = self.replay.as_ref().map_or(0, |r| r.sequence);
                 self.jobs.record_done(job, Ok(sequence));
@@ -4761,7 +4765,9 @@ impl Owner {
                     // before this call's kind 14.
                     let mut constraints = None;
                     if execution
-                        && let Some(location) = registration.as_ref().map(|r| r.location.clone())
+                        && let Some((location, device, inode)) = registration
+                            .as_ref()
+                            .map(|r| (r.location.clone(), r.device, r.inode))
                     {
                         let policy = self.policy.get_or_insert_with(|| {
                             crate::policy::PolicyOwner::start(
@@ -4776,6 +4782,15 @@ impl Owner {
                         let turn = &active.turn;
                         let ordinal = tool.ordinal;
                         let command = journal::exec_cmd_command(&tool.record).unwrap_or_default();
+                        // PL2: the plan facts of the intent extractor.
+                        let plan = tool.exec.as_ref().map_or_else(Default::default, |e| {
+                            asura_platform::exec_cmd::split::PlanFacts {
+                                secret_vars: u32::try_from(e.secrets.variables.len())
+                                    .unwrap_or(u32::MAX),
+                                secret_reference: false,
+                                whole_command: e.secrets.command.is_some(),
+                            }
+                        });
                         let request = || crate::policy::JobRequest {
                             agent: crate::job_controller::AgentKey {
                                 conversation: turn.conversation,
@@ -4788,7 +4803,11 @@ impl Owner {
                             }),
                             project: turn.project,
                             location,
-                            command_digest: policy_call::command_digest(&command),
+                            device,
+                            inode,
+                            command,
+                            plan,
+                            person: None,
                             now_ms: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
@@ -4803,7 +4822,11 @@ impl Owner {
                             request,
                             revision,
                             last_seq,
-                            (turn.operation, turn.generation, ordinal),
+                            journal::PolicySubject::ModelCall {
+                                operation: turn.operation,
+                                generation: turn.generation,
+                                ordinal,
+                            },
                         ) {
                             policy_call::Next::Wait => return,
                             policy_call::Next::Append(record, decision) => {

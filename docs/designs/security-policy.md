@@ -8,7 +8,12 @@ the [owner questions](#open-owner-questions) on 2026-11-03.
 Packet PL1 is implemented (2026-11-03). Against the owner's revised budgets
 (AD-33), PL-B1 passes and the single PL-B2 run missed by 28 µs, reported to
 the owner ([PL1 delivery record](#pl1-delivery-record)).
-Later packets are not implemented. Protocol numbering stays `0.1` and the
+Packet PL2 is implemented (2026-11-04) under its
+[implementation contract](#pl2-implementation-contract). PL-B1 passes.
+PL-B2 failed its 1.5 ms target; the owner revised it to p99 at most 2.5 ms
+(AD-34, 2026-11-04), and the quiet-machine runs pass it
+([PL2 delivery record](#pl2-delivery-record)). Later packets are not
+implemented. Protocol numbering stays `0.1` and the
 journal format stays `1` until release 1.0.0; schemas change in place.
 
 This is the D3 policy design that the [security policy brief](security-policy-brief.md)
@@ -41,7 +46,7 @@ spike evidence only.
 | AD-14 | Pattern A: each scope is evaluated separately; allow only if every scope allows; a refusal names the denying scope | 2026-11-03 |
 | AD-17 | cvc5 built from source with a dynamic or replaceable GMP, signed and notarised inside `Asura.app`; proofs on the person's Mac, offline; a bounded admission tool with no default time limit. Refined by SBQ1 (GMP 6.3.0 as `@rpath/libgmp.10.dylib`) and SBQ2 (no LibPoly) | 2026-11-03 |
 | AD-27 | Effects are the authority. Commands, MCP tools and skills are intent: they may only tighten | 2026-11-03 |
-| Budgets | Decision p50 at most 150 µs; end-to-end p99 at most 1.5 ms at 64 concurrent requests; at most 8 MiB added to the `asura` executable (AD-31); startup at most 200 ms. Revised by the owner on 2026-11-03 after the PL1 measurements (AD-33), from p50 100 µs and p99 1 ms: pattern A evaluates four scopes over 258 policies, about 80 µs of the decision, and a model turn takes seconds | 2026-11-03 |
+| Budgets | Decision p50 at most 150 µs; end-to-end p99 at most 2.5 ms at 64 concurrent requests (AD-34, 2026-11-04, after the PL2 measurements; was 1.5 ms under AD-33); at most 8 MiB added to the `asura` executable (AD-31); startup at most 200 ms. Revised by the owner on 2026-11-03 after the PL1 measurements (AD-33), from p50 100 µs and p99 1 ms: pattern A evaluates four scopes over 258 policies, about 80 µs of the decision, and a model turn takes seconds | 2026-11-03 |
 | AD-24 | Envelope approval is an authorized policy change; envelopes end with their task or on revocation | 2026-11-02 |
 | AD-15, AD-16 | The classifier may stop a model job to ask; `unknown` asks; an unanswered job waits in its agent's queue with a short reason | 2026-11-02 |
 | AD-25 | Context egress is a policy decision over data classes, destinations and projects | 2026-10-31 |
@@ -635,7 +640,7 @@ Selected. Path entities are built only from canonical forms.
 | `..`, `.`, empty components, `//`, trailing `/` | Refused in every input path (`path_not_canonical`). A request never resolves `..` lexically |
 | Symlink component | Refused (`path_symlink`). A symlink is never followed into a decision |
 | Firmlinks and mount spellings | Compared by device and inode with the retained descriptors, as [state isolation](asura-state-isolation.md) does. The canonical spelling is the one of the retained root plus walked names |
-| Case and Unicode | A component is kept as stored on disk (read back through the descriptor), so two spellings of one file on a case-insensitive volume give one entity ID. Probe SP-P1 must confirm the spelling source |
+| Case and Unicode | A component is kept as stored on disk (read back through the descriptor), so two spellings of one file on a case-insensitive volume give one entity ID. Probe SP-P1 confirmed `F_GETPATH` of the walked descriptor as the spelling source ([SP-P1 result](#sp-p1-result), [PL2 canonical paths](#pl2-canonical-paths)) |
 | Hard links | A file with `st_nlink > 1` has no single canonical parent. A service-mediated write to such a file is refused (`path_hard_link`); for job regions, Seatbelt decides by the path used, which is a stated residual ([threat PL-T3](execution-threat-model.md#policy-layer)) |
 | `/private` aliases | `/tmp`, `/var` and `/etc` are spelled `/private/...` after the walk |
 | Class | `asura_state` when the path is inside `~/.asura` by identity; else `implicit_exec` or `build_test` from the path guard lists; else `ordinary`. The first match in this order wins |
@@ -1579,9 +1584,10 @@ its reason and text.
 
 ### Person commands (`!` and `!!`)
 
-Selected (packet PL2). At dispatch, after the secret item read and the path
-guard check, the conversation owner asks for a job decision with profile
-`person-1` or `person-outside-1` and intent source `person_command`.
+Selected (packet PL2; details in the [PL2 person command decision](#pl2-person-command-decision)).
+At dispatch, after the secret item read and the path guard check, the
+conversation owner asks for a job decision with profile `person-1` or
+`person-outside-1` and intent source `person_command`.
 
 - The entry `process.exec` request carries `env_terminal`, `env_declared`
   and `outside_switch`. The environment builder stays the enforcer of the
@@ -1609,7 +1615,8 @@ Selected. `secret_use` decides each named reference of a person command, with
 delivery `raw`. The installation hard forbid (S4) denies every named secret
 to a model-origin job; the model refusal `model_secret_reference` keeps its
 owner and its order (NS-F4), because it is a usability rule about the
-command text. Brokered delivery is decided when brokers exist.
+command text. Brokered delivery is decided when brokers exist. PL2
+delivers these decisions ([PL2 person command decision](#pl2-person-command-decision)).
 
 ### Context composer
 
@@ -2289,7 +2296,7 @@ They are acceptance criteria, never runtime closures (AE-04).
 | ID | Budget | Measurement |
 | --- | --- | --- |
 | PL-B1 | Decision p50 at most 150 µs (owner revision of 2026-11-03, AD-33; was 100 µs) | In the worker: request and entity slice construction, schema checks, every applicable scope, wrapper and reasons; on the product schema with the scale workload below |
-| PL-B2 | End-to-end p99 at most 1.5 ms at 64 concurrent requests (owner revision of 2026-11-03, AD-33; was 1 ms) | From `decide` on the reactor to the `decided` event, 64 closed-loop requesters, the product worker pool |
+| PL-B2 | End-to-end p99 at most 2.5 ms at 64 concurrent requests (owner revision of 2026-11-04, AD-34; was 1.5 ms under AD-33 of 2026-11-03, and 1 ms before) | From `decide` on the reactor to the `decided` event, 64 closed-loop requesters, the product worker pool |
 | PL-B3 | At most 8 MiB added size | Stripped release `asura` with the policy layer against the same build without it. The solver and GMP files are reported separately for each release, with no limit (AD-31, [OQ4](#open-owner-questions)) |
 | PL-B4 | Startup at most 200 ms | From the owner's start to the first decision: schema, every admitted scope of the workload, worker installation |
 | PL-B5 | Safety budgets kept from the spike | PES-M2 (0 unenforced conventions), M3 (100 % injected errors deny), M4 (0 allows in 1,000,000 malformed requests), M5 (determinism), M6 (12 of 12 seeded defects refused, warnings refuse), M7 (reasons), M15 to M18 (proofs) |
@@ -2321,7 +2328,7 @@ IDs are stable; each packet lists the IDs it delivers.
 | PL-U10 | Intent extractor: features per fixture; no positional argv; `unparsed` cases | PL2 |
 | PL-U11 | Lints: tighten-only, forbid-only, reserved annotations, literals | PL3 |
 | PL-U12 | Envelope rendering: typed fields to text; no free text | PL8 |
-| PL-U13 | Kind 34, 35, 36 codecs and replay rules (`Corrupt` cases) | PL1, PL3, PL7 |
+| PL-U13 | Kind 34, 35, 36 codecs and replay rules (`Corrupt` cases) | PL1, PL2, PL3, PL7 |
 
 ### Integration
 
@@ -2360,6 +2367,7 @@ IDs are stable; each packet lists the IDs it delivers.
 | PL-E4 | Malicious repository policy with a `permit` and an instruction in `@explain`: refused; after removing the permit, admitted as forbid-only; the model never sees the text | PL5 |
 | PL-E5 | Envelope: approve, a job writes inside, a job writing just outside is denied by the sandbox, the task ends and a new job loses the region | PL8 |
 | PL-E6 | Unattended approval wait: the job waits with its reason until the person answers in a second client | PL7 |
+| PL-E7 | TUI PTY journey: a `!` command's kind 34 precedes its kind 26; with a test-only denying set, a `!` command is held `policy_denied` and does not run | PL2 |
 
 ### Proof and budget evidence
 
@@ -2777,6 +2785,454 @@ without the per-request schema check (saves about 30 µs, changes rule W2);
 cache each principal's entities per worker; for PL-B2, more workers than
 `clamp(n / 2, 2, 8)` or a lower concurrency in the budget's definition.
 
+## PL2 implementation contract
+
+Selected, 2026-11-04. This section fixes the details that packet PL2 needs
+and that the sections above leave open. Where it narrows an earlier
+section, that section links here. PL2 changes no confinement: the `model-1`
+profile stays byte-equal, and the person profiles keep their guardian
+profiles (`CONSTRAINTS` stays `-` until PL6). With the shipped sets, every
+`!` and `!!` command that ran before still runs.
+
+### What PL2 builds and what waits
+
+| Item | PL2 | Later |
+| --- | --- | --- |
+| Canonicaliser | The descriptor walk of [canonical paths](#pl2-canonical-paths) in `asura-platform::project_identity`, with SP-P1 answered. Production use: the project root of every job decision and the entry program path | PL3 policy literals; PL5 `rel` literals; PL6 region candidates; PL8 envelope roots |
+| Program identity | `asura-platform::code_identity`: the static code check of the entry program (`/bin/sh`) of every job | Exec region candidates keep `identity_known = false` ([programs](#programs)); live exec checks are proposed |
+| Intent | `source`, `name`, `digest` and the `command` features of the [intent extractor](#pl2-intent-extractor), for model and person commands | MCP tools and skills stay reserved |
+| Person decisions | The entry `process.exec` of every `!` and `!!` job, with its environment names and the outside switch; one `secret_use` per named reference, delivery `raw`; kind 34 subject code 2 | PL6 compiles the person regions; PL7 adds `ask` |
+| Network | No per-connection decision. The built-in sets permit `network.connect` for both person profiles, and the [AD-7 load check](#pl2-ad-7-load-check) refuses a revision that forbids it | PL3 proves it at admission; PL10 adds the proxy |
+| Approvals | None. No tighten-only forbid is shipped, so no decision is `ask` | PL7 (AD-29) |
+| Admission | None. The built-in sets change only with a release | PL3 |
+
+The Asura home and the job scratch path keep the PL1 rule: they come from
+the validated runtime, whose state isolation already checks them by
+identity ([state isolation](asura-state-isolation.md)).
+
+### SP-P1 result
+
+Verified, 2026-11-04, on the reference Mac (macOS 27, one APFS container,
+case-insensitive and normalization-insensitive volumes), with a read-only
+probe in a scratch directory under `/private/tmp`. Each path was walked
+from `/` one component at a time with `O_NOFOLLOW`, and the final
+descriptor was read back with `fcntl(F_GETPATH)`.
+
+| Case | Walk result | `F_GETPATH` of the final descriptor |
+| --- | --- | --- |
+| `/Users/<name>` and `/USERS/<NAME>` | Both open the same device and inode | `/Users/<name>`: the case stored on disk |
+| `/System/Volumes/Data/Users` (firmlink target) | Opens the same device and inode as `/Users` | `/Users`: the root-volume spelling |
+| `/System/Volumes/Data/Applications`, `/System/Volumes/Data/Library` | Same identity as `/Applications`, `/Library` | `/Applications`, `/Library` |
+| `/tmp`, `/var`, `/etc`, `$TMPDIR` (`/var/folders/...`) | Refused: each is a symbolic link (`ELOOP`, or `ENOTDIR` inside the walk) | — |
+| `/private/tmp`, `/private/var/folders/.../T` | Open | The same spelling |
+| A name stored in NFC, opened in NFC, in NFD, or in upper case | All open one directory | The stored NFC bytes |
+| `<dir>/link/File.txt` with `link` a symbolic link | Refused at `link` (`ENOTDIR`) | — |
+| A file with two hard links, opened by its second name | Opens; `st_nlink` is 2 | The name used for the open |
+| `/bin/sh`, `/usr/bin/git`, `/opt/homebrew` | Open | The same spelling |
+
+Answer: the walk alone keeps the typed spelling; the stored spelling comes
+from `F_GETPATH` of the walked descriptor, which gives the stored case and
+normalization and the root-volume spelling across firmlinks. The `/private`
+aliases cannot be walked with `O_NOFOLLOW` and need a fixed rewrite. A hard
+link has no single spelling; `F_GETPATH` gives the name used. No
+case-sensitive volume was probed: on such a volume the walk opens only the
+stored spelling, which `F_GETPATH` returns unchanged.
+
+### PL2 canonical paths
+
+Selected, refining the [paths](#paths) table with the SP-P1 result. One
+function in `asura-platform::project_identity` canonicalises a path. It
+runs only on the [attribute reader](#pl2-attribute-reader) thread or on
+another platform worker, never on the reactor.
+
+| Step | Rule |
+| --- | --- |
+| 1 Bounds and form | At most 1,024 bytes and 64 components (W1). Absolute, or relative to a retained root. No empty, `.` or `..` component, no `//`, no trailing `/`, no NUL or control character. Else `path_not_canonical` |
+| 2 Aliases | An absolute path whose first component is `tmp`, `var` or `etc` gets the prefix `/private`. These three are fixed symbolic links on the sealed system volume; no other link is rewritten |
+| 3 Walk | From `/` or from a duplicate of the retained root descriptor, one component at a time with `O_NOFOLLOW` (`O_DIRECTORY` for every component but the last). A symbolic link component gives `path_symlink`; a missing or unreadable component gives `path_unavailable`. With a mode that allows a missing final component, the parent must exist and the final name is kept as typed |
+| 4 Spelling | The canonical spelling is `F_GETPATH` of the final descriptor (for a missing final component: of the parent, plus the typed name). The spelling is walked again under step 3 and must give the same device and inode; otherwise `path_unavailable` (the tree changed during the check) |
+| 5 Root | Under a retained root, the root's current `F_GETPATH` spelling plus `/` must be a prefix of the result, and the root's device and inode must equal the retained ones; otherwise `path_outside_root`. `rel` is the rest of the spelling |
+| 6 Hard links | In the mediated-write mode, a regular file with `st_nlink > 1` gives `path_hard_link`. The other modes record the link count only |
+| 7 Class inputs | The walk reports whether any walked directory, or the final object, has the identity of the Asura home (`StateBoundary`). The service then assigns the class: `asura_state` by that identity, else the path guard class of `rel`, else `ordinary` |
+
+Reason codes: `path_not_canonical`, `path_symlink`, `path_outside_root`,
+`path_hard_link`, `path_unavailable`. A job decision whose project root
+fails to canonicalise is a refusal with no scope (`primary_scope` 0), the
+path reason as its reason and `request_invalid` in every scope result. The
+model text is `denied: policy: <reason>`.
+
+### PL2-F1: canonical path walk
+
+Selected design. Arrows show the order of checks for one input path; every
+refusal names its reason. The walk runs on a platform worker thread.
+
+```mermaid
+flowchart TD
+    In["Input path: absolute, or relative to a retained root; mode"] --> Form{"Step 1: within bounds and lexically canonical?"}
+    Form -->|"No"| R1["Refuse: path_not_canonical"]
+    Form -->|"Yes"| Alias["Step 2: first component tmp, var or etc gets /private"]
+    Alias --> Walk["Step 3: open each component with O_NOFOLLOW"]
+    Walk --> Link{"A component is a symbolic link?"}
+    Link -->|"Yes"| R2["Refuse: path_symlink"]
+    Link -->|"No"| Found{"Every component exists, or only the final one is missing in a create mode?"}
+    Found -->|"No"| R3["Refuse: path_unavailable"]
+    Found -->|"Yes"| Spell["Step 4: F_GETPATH of the final descriptor gives the stored spelling"]
+    Spell --> Again{"The spelling walked again gives the same device and inode?"}
+    Again -->|"No"| R3
+    Again -->|"Yes"| Root{"Step 5: under a root: root identity unchanged and its spelling a prefix?"}
+    Root -->|"No"| R4["Refuse: path_outside_root"]
+    Root -->|"Yes, or absolute"| Hard{"Step 6: mediated write to a file with more than one link?"}
+    Hard -->|"Yes"| R5["Refuse: path_hard_link"]
+    Hard -->|"No"| Out["Canonical spelling, rel, link count, inside-Asura-home flag"]
+```
+
+### Program identity in PL2
+
+Selected, refining [programs](#programs).
+
+| Item | Rule |
+| --- | --- |
+| Path | The program path is canonicalised first ([PL2 canonical paths](#pl2-canonical-paths)); a refusal gives `identity_known = false` and keeps the input path only when it is lexically canonical |
+| Check | `SecStaticCodeCreateWithPath` on the canonical path, then `SecStaticCodeCheckValidity` with `kSecCSDoNotValidateResources` and no requirement. Success sets `identity_known` |
+| Fields | `SecCodeCopySigningInformation` with `kSecCSSigningInformation`: `kSecCodeInfoIdentifier` (signing ID), `kSecCodeInfoTeamIdentifier` (team ID; absent for platform and ad-hoc code), `kSecCodeInfoUnique` (cdhash, lowercase hex), and `kSecCodeInfoPlatformIdentifier` (a nonzero value sets `platform`). Each string is at most 128 bytes, or the field is left empty |
+| Race | The reader takes the fingerprint (device, inode, size, modification time) before and after the check. A difference gives `identity_known = false` |
+| Cache | By fingerprint, at most 1,024 entries, least recently used first out, in the reader. A changed fingerprint reads the signature again |
+| Entry program | `/bin/sh`. The owner reads it before it becomes `Active`. After it dispatches a decision, the owner asks the reader to refresh it, at most one refresh in flight. The reader takes the fingerprint and reads the signature again only when it changed; it wakes the reactor only for a changed result. A decision uses the newest result the owner holds |
+| Failure | Never fails a decision. A failed check gives `identity_known = false` and empty strings |
+
+Platform calls (Security framework, file reads) are blocking (AE-02) and run
+only on the attribute reader thread.
+
+### PL2 attribute reader
+
+Selected. The policy owner owns one platform thread,
+`asura-policy-attributes`, for path canonicalisation and program identity.
+
+| Item | Rule |
+| --- | --- |
+| Requests | `program(path)` and `root(project, location, device, inode)` |
+| Queue | A bounded channel of 64. A full channel keeps the request in the owner; the next reactor step tries again |
+| Replies | On the owner's reply channel, then the reactor's wake (except an unchanged refresh) |
+| Root cache | In the owner: canonical root spellings keyed by project, registered location, device and inode; at most 256 entries, oldest first out. Refusals are not cached |
+| Dispatch | An agent queue whose head needs an unresolved root is skipped by dispatch until the reply; the request keeps its place and counts toward the queue bounds. One lookup serves every request with the same key |
+| Loss | A finished reader thread is joined and replaced; its lookups are sent again to the replacement |
+| Shutdown | The owner drops the sender and joins the thread when it has finished, as for the evaluation workers |
+
+### PL2 intent extractor
+
+Selected, refining [commands and other intent](#commands-and-other-intent).
+`asura_platform::exec_cmd::split::intent` builds the features from the
+existing tokenizer (`analyze`, the segment, group, heredoc and clause
+helpers). It is pure, bounded by the 8,192-byte command bound, and runs on
+the evaluation worker.
+
+| Item | Rule |
+| --- | --- |
+| Source text | The stored (rewritten) command: kind 14's command for a model call, kind 31's command for a person command. No secret value enters the features. A whole-command plan gives the stored form's features with `parse = unparsed` |
+| Segments | The top-level segments, then, recursively, the bodies of `$(…)`, backticks and `(…)` groups, the script word of `sh -c` and similar shells and the words after `eval`. Depth at most 8 and at most 64 segments in total; beyond either bound the command is `unparsed` and the rest is not read |
+| Command word | After leading keywords (the existing `clause` rule) and leading assignments. For `env`, `command`, `exec`, `nohup`, `time`, `xargs` and `sudo`, the options are skipped (a value option takes the next word, as `unwrap` does), and the next command word is a tool too, repeatedly |
+| `tools` | The basename of every command word found. A command word that starts with `$(`, a backtick or `(` is not a tool and makes the command `unparsed` |
+| `first_tool`, `subcommand`, `flags` | From the first top-level segment only: its first command word (wrappers included); the first later word that does not start with `-`; and every later word that starts with `-`, cut at its first `=` |
+| `shell_features` | `pipe` (a top-level `\|`); `list` (`;`, newline, `&&` or `\|\|`); `background` (a lone `&`); `redirect_out` (an unquoted `>`, `>>`, `>\|` or `&>`); `redirect_in` (an unquoted `<` or `<<<`); `heredoc` (`<<` or `<<-`); `command_substitution` (`$(` or a backtick); `process_substitution` (`<(` or `>(`); `subshell` (a `(…)` group); `eval`, `source` (a tool `source` or `.`), `nested_shell` (a tool `sh`, `bash`, `zsh`, `dash`, `ksh` or `fish`); `pipe_to_interpreter` (a segment after a `\|` whose tool is a shell, `python`, `python3`, `perl`, `ruby`, `node`, `php` or `osascript`); `assignment` (a leading assignment); `glob` (an unquoted `*`, `?` or `[` in a word); `tilde` (an unquoted `~` that starts a word); `parameter_expansion` (an unquoted or double-quoted `$` followed by a name byte, `{`, a digit or one of `@*#?$!-`) |
+| `parse` | `unparsed` for a tokenizer failure (`Analysis::parsed` false), a heredoc, a command word with `$(`, a backtick or `(`, the depth or segment bound, a set bound, or a whole-command plan. Else `compound` when there is more than one segment, or any group, inner script or `eval` body; else `simple` |
+| Bounds | `tools` and `flags` hold at most 32 distinct entries each; each tool, flag and subcommand is at most 128 bytes. A longer word, or one more entry, makes the command `unparsed`; the set keeps its first 32 entries in order of appearance and the long word is left out |
+| Secret facts | `secret_vars`: the number of secret variables the job receives (numbered and named). `secret_reference`: at least one named reference. `whole_command`: the plan was a whole-command plan |
+| `bytes` | The stored command's length in bytes |
+| Intent record | Model: `source = model_tool`, `name = "exec_cmd"`. Person: `source = person_command`, `name` `"!"` or `"!!"`. `digest` is the SHA-256 of the stored command, as in PL1 |
+
+The intent digest of kind 34 covers every feature in a fixed order, so two
+commands with the same features and digest give the same intent digest.
+
+### PL2-F2: intent extraction
+
+Selected design. Arrows show the order of steps for one stored command;
+the loop over segments is bounded by depth 8 and 64 segments.
+
+```mermaid
+flowchart TD
+    Cmd["Stored command and the plan facts"] --> Whole{"Whole-command plan?"}
+    Whole -->|"Yes"| Mark["Mark unparsed; read the stored form"]
+    Whole -->|"No"| An["analyze: per-byte contexts, parsed flag"]
+    Mark --> An
+    An --> Ok{"Tokenizer parsed and no heredoc?"}
+    Ok -->|"No"| U1["Mark unparsed; keep reading the features it can"]
+    Ok -->|"Yes"| Seg["Next segment: top level, then group bodies and inner scripts"]
+    U1 --> Seg
+    Seg --> Bound{"Depth at most 8 and at most 64 segments?"}
+    Bound -->|"No"| U2["Mark unparsed; stop reading"]
+    Bound -->|"Yes"| Word["Command word after keywords, assignments and wrappers"]
+    Word --> Sub{"Command word starts with $(, a backtick or (?"}
+    Sub -->|"Yes"| U3["Mark unparsed; recurse into the group body"]
+    Sub -->|"No"| Tool["Add its basename to tools; wrappers add the next command word"]
+    U3 --> Seg
+    Tool --> First{"First top-level segment?"}
+    First -->|"Yes"| FS["first_tool, subcommand, flags cut at ="]
+    First -->|"No"| More{"More segments?"}
+    FS --> More
+    More -->|"Yes"| Seg
+    More -->|"No"| Feat["shell_features from byte contexts; set bounds; parse"]
+    U2 --> Feat
+    Feat --> Out["Command record: parse, tools, first_tool, subcommand, flags, shell_features, bytes, secret facts"]
+```
+
+### PL2 person command decision
+
+Selected, refining [person commands](#person-commands--and-). The
+conversation owner asks for the decision at dispatch, after the item read,
+the rule-set check, the project's identity and the path guard
+acknowledgement (P5), and before the job controller's submit.
+
+| Item | Rule |
+| --- | --- |
+| Principal | Job ID of the input (origin 2); origin `person_typed`; profile `person-1` (`!`) or `person-outside-1` (`!!`) from kind 31; project and its canonical root; task: the conversation's main agent; scratch `<Asura home>/tmp/exec-cmd-<job hex>`; `cache_roots` empty and `developer_dir` absent until PL6 compiles the person regions; `declared_env`: the declared names in kind 31 (the configuration owner's copy) |
+| Entry | `process.exec` of the entry program with its identity. Context: `env_terminal` the terminal table names of kind 31's terminal variables; `env_declared` the declared names; `outside_switch` the configuration owner's current value; the person intent |
+| Secrets | One `secret_use` request per named reference of kind 31, in reference order, resource `Secret::"<NAME>"`, delivery `raw`, the same intent |
+| Evaluation | On one worker, every request in every applicable scope. The outcome is `run` only when every request allows. The deciding request is the first denying one in the order entry, then secrets; with no denial it is the entry |
+| Outside switch | A `!!` dispatch waits while the switch value is not yet read. The job controller still checks the switch again at slot grant (person command mode, [switch check](person-command-mode.md#outside-switch-check)) |
+| Record | One kind 34, subject code 2 (the input ID), action and resource digest of the deciding request, request digest over every request, no constraint digest |
+| Order | Kind 35 when the replay's active revision differs, then kind 34, then the controller submit; the controller appends kind 26 at slot grant, as before |
+| Deny | The input is held with the hold reason `policy_denied`. The person may Resume (decided again) or Drop |
+| Unavailable owner | The input is held with `policy_unavailable`; no kind 34 |
+| Busy | A full agent queue (`policy_busy`) leaves the command at the lane head; the next wake asks again; no record |
+| Reuse | A committed `run` decision stays with the dispatch until the controller accepts the start, so a controller `busy` retry writes no second kind 34 |
+
+### PL2-Q1: person command decision
+
+Selected design. Solid arrows are messages or calls; dashed arrows are
+replies or events. The attribute steps run only on a cache miss.
+
+```mermaid
+sequenceDiagram
+    participant T as TUI
+    participant C as Conversation owner
+    participant O as Policy owner
+    participant A as Attribute reader
+    participant W as Worker
+    participant J as Authority writer
+    participant K as Job controller
+    T->>C: ConversationQueueCommandSubmit
+    C->>J: Kind 31
+    Note over C: Dispatch: item read, rule set, project identity, path check
+    C->>O: decide_job(ticket, agent, person-1 or person-outside-1, env names, switch, secret names, intent)
+    alt Project root not cached
+        O->>A: root(project, location, device, inode)
+        A-->>O: Canonical spelling, or a path refusal
+    end
+    O->>W: Entry process.exec and each secret_use, with the command text
+    W->>W: Extract intent features, then evaluate every scope
+    W-->>O: Outcome and the deciding request
+    O-->>C: job_decided: run or deny
+    opt Replay's active revision differs
+        C->>J: Kind 35 activated
+    end
+    C->>J: Kind 34, subject: input
+    J-->>C: Committed
+    alt Run
+        C->>K: submit(person start)
+        K->>J: Kind 26 at slot grant
+    else Deny
+        C->>J: Hold decision, reason policy_denied
+        C-->>T: Entry held (policy_denied)
+    end
+```
+
+### Built-in set additions in PL2
+
+The installation set gains, for person jobs only (origin `person_typed`,
+profiles `person-1` and `person-outside-1`):
+
+| ID | Effect | Rule |
+| --- | --- | --- |
+| `person.entry` | Permit | `process.exec` of the program at `/bin/sh` |
+| `person.network` | Permit | Every `network.connect` (AD-7) |
+| `person.secret` | Permit | `secret_use` with delivery `raw` |
+| `person.env_terminal` | Hard forbid, reason `env_not_allowed` | Any `process.exec.any` whose `env_terminal` is not inside the 39 names of the [terminal table](person-command-environment.md#terminal-table) |
+| `person.env_declared` | Hard forbid, reason `env_not_allowed` | Any `process.exec.any` whose `env_declared` is not inside the project's `declared_env` |
+| `person.outside_switch` | Hard forbid, reason `outside_sandbox_off` | Any `process.exec.any` of a `person-outside-1` job with `outside_switch` false |
+
+The default user set gains the three permits. The environment builder and
+the guardian stay the enforcers of the allow-list (PE-R1); the forbids state
+it, and a denial refuses the start. S4 (`s4.model_secret`) already denies
+every `secret_use` of a model job; the model refusal `model_secret_reference`
+keeps its owner and its earlier order, so a model command with a named
+reference never reaches the policy owner.
+
+### PL2 AD-7 load check
+
+Selected. After an engine builds a revision, it evaluates `network.connect`
+for a `person_typed` job of each person profile, to `Address::"192.0.2.1"`
+port 443 and to `Domain::"example.com"` port 443, each with `via_proxy`
+false and true. Any refusal in any scope fails the load
+(`person network forbidden (AD-7)`), so the owner is `unavailable`. This is
+a sampled check of the built-in and test texts. PL3 replaces it with the
+admission rule that refuses any policy forbidding person network.
+
+Required behavior for PL3 (AD-7; coordinator, 2026-11-04): person commands
+never get network lockdown, so the PL3 admission proof must cover every
+host, address and port, not a sample. Admission proves, for each scope and
+for both person profiles, that `network.connect` by a `person_typed` job is
+allowed for every `Domain` and `Address` resource and every `ip`, `port` and
+`via_proxy` value, and refuses the candidate otherwise. The sampled load
+check stays only until that proof runs.
+
+### Kind 34 in PL2
+
+Kind 34 gains subject code 2, the person input: the 16-byte input ID.
+For subject 2 the record has origin 2, profile 2 or 3, task agent 0 and no
+constraint digest; `run` needs no constraint digest. For subject 1 the
+PL1 rules stay (origin 1, profile 1, a constraint digest exactly with
+`run`).
+
+Replay rules for subject 2 (each violation is `Corrupt`):
+
+| Rule | Check |
+| --- | --- |
+| R8 | The record names the active revision (R3) and a kind 31 input that is `Queued`, not held, not dropped and without a kind 26; its profile matches the input's outside flag. It replaces any pending person kind 34 of that input |
+| R9 | A person-origin kind 26 whose input has a pending person kind 34 needs that outcome to be `run`; the kind 26 clears it. A person kind 26 with none stays valid, as R7's model rule keeps a kind 14 with no kind 34 |
+| R10 | A hold or drop decision of the input clears its pending person kind 34 |
+
+At most 512 person kind 34 records are pending (the service decision queue
+bound); the checkpoint stores them after the model ones, as (input,
+outcome) pairs in input order.
+
+### PL2-D1: PL2 request data
+
+Selected design. Boxes are typed values of `asura-policy` and the service;
+lines show ownership with cardinality.
+
+```mermaid
+classDiagram
+    class JobRequest {
+        agent, job, project
+        location, device, inode
+        stored command, plan facts
+        kind: model or person
+        now
+    }
+    class PersonFacts {
+        outside: bool
+        terminal names: at most 39
+        declared names: at most 32
+        named secrets: at most 16
+        outside switch: bool
+    }
+    class Intent {
+        source, name, digest
+        command: optional
+    }
+    class Command {
+        parse: simple, compound, unparsed
+        tools, flags: at most 32 each
+        first_tool, subcommand
+        shell_features
+        bytes, secret_vars
+        secret_reference, whole_command
+    }
+    class ProgramRef {
+        canonical path
+        identity_known, platform
+        team_id, signing_id, cdhash
+    }
+    class JobDecision {
+        run or deny
+        action and resource digest of the deciding request
+        scope results, primary reason
+        constraints: model-1 run only
+    }
+    JobRequest "1" --> "0..1" PersonFacts : person only
+    JobRequest "1" --> "1" Intent : built on the worker
+    Intent "1" --> "0..1" Command : features
+    JobRequest "1" --> "1" ProgramRef : entry, from the reader cache
+    JobRequest "1" --> "1" JobDecision : decided as
+```
+
+### PL2 validation map
+
+| ID | PL2 evidence |
+| --- | --- |
+| PL-U9 | `asura-platform` unit tests in scratch directories: `..`, `.`, `//` and trailing `/` refused; a symbolic link component refused; a firmlink spelling (`/System/Volumes/Data/Users`) gives `/Users`; `/tmp`, `/var` and `/etc` give `/private/...`; an upper-case and an NFD spelling give the stored spelling; a hard link refused only in the mediated-write mode; a path outside the root refused; the Asura home identity flagged |
+| PL-U10 | `asura-platform` unit tests of the extractor on tricky shell text: quotes, escapes, `$IFS`, wrappers (`sudo`, `env`, `command`, `xargs`), assignments, keywords, pipes to interpreters, substitutions, process substitution, subshells, `sh -c` and `eval` bodies, heredocs and unclosed quotes (`unparsed`), the depth, segment and set bounds; no feature holds a positional argument beyond `first_tool` and `subcommand`. `asura-policy` tests that a tighten-only forbid reading the features denies, and that the features change no region |
+| PL-U13 | Kind 34 subject 2 codec and validation; R8 to R10, the checkpoint round trip |
+| PL-I15 | Policy owner with real workers: a `!` decision with an unlisted terminal name or an undeclared name is denied `env_not_allowed`; a `!!` decision with the switch off is denied `outside_sandbox_off`; named references give `secret_use` allowed for a person and denied `model_secret` for a model principal; a revision with a person network forbid fails to load. Service: a `!` command's kind 34 (subject 2) precedes its kind 26; a model command with a named reference is refused `model_secret_reference` with no kind 34 |
+| PL-N1 | Program identity of `/bin/sh` and `/usr/bin/git` (platform), a Homebrew binary (ad-hoc, no team) and Xcode's main executable (team-signed), each compared with `codesign -dvvv`; a symbolic link spelling refused |
+| PL-E7 | PTY journey (`--person-commands`): a `!` command runs and the journal holds its kind 34 immediately before its kind 26; with the test-only denying set, a `!` command whose first tool is `asura-policy-test-deny` is held `policy_denied` and does not run |
+| PL-B1, PL-B2 | Re-measured with command features on every entry request, by the median of three runs |
+
+The test-only denying set gains one tighten-only forbid of person
+`process.exec` with reason `test_denied`, conditioned on
+`context.intent.command.first_tool == "asura-policy-test-deny"`. No scope
+permits `process.exec.ask`, so the outcome is `deny`.
+
+### PL2 delivery record
+
+Verified, 2026-11-04, on the reference Mac (Apple M4 Max, 16 cores,
+macOS 27), release builds, while another packet built cvc5 on the same
+machine: the 1-minute load average was 6.9 to 14.7. Every entry request
+of the workload now carries the command features. Verdict: the median of
+three runs, with the worst run recorded.
+
+| Budget | Three runs | Verdict |
+| --- | --- | --- |
+| PL-B1 p50 at most 150 µs | p50 144.5, 145.3 and 148.7 µs (p99 209.8, 221.1 and 278.8 µs); median 145.3 µs; worst run 148.7 µs | **Pass**, 4.7 µs inside the budget |
+| PL-B2 p99 at most 1.5 ms at 64 requesters | p99 1.950, 1.904 and 2.056 ms (p50 1.785, 1.770 and 1.767 ms; max 2.098, 2.033 and 2.943 ms); median 1.950 ms; worst run 2.056 ms | **Fail**, 0.45 ms over |
+| PL-B4 startup at most 200 ms | 40.1, 38.2 and 39.1 ms | **Pass** |
+| PL-B5 safety | 0 allows in 1,000,000 malformed requests in each run; identical decisions on fresh engines | **Pass** |
+
+Attribution, from the `policy-bench` breakdown: the built-in sets decide the
+exec entry at p50 159 to 162 µs with the command features and 97.8 µs
+without them (PL1: 93.8 µs). Request construction under W2
+(`Context::from_json_value` with the schema) takes p50 147.4 µs with the
+features and 84.5 µs without, so the intent record costs about 62 µs per
+entry decision. With 64 requests outstanding on 8 workers each decision
+waits for about 7 others, so the added cost appears about eight times in
+PL-B2. The load during the runs was about three times that of the PL1
+re-measurement. The intent extraction itself and the entry identity
+refresh were not timed separately.
+
+Under the [budget rule](#performance-budgets) the PL-B2 failure goes to the
+owner; the mechanism is not changed silently. Options the owner may choose
+between, none applied:
+
+1. Re-measure on an idle machine, after the parallel solver build.
+2. Build the context from typed values (`Context::from_pairs`) and keep
+   the schema check in `Request::new`. This changes the wording of rule W2,
+   not its effect; the saving is not measured.
+3. Send the command features only when the active revision has a policy
+   that reads `context.intent`. No shipped set reads it until PL7, so the
+   cost returns with the AD-29 rules.
+4. Revise PL-B2 again, or its definition (more workers, or fewer
+   concurrent requesters).
+
+Re-measurement on the quieter machine (option 1, coordinator, 2026-11-04),
+after the solver build finished: release builds, and each run started only
+when the 1-minute load average was below 3 (2.29 to 2.81 at the starts).
+
+| Budget | Three runs | Verdict |
+| --- | --- | --- |
+| PL-B1 p50 at most 150 µs | p50 141.8, 144.5 and 144.0 µs (p99 209.8, 211.5 and 205.4 µs); median 144.0 µs; worst run 144.5 µs | **Pass** |
+| PL-B2 p99 at most 1.5 ms at 64 requesters | p99 2.080, 2.024 and 1.904 ms (p50 1.884, 1.756 and 1.773 ms; max 2.227, 3.230 and 2.005 ms); median 2.024 ms; worst run 2.080 ms | **Fail**, 0.52 ms over |
+| PL-B4, PL-B5 | Startup 37.6 to 39.1 ms; 0 allows in 1,000,000 malformed requests; deterministic | **Pass** |
+
+The breakdown is unchanged: the built-in entry decides at p50 157 to 159 µs
+with the command features and 96.5 to 97.6 µs without them. The load was
+not the cause. W2 is unchanged.
+
+Owner revision of 2026-11-04 (AD-34): PL-B2 becomes end-to-end p99 at most
+2.5 ms at 64 requesters; PL-B1 stays at p50 at most 150 µs. Reason: the PL2 command features add about 62 µs per request under W2, which queueing at 64 requesters on 8 workers multiplies about eight times, and a model turn takes seconds.
+The earlier targets (1 ms, then 1.5 ms under AD-33) and every measurement
+above stay as the history. The verdict against the revised target is taken
+from the quiet-machine runs, with no new measurement:
+
+| Budget | Median of three | Worst run | Verdict |
+| --- | --- | --- | --- |
+| PL-B1 p50 at most 150 µs | 144.0 µs | 144.5 µs | **Pass** |
+| PL-B2 p99 at most 2.5 ms (AD-34) | 2.024 ms | 2.080 ms | **Pass** |
+
+The service bench (`pl_b2_end_to_end_p99_at_64_concurrent_requesters`)
+prints its verdict against 2.5 ms.
+
+SP-P1 is answered ([SP-P1 result](#sp-p1-result)).
+
 ## Delivery packets
 
 Selected order. Each packet updates this design first if its implementation
@@ -2785,9 +3241,9 @@ needs a change. Owned paths are exclusive while a packet runs.
 | Packet | Delivers | Owned paths | Depends on | Gate |
 | --- | --- | --- | --- | --- |
 | PL1 | The policy owner; schema v1; built-in installation and default user sets; deny-on-any-error wrapper; installation and user scopes; region compiler for `model-1`; model exec_cmd job decisions by effect envelope with the command as intent; constraint set to the guardian (byte-equal profile); kinds 34 and 35; `/status` line; denial text | `rust/crates/asura-policy/**` (new, with `AGENTS.md`), `rust/crates/asura-service/src/policy.rs` and `policy/**`, the exec_cmd decision point in `conversation.rs` and `tools.rs`, the guardian profile input in `asura-platform/src/exec_cmd/guardian.rs`, kinds 34–35 in `asura-storage/src/authority/**`, `Cargo.toml`, `Cargo.lock` | This design | PL-U1–U8, U13; PL-I1–I4, I10, I12; PL-E1, E2; PL-B1–B5 recorded |
-| PL2 | Canonicaliser, program identity, intent extractor; person command decisions; named secret `secret_use` | `asura-platform/src/project_identity.rs`, new `asura-platform/src/code_identity.rs`, `exec_cmd/split.rs`, person dispatch in `conversation.rs`, `asura-policy` request types | PL1 | PL-U9, U10; PL-I15; PL-N1 |
+| PL2 | Canonicaliser, program identity, intent extractor; person command decisions; named secret `secret_use` | `asura-platform/src/project_identity.rs`, new `asura-platform/src/code_identity.rs`, `exec_cmd/split.rs` (and `split/intent*`), person dispatch in `conversation.rs` and `conversation/person_command.rs`, `asura-service/src/policy.rs` and `policy/**`, `conversation/policy_call.rs`, `asura-policy` request types and built-in sets, kind 34 subject 2 in `asura-storage/src/authority/**` | PL1 | PL-U9, U10, U13; PL-I15; PL-N1; PL-E7; PL-B1, B2 re-measured |
 | PL4a | Solver build script and lock file; unsigned package for tests; probe findings F1 to F5 as script and adapter requirements | `tools/release/solver/**` | The solver build probes (SBQ1, SBQ2); SV-P1 re-run on the product corpus | Script builds offline; SV probes recorded |
-| PL3 | Admission worker, SymCC solver adapter, platform solver process, lints, proofs, change difference, lifecycle with user-scope admission, rollback, restart reproving, control messages, audit | `rust/crates/asura-policy-admission/**` (new), `asura-platform/src/solver.rs`, `asura-service/src/policy/admission*`, control messages in `asura-control`, kind 35 events | PL1, PL4a | PL-U11; PL-I5–I8, I11, I13; PL-E3 |
+| PL3 | Admission worker, SymCC solver adapter, platform solver process, lints, proofs, change difference, lifecycle with user-scope admission, rollback, restart reproving, control messages, audit | `rust/crates/asura-policy-admission/**` (new), `asura-platform/src/solver.rs`, `asura-service/src/policy/admission*`, control messages in `asura-control`, kind 35 events | PL1, PL4a | PL-U11; PL-I5–I8, I11, I13; PL-E3; the AD-7 person network proof over every host and port ([PL2 AD-7 load check](#pl2-ad-7-load-check)) |
 | PL4b | Bundle placement, signing, notice, licence folder, release checks | `tools/release/asura-bundle`, `tools/release/asura-release`, `tools/release/host-paths`, `docs/designs/release-signing.md` (first), DMG `LICENSE` | PL4a, PL3 | PL-N2; release proof gate |
 | PL5 | Workspace and repository scopes, forbid-only lint, baseline permit, `rel` literals | `asura-service/src/policy/scopes*`, `asura-policy` lints, repository source read | PL3 | PL-U5, U6; PL-I7; PL-E4 |
 | PL6 | Compiler for `person-1` and lower-scope narrowings; EPG deny rules moved into the compiler; SP-AQ7 soundness proofs | `asura-policy` compiler, `guardian.rs`, `path_guard` interface | PL5 | PL-I9; EV-E |
@@ -2872,7 +3328,7 @@ Probes to run in the named packet, before the code that depends on them.
 | SV-P4 | Does notarisation accept the bundle with no issue for cvc5 and the dylibs? | PL4b |
 | SV-P5 | Is the host-paths scan clean for the solver files? | PL4a: yes for the package; PL4b: in the bundle |
 | SV-P6 | Is there a usable memory bound for a child process on macOS 27? | PL3 |
-| SP-P1 | Which spelling does a path walk give across firmlinks, `/private` aliases and case-insensitive volumes? | PL2 |
+| SP-P1 | Which spelling does a path walk give across firmlinks, `/private` aliases and case-insensitive volumes? Answered by PL2 ([SP-P1 result](#sp-p1-result)) | PL2 |
 | SP-P2 | Per-request entity slices: does PL-B1 hold on the product schema? Answered by PL1: no ([delivery record](#pl1-delivery-record)) | PL1 |
 | ER-1 to ER-3, ES-1 to ES-5, NE-1, NE-2, VM-1 | [Live enforcement research](#live-enforcement-later-proposed) | Later designs |
 
@@ -2886,5 +3342,11 @@ the upstream cvc5 1.3.1 static binary's `--show-config` (GMP and LibPoly
 linked statically). No product code or test was run. Each Mermaid diagram
 was rendered with the local Mermaid CLI 12.0.0 at scale 2 into a temporary
 directory outside the repository and inspected.
+
+Recorded on 2026-11-04 for the PL2 contract: written from the PL1 code, the
+SP-P1 probe, the person command, environment and named secret designs and
+the installed Security framework headers. Diagrams PL2-F1, PL2-F2, PL2-Q1
+and PL2-D1 were rendered with the same Mermaid CLI at scale 2 into a
+temporary directory outside the repository and inspected.
 
 Return to the [design index](README.md).

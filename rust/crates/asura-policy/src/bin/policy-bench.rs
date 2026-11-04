@@ -5,9 +5,9 @@
 //! requests. Loops are bounded by counts, never by wall-clock deadlines.
 //! Run in release: `cargo run --release -p asura-policy --bin policy-bench`.
 use asura_policy::{
-    Action, Context, Engine, Intent, IntentSource, JobPrincipal, Origin, PathClass, PathRef,
-    ProfileKind, ProgramRef, Request, Resource, RevisionTexts, Scope, ScopeText, compile_model1,
-    model1_principal,
+    Action, Command, Context, Engine, Intent, IntentSource, JobPrincipal, Origin, Parse, PathClass,
+    PathRef, ProfileKind, ProgramRef, Request, Resource, RevisionTexts, Scope, ScopeText,
+    compile_model1, model1_principal,
 };
 use std::time::{Duration, Instant};
 
@@ -213,10 +213,12 @@ fn requests() -> Vec<Request> {
                             env_terminal: Vec::new(),
                             env_declared: Vec::new(),
                             outside_switch: false,
+                            // PL2: every entry carries the command features.
                             intent: Some(Intent {
                                 source: IntentSource::ModelTool,
                                 name: "exec_cmd".into(),
                                 digest: format!("{:064x}", rng.next()),
+                                command: Some(bench_command(&mut rng)),
                             }),
                         },
                     }
@@ -229,6 +231,25 @@ fn requests() -> Vec<Request> {
             }
         })
         .collect()
+}
+
+/// Command features of a typical model command: two segments, a few
+/// flags and shell features.
+fn bench_command(rng: &mut Lcg) -> Command {
+    let tools = ["git", "cargo", "rg", "sed", "make"];
+    let first = tools[rng.below(tools.len())];
+    Command {
+        parse: Parse::Compound,
+        tools: vec![first.into(), "head".into()],
+        first_tool: first.into(),
+        subcommand: "status".into(),
+        flags: vec!["--short".into(), "-n".into(), "--color".into()],
+        shell_features: vec!["parameter_expansion".into(), "pipe".into()],
+        bytes: 48,
+        secret_vars: 0,
+        secret_reference: false,
+        whole_command: false,
+    }
 }
 
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
@@ -253,12 +274,12 @@ fn malformed(base: &Request, class: usize, rng: &mut Lcg) -> Request {
     };
     match class {
         0 => {
-            let (Context::Exec { intent, .. } | Context::File { intent, .. }) = &mut r.context;
-            {
+            if let Context::Exec { intent, .. } | Context::File { intent, .. } = &mut r.context {
                 *intent = Some(Intent {
                     source: IntentSource::ModelTool,
                     name: "x".repeat(1025 + rng.below(64)),
                     digest: String::new(),
+                    command: None,
                 });
             }
         }
@@ -281,12 +302,14 @@ fn malformed(base: &Request, class: usize, rng: &mut Lcg) -> Request {
                     outside_switch: false,
                     intent,
                 },
+                other => other,
             }
         }
         6 => {
             r.resource = match r.resource {
                 Resource::Path(p) => Resource::Program(ProgramRef::unidentified(p)),
                 Resource::Program(p) => Resource::Path(p.path),
+                other => other,
             }
         }
         7 => {
@@ -386,6 +409,46 @@ fn main() {
         }
     }
     entry.sort();
+    // PL2 breakdown: the same entries without the command features, and
+    // the request construction (W1, W2) with and without them.
+    let bare: Vec<Request> = entries
+        .iter()
+        .map(|r| {
+            let mut r = (*r).clone();
+            if let Context::Exec {
+                intent: Some(intent),
+                ..
+            } = &mut r.context
+            {
+                intent.command = None;
+            }
+            r
+        })
+        .collect();
+    let mut without = Vec::new();
+    let (mut built_with, mut built_without) = (Vec::new(), Vec::new());
+    for _ in 0..PASSES {
+        for (r, b) in entries.iter().zip(&bare) {
+            let start = Instant::now();
+            std::hint::black_box(shipped.decide(b));
+            without.push(start.elapsed());
+            let start = Instant::now();
+            std::hint::black_box(shipped.build_only(r));
+            built_with.push(start.elapsed());
+            let start = Instant::now();
+            std::hint::black_box(shipped.build_only(b));
+            built_without.push(start.elapsed());
+        }
+    }
+    for v in [&mut without, &mut built_with, &mut built_without] {
+        v.sort();
+    }
+    println!(
+        "built-in sets, entry without command features: decision p50 {:.1} µs; construction p50 {:.1} µs with features, {:.1} µs without",
+        micros(percentile(&without, 0.5)),
+        micros(percentile(&built_with, 0.5)),
+        micros(percentile(&built_without, 0.5))
+    );
     println!(
         "built-in sets (PL1 production): exec entry decision p50 {:.1} µs, p99 {:.1} µs over {}",
         micros(percentile(&entry, 0.5)),

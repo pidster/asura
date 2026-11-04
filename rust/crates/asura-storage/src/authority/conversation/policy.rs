@@ -131,8 +131,8 @@ pub(crate) fn read_policy_refusal(r: &mut Reader<'_>) -> Result<Option<PolicyRef
     Ok(Some(value))
 }
 
-/// What a kind 34 decides about. Codes 2 (person input) and 3 (job
-/// recheck) are reserved for later packets.
+/// What a kind 34 decides about. Code 3 (job recheck) is reserved for a
+/// later packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolicySubject {
     /// Code 1: one model tool call.
@@ -141,7 +141,12 @@ pub enum PolicySubject {
         generation: u64,
         ordinal: u32,
     },
+    /// Code 2 (PL2): one person command start, named by its input.
+    PersonInput { input: Id },
 }
+/// Pending person kind 34 records (R8 to R10): the service decision queue
+/// bound.
+pub const MAX_PENDING_PERSON_DECISIONS: usize = 512;
 /// One scope's result in a kind 34.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyScopeResult {
@@ -203,12 +208,29 @@ pub struct PolicyDecision {
 }
 impl PolicyDecision {
     pub(crate) fn validate(&self) -> Result<()> {
-        let PolicySubject::ModelCall {
-            operation,
-            generation,
-            ordinal,
-        } = self.subject;
-        let subject = operation != [0; 16] && generation >= 1 && ordinal >= 1;
+        // Subject 1 is a model `model-1` job with a constraint set; subject
+        // 2 a person job with none until PL6.
+        let (subject, model) = match self.subject {
+            PolicySubject::ModelCall {
+                operation,
+                generation,
+                ordinal,
+            } => (
+                operation != [0; 16]
+                    && generation >= 1
+                    && ordinal >= 1
+                    && self.origin == 1
+                    && self.profile == 1,
+                true,
+            ),
+            PolicySubject::PersonInput { input } => (
+                input != [0; 16]
+                    && self.origin == 2
+                    && matches!(self.profile, 2 | 3)
+                    && self.task_agent == 0,
+                false,
+            ),
+        };
         let scopes = (1..=MAX_POLICY_SCOPES).contains(&self.scopes.len())
             && self.scopes.windows(2).all(|w| w[0].scope < w[1].scope)
             && self.scopes.iter().all(|s| {
@@ -221,7 +243,7 @@ impl PolicyDecision {
         let all_allow = self.scopes.iter().all(|s| s.allow);
         let outcome = match self.outcome {
             PolicyOutcome::Run => {
-                all_allow && self.primary_scope == 0 && self.constraint_digest.is_some()
+                all_allow && self.primary_scope == 0 && self.constraint_digest.is_some() == model
             }
             PolicyOutcome::Ask | PolicyOutcome::Deny => {
                 self.constraint_digest.is_none()
@@ -246,14 +268,16 @@ impl PolicyDecision {
                 && outcome,
         )
     }
-    /// The subject's call key.
-    pub fn call(&self) -> (Id, u64, u32) {
-        let PolicySubject::ModelCall {
-            operation,
-            generation,
-            ordinal,
-        } = self.subject;
-        (operation, generation, ordinal)
+    /// The subject's call key; `None` for a person subject.
+    pub fn call(&self) -> Option<(Id, u64, u32)> {
+        match self.subject {
+            PolicySubject::ModelCall {
+                operation,
+                generation,
+                ordinal,
+            } => Some((operation, generation, ordinal)),
+            PolicySubject::PersonInput { .. } => None,
+        }
     }
 }
 fn option_hash(w: &mut Writer, value: Option<&Hash>) {
@@ -268,15 +292,22 @@ fn read_option_hash(r: &mut Reader<'_>) -> Result<Option<Hash>> {
 pub(crate) fn write_policy_decision(w: &mut Writer, p: &PolicyDecision) -> Result<()> {
     p.validate()?;
     let start = w.0.len();
-    let PolicySubject::ModelCall {
-        operation,
-        generation,
-        ordinal,
-    } = p.subject;
-    w.byte(1);
-    w.bytes(&operation);
-    w.u64(generation);
-    w.u32(ordinal);
+    match p.subject {
+        PolicySubject::ModelCall {
+            operation,
+            generation,
+            ordinal,
+        } => {
+            w.byte(1);
+            w.bytes(&operation);
+            w.u64(generation);
+            w.u32(ordinal);
+        }
+        PolicySubject::PersonInput { input } => {
+            w.byte(2);
+            w.bytes(&input);
+        }
+    }
     w.byte(p.action);
     w.byte(p.origin);
     w.byte(p.profile);
@@ -315,6 +346,7 @@ pub(crate) fn read_policy_decision(r: &mut Reader<'_>) -> Result<PolicyDecision>
             generation: r.u64()?,
             ordinal: r.u32()?,
         },
+        2 => PolicySubject::PersonInput { input: r.array()? },
         _ => return Err(ReplayError::Corrupt),
     };
     let action = r.byte()?;
@@ -538,6 +570,9 @@ pub struct PolicyReplay {
     /// The active revision's sequence and digest.
     pub active: Option<(u64, Hash)>,
     pub(crate) pending: BTreeMap<(Id, u64, u32), PolicyOutcome>,
+    /// Person kind 34 records that wait for their kind 26, hold or drop
+    /// (R8 to R10).
+    pub(crate) person: BTreeMap<Id, PolicyOutcome>,
 }
 impl PolicyReplay {
     /// The active revision, if any.
@@ -566,18 +601,47 @@ impl PolicyReplay {
         Ok(())
     }
     /// R3 and the pending half of R4 for one kind 34; the caller checks the
-    /// call's turn and ordinal.
+    /// call's turn and ordinal, or (R8) the person input's state.
     pub(crate) fn decision(&mut self, p: &PolicyDecision) -> Result<()> {
         require(
             p.outcome != PolicyOutcome::Ask
-                && self.active == Some((p.revision_seq, p.revision_digest))
-                && !self.pending.contains_key(&p.call()),
+                && self.active == Some((p.revision_seq, p.revision_digest)),
         )?;
-        if self.pending.len() >= MAX_PENDING_POLICY_DECISIONS {
-            return Err(ReplayError::Limit);
+        match (p.call(), p.subject) {
+            (Some(call), _) => {
+                require(!self.pending.contains_key(&call))?;
+                if self.pending.len() >= MAX_PENDING_POLICY_DECISIONS {
+                    return Err(ReplayError::Limit);
+                }
+                self.pending.insert(call, p.outcome);
+            }
+            (None, PolicySubject::PersonInput { input }) => {
+                // R8: a new decision replaces the input's pending one.
+                if !self.person.contains_key(&input)
+                    && self.person.len() >= MAX_PENDING_PERSON_DECISIONS
+                {
+                    return Err(ReplayError::Limit);
+                }
+                self.person.insert(input, p.outcome);
+            }
+            (None, PolicySubject::ModelCall { .. }) => return Err(ReplayError::Corrupt),
         }
-        self.pending.insert(p.call(), p.outcome);
         Ok(())
+    }
+    /// The person kind 34 outcome that waits for the input's kind 26.
+    pub fn person_pending(&self, input: Id) -> Option<PolicyOutcome> {
+        self.person.get(&input).copied()
+    }
+    /// R9 for a person-origin kind 26: a pending decision must be `run`.
+    pub(crate) fn person_job(&mut self, input: Id) -> Result<()> {
+        match self.person.remove(&input) {
+            Some(PolicyOutcome::Deny | PolicyOutcome::Ask) => Err(ReplayError::Corrupt),
+            Some(PolicyOutcome::Run) | None => Ok(()),
+        }
+    }
+    /// R10 for a hold or drop decision of the input.
+    pub(crate) fn person_settled(&mut self, input: Id) {
+        self.person.remove(&input);
     }
     /// R5 to R7 for one kind 14: its pending kind 34 is cleared.
     pub(crate) fn tool_call(&mut self, p: &ToolCall) -> Result<()> {
@@ -614,17 +678,26 @@ impl PolicyReplay {
         last_seq: u64,
         active: Option<(u64, Hash)>,
         pending: BTreeMap<(Id, u64, u32), PolicyOutcome>,
+        person: BTreeMap<Id, PolicyOutcome>,
     ) -> Result<Self> {
         require(
             active.is_none_or(|(seq, _)| seq >= 1 && seq <= last_seq)
                 && (last_seq == 0) == active.is_none()
                 && pending.len() <= MAX_PENDING_POLICY_DECISIONS
-                && pending.values().all(|o| *o != PolicyOutcome::Ask),
+                && pending.values().all(|o| *o != PolicyOutcome::Ask)
+                && person.len() <= MAX_PENDING_PERSON_DECISIONS
+                && person.values().all(|o| *o != PolicyOutcome::Ask)
+                && (person.is_empty() || active.is_some()),
         )?;
         Ok(Self {
             last_seq,
             active,
             pending,
+            person,
         })
+    }
+    /// The pending person entries in input order (checkpoint encoding).
+    pub(crate) fn person_entries(&self) -> impl Iterator<Item = (&Id, &PolicyOutcome)> {
+        self.person.iter()
     }
 }

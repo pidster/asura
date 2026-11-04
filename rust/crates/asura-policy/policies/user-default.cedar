@@ -35,3 +35,31 @@ when {
    resource.path in Asura::Path::"/System" ||
    resource.path in principal.project.root || resource.path in principal.scratch)
 };
+
+// PL2: the person's default person-job permits.
+
+@id("person.entry") @reason("person_entry")
+permit (principal is Asura::Job, action == Asura::Action::"process.exec", resource is Asura::Program)
+when {
+  principal.origin == Asura::Origin::"person_typed" &&
+  (principal.profile == Asura::Profile::"person-1" ||
+   principal.profile == Asura::Profile::"person-outside-1") &&
+  resource.path == Asura::Path::"/bin/sh"
+};
+
+@id("person.network") @reason("person_network")
+permit (principal is Asura::Job, action == Asura::Action::"network.connect", resource)
+when {
+  principal.origin == Asura::Origin::"person_typed" &&
+  (principal.profile == Asura::Profile::"person-1" ||
+   principal.profile == Asura::Profile::"person-outside-1")
+};
+
+@id("person.secret") @reason("person_secret")
+permit (principal is Asura::Job, action == Asura::Action::"secret_use", resource is Asura::Secret)
+when {
+  principal.origin == Asura::Origin::"person_typed" &&
+  (principal.profile == Asura::Profile::"person-1" ||
+   principal.profile == Asura::Profile::"person-outside-1") &&
+  context.delivery == Asura::Delivery::"raw"
+};

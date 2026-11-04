@@ -1515,12 +1515,14 @@ measurements, set PL-B1 (from PES-M11) to p50 at most 150 µs and PL-B2 (from
 PES-M12) to p99 at most 1.5 ms: pattern A evaluates four scopes over 258 policies, about 80 µs of the decision, and a model turn takes seconds. The values in the
 table above stay as the history.
 
-| ID | First revision (owner, 2026-11-03) | Second revision (owner, 2026-11-03, AD-33) |
-| --- | --- | --- |
-| PES-M11 / PL-B1 Evaluation latency | p50 at most 100 µs | p50 at most 150 µs |
-| PES-M12 / PL-B2 End-to-end latency | p99 at most 1 ms at 64 concurrent requests | p99 at most 1.5 ms at 64 concurrent requests |
-| PES-M9 Build size | At most 4 MiB added to a stripped release binary | At most 8 MiB added |
-| PES-M10 Startup | Median at most 100 ms; peak resident memory at most 64 MiB | At most 200 ms. The memory value is not revised |
+| ID | First revision (owner, 2026-11-03) | Second revision (owner, 2026-11-03, AD-33) | Third revision (owner, 2026-11-04, AD-34) |
+| --- | --- | --- | --- |
+| PES-M11 / PL-B1 Evaluation latency | p50 at most 100 µs | p50 at most 150 µs | Not revised |
+| PES-M12 / PL-B2 End-to-end latency | p99 at most 1 ms at 64 concurrent requests | p99 at most 1.5 ms at 64 concurrent requests | p99 at most 2.5 ms at 64 concurrent requests |
+| PES-M9 Build size | At most 4 MiB added to a stripped release binary | At most 8 MiB added | Not revised |
+| PES-M10 Startup | Median at most 100 ms; peak resident memory at most 64 MiB | At most 200 ms. The memory value is not revised | Not revised |
+
+The third revision (AD-34) followed the product PL2 measurements: the PL2 command features add about 62 µs per request under W2, which queueing at 64 requesters on 8 workers multiplies about eight times, and a model turn takes seconds. The earlier values stay as the history.
 
 Measured against the revised values, the diagnostic variant "partitioned by
 action, one engine per worker" gave p50 76 µs and end-to-end p99 921 µs,

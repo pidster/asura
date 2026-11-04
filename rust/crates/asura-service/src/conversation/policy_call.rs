@@ -6,7 +6,6 @@
 use crate::policy::{JobDecision, JobRequest, PolicyOwner, Ticket};
 use asura_policy as ap;
 use asura_storage::authority::conversation as journal;
-use sha2::{Digest, Sha256};
 
 /// Where one call stands in its policy decision.
 #[derive(Debug, Default)]
@@ -42,7 +41,7 @@ pub(super) fn step(
     request: impl FnOnce() -> JobRequest,
     revision: Option<(u64, [u8; 32])>,
     last_seq: u64,
-    subject: (journal::Id, u64, u32),
+    subject: journal::PolicySubject,
 ) -> Next {
     loop {
         match std::mem::take(stage) {
@@ -109,11 +108,6 @@ pub(super) fn cancel(stage: &mut Stage, owner: Option<&mut PolicyOwner>) {
     *stage = Stage::Idle;
 }
 
-/// SHA-256 of the stored command: the PL1 intent digest input.
-pub(super) fn command_digest(command: &str) -> [u8; 32] {
-    Sha256::digest(command.as_bytes()).into()
-}
-
 fn scope_code(scope: Option<ap::Scope>) -> u8 {
     scope.map_or(0, ap::Scope::code)
 }
@@ -125,18 +119,18 @@ fn error_code(error: Option<ap::ErrorClass>) -> u8 {
 fn decision_record(
     decision: &JobDecision,
     revision_seq: u64,
-    (operation, generation, ordinal): (journal::Id, u64, u32),
+    subject: journal::PolicySubject,
 ) -> journal::Record {
     let primary = decision.primary.as_ref();
+    let origin = match decision.profile {
+        ap::ProfileKind::Model1 => ap::Origin::Model,
+        ap::ProfileKind::Person1 | ap::ProfileKind::PersonOutside1 => ap::Origin::PersonTyped,
+    };
     journal::Record::PolicyDecision(Box::new(journal::PolicyDecision {
-        subject: journal::PolicySubject::ModelCall {
-            operation,
-            generation,
-            ordinal,
-        },
-        action: ap::Action::ProcessExec.code(),
-        origin: 1,
-        profile: 1,
+        subject,
+        action: decision.action.code(),
+        origin: origin.code(),
+        profile: decision.profile.code(),
         project: decision.project,
         task_conversation: decision.task,
         task_agent: 0,
@@ -243,23 +237,28 @@ mod tests {
             (ap::RevisionTexts::builtin_test_deny(), false),
         ] {
             let mut owner = PolicyOwner::with_texts(texts, "/Users/p/.asura".into(), None, 2);
-            let request = || JobRequest {
-                agent: crate::job_controller::AgentKey {
-                    conversation: [3; 16],
-                    agent: 0,
-                },
-                job: [4; 16],
-                project: [5; 16],
-                location: "/Users/p/src/project".into(),
-                command_digest: command_digest("printf ok"),
-                now_ms: 1_762_000_000_000,
+            let request = || {
+                let mut r = crate::policy::test_request("records", 3, 4, "printf ok");
+                r.project = [5; 16];
+                r
             };
             let mut stage = Stage::Idle;
             let end = Instant::now() + Duration::from_secs(30);
             let record = loop {
                 assert!(Instant::now() < end, "no decision");
                 owner.poll();
-                match step(&mut stage, &mut owner, request, None, 0, ([6; 16], 1, 1)) {
+                match step(
+                    &mut stage,
+                    &mut owner,
+                    request,
+                    None,
+                    0,
+                    journal::PolicySubject::ModelCall {
+                        operation: [6; 16],
+                        generation: 1,
+                        ordinal: 1,
+                    },
+                ) {
                     Next::Append(record, false) => break record,
                     Next::Wait => std::thread::sleep(Duration::from_millis(1)),
                     _ => panic!("unexpected step"),
@@ -285,15 +284,28 @@ mod tests {
                 request,
                 Some((1, digest)),
                 1,
-                ([6; 16], 1, 1),
+                journal::PolicySubject::ModelCall {
+                    operation: [6; 16],
+                    generation: 1,
+                    ordinal: 1,
+                },
             ) else {
                 panic!("kind 34 next")
             };
             journal::encode_frame(&context, &decision).expect("kind 34 encodes");
             recorded(&mut stage);
-            let Next::Ready(ready) =
-                step(&mut stage, &mut owner, request, None, 1, ([6; 16], 1, 1))
-            else {
+            let Next::Ready(ready) = step(
+                &mut stage,
+                &mut owner,
+                request,
+                None,
+                1,
+                journal::PolicySubject::ModelCall {
+                    operation: [6; 16],
+                    generation: 1,
+                    ordinal: 1,
+                },
+            ) else {
                 panic!("ready")
             };
             assert_eq!(ready.run, run);

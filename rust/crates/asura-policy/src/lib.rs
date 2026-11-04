@@ -15,16 +15,20 @@ mod request;
 mod text;
 
 #[cfg(test)]
+mod pl2_tests;
+#[cfg(test)]
 mod tests;
 
 pub use compile::{
-    JobOutcome, ROOTS, Regions, Root, RootSet, compile_model1, decide_model1_job, model1_principal,
+    ENTRY, JobOutcome, PersonEntry, PersonOutcome, ROOTS, Regions, Root, RootSet, compile_model1,
+    decide_model1_job, decide_person_job, model1_principal, person_principal,
 };
 pub use engine::{Engine, LoadError};
 pub use request::{
-    Action, ActionGroup, Context, Decision, ErrorClass, Intent, IntentSource, JobPrincipal,
-    MAX_ANCESTORS, MAX_ENTITIES, MAX_REQUEST_BYTES, MAX_SET_ELEMENTS, MAX_STRING_BYTES, Origin,
-    PathClass, PathRef, Primary, ProfileKind, ProgramRef, Request, Resource, ScopeResult,
+    Action, ActionGroup, Command, Context, Decision, Delivery, ErrorClass, Intent, IntentSource,
+    JobPrincipal, MAX_ANCESTORS, MAX_ENTITIES, MAX_REQUEST_BYTES, MAX_SET_ELEMENTS,
+    MAX_STRING_BYTES, Origin, Parse, PathClass, PathRef, Primary, ProfileKind, ProgramRef, Request,
+    Resource, ScopeResult,
 };
 pub use text::{
     MAX_POLICIES_PER_SCOPE, MAX_SCOPE_TEXT_BYTES, RevisionTexts, Scope, ScopeText, validate_text,

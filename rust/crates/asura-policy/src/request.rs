@@ -182,6 +182,52 @@ impl IntentSource {
     }
 }
 
+/// How a named secret reaches a job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Delivery {
+    Raw,
+    Brokered,
+}
+impl Delivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Delivery::Raw => "raw",
+            Delivery::Brokered => "brokered",
+        }
+    }
+}
+/// The parse of a command (security-policy.md, PL2 intent extractor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Parse {
+    Simple,
+    Compound,
+    Unparsed,
+}
+impl Parse {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Parse::Simple => "simple",
+            Parse::Compound => "compound",
+            Parse::Unparsed => "unparsed",
+        }
+    }
+}
+/// The command features of an intent (PL2). Tighten-only: only `forbid`
+/// policies read them.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Command {
+    pub parse: Parse,
+    pub tools: Vec<String>,
+    pub first_tool: String,
+    pub subcommand: String,
+    pub flags: Vec<String>,
+    pub shell_features: Vec<String>,
+    pub bytes: u64,
+    pub secret_vars: u32,
+    pub secret_reference: bool,
+    pub whole_command: bool,
+}
+
 /// A canonical path with its trusted attributes. `path` is absolute,
 /// with no empty, `.` or `..` component and no trailing `/` (except `/`
 /// itself). Its parents are the lexical parent directories, which PL1
@@ -215,6 +261,9 @@ pub struct JobPrincipal {
     pub scratch: PathRef,
     pub cache_roots: Vec<PathRef>,
     pub developer_dir: Option<PathRef>,
+    /// The project's declared variable names (person jobs; empty for
+    /// model jobs).
+    pub declared_env: Vec<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgramRef {
@@ -242,13 +291,21 @@ impl ProgramRef {
 pub enum Resource {
     Path(PathRef),
     Program(ProgramRef),
+    /// A named secret, `Secret::"<NAME>"`.
+    Secret(String),
+    /// A canonical host name; its parents are its label suffixes.
+    Domain(String),
+    /// An IP address in its standard text form.
+    Address(String),
 }
-/// Intent: tighten-only context (AD-27). PL1 carries no command features.
+/// Intent: tighten-only context (AD-27), with the command features of the
+/// intent extractor when the proposer is a command (PL2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Intent {
     pub source: IntentSource,
     pub name: String,
     pub digest: String,
+    pub command: Option<Command>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Context {
@@ -264,6 +321,29 @@ pub enum Context {
         outside_switch: bool,
         intent: Option<Intent>,
     },
+    Secret {
+        now_ms: i64,
+        delivery: Delivery,
+        intent: Option<Intent>,
+    },
+    Connect {
+        now_ms: i64,
+        ip: String,
+        port: u16,
+        via_proxy: bool,
+        intent: Option<Intent>,
+    },
+}
+impl Context {
+    /// The intent of the context, when it can hold one.
+    pub fn intent(&self) -> Option<&Intent> {
+        match self {
+            Context::File { intent, .. }
+            | Context::Exec { intent, .. }
+            | Context::Secret { intent, .. }
+            | Context::Connect { intent, .. } => intent.as_ref(),
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {

@@ -874,5 +874,10 @@ pub fn analyze(command: &str) -> Analysis {
     }
 }
 
+mod intent;
+pub use intent::{IntentFeatures, MAX_INTENT_SET, MAX_INTENT_WORD, Parse, PlanFacts, intent};
+
+#[cfg(test)]
+mod intent_tests;
 #[cfg(test)]
 mod tests;

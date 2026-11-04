@@ -74,6 +74,20 @@ pub(super) const SECRET_RULES_CHANGED: &str = "secret_rules_changed";
 /// A person waiter cancelled before its slot (a client `JobCancel`): the
 /// input is held, so it never dispatches again without Resume.
 pub(super) const CANCELLED: &str = "cancelled";
+/// PL2: the policy owner refused the start (a kind 34 `deny`).
+pub(super) const POLICY_DENIED: &str = "policy_denied";
+/// PL2: the policy owner could not decide; no kind 34.
+pub(super) const POLICY_UNAVAILABLE: &str = "policy_unavailable";
+
+/// What the policy decision of a person start allows next (PL2).
+enum PolicyGate {
+    /// Wait for the reply, the journal ticket or the switch read.
+    Wait,
+    /// The kind 34 `run` committed: the controller submit follows.
+    Run,
+    /// Hold the input with this reason.
+    Hold(&'static str),
+}
 
 /// The secret store target for this runtime. Production uses the
 /// data-protection keychain with the access group from the entitlements
@@ -541,6 +555,9 @@ pub(super) struct Persons {
     /// Named secret requests in flight (named-secrets.md), at most
     /// [`super::named_secrets::IN_FLIGHT`].
     pub(super) named: Vec<super::named_secrets::Pending>,
+    /// The policy decision of each dispatch (PL2), kept until the
+    /// controller accepts the start or the input is held.
+    pub(super) policy: BTreeMap<Id, super::policy_call::Stage>,
     /// The waiting reasons last published, by input (live display state).
     published: BTreeMap<Id, (i32, String)>,
     /// Test-support seam (SS-I3): kind 31 appends are held for this run.
@@ -569,6 +586,7 @@ impl Default for Persons {
             recovering: None,
             holds: VecDeque::new(),
             named: Vec::new(),
+            policy: BTreeMap::new(),
             published: BTreeMap::new(),
             #[cfg(feature = "test-support")]
             hold_append: false,
@@ -1567,6 +1585,11 @@ impl Owner {
                 self.persons.dispatches.remove(&input);
             }
             Job::PersonCheck(_) => self.persons.checking = None,
+            // The append failed: the start decides again on the next pass
+            // (R8 lets a new kind 34 replace an unconfirmed one).
+            Job::PersonPolicy(input, _) => {
+                self.persons.policy.remove(&input);
+            }
             Job::PersonHold(input) => {
                 self.persons.dispatches.remove(&input);
                 if !matches!(
@@ -1784,6 +1807,7 @@ impl Owner {
                 .entry(input)
                 .or_insert(Dispatch::Reading);
         }
+        self.retain_person_policy();
         // Advance the item reads, the paced rechecks and the starts.
         let inputs: Vec<Id> = self.persons.dispatches.keys().copied().collect();
         for input in inputs {
@@ -1924,6 +1948,17 @@ impl Owner {
             let step = GuardStep::Record;
             return self.advance_guard(record, values.map(Box::new), step);
         }
+        // PL2: the policy decision, after the path check and before the
+        // controller submit; kind 35 and kind 34 commit first.
+        match self.person_policy(&record, &path, device, inode) {
+            PolicyGate::Wait => return Dispatch::Admit(record, values.map(Box::new)),
+            PolicyGate::Hold(reason) => {
+                drop(values);
+                self.persons.policy.remove(&record.input);
+                return self.command_hold(record.input, reason);
+            }
+            PolicyGate::Run => {}
+        }
         let values = values.unwrap_or_default();
         // The numbered values, or the whole-command value, re-planned.
         let (variables, command, literals) = if record.whole_command {
@@ -2026,6 +2061,7 @@ impl Owner {
         };
         match controller.submit(request, now) {
             Admission::Accepted { job } | Admission::Existing { job } => {
+                self.persons.policy.remove(&record.input);
                 // The controller grants slots in its own poll, which ran
                 // earlier in this reactor step: wake the reactor so the
                 // start is evaluated now, not at the next unrelated wake.
@@ -2039,7 +2075,134 @@ impl Owner {
             // moved into the refused request and were dropped; the next
             // try reads the item again.
             Admission::Busy(_) => Dispatch::Ready(record),
-            Admission::Conflict => self.command_hold(record.input, CANCELLED),
+            Admission::Conflict => {
+                self.persons.policy.remove(&record.input);
+                self.command_hold(record.input, CANCELLED)
+            }
+        }
+    }
+
+    /// One step of a person start's policy decision (security-policy.md,
+    /// PL2 person command decision). Bounded in-memory work: the decision
+    /// runs on the policy workers; the appends take the journal ticket.
+    fn person_policy(
+        &mut self,
+        record: &PersonCommandQueued,
+        location: &str,
+        device: u64,
+        inode: u64,
+    ) -> PolicyGate {
+        // A `!!` start waits for the switch's start-time read.
+        let switch = self.persons.switch();
+        if record.outside_sandbox && switch.is_none() {
+            return PolicyGate::Wait;
+        }
+        let input = record.input;
+        let mut stage = self.persons.policy.remove(&input).unwrap_or_default();
+        let wake = self.wake.clone();
+        let home = self
+            .runtime
+            .asura_home_path()
+            .to_string_lossy()
+            .into_owned();
+        let test_deny = self.policy_test_deny;
+        let owner = self
+            .policy
+            .get_or_insert_with(|| crate::policy::PolicyOwner::start(home, wake, test_deny));
+        let (revision, last_seq) = self
+            .replay
+            .as_ref()
+            .map_or((None, 0), |r| (r.policy.active(), r.policy.last_seq));
+        let request = || crate::policy::JobRequest {
+            agent: crate::job_controller::AgentKey {
+                conversation: record.conversation,
+                agent: 0,
+            },
+            job: journal::job_id(&journal::JobOrigin::Person { input }),
+            project: record.project,
+            location: location.to_owned(),
+            device,
+            inode,
+            command: record.command_text().to_owned(),
+            plan: asura_platform::exec_cmd::split::PlanFacts {
+                secret_vars: u32::try_from(record.number_kinds.len()).unwrap_or(u32::MAX),
+                secret_reference: !record.named.is_empty(),
+                whole_command: record.whole_command,
+            },
+            person: Some(crate::policy::PersonRequest {
+                outside: record.outside_sandbox,
+                env_terminal: record
+                    .environment
+                    .iter()
+                    .filter_map(|(code, _)| env::by_code(*code).map(|t| t.name.to_owned()))
+                    .collect(),
+                env_declared: record.declared.iter().map(|(n, _)| n.clone()).collect(),
+                outside_switch: switch.unwrap_or(false),
+                secrets: record.named.iter().map(|(_, n)| n.clone()).collect(),
+            }),
+            now_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
+        };
+        let next = super::policy_call::step(
+            &mut stage,
+            owner,
+            request,
+            revision,
+            last_seq,
+            journal::PolicySubject::PersonInput { input },
+        );
+        let gate = match next {
+            super::policy_call::Next::Wait => PolicyGate::Wait,
+            // A full agent queue: the command stays at the lane head and
+            // asks again on the next wake; nothing is recorded.
+            super::policy_call::Next::Busy => {
+                stage = super::policy_call::Stage::Idle;
+                PolicyGate::Wait
+            }
+            super::policy_call::Next::Append(record, decision) => {
+                match self.append(record, Job::PersonPolicy(input, decision), None) {
+                    Ok(()) | Err(writer::Error::Busy) => {}
+                    Err(e) => self.unavailable = Some(storage_error(e)),
+                }
+                PolicyGate::Wait
+            }
+            super::policy_call::Next::Ready(decision) => {
+                if decision.unavailable {
+                    PolicyGate::Hold(POLICY_UNAVAILABLE)
+                } else if decision.run {
+                    PolicyGate::Run
+                } else {
+                    PolicyGate::Hold(POLICY_DENIED)
+                }
+            }
+        };
+        self.persons.policy.insert(input, stage);
+        gate
+    }
+
+    /// A person policy append committed (kind 35, or the kind 34 when
+    /// `decision`).
+    pub(super) fn person_policy_recorded(&mut self, input: Id, decision: bool) {
+        if decision && let Some(stage) = self.persons.policy.get_mut(&input) {
+            super::policy_call::recorded(stage);
+        }
+    }
+
+    /// Drops the policy stages of inputs with no live dispatch; a waiting
+    /// request is cancelled at the policy owner.
+    pub(super) fn retain_person_policy(&mut self) {
+        let dead: Vec<Id> = self
+            .persons
+            .policy
+            .keys()
+            .filter(|input| !self.persons.dispatches.contains_key(*input))
+            .copied()
+            .collect();
+        for input in dead {
+            if let Some(mut stage) = self.persons.policy.remove(&input) {
+                super::policy_call::cancel(&mut stage, self.policy.as_mut());
+            }
         }
     }
 
