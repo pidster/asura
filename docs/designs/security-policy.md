@@ -2622,6 +2622,14 @@ false and true. Any refusal in any scope fails the load
 a sampled check of the built-in and test texts. PL3 replaces it with the
 admission rule that refuses any policy forbidding person network.
 
+Required behavior for PL3 (AD-7; coordinator, 2026-11-04): person commands
+never get network lockdown, so the PL3 admission proof must cover every
+host, address and port, not a sample. Admission proves, for each scope and
+for both person profiles, that `network.connect` by a `person_typed` job is
+allowed for every `Domain` and `Address` resource and every `ip`, `port` and
+`via_proxy` value, and refuses the candidate otherwise. The sampled load
+check stays only until that proof runs.
+
 ### Kind 34 in PL2
 
 Kind 34 gains subject code 2, the person input: the 16-byte input ID.
@@ -2750,6 +2758,21 @@ between, none applied:
 4. Revise PL-B2 again, or its definition (more workers, or fewer
    concurrent requesters).
 
+Re-measurement on the quieter machine (option 1, coordinator, 2026-11-04),
+after the solver build finished: release builds, and each run started only
+when the 1-minute load average was below 3 (2.29 to 2.81 at the starts).
+
+| Budget | Three runs | Verdict |
+| --- | --- | --- |
+| PL-B1 p50 at most 150 µs | p50 141.8, 144.5 and 144.0 µs (p99 209.8, 211.5 and 205.4 µs); median 144.0 µs; worst run 144.5 µs | **Pass** |
+| PL-B2 p99 at most 1.5 ms at 64 requesters | p99 2.080, 2.024 and 1.904 ms (p50 1.884, 1.756 and 1.773 ms; max 2.227, 3.230 and 2.005 ms); median 2.024 ms; worst run 2.080 ms | **Fail**, 0.52 ms over |
+| PL-B4, PL-B5 | Startup 37.6 to 39.1 ms; 0 allows in 1,000,000 malformed requests; deterministic | **Pass** |
+
+The breakdown is unchanged: the built-in entry decides at p50 157 to 159 µs
+with the command features and 96.5 to 97.6 µs without them. The load was
+not the cause. The failure is reported to the owner; W2 and the budgets
+are unchanged.
+
 SP-P1 is answered ([SP-P1 result](#sp-p1-result)).
 
 ## Delivery packets
@@ -2762,7 +2785,7 @@ needs a change. Owned paths are exclusive while a packet runs.
 | PL1 | The policy owner; schema v1; built-in installation and default user sets; deny-on-any-error wrapper; installation and user scopes; region compiler for `model-1`; model exec_cmd job decisions by effect envelope with the command as intent; constraint set to the guardian (byte-equal profile); kinds 34 and 35; `/status` line; denial text | `rust/crates/asura-policy/**` (new, with `AGENTS.md`), `rust/crates/asura-service/src/policy.rs` and `policy/**`, the exec_cmd decision point in `conversation.rs` and `tools.rs`, the guardian profile input in `asura-platform/src/exec_cmd/guardian.rs`, kinds 34–35 in `asura-storage/src/authority/**`, `Cargo.toml`, `Cargo.lock` | This design | PL-U1–U8, U13; PL-I1–I4, I10, I12; PL-E1, E2; PL-B1–B5 recorded |
 | PL2 | Canonicaliser, program identity, intent extractor; person command decisions; named secret `secret_use` | `asura-platform/src/project_identity.rs`, new `asura-platform/src/code_identity.rs`, `exec_cmd/split.rs` (and `split/intent*`), person dispatch in `conversation.rs` and `conversation/person_command.rs`, `asura-service/src/policy.rs` and `policy/**`, `conversation/policy_call.rs`, `asura-policy` request types and built-in sets, kind 34 subject 2 in `asura-storage/src/authority/**` | PL1 | PL-U9, U10, U13; PL-I15; PL-N1; PL-E7; PL-B1, B2 re-measured |
 | PL4a | Solver build script and lock file; unsigned package for tests; probe findings F1 to F5 as script and adapter requirements | `tools/release/solver/**` | The solver build probes (SBQ1, SBQ2); SV-P1 re-run on the product corpus | Script builds offline; SV probes recorded |
-| PL3 | Admission worker, SymCC solver adapter, platform solver process, lints, proofs, change difference, lifecycle with user-scope admission, rollback, restart reproving, control messages, audit | `rust/crates/asura-policy-admission/**` (new), `asura-platform/src/solver.rs`, `asura-service/src/policy/admission*`, control messages in `asura-control`, kind 35 events | PL1, PL4a | PL-U11; PL-I5–I8, I11, I13; PL-E3 |
+| PL3 | Admission worker, SymCC solver adapter, platform solver process, lints, proofs, change difference, lifecycle with user-scope admission, rollback, restart reproving, control messages, audit | `rust/crates/asura-policy-admission/**` (new), `asura-platform/src/solver.rs`, `asura-service/src/policy/admission*`, control messages in `asura-control`, kind 35 events | PL1, PL4a | PL-U11; PL-I5–I8, I11, I13; PL-E3; the AD-7 person network proof over every host and port ([PL2 AD-7 load check](#pl2-ad-7-load-check)) |
 | PL4b | Bundle placement, signing, notice, licence folder, release checks | `tools/release/asura-bundle`, `tools/release/asura-release`, `tools/release/host-paths`, `docs/designs/release-signing.md` (first), DMG `LICENSE` | PL4a, PL3 | PL-N2; release proof gate |
 | PL5 | Workspace and repository scopes, forbid-only lint, baseline permit, `rel` literals | `asura-service/src/policy/scopes*`, `asura-policy` lints, repository source read | PL3 | PL-U5, U6; PL-I7; PL-E4 |
 | PL6 | Compiler for `person-1` and lower-scope narrowings; EPG deny rules moved into the compiler; SP-AQ7 soundness proofs | `asura-policy` compiler, `guardian.rs`, `path_guard` interface | PL5 | PL-I9; EV-E |
