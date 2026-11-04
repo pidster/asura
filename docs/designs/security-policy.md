@@ -9,9 +9,10 @@ Packet PL1 is implemented (2026-11-03). Against the owner's revised budgets
 (AD-33), PL-B1 passes and the single PL-B2 run missed by 28 µs, reported to
 the owner ([PL1 delivery record](#pl1-delivery-record)).
 Packet PL2 is implemented (2026-11-04) under its
-[implementation contract](#pl2-implementation-contract); its measurements
-are in the [PL2 delivery record](#pl2-delivery-record). Later packets are
-not implemented. Protocol numbering stays `0.1` and the
+[implementation contract](#pl2-implementation-contract). PL-B1 passes;
+PL-B2 fails by 0.45 ms on the median of three runs and is reported to the
+owner ([PL2 delivery record](#pl2-delivery-record)). Later packets are not
+implemented. Protocol numbering stays `0.1` and the
 journal format stays `1` until release 1.0.0; schemas change in place.
 
 This is the D3 policy design that the [security policy brief](security-policy-brief.md)
@@ -2711,7 +2712,45 @@ permits `process.exec.ask`, so the outcome is `deny`.
 
 ### PL2 delivery record
 
-Pending: filled by the PL2 measurement.
+Verified, 2026-11-04, on the reference Mac (Apple M4 Max, 16 cores,
+macOS 27), release builds, while another packet built cvc5 on the same
+machine: the 1-minute load average was 6.9 to 14.7. Every entry request
+of the workload now carries the command features. Verdict: the median of
+three runs, with the worst run recorded.
+
+| Budget | Three runs | Verdict |
+| --- | --- | --- |
+| PL-B1 p50 at most 150 µs | p50 144.5, 145.3 and 148.7 µs (p99 209.8, 221.1 and 278.8 µs); median 145.3 µs; worst run 148.7 µs | **Pass**, 4.7 µs inside the budget |
+| PL-B2 p99 at most 1.5 ms at 64 requesters | p99 1.950, 1.904 and 2.056 ms (p50 1.785, 1.770 and 1.767 ms; max 2.098, 2.033 and 2.943 ms); median 1.950 ms; worst run 2.056 ms | **Fail**, 0.45 ms over |
+| PL-B4 startup at most 200 ms | 40.1, 38.2 and 39.1 ms | **Pass** |
+| PL-B5 safety | 0 allows in 1,000,000 malformed requests in each run; identical decisions on fresh engines | **Pass** |
+
+Attribution, from the `policy-bench` breakdown: the built-in sets decide the
+exec entry at p50 159 to 162 µs with the command features and 97.8 µs
+without them (PL1: 93.8 µs). Request construction under W2
+(`Context::from_json_value` with the schema) takes p50 147.4 µs with the
+features and 84.5 µs without, so the intent record costs about 62 µs per
+entry decision. With 64 requests outstanding on 8 workers each decision
+waits for about 7 others, so the added cost appears about eight times in
+PL-B2. The load during the runs was about three times that of the PL1
+re-measurement. The intent extraction itself and the entry identity
+refresh were not timed separately.
+
+Under the [budget rule](#performance-budgets) the PL-B2 failure goes to the
+owner; the mechanism is not changed silently. Options the owner may choose
+between, none applied:
+
+1. Re-measure on an idle machine, after the parallel solver build.
+2. Build the context from typed values (`Context::from_pairs`) and keep
+   the schema check in `Request::new`. This changes the wording of rule W2,
+   not its effect; the saving is not measured.
+3. Send the command features only when the active revision has a policy
+   that reads `context.intent`. No shipped set reads it until PL7, so the
+   cost returns with the AD-29 rules.
+4. Revise PL-B2 again, or its definition (more workers, or fewer
+   concurrent requesters).
+
+SP-P1 is answered ([SP-P1 result](#sp-p1-result)).
 
 ## Delivery packets
 
@@ -2822,5 +2861,11 @@ the upstream cvc5 1.3.1 static binary's `--show-config` (GMP and LibPoly
 linked statically). No product code or test was run. Each Mermaid diagram
 was rendered with the local Mermaid CLI 12.0.0 at scale 2 into a temporary
 directory outside the repository and inspected.
+
+Recorded on 2026-11-04 for the PL2 contract: written from the PL1 code, the
+SP-P1 probe, the person command, environment and named secret designs and
+the installed Security framework headers. Diagrams PL2-F1, PL2-F2, PL2-Q1
+and PL2-D1 were rendered with the same Mermaid CLI at scale 2 into a
+temporary directory outside the repository and inspected.
 
 Return to the [design index](README.md).
