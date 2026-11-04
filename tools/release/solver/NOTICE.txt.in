@@ -1,0 +1,18 @@
+Asura includes the cvc5 SMT solver, version 1.3.1, under the BSD 3-Clause
+licence (cvc5-COPYING.txt). Asura uses it on this Mac to check policy
+changes before they take effect.
+
+cvc5 uses the GNU Multiple Precision Arithmetic Library (GMP), version
+6.3.0, under the GNU Lesser General Public License, version 3
+(gmp-COPYING.LESSERv3.txt and gmp-COPYINGv3.txt). GMP is a separate shared
+library: Asura.app/Contents/Frameworks/libgmp.10.dylib. You may replace it
+with a modified version. To run cvc5 with your GMP, copy MacOS/cvc5 and the
+Frameworks folder, replace the library, and sign both with your own identity
+or ad hoc. Asura itself runs only the solver files it shipped and checked.
+
+The source code of this GMP version and of cvc5, and the script that built
+them, are published with this Asura release: the assets of release
+v@VERSION@ of the GitHub repository pidster/asura.
+
+cvc5 also contains CaDiCaL, SymFPU and MiniSat; their licences are in this
+folder.

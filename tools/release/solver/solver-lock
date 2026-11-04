@@ -1,0 +1,301 @@
+#!/usr/bin/python3 -I
+"""Lock file helper for the solver build (security policy design, PL4a
+implementation contract: docs/designs/security-policy.md#lock-file).
+
+    solver-lock validate LOCK
+    solver-lock get LOCK KEY                 gmp_version, cvc5_version, deployment_target
+    solver-lock entries LOCK [ROLE...]       name, file, url, bytes, sha256, top_level, version
+    solver-lock licences LOCK                package file, entry, member
+    solver-lock publish LOCK                 entry names published with each release
+    solver-lock verify FILE BYTES SHA256
+    solver-lock check-archive tar|zip TOP_LEVEL FILE
+    solver-lock manifest PACKAGE LOCK
+    solver-lock check-manifest PACKAGE
+
+Lines are tab-separated. Exit 0 on success, 1 on a refusal (one line on
+standard error), 2 on a usage error. The helper reads archives only to list
+their member names; it never extracts them.
+"""
+import hashlib
+import json
+import os
+import re
+import sys
+import tarfile
+import zipfile
+
+TOP_KEYS = {"format_version", "host", "gmp_version", "cvc5_version", "entries", "licences", "publish"}
+HOST_KEYS = {"os", "os_major", "arch", "deployment_target"}
+ENTRY_KEYS = {"name", "role", "file", "url", "bytes", "sha256", "top_level", "version"}
+ROLES = {"source", "dependency", "build-tool", "comparison"}
+SHA = re.compile(r"^[0-9a-f]{64}$")
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+VERSION = re.compile(r"^[0-9]+(\.[0-9]+)*$")
+MANIFEST = "manifest.json"
+
+
+class Refused(Exception):
+    pass
+
+
+def refuse(message):
+    raise Refused(message)
+
+
+def load(path):
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        lock = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        refuse("cannot read the lock: %s" % error)
+    validate(lock)
+    return lock, hashlib.sha256(raw).hexdigest()
+
+
+def validate(lock):
+    if not isinstance(lock, dict):
+        refuse("the lock is not an object")
+    unknown = set(lock) - TOP_KEYS
+    if unknown:
+        refuse("unknown lock key: %s" % sorted(unknown)[0])
+    missing = TOP_KEYS - set(lock)
+    if missing:
+        refuse("missing lock key: %s" % sorted(missing)[0])
+    if lock["format_version"] != 1 or isinstance(lock["format_version"], bool):
+        refuse("unsupported format_version: %r" % (lock["format_version"],))
+    host = lock["host"]
+    if not isinstance(host, dict) or set(host) != HOST_KEYS:
+        refuse("host must hold exactly %s" % ", ".join(sorted(HOST_KEYS)))
+    for key in ("gmp_version", "cvc5_version"):
+        if not isinstance(lock[key], str) or not VERSION.match(lock[key]):
+            refuse("%s is not a version" % key)
+    if not isinstance(host["deployment_target"], str) or not VERSION.match(host["deployment_target"]):
+        refuse("deployment_target is not a version")
+    entries = lock["entries"]
+    if not isinstance(entries, list) or not entries:
+        refuse("entries must be a non-empty list")
+    names, files = set(), set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            refuse("an entry is not an object")
+        unknown = set(entry) - ENTRY_KEYS
+        if unknown:
+            refuse("unknown entry key: %s" % sorted(unknown)[0])
+        for key in ("name", "role", "file", "url", "bytes", "sha256"):
+            if key not in entry:
+                refuse("entry without %s" % key)
+        name = entry["name"]
+        if not isinstance(name, str) or not NAME.match(name):
+            refuse("bad entry name: %r" % (name,))
+        if name in names:
+            refuse("duplicate entry name: %s" % name)
+        names.add(name)
+        if entry["role"] not in ROLES:
+            refuse("%s: unknown role %r" % (name, entry["role"]))
+        if not isinstance(entry["file"], str) or not NAME.match(entry["file"]) or entry["file"] in files:
+            refuse("%s: bad or duplicate file name" % name)
+        files.add(entry["file"])
+        url = entry["url"]
+        if not isinstance(url, str) or not url.startswith("https://") or any(c.isspace() for c in url):
+            refuse("%s: the URL must be https://" % name)
+        size = entry["bytes"]
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            refuse("%s: bytes must be a positive integer" % name)
+        if not isinstance(entry["sha256"], str) or not SHA.match(entry["sha256"]):
+            refuse("%s: sha256 must be 64 lowercase hex digits" % name)
+        if "top_level" in entry and (not isinstance(entry["top_level"], str) or not NAME.match(entry["top_level"])):
+            refuse("%s: bad top_level" % name)
+        if "version" in entry and (not isinstance(entry["version"], str) or not VERSION.match(entry["version"])):
+            refuse("%s: bad version" % name)
+        if entry["role"] in ("source", "dependency", "comparison") and "top_level" not in entry:
+            refuse("%s: an archive entry needs top_level" % name)
+        if entry["role"] == "build-tool" and "version" not in entry:
+            refuse("%s: a build tool needs version" % name)
+    licences = lock["licences"]
+    if not isinstance(licences, dict) or not licences:
+        refuse("licences must be a non-empty object")
+    for target, source in licences.items():
+        if not NAME.match(target) or not target.endswith(".txt"):
+            refuse("bad licence file name: %r" % (target,))
+        if (not isinstance(source, list) or len(source) != 2 or source[0] not in names
+                or not isinstance(source[1], str) or not member_ok(source[1])):
+            refuse("%s: the source must be [entry, relative member]" % target)
+    publish = lock["publish"]
+    if not isinstance(publish, list) or not publish or len(set(publish)) != len(publish):
+        refuse("publish must be a non-empty list of distinct names")
+    roles = {e["name"]: e["role"] for e in entries}
+    for name in publish:
+        if roles.get(name) not in ("source", "dependency"):
+            refuse("publish names %r, which is not a source or dependency entry" % (name,))
+
+
+def member_ok(member):
+    if not member or member.startswith("/") or "\\" in member:
+        return False
+    return all(part not in ("", ".", "..") for part in member.rstrip("/").split("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            hasher.update(block)
+    return hasher.hexdigest()
+
+
+def verify(path, size, sha):
+    if not os.path.isfile(path) or os.path.islink(path):
+        refuse("%s: not a regular file" % path)
+    actual = os.path.getsize(path)
+    if actual != int(size):
+        refuse("%s: %d bytes, the lock says %s" % (os.path.basename(path), actual, size))
+    found = digest(path)
+    if found != sha:
+        refuse("%s: SHA-256 %s, the lock says %s" % (os.path.basename(path), found, sha))
+
+
+def check_archive(kind, top, path):
+    """Every member lies under TOP; no absolute path, no '..', no link out."""
+    if kind == "tar":
+        try:
+            with tarfile.open(path, "r:*") as archive:
+                members = [(m.name, m.linkname if (m.issym() or m.islnk()) else None, m.isdev()) for m in archive]
+        except (OSError, tarfile.TarError) as error:
+            refuse("%s: not a readable tar archive: %s" % (path, error))
+    elif kind == "zip":
+        try:
+            with zipfile.ZipFile(path) as archive:
+                members = []
+                for info in archive.infolist():
+                    mode = (info.external_attr >> 16) & 0o170000
+                    link = archive.read(info).decode("utf-8", "replace") if mode == 0o120000 else None
+                    members.append((info.filename, link, False))
+        except (OSError, zipfile.BadZipFile) as error:
+            refuse("%s: not a readable zip archive: %s" % (path, error))
+    else:
+        refuse("unknown archive kind %r" % kind)
+    if not members:
+        refuse("%s: empty archive" % path)
+    for name, link, device in members:
+        if name.startswith("/"):
+            refuse("absolute member: %s" % name)
+        if not member_ok(name):
+            refuse("member with an empty, '.' or '..' component: %s" % name)
+        if name.rstrip("/") != top and not name.startswith(top + "/"):
+            refuse("member outside %s: %s" % (top, name))
+        if device:
+            refuse("device member: %s" % name)
+        if link is not None:
+            if link.startswith("/"):
+                refuse("link with an absolute target: %s" % name)
+            depth = len(name.rstrip("/").split("/")) - 1
+            for part in link.split("/"):
+                depth += -1 if part == ".." else (0 if part in ("", ".") else 1)
+                if depth < 1:
+                    refuse("link leaving %s: %s" % (top, name))
+
+
+def package_files(package):
+    out = []
+    for base, dirs, names in os.walk(package):
+        dirs.sort()
+        for name in sorted(names):
+            path = os.path.join(base, name)
+            rel = os.path.relpath(path, package)
+            if rel != MANIFEST:
+                out.append(rel)
+    return out
+
+
+def manifest(package, lock_path):
+    _, lock_sha = load(lock_path)
+    files = {}
+    for rel in package_files(package):
+        path = os.path.join(package, rel)
+        if os.path.islink(path) or not os.path.isfile(path):
+            refuse("%s: not a regular file" % rel)
+        files[rel] = {"bytes": os.path.getsize(path), "sha256": digest(path)}
+    document = {"format_version": 1, "lock_sha256": lock_sha, "files": files}
+    with open(os.path.join(package, MANIFEST), "w", encoding="utf-8") as handle:
+        json.dump(document, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def check_manifest(package):
+    try:
+        with open(os.path.join(package, MANIFEST), encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError) as error:
+        refuse("cannot read the manifest: %s" % error)
+    listed = document.get("files", {})
+    present = package_files(package)
+    if sorted(listed) != present:
+        refuse("the manifest lists %d files, the package holds %d" % (len(listed), len(present)))
+    for rel, item in listed.items():
+        verify(os.path.join(package, rel), item["bytes"], item["sha256"])
+
+
+def main(argv):
+    if not argv:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    command, args = argv[0], argv[1:]
+    arity = {"validate": 1, "get": 2, "licences": 1, "publish": 1, "verify": 3,
+             "check-archive": 3, "manifest": 2, "check-manifest": 1}
+    if command == "entries":
+        if not args:
+            print("solver-lock: usage: entries LOCK [ROLE...]", file=sys.stderr)
+            return 2
+    elif command not in arity or len(args) != arity[command]:
+        print("solver-lock: usage error; run without arguments for help", file=sys.stderr)
+        return 2
+    try:
+        if command == "validate":
+            load(args[0])
+        elif command == "get":
+            lock, _ = load(args[0])
+            key = args[1]
+            if key in ("gmp_version", "cvc5_version"):
+                print(lock[key])
+            elif key == "deployment_target":
+                print(lock["host"]["deployment_target"])
+            elif key == "sha256":
+                print(load(args[0])[1])
+            else:
+                refuse("unknown key %r" % key)
+        elif command == "entries":
+            lock, _ = load(args[0])
+            roles = set(args[1:])
+            for e in lock["entries"]:
+                if not roles or e["role"] in roles:
+                    print("\t".join([e["name"], e["file"], e["url"], str(e["bytes"]), e["sha256"],
+                                     e.get("top_level", "-"), e.get("version", "-")]))
+        elif command == "licences":
+            lock, _ = load(args[0])
+            for target in sorted(lock["licences"]):
+                entry, member = lock["licences"][target]
+                print("\t".join([target, entry, member]))
+        elif command == "publish":
+            lock, _ = load(args[0])
+            for name in lock["publish"]:
+                print(name)
+        elif command == "verify":
+            if not args[1].isdigit() or not SHA.match(args[2]):
+                print("solver-lock: verify FILE BYTES SHA256", file=sys.stderr)
+                return 2
+            verify(*args)
+        elif command == "check-archive":
+            check_archive(*args)
+        elif command == "manifest":
+            manifest(*args)
+        elif command == "check-manifest":
+            check_manifest(args[0])
+    except Refused as error:
+        print("solver-lock: %s" % error, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

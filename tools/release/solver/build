@@ -1,0 +1,322 @@
+#!/bin/sh
+# Build the cvc5 solver package from pinned sources (security policy design,
+# packet PL4a: docs/designs/security-policy.md#pl4a-implementation-contract).
+#
+#   build --scratch DIR [--lock FILE] [--jobs N]
+#
+# Fetches every lock entry except the comparison binary into DIR/cache,
+# checking each size and SHA-256 against the lock, then builds offline under
+# sandbox-exec with (deny network*): GMP 6.3.0 shared, then cvc5 1.3.1
+# --static --no-poly against it. The package is DIR/solver: MacOS/cvc5,
+# Frameworks/libgmp.10.dylib, licenses/ and manifest.json, signed ad hoc.
+# Exit 0: package built and checks BC1 to BC9 passed. Exit 1: a stage failed
+# (one "solver-build: STAGE: reason" line). Exit 2: a usage error, before any
+# file is written. No step has a time limit; the operator's interrupt ends a
+# run, and the next run removes DIR/work and starts again.
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C
+export PATH LC_ALL
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+root=$(CDPATH= cd -- "$here/../../.." && pwd -P)
+helper=$here/solver-lock
+stage=preflight
+
+usage() {
+    printf 'solver-build: %s\n' "$*" >&2
+    printf 'usage: build --scratch DIR [--lock FILE] [--jobs N]\n' >&2
+    exit 2
+}
+fail() {
+    printf 'solver-build: %s: %s\n' "$stage" "$*" >&2
+    exit 1
+}
+note() { printf 'solver-build: %s: %s\n' "$stage" "$*"; }
+
+scratch= lock=$here/solver.lock jobs= offline=no
+while [ $# -gt 0 ]; do
+    case $1 in
+        --scratch) [ $# -ge 2 ] || usage '--scratch needs a directory'; scratch=$2; shift 2 ;;
+        --lock) [ $# -ge 2 ] || usage '--lock needs a file'; lock=$2; shift 2 ;;
+        --jobs) [ $# -ge 2 ] || usage '--jobs needs a number'; jobs=$2; shift 2 ;;
+        --offline-stage) offline=yes; shift ;;
+        *) usage "unknown argument: $1" ;;
+    esac
+done
+[ -n "$scratch" ] || usage '--scratch DIR is required'
+case $scratch in /*) ;; *) usage 'the scratch directory must be an absolute path' ;; esac
+case $lock in /*) ;; *) lock=$(pwd -P)/$lock ;; esac
+[ -n "$jobs" ] || jobs=$(sysctl -n hw.ncpu)
+case $jobs in ''|*[!0-9]*|0) usage '--jobs must be a positive integer' ;; esac
+# Resolve the path before creating anything: the parent must exist.
+parent=$(dirname -- "$scratch")
+[ -d "$parent" ] || usage "the parent of $scratch does not exist"
+dir=$(CDPATH= cd -- "$parent" && pwd -P)/$(basename -- "$scratch")
+[ ! -d "$dir" ] || dir=$(CDPATH= cd -- "$dir" && pwd -P)
+case $dir/ in "$root"/*) usage 'the scratch directory must be outside the repository' ;; esac
+case $root/ in "$dir"/*) usage 'the scratch directory must not contain the repository' ;; esac
+[ -d "$dir" ] || mkdir -- "$dir" 2>/dev/null || usage "cannot create $dir"
+cache=$dir/cache work=$dir/work out=$dir/solver
+
+# ---------------------------------------------------------------- preflight
+preflight() {
+    [ "$(uname -s)" = Darwin ] || fail 'macOS is required'
+    [ "$(uname -m)" = arm64 ] || fail 'arm64 is required'
+    major=$(sw_vers -productVersion | cut -d. -f1)
+    [ "$major" -ge 27 ] || fail "macOS 27 or later is required (found $(sw_vers -productVersion))"
+    for tool in clang clang++ make m4 curl shasum tar unzip otool install_name_tool codesign sandbox-exec python3; do
+        [ -x "/usr/bin/$tool" ] || fail "/usr/bin/$tool is missing"
+    done
+    [ -x /usr/sbin/sysctl ] || fail '/usr/sbin/sysctl is missing'
+    [ -x "$root/tools/release/host-paths" ] || fail 'tools/release/host-paths is missing'
+    [ -f "$lock" ] || fail "no lock file: $lock"
+    "$helper" validate "$lock" || fail 'the lock file is invalid'
+    [ ! -e "$out" ] || fail "$out exists; remove it or choose another scratch directory"
+}
+
+# ---------------------------------------------------------------- fetch
+fetch() {
+    stage=fetch
+    mkdir -p -- "$cache"
+    entries=$("$helper" entries "$lock" source dependency build-tool) || fail 'cannot read the lock entries'
+    # First pass: every cached file must match. Nothing is replaced silently.
+    printf '%s\n' "$entries" | while IFS='	' read -r name file url bytes sha top version; do
+        if [ -e "$cache/$file" ]; then
+            "$helper" verify "$cache/$file" "$bytes" "$sha" ||
+                fail "cached $file does not match the lock; remove it and run again"
+        fi
+    done
+    printf '%s\n' "$entries" | while IFS='	' read -r name file url bytes sha top version; do
+        [ -e "$cache/$file" ] && continue
+        part=$cache/.$file.part
+        rm -f -- "$part"
+        note "fetching $name ($bytes bytes)"
+        if ! curl -fsSL --proto =https --proto-redir =https --tlsv1.2 --max-filesize "$bytes" -o "$part" -- "$url"; then
+            rm -f -- "$part"
+            fail "download of $name failed"
+        fi
+        if ! "$helper" verify "$part" "$bytes" "$sha"; then
+            rm -f -- "$part"
+            fail "$name does not match the lock"
+        fi
+        mv -- "$part" "$cache/$file"
+    done
+    note 'every entry is cached and verified'
+}
+
+# ---------------------------------------------------------------- offline stages
+benv() {
+    env -i PATH="$work/venv/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$work/home" TMPDIR="$work/tmp" \
+        LANG=C LC_ALL=C MACOSX_DEPLOYMENT_TARGET="$target" "$@"
+}
+logged() {
+    log=$work/logs/$1.log
+    shift
+    "$@" > "$log" 2>&1 || fail "failed; see $log"
+}
+entry_field() { # NAME FIELD-NUMBER
+    "$helper" entries "$lock" | awk -F '	' -v n="$1" -v f="$2" '$1 == n { print $f }'
+}
+
+verify_cache() {
+    stage=verify
+    "$helper" entries "$lock" source dependency build-tool | while IFS='	' read -r name file url bytes sha top version; do
+        "$helper" verify "$cache/$file" "$bytes" "$sha" || fail "$file does not match the lock"
+    done
+}
+
+unpack() {
+    stage=unpack
+    "$helper" entries "$lock" source dependency | while IFS='	' read -r name file url bytes sha top version; do
+        "$helper" check-archive tar "$top" "$cache/$file" || fail "$file: refused"
+        mkdir "$work/src/$name"
+        tar -xf "$cache/$file" -C "$work/src/$name" || fail "$file: extraction failed"
+        [ -d "$work/src/$name/$top" ] || fail "$file: no $top"
+    done
+}
+
+tools() {
+    stage=tools
+    logged venv benv /usr/bin/python3 -m venv "$work/venv"
+    wheels=$("$helper" entries "$lock" build-tool | awk -F '	' -v c="$cache" '{ print c "/" $2 }')
+    # shellcheck disable=SC2086 # one wheel path per word; cache paths hold no space (checked below)
+    case $cache in *' '*) fail 'the scratch path must not contain a space' ;; esac
+    logged pip benv "$work/venv/bin/python" -m pip install --no-index --no-deps --no-cache-dir \
+        --disable-pip-version-check $wheels
+    want=$(entry_field cmake 7)
+    got=$(benv "$work/venv/bin/cmake" --version | sed -n '1s/^cmake version //p')
+    [ "$got" = "$want" ] || fail "CMake reports $got, the lock says $want"
+    note "CMake $got, Python $(benv "$work/venv/bin/python" -c 'import platform; print(platform.python_version())')"
+}
+
+gmp() {
+    stage=gmp
+    src=$work/src/gmp/$(entry_field gmp 6)
+    obj=$work/gmp-obj prefix=$work/gmp
+    mkdir "$obj"
+    maps="-ffile-prefix-map=$dir=/solver -fdebug-prefix-map=$dir=/solver"
+    (cd "$obj" && logged gmp-configure benv "$src/configure" --prefix="$prefix" \
+        --enable-shared --disable-static --enable-cxx --with-pic \
+        CC=/usr/bin/clang CXX=/usr/bin/clang++ \
+        CFLAGS="-O2 -std=gnu99 $maps" CXXFLAGS="-O2 $maps" LDFLAGS=-Wl,-S MAKEINFO=true)
+    logged gmp-make benv make -C "$obj" -j "$jobs"
+    logged gmp-check benv make -C "$obj" -j "$jobs" check
+    counts=$(awk '/^# (PASS|SKIP|FAIL|XFAIL|XPASS|ERROR): / { n[$2] += $3 } END {
+        printf "%d %d %d %d %d %d", n["PASS:"], n["SKIP:"], n["FAIL:"], n["XFAIL:"], n["XPASS:"], n["ERROR:"] }' "$work/logs/gmp-check.log")
+    set -- $counts
+    [ "$1" -gt 0 ] && [ "$3" -eq 0 ] && [ "$5" -eq 0 ] && [ "$6" -eq 0 ] ||
+        fail "GMP test suite: $1 passed, $2 skipped, $3 failed, $5 unexpectedly passed, $6 errors"
+    printf '%s %s %s\n' "$1" "$2" "$3" > "$work/gmp-check.counts"
+    note "GMP test suite (BC9): $1 passed, $2 skipped, 0 failed"
+    logged gmp-install benv make -C "$obj" install
+    # F2: the built GMP must be the locked version, by header and by library.
+    want=$("$helper" get "$lock" gmp_version)
+    cat > "$work/gmp-version.c" <<'EOF'
+#include <stdio.h>
+#include <gmp.h>
+int main(void)
+{
+    printf("%d.%d.%d %s\n", __GNU_MP_VERSION, __GNU_MP_VERSION_MINOR, __GNU_MP_VERSION_PATCHLEVEL, gmp_version);
+    return 0;
+}
+EOF
+    logged gmp-version-cc benv /usr/bin/clang -I"$prefix/include" "$work/gmp-version.c" \
+        -L"$prefix/lib" -lgmp -o "$work/gmp-version"
+    got=$(benv "$work/gmp-version")
+    [ "$got" = "$want $want" ] || fail "F2: GMP reports '$got', the lock says $want"
+    note "F2: GMP header and library report $want"
+    install_name_tool -id @rpath/libgmp.10.dylib "$prefix/lib/libgmp.10.dylib" 2> "$work/logs/gmp-id.log" ||
+        fail "install_name_tool failed; see $work/logs/gmp-id.log"
+    codesign -f -s - "$prefix/lib/libgmp.10.dylib" > "$work/logs/gmp-sign.log" 2>&1 ||
+        fail "ad hoc signature of the built GMP failed"
+}
+
+cvc5() {
+    stage=cvc5
+    src=$work/src/cvc5/$(entry_field cvc5 6)
+    build=$work/cvc5-build prefix=$work/cvc5 gmp=$work/gmp
+    # cvc5's external projects find these archives in their download directory
+    # and accept them by their own URL_HASH; the sandbox denies any download.
+    mkdir -p "$build/deps/src/CaDiCaL-EP" "$build/deps/src/SymFPU-EP"
+    cp "$cache/$(entry_field cadical 2)" "$cache/$(entry_field symfpu 2)" "$build/deps/src/"
+    maps="-ffile-prefix-map=$dir=/solver -fdebug-prefix-map=$dir=/solver"
+    (cd "$src" && logged cvc5-configure benv CC=/usr/bin/clang CXX=/usr/bin/clang++ \
+        CFLAGS="$maps" CXXFLAGS="$maps" LDFLAGS="-Wl,-S -Wl,-rpath,@executable_path/../Frameworks" \
+        ./configure.sh production --static --no-poly --no-pyvenv --no-auto-download \
+        --dep-path="$gmp" --prefix="$prefix" --name="$build" \
+        -DGMP_LIBRARIES="$gmp/lib/libgmp.10.dylib" -DGMPXX_LIBRARIES="$gmp/lib/libgmpxx.4.dylib" \
+        '-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local;/opt/local')
+    logged cvc5-make benv make -C "$build" -j "$jobs"
+    logged cvc5-install benv make -C "$build" install
+    for ep in CaDiCaL SymFPU; do
+        grep -q 'hash match (skip download)' "$build/deps/src/$ep-EP-stamp/$ep-EP-download.log" ||
+            fail "$ep: cvc5 did not take the cached archive"
+    done
+    if grep -l -E '^-- (Downloading|Using src=)' "$build"/deps/src/*-EP-stamp/*-download.log > "$work/logs/cvc5-downloads.log" 2>/dev/null; then
+        fail "an external project downloaded; see $work/logs/cvc5-downloads.log"
+    fi
+    note 'cvc5 built; CaDiCaL and SymFPU taken from the cache by their URL_HASH; no download'
+}
+
+package() {
+    stage=package
+    pkg=$work/solver
+    mkdir -p "$pkg/MacOS" "$pkg/Frameworks" "$pkg/licenses"
+    cp "$work/cvc5/bin/cvc5" "$pkg/MacOS/cvc5"
+    cp "$work/gmp/lib/libgmp.10.dylib" "$pkg/Frameworks/libgmp.10.dylib"
+    "$helper" licences "$lock" | while IFS='	' read -r target name member; do
+        top=$(entry_field "$name" 6)
+        cp "$work/src/$name/$top/$member" "$pkg/licenses/$target" || fail "licence $member of $name is missing"
+    done
+    codesign -f -s - -i org.pidster.asura.gmp "$pkg/Frameworks/libgmp.10.dylib" > "$work/logs/sign.log" 2>&1 &&
+        codesign -f -s - -i org.pidster.asura.cvc5 "$pkg/MacOS/cvc5" >> "$work/logs/sign.log" 2>&1 ||
+        fail "ad hoc signing failed; see $work/logs/sign.log"
+    "$helper" manifest "$pkg" "$lock" || fail 'cannot write the manifest'
+}
+
+checks() {
+    stage=checks
+    pkg=$work/solver bin=$work/solver/MacOS/cvc5 lib=$work/solver/Frameworks/libgmp.10.dylib
+    got=$(otool -L "$bin" | tail -n +2 | awk '{ print $1 }' | sort | tr '\n' ' ')
+    [ "$got" = '/usr/lib/libSystem.B.dylib /usr/lib/libc++.1.dylib @rpath/libgmp.10.dylib ' ] ||
+        fail "BC1: cvc5 links $got"
+    note "BC1 otool -L cvc5: $got"
+    rpaths=$(otool -l "$bin" | awk '/cmd LC_RPATH/ { r = 1 } r && /^ +path / { print $2; r = 0 }' | tr '\n' ' ')
+    [ "$rpaths" = '@executable_path/../Frameworks ' ] || fail "BC2: LC_RPATH is '$rpaths'"
+    minos=$(otool -l "$bin" | awk '/cmd LC_BUILD_VERSION/ { b = 1 } b && /^ +minos / { print $2; exit }')
+    platform=$(otool -l "$bin" | awk '/cmd LC_BUILD_VERSION/ { b = 1 } b && /^ +platform / { print $2; exit }')
+    [ "$minos" = "$target" ] && [ "$platform" = 1 ] || fail "BC2: platform $platform, minimum $minos"
+    note "BC2 LC_RPATH $rpaths, macOS minimum $minos"
+    id=$(otool -D "$lib" | tail -n +2)
+    deps=$(otool -L "$lib" | tail -n +2 | awk '{ print $1 }' | grep -v -x -F '@rpath/libgmp.10.dylib' | tr '\n' ' ')
+    [ "$id" = @rpath/libgmp.10.dylib ] && [ "$deps" = '/usr/lib/libSystem.B.dylib ' ] ||
+        fail "BC3: install name $id, dependencies $deps"
+    note "BC3 GMP install name $id, dependencies $deps"
+    version=$("$bin" --version | sed -n '1s/^This is cvc5 version \([0-9.]*\).*/\1/p')
+    [ "$version" = "$("$helper" get "$lock" cvc5_version)" ] || fail "BC4: cvc5 reports version $version"
+    "$bin" --show-config > "$work/show-config.txt" || fail 'BC4: --show-config failed'
+    config=$(awk -F ' *: *' '$1 ~ /^(gmp|poly|cln|glpk|cocoa|editline|kissat|cryptominisat)$/ { print $1 "=" $2 }' \
+        "$work/show-config.txt" | sort | tr '\n' ' ')
+    [ "$config" = 'cln=no cocoa=no cryptominisat=no editline=no glpk=no gmp=yes kissat=no poly=no ' ] ||
+        fail "BC4: configuration $config"
+    lgpl=$(awk '/covered by the LGPLv3 license/ { l = 1; next } l && /^  [A-Za-z].* - / { print $1 } /statically linked|dynamically linked|^See the file/ { l = 0 }' \
+        "$work/show-config.txt" | sort -u | tr '\n' ' ')
+    [ "$lgpl" = 'GMP ' ] || fail "BC4: LGPL libraries $lgpl"
+    ! grep -q -i 'GPL.ed third party\|covered by the GPL' "$work/show-config.txt" || fail 'BC4: a GPL library is linked'
+    note "BC4 cvc5 $version: $config; LGPL: $lgpl"
+    for f in "$lib" "$bin"; do
+        codesign --verify --strict "$f" 2> "$work/logs/verify.log" || fail "BC5: $f does not verify"
+        codesign -dv "$f" > "$work/logs/sigdetail.log" 2>&1
+        grep -q '^Signature=adhoc' "$work/logs/sigdetail.log" || fail "BC5: $f is not signed ad hoc"
+    done
+    grep -q '^Identifier=org.pidster.asura.cvc5$' "$work/logs/sigdetail.log" || fail 'BC5: cvc5 identifier'
+    note 'BC5 ad hoc signatures verify (strict)'
+    "$root/tools/release/host-paths" --repository "$root" "$pkg" > "$work/logs/host-paths.log" 2>&1 ||
+        fail "BC6: host-paths reports a build-host path; see $work/logs/host-paths.log"
+    # -a reads binary files as text; -F matches the scratch path literally.
+    alias_dir=${dir#/private}
+    if grep -r -l -a -F -e "$dir" -e "$alias_dir/" "$pkg" > "$work/logs/scratch-paths.log"; then
+        fail "BC6: a package file holds the scratch path; see $work/logs/scratch-paths.log"
+    fi
+    note 'BC6 host-paths clean; no scratch path in the package'
+    answer=$(printf '(set-logic ALL)\n(declare-const x Int)\n(declare-const y Int)\n(assert (= (* x y) 391))\n(assert (> x 1))\n(assert (> y 1))\n(check-sat)\n' |
+        "$bin" --lang smt) || fail 'BC7: the smoke query failed'
+    [ "$answer" = sat ] || fail "BC7: the smoke query answered $answer"
+    note 'BC7 smoke query: sat'
+    want=$("$helper" licences "$lock" | cut -f1 | sort | tr '\n' ' ')
+    have=$(ls "$pkg/licenses" | sort | tr '\n' ' ')
+    [ "$want" = "$have" ] || fail "BC8: licences $have, the lock lists $want"
+    "$helper" check-manifest "$pkg" || fail 'BC8: the manifest does not match'
+    note 'BC8 licences match the lock; manifest verifies'
+    set -- $(cat "$work/gmp-check.counts")
+    note "BC9 GMP test suite: $1 passed, $2 skipped, $3 failed"
+}
+
+offline_build() {
+    target=$("$helper" get "$lock" deployment_target)
+    verify_cache
+    stage=work
+    rm -rf -- "$work"
+    mkdir -p "$work/logs" "$work/home" "$work/tmp" "$work/src"
+    unpack
+    tools
+    gmp
+    cvc5
+    package
+    checks
+    stage=done
+    mv -- "$work/solver" "$out"
+    note "package: $out"
+    note "size: MacOS/cvc5 $(stat -f %z "$out/MacOS/cvc5") bytes, Frameworks/libgmp.10.dylib $(stat -f %z "$out/Frameworks/libgmp.10.dylib") bytes"
+}
+
+if [ "$offline" = yes ]; then
+    stage=offline
+    offline_build
+    exit 0
+fi
+preflight
+fetch
+stage=offline
+note 'building with the network denied (sandbox-exec)'
+sandbox-exec -p '(version 1)(allow default)(deny network*)' /bin/sh "$here/build" --offline-stage \
+    --scratch "$dir" --lock "$lock" --jobs "$jobs" || exit 1

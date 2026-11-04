@@ -1,0 +1,318 @@
+#!/bin/sh
+# Solver probes on a built package (security policy design, packet PL4a:
+# docs/designs/security-policy.md#probes).
+#
+#   probe --package DIR/solver --scratch DIR2
+#
+# SV-B1 (linkage), SV-P1 (product and spike corpora: the package's cvc5
+# against the upstream 1.3.1 binary), SV-P2 (the candidate profile, from a
+# copy), SV-P3 (ad hoc analogue), SV-P4 (pending), SV-P5 (host paths) and
+# SV-P6 (memory limits). DIR2 must be absolute, outside the repository, and
+# must not exist; the probe writes only there. The upstream binary is fetched
+# into DIR2 with the lock's size bound and digest. Crates come from the local
+# Cargo cache only (--offline). One PASS, FAIL or PENDING line per case; exit
+# 1 when a case fails, 2 on a usage error. No solver run has a time limit.
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C
+export PATH LC_ALL
+# A solver that dies early closes its pipe; a write to it must not end the probe.
+trap '' PIPE
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+root=$(CDPATH= cd -- "$here/../../.." && pwd -P)
+helper=$here/solver-lock
+lock=$here/solver.lock
+cargo=$(command -v cargo || true)
+[ -n "$cargo" ] || cargo=$HOME/.cargo/bin/cargo
+policy=$root/rust/crates/asura-policy
+spike=$root/experiments/policy-engine-spike
+passed=0 failed=0 pending=0
+
+usage() { printf 'solver-probe: %s\nusage: probe --package DIR/solver --scratch DIR2\n' "$*" >&2; exit 2; }
+pass() { passed=$((passed + 1)); printf 'PASS %s\n' "$*"; }
+bad() { failed=$((failed + 1)); printf 'FAIL %s\n' "$*"; }
+pend() { pending=$((pending + 1)); printf 'PENDING %s\n' "$*"; }
+info() { printf '     %s\n' "$*"; }
+stop() { printf 'solver-probe: %s\n' "$*" >&2; exit 1; }
+
+package= scratch=
+while [ $# -gt 0 ]; do
+    case $1 in
+        --package) [ $# -ge 2 ] || usage '--package needs a directory'; package=$2; shift 2 ;;
+        --scratch) [ $# -ge 2 ] || usage '--scratch needs a directory'; scratch=$2; shift 2 ;;
+        *) usage "unknown argument: $1" ;;
+    esac
+done
+[ -n "$package" ] && [ -n "$scratch" ] || usage '--package and --scratch are required'
+[ -x "$package/MacOS/cvc5" ] || usage "no MacOS/cvc5 in $package"
+package=$(CDPATH= cd -- "$package" && pwd -P)
+case $scratch in /*) ;; *) usage 'the scratch directory must be an absolute path' ;; esac
+[ ! -e "$scratch" ] || usage "$scratch exists"
+mkdir -p -- "$scratch"
+d=$(CDPATH= cd -- "$scratch" && pwd -P)
+case $d/ in "$root"/*) rmdir -- "$d"; usage 'the scratch directory must be outside the repository' ;; esac
+mkdir "$d/cache" "$d/bin" "$d/logs" "$d/run"
+built=$package/MacOS/cvc5
+"$helper" check-manifest "$package" || stop 'the package does not match its manifest'
+
+# ------------------------------------------------ upstream comparison binary
+up_line=$("$helper" entries "$lock" comparison)
+IFS='	' read -r up_name up_file up_url up_bytes up_sha up_top up_version <<EOF
+$up_line
+EOF
+curl -fsSL --proto =https --proto-redir =https --tlsv1.2 --max-filesize "$up_bytes" -o "$d/cache/$up_file" -- "$up_url" ||
+    stop "download of $up_name failed"
+"$helper" verify "$d/cache/$up_file" "$up_bytes" "$up_sha" || stop "$up_name does not match the lock"
+"$helper" check-archive zip "$up_top" "$d/cache/$up_file" || stop "$up_name: archive refused"
+mkdir "$d/upstream"
+unzip -q "$d/cache/$up_file" -d "$d/upstream"
+upstream=$d/upstream/$up_top/bin/cvc5
+[ -x "$upstream" ] || stop "no bin/cvc5 in $up_name"
+info "upstream: $up_file, SHA-256 $up_sha"
+
+# ------------------------------------------------ helpers built in scratch
+"$cargo" build --offline --locked --release --manifest-path "$here/admission-probe/Cargo.toml" \
+    --target-dir "$d/target" > "$d/logs/cargo-probe.log" 2>&1 || stop "admission-probe build failed; see $d/logs/cargo-probe.log"
+aprobe=$d/target/release/asura-solver-admission-probe
+"$cargo" build --offline --locked --release --features admission --bin admission \
+    --manifest-path "$spike/Cargo.toml" --target-dir "$d/target-spike" > "$d/logs/cargo-spike.log" 2>&1 ||
+    stop "spike build failed; see $d/logs/cargo-spike.log"
+admission=$d/target-spike/release/admission
+/usr/bin/clang -O1 -Wall -Werror -o "$d/bin/memory-probe" "$here/memory-probe.c" || stop 'memory-probe build failed'
+
+# SymCC's LocalSolver::cvc5() adds --tlimit=60000. This wrapper drops every
+# argument and runs SOLVER_BIN with --lang smt only; with SOLVER_LOG set it
+# records each process's input and output.
+cat > "$d/bin/solver" <<'EOF'
+#!/bin/sh
+if [ -n "${SOLVER_LOG:-}" ]; then
+    n=$(mktemp "$SOLVER_LOG/q.XXXXXX")
+    /usr/bin/tee "$n.in" | "$SOLVER_BIN" --lang smt | /usr/bin/tee "$n.out"
+    exit 0
+fi
+exec "$SOLVER_BIN" --lang smt
+EOF
+# Records the solver's peak memory with /usr/bin/time -l (SV-P6).
+cat > "$d/bin/timed-solver" <<'EOF'
+#!/bin/sh
+exec /usr/bin/time -l "$SOLVER_BIN" --lang smt 2>> "$SOLVER_TIME_LOG"
+EOF
+chmod +x "$d/bin/solver" "$d/bin/timed-solver"
+
+product() { # OUT SOLVER-COMMAND...
+    out=$1
+    shift
+    set +e
+    "$aprobe" --schema "$policy/schema/asura.cedarschema" --installation "$policy/policies/installation.cedar" \
+        --user "$policy/policies/user-default.cedar" --test-deny "$policy/policies/installation-test-deny.cedar" \
+        -- "$@" > "$out" 2> "$out.err"
+    status=$?
+    set -e
+    grep -E '^(result|decisions)	' "$out" > "$out.answers" || true
+    return $status
+}
+
+# ------------------------------------------------ SV-B1
+got=$(otool -L "$built" | tail -n +2 | awk '{ print $1 }' | sort | tr '\n' ' ')
+if [ "$got" = '/usr/lib/libSystem.B.dylib /usr/lib/libc++.1.dylib @rpath/libgmp.10.dylib ' ]; then
+    pass "SV-B1 cvc5 links $got"
+else
+    bad "SV-B1 cvc5 links $got"
+fi
+info "otool -L: $(otool -L "$built" | tail -n +2 | sed 's/^[[:space:]]*//' | tr '\n' ';')"
+info "size: cvc5 $(stat -f %z "$built") bytes; libgmp.10.dylib $(stat -f %z "$package/Frameworks/libgmp.10.dylib") bytes"
+
+# ------------------------------------------------ SV-P1 product corpus
+s_up=0 s_built=0
+product "$d/product-upstream.txt" "$upstream" --lang smt || s_up=$?
+: > "$d/logs/time-product.log"
+SOLVER_BIN=$built SOLVER_TIME_LOG=$d/logs/time-product.log product "$d/product-built.txt" "$d/bin/timed-solver" || s_built=$?
+info "product: $(grep -c '^result' "$d/product-built.txt") queries; built $(grep '^decisions' "$d/product-built.txt" | tr '\t' ' '); upstream $(grep '^decisions' "$d/product-upstream.txt" | tr '\t' ' ')"
+if [ "$s_up" -eq 0 ] && [ "$s_built" -eq 0 ] && cmp -s "$d/product-upstream.txt.answers" "$d/product-built.txt.answers"; then
+    pass 'SV-P1 product corpus: every result and the answer counts equal the upstream binary; all expected'
+else
+    bad "SV-P1 product corpus: upstream exit $s_up, built exit $s_built; see $d/product-*.txt"
+fi
+
+# ------------------------------------------------ SV-P1 spike corpus
+for who in upstream built; do
+    case $who in upstream) bin=$upstream ;; built) bin=$built ;; esac
+    mkdir "$d/run/log-$who"
+    set +e
+    (cd "$spike" && CVC5=$d/bin/solver SOLVER_BIN=$bin SOLVER_LOG=$d/run/log-$who "$admission") > "$d/spike-$who.txt" 2>&1
+    echo $? > "$d/spike-$who.status"
+    set -e
+done
+/usr/bin/python3 -I - "$d/run/log-upstream" "$d/run/log-built" > "$d/spike-compare.txt" <<'EOF'
+import glob, hashlib, sys
+def load(directory):
+    out = []
+    for path in sorted(glob.glob(directory + "/q.*.in")):
+        text = open(path, encoding="utf-8").read()
+        answers = [l.strip() for l in open(path[:-3] + ".out", encoding="utf-8") if l.strip() in ("sat", "unsat", "unknown")]
+        parts = text.split("(reset)")[1:] if "(reset)" in text else [text]
+        for part, answer in zip(parts, answers):
+            lines = sorted(l for l in part.splitlines() if l.strip())
+            out.append((hashlib.sha256("\n".join(lines).encode()).hexdigest(), answer))
+        if len(parts) != len(answers):
+            out.append(("count-mismatch:" + path, "%d queries, %d answers" % (len(parts), len(answers))))
+    return out
+a, b = load(sys.argv[1]), load(sys.argv[2])
+by = {}
+for q, r in a:
+    by.setdefault(q, set()).add(r)
+mismatch = sum(1 for q, r in b if by.get(q) != {r})
+counts = lambda xs: " ".join("%s=%d" % (k, sum(1 for _, r in xs if r == k)) for k in ("sat", "unsat", "unknown"))
+print("queries upstream=%d built=%d" % (len(a), len(b)))
+print("answers upstream: %s" % counts(a))
+print("answers built: %s" % counts(b))
+print("same queries: %s" % (sorted(q for q, _ in a) == sorted(q for q, _ in b)))
+print("mismatches %d" % mismatch)
+EOF
+while read -r line; do info "spike: $line"; done < "$d/spike-compare.txt"
+info "spike harness: upstream $(grep '^unexpected results' "$d/spike-upstream.txt"), exit $(cat "$d/spike-upstream.status"); built $(grep '^unexpected results' "$d/spike-built.txt"), exit $(cat "$d/spike-built.status")"
+if grep -q '^same queries: True$' "$d/spike-compare.txt" && grep -q '^mismatches 0$' "$d/spike-compare.txt" &&
+    [ "$(cat "$d/spike-upstream.status")" = 0 ] && [ "$(cat "$d/spike-built.status")" = 0 ]; then
+    pass 'SV-P1 spike corpus: every solver answer equals the upstream binary; 0 unexpected results'
+else
+    bad "SV-P1 spike corpus; see $d/spike-*.txt"
+fi
+set +e
+(cd "$spike" && CVC5=$d/bin/solver SOLVER_BIN=$built "$cargo" test --offline --locked --release --features admission \
+    --test admission --target-dir "$d/target-spike") > "$d/logs/spike-test.log" 2>&1
+status=$?
+set -e
+if [ "$status" -eq 0 ]; then
+    pass "SV-P1 spike admission test with the package's cvc5: $(grep '^test result' "$d/logs/spike-test.log" | head -1)"
+else
+    bad "SV-P1 spike admission test; see $d/logs/spike-test.log"
+fi
+
+# ------------------------------------------------ SV-P2 profile, from a copy
+copy=$(mktemp -d "$d/run/solver-XXXXXXXX")
+copy=$(CDPATH= cd -- "$copy" && pwd -P)
+cp -R "$package/MacOS" "$package/Frameworks" "$copy/"
+s_sb=0
+product "$d/product-sandboxed.txt" /usr/bin/sandbox-exec -f "$here/solver.sb" -D "SOLVER_DIR=$copy" "$copy/MacOS/cvc5" --lang smt || s_sb=$?
+if [ "$s_sb" -eq 0 ] && cmp -s "$d/product-built.txt.answers" "$d/product-sandboxed.txt.answers"; then
+    pass 'SV-P2 cvc5 under solver.sb from a copy: product results equal the unsandboxed run'
+else
+    bad "SV-P2 sandboxed product run: exit $s_sb; see $d/product-sandboxed.txt.err"
+fi
+target_file=$d/run/denied-output.txt
+printf '(set-option :regular-output-channel "%s")\n(set-logic ALL)\n(check-sat)\n' "$target_file" |
+    /usr/bin/sandbox-exec -f "$here/solver.sb" -D "SOLVER_DIR=$copy" "$copy/MacOS/cvc5" --lang smt > "$d/logs/sb-write.txt" 2>&1 || true
+# cvc5 must be running (it reports the refused open and still answers), and no file appears.
+if [ ! -e "$target_file" ] && grep -q 'Cannot open file' "$d/logs/sb-write.txt" && grep -qx sat "$d/logs/sb-write.txt"; then
+    pass "SV-P2 the profile denies a file write by cvc5 ($(head -1 "$d/logs/sb-write.txt" | cut -c1-100))"
+else
+    bad "SV-P2 file write: see $d/logs/sb-write.txt"
+fi
+if /usr/bin/sandbox-exec -f "$here/solver.sb" -D "SOLVER_DIR=$copy" /bin/sh -c true > "$d/logs/sb-exec.txt" 2>&1; then
+    bad 'SV-P2 /bin/sh started under the profile'
+else
+    pass 'SV-P2 the profile denies starting /bin/sh'
+fi
+
+# ------------------------------------------------ SV-P3 ad hoc analogue
+smoke='(set-logic ALL)
+(declare-const x Int)
+(declare-const y Int)
+(assert (= (* x y) 391))
+(assert (> x 1))
+(assert (> y 1))
+(check-sat)
+'
+loaded_gmp() { # BIN: run one query through FIFOs, then list the GMP the live process mapped
+    fifo=$d/run/fifo.$$
+    rm -f "$fifo.in" "$fifo.out"
+    mkfifo "$fifo.in" "$fifo.out"
+    "$1" --lang smt < "$fifo.in" > "$fifo.out" 2> "$d/logs/p3-stderr.txt" &
+    pid=$!
+    exec 3> "$fifo.in" 4< "$fifo.out"
+    printf '%s' "$smoke" >&3
+    answer=
+    read -r answer <&4 || true
+    gmp_path=$(lsof -p "$pid" 2>/dev/null | awk '/libgmp/ { print $NF }' | head -1)
+    exec 3>&- 4<&-
+    wait "$pid" || true
+    rm -f "$fifo.in" "$fifo.out"
+    printf '%s %s\n' "${answer:-none}" "${gmp_path:-none}"
+}
+p3case() { # LABEL DIR EXPECT(ok|refused) [TEXT]: TEXT must appear in the refusal
+    result=$(loaded_gmp "$2/MacOS/cvc5")
+    answer=${result%% *} path=${result#* }
+    want_path=$(CDPATH= cd -- "$2/Frameworks" && pwd -P)/libgmp.10.dylib
+    if [ "$3" = ok ] && [ "$answer" = sat ] && [ "$path" = "$want_path" ]; then
+        pass "SV-P3 $1: answers and maps its own GMP"
+    elif [ "$3" = refused ] && [ "$answer" != sat ] && grep -Fq -- "$4" "$d/logs/p3-stderr.txt"; then
+        pass "SV-P3 $1: dyld refuses it ($4)"
+    else
+        bad "SV-P3 $1: answer $answer, mapped $path; $(head -3 "$d/logs/p3-stderr.txt" | tr '\n' ' ' | cut -c1-300)"
+    fi
+}
+copy_to() { mkdir -p "$1"; cp -R "$package/MacOS" "$package/Frameworks" "$1/"; }
+sign_gmp() { codesign -f -s - -i org.pidster.asura.gmp "$1/Frameworks/libgmp.10.dylib" > /dev/null 2>&1; }
+sign_cvc5() { # DIR [-o runtime]
+    dir_=$1; shift
+    codesign -f -s - "$@" -i org.pidster.asura.cvc5 "$dir_/MacOS/cvc5" > /dev/null 2>&1
+}
+replace_gmp() { # DIR: an interface-compatible GMP that differs from the shipped file
+    install_name_tool -add_rpath /nonexistent/asura-probe "$1/Frameworks/libgmp.10.dylib" 2> /dev/null
+    sign_gmp "$1"
+    ! cmp -s "$1/Frameworks/libgmp.10.dylib" "$package/Frameworks/libgmp.10.dylib"
+}
+lv='different Team IDs'
+# (a) The bundle layout with the Hardened Runtime: library validation is on,
+# so an ad hoc GMP (no team ID) is refused. The team-signed case is PL4b.
+dir=$d/run/p3a/Contents; copy_to "$dir"; sign_gmp "$dir"; sign_cvc5 "$dir" -o runtime
+codesign -dv "$dir/MacOS/cvc5" 2>&1 | grep -q 'flags=0x[0-9a-f]*(.*runtime.*)' || bad 'SV-P3 the runtime flag is not set'
+p3case '(a) Hardened Runtime, ad hoc GMP, bundle layout' "$dir" refused "$lv"
+# (b) The same from a copy directory elsewhere, as the platform copies it.
+dir=$(mktemp -d "$d/run/p3b-XXXXXXXX"); copy_to "$dir"; sign_gmp "$dir"; sign_cvc5 "$dir" -o runtime
+p3case '(b) Hardened Runtime, ad hoc GMP, copy directory' "$dir" refused "$lv"
+# (c) The replacement route of the notice: replace GMP, sign both ad hoc.
+# An ad hoc signature without -o runtime has no library validation.
+dir=$(mktemp -d "$d/run/p3c-XXXXXXXX"); copy_to "$dir"
+if replace_gmp "$dir"; then
+    sign_cvc5 "$dir"
+    p3case '(c) replaced GMP, both signed ad hoc as the notice says' "$dir" ok
+else
+    bad 'SV-P3 (c) the replacement GMP is identical to the shipped one'
+fi
+# (d) The replacement with the Hardened Runtime kept: refused, as (a).
+dir=$(mktemp -d "$d/run/p3d-XXXXXXXX"); copy_to "$dir"; replace_gmp "$dir" || true; sign_cvc5 "$dir" -o runtime
+p3case '(d) replaced GMP, Hardened Runtime kept' "$dir" refused "$lv"
+# (e) An unsigned GMP never loads on arm64.
+dir=$(mktemp -d "$d/run/p3e-XXXXXXXX"); copy_to "$dir"; codesign --remove-signature "$dir/Frameworks/libgmp.10.dylib"
+p3case '(e) unsigned GMP' "$dir" refused 'missing code signature'
+# (f) The package as built (ad hoc, no runtime flag), from a copy directory.
+dir=$(mktemp -d "$d/run/p3f-XXXXXXXX"); copy_to "$dir"
+p3case '(f) the package as built, from a copy directory' "$dir" ok
+pend 'SV-P3 team-signed cvc5 and GMP from the bundle and the pinned copy (PL4b, PL-N2)'
+
+# ------------------------------------------------ SV-P4
+pend 'SV-P4 notarisation: the notary service has no offline mode; needs a submission (PL4b)'
+
+# ------------------------------------------------ SV-P5
+build_dir=$(dirname -- "$package")
+if "$root/tools/release/host-paths" --repository "$root" "$package" > "$d/logs/host-paths.txt" 2>&1 &&
+    ! grep -r -l -a -F -e "$build_dir/" -e "${build_dir#/private}/" "$package" > "$d/logs/scratch-paths.txt"; then
+    pass 'SV-P5 host-paths finds nothing; no package file holds the build scratch path'
+else
+    bad "SV-P5 a build path remains; see $d/logs/host-paths.txt and scratch-paths.txt"
+fi
+
+# ------------------------------------------------ SV-P6
+for spec in 'none 1' 'as 256' 'data 256' 'rss 256' 'as 65536' 'data 65536'; do
+    set -- $spec
+    log=$d/logs/memory-$1-$2.txt
+    "$d/bin/memory-probe" "$1" "$2" 8 > "$log" 2>&1 || true
+    info "SV-P6 $1 $2 MiB, 8 x 64 MiB: $(grep -c 'chunk .* ok' "$log") ok, $(grep -c 'refused' "$log") refused; $(grep -E 'setrlimit|^(phys_footprint|exit|signal)' "$log" | sed 's/^child: //' | tr '\n' ' ')"
+done
+peak=$(awk '/peak memory footprint/ { print $1 }' "$d/logs/time-product.log" | sort -n | tail -1)
+rss=$(awk '/maximum resident set size/ { print $1 }' "$d/logs/time-product.log" | sort -n | tail -1)
+info "SV-P6 cvc5 on the product corpus: peak footprint ${peak:-?} bytes, maximum RSS ${rss:-?} bytes"
+pass 'SV-P6 limits measured (the record states which macOS enforces)'
+
+printf '%d passed, %d failed, %d pending\n' "$passed" "$failed" "$pending"
+[ "$failed" -eq 0 ]

@@ -1,0 +1,94 @@
+{
+  "format_version": 1,
+  "host": {
+    "os": "macos",
+    "os_major": 27,
+    "arch": "arm64",
+    "deployment_target": "27.0"
+  },
+  "gmp_version": "6.3.0",
+  "cvc5_version": "1.3.1",
+  "entries": [
+    {
+      "name": "cvc5",
+      "role": "source",
+      "file": "cvc5-1.3.1.tar.gz",
+      "url": "https://github.com/cvc5/cvc5/archive/refs/tags/cvc5-1.3.1.tar.gz",
+      "bytes": 9205045,
+      "sha256": "ce1dce7b1ba8ade0ba7937b8ad7aa6ffa1df0dd9586963ead082baa299ef32d5",
+      "top_level": "cvc5-cvc5-1.3.1"
+    },
+    {
+      "name": "gmp",
+      "role": "source",
+      "file": "gmp-6.3.0.tar.bz2",
+      "url": "https://gmplib.org/download/gmp/gmp-6.3.0.tar.bz2",
+      "bytes": 2643888,
+      "sha256": "ac28211a7cfb609bae2e2c8d6058d66c8fe96434f740cf6fe2e47b000d1c20cb",
+      "top_level": "gmp-6.3.0"
+    },
+    {
+      "name": "cadical",
+      "role": "dependency",
+      "file": "rel-2.1.3-elevate.tar.gz",
+      "url": "https://github.com/arminbiere/cadical/archive/rel-2.1.3-elevate.tar.gz",
+      "bytes": 732469,
+      "sha256": "15e1e82f7f9a9da0e97070cb8ac41d5b32139f65d54f72d2ff84849b0466ef92",
+      "top_level": "cadical-rel-2.1.3-elevate"
+    },
+    {
+      "name": "symfpu",
+      "role": "dependency",
+      "file": "e6ac3af9c2c574498ea171c957425b407625448b.tar.gz",
+      "url": "https://github.com/cvc5/symfpu/archive/e6ac3af9c2c574498ea171c957425b407625448b.tar.gz",
+      "bytes": 37558,
+      "sha256": "823aa663fcc2f6844ae5e9ea83ceda4ed393cdb3dadefce9b3c7c41cd0f4f702",
+      "top_level": "symfpu-e6ac3af9c2c574498ea171c957425b407625448b"
+    },
+    {
+      "name": "cmake",
+      "role": "build-tool",
+      "file": "cmake-4.4.4-py3-none-macosx_10_10_universal2.whl",
+      "url": "https://files.pythonhosted.org/packages/3f/02/86b484e16c91de4bdf90dfab37a33c3e5512bc30d3a494759976df0943b9/cmake-4.4.4-py3-none-macosx_10_10_universal2.whl",
+      "bytes": 54404900,
+      "sha256": "883962a72b1b3a16ff445427f24c8caca9797dd9e563bbe208cbcd89e877f9d3",
+      "version": "4.4.4"
+    },
+    {
+      "name": "pyparsing",
+      "role": "build-tool",
+      "file": "pyparsing-3.3.3-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/38/bb/d215ee7c73b61497b28a5503f9f53523f294fcc936762b7caf90e0c1c2b5/pyparsing-3.3.3-py3-none-any.whl",
+      "bytes": 126420,
+      "sha256": "ece8c00a69cf01b45d0b1dedabb469c90d8caf996d4fda40f147627a122849a4",
+      "version": "3.3.3"
+    },
+    {
+      "name": "tomli",
+      "role": "build-tool",
+      "file": "tomli-2.5.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/60/3f/3e3f8fd0919249b0200c80fbc4f9a1e70be19f9883da71dfb7f8b9ab8aca/tomli-2.5.0-py3-none-any.whl",
+      "bytes": 14765,
+      "sha256": "32a7b79ac57a2e83670ce329ccf675798bc5a2094783a63676866b70503f2e2b",
+      "version": "2.5.0"
+    },
+    {
+      "name": "cvc5-upstream",
+      "role": "comparison",
+      "file": "cvc5-macOS-arm64-static.zip",
+      "url": "https://github.com/cvc5/cvc5/releases/download/cvc5-1.3.1/cvc5-macOS-arm64-static.zip",
+      "bytes": 35012495,
+      "sha256": "a0e7f5b03b1bc4284fbfff7cdfb08c704801701cf7ece83a13f8a505e7581215",
+      "top_level": "cvc5-macOS-arm64-static"
+    }
+  ],
+  "licences": {
+    "cvc5-COPYING.txt": ["cvc5", "COPYING"],
+    "minisat-LICENSE.txt": ["cvc5", "licenses/minisat-LICENSE"],
+    "gmp-COPYING.LESSERv3.txt": ["gmp", "COPYING.LESSERv3"],
+    "gmp-COPYINGv3.txt": ["gmp", "COPYINGv3"],
+    "cadical-LICENSE.txt": ["cadical", "LICENSE"],
+    "symfpu-LICENSE.txt": ["symfpu", "LICENSE"]
+  },
+  "publish": ["cvc5", "gmp", "cadical", "symfpu"]
+}

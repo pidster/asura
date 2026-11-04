@@ -23,6 +23,7 @@ profile.
 | `secret-store-qualification` | The signed qualification of the team Keychain store (SG3, SGQ6): builds, signs and runs `AsuraKeychainQualification.app` with the test App ID |
 | `Info.plist.in` | `Asura.app/Contents/Info.plist`; `@VERSION@` is the `asura-cli` version |
 | `entitlements/*.plist` | One list for each executable and mode; `@TEAM_ID@` is replaced at signing time |
+| `solver/` | The cvc5 solver package (packet PL4a, [security policy design](../../docs/designs/security-policy.md#pl4a-implementation-contract)): `build --scratch DIR` builds `DIR/solver` from the pinned `solver.lock`, offline after the fetch, signed ad hoc; `test-build --static` checks the lock and the refusals; `probe --package DIR/solver --scratch DIR2` runs SV-P1 to SV-P6. `asura-bundle` does not use it yet (PL4b) |
 
 ## Before the first run
 
