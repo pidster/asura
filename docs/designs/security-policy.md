@@ -1820,7 +1820,7 @@ name.
 | `host` | `os` `macos`, `os_major` 27, `arch` `arm64`, `deployment_target` `27.0` |
 | `gmp_version` | `6.3.0`. The script checks the built GMP against it (F2) |
 | `cvc5_version` | `1.3.1`. The script checks `cvc5 --version` against it |
-| `entries` | One object per download: `name`, `role`, `file`, `url`, `bytes`, `sha256`, and `top_level` for a tar archive |
+| `entries` | One object per download: `name`, `role`, `file`, `url`, `bytes`, `sha256`; `top_level` for an archive; `version` for a build tool, which the script checks where the tool reports one (CMake) |
 | `licences` | Package file name to the entry and the member path it is copied from |
 | `publish` | The entry names that each release publishes as source |
 
@@ -1841,8 +1841,10 @@ Interface: `tools/release/solver/build --scratch DIR [--lock FILE] [--jobs N]`.
 `DIR` must be an absolute path outside the repository. `--lock` defaults to
 the tracked lock. `--jobs` defaults to `sysctl -n hw.ncpu`. Exit status 0
 means the package and every check passed; 1 means a stage failed, with one
-line `solver-build: STAGE: reason`; 2 means a usage error, before any file is
-written. The script writes only under `DIR`.
+line `solver-build: STAGE: reason`; 2 means a usage error (a missing or
+unknown argument, a relative path, a path inside the repository or a parent
+that does not exist), before any file is written. The script resolves `DIR`
+before it creates it. It writes only under `DIR`.
 
 | Directory | Rule |
 | --- | --- |
@@ -1962,7 +1964,7 @@ size bound and digest, and unpacks it after the member check. It prints one
 | SV-P1 product | `admission-probe` with the product corpus (below), once with the upstream binary and once with the package's `cvc5`, each as `<cvc5> --lang smt` | Each query has the same result (holds, refuted or failed) with both solvers; the solvers' `sat`, `unsat` and `unknown` counts are equal; every result is the expected one |
 | SV-P1 spike | The spike's `admission` binary through a recording wrapper that runs `<cvc5> --lang smt` only, once per solver; then the spike's `admission` test with the package's `cvc5` | Every solver query has the same answer, matched by the digest of its sorted lines (as in the probe); both runs report 0 unexpected results; the test passes |
 | SV-P2 | The package is copied into a new directory under `DIR2`, as the platform will copy it into its run directory. `admission-probe` runs with `sandbox-exec -f solver.sb -D SOLVER_DIR=<copy> <copy>/MacOS/cvc5 --lang smt` | The results equal the unsandboxed run; under the same profile, cvc5 cannot create a file through `(set-option :regular-output-channel "<path>")`, and `/bin/sh` cannot start |
-| SV-P3 (ad hoc analogue) | Copies signed ad hoc with the Hardened Runtime flag (`codesign -o runtime -s -`): (a) the package layout; (b) a copy directory elsewhere; (c) a replaced, interface-compatible GMP (a copy changed by `install_name_tool` and signed ad hoc again), per the LGPL §4(d)(1) mechanism; (d) an unsigned GMP | (a) to (c) answer the smoke query and `DYLD_PRINT_LIBRARIES` names the copy's GMP; (d) does not start. The team-signed case stays `PENDING` for PL4b |
+| SV-P3 (ad hoc analogue) | Copies of the package, each run through two FIFOs so that `lsof` lists the GMP the live process mapped (`DYLD_PRINT_LIBRARIES` is ignored under the Hardened Runtime): (a) `cvc5` signed ad hoc with the Hardened Runtime (`-o runtime`), bundle layout; (b) the same from a copy directory; (c) a replaced, interface-compatible GMP (changed by `install_name_tool`), both files signed ad hoc without `-o runtime`, as the notice tells a person to do (LGPL §4(d)(1)); (d) the replaced GMP with the Hardened Runtime kept; (e) an unsigned GMP; (f) the package as built, from a copy directory | (a), (b) and (d): dyld refuses the GMP by library validation ("different Team IDs"), which shows that library validation is on under the Hardened Runtime and that an ad hoc GMP cannot satisfy it; (c) and (f) answer and map their own GMP; (e) is refused ("missing code signature"). The team-signed case stays `PENDING` for PL4b |
 | SV-P4 | No submission | `PENDING`: Apple's notary service has no offline mode, so the check needs a submission (PL4b) |
 | SV-P5 | `host-paths` and the scratch-path scan on the package | No finding |
 | SV-P6 | `memory-probe` (below); peak footprint of cvc5 on the product corpus from `/usr/bin/time -l` | The record states which limits macOS 27 enforces on a child, and the peak footprint of the corpus run |
@@ -1989,7 +1991,7 @@ test-only forbid. Every query runs once for each request environment of
 | PA1s | `check_never_errors` on two seeded forbids that can error: `context.port + 9223372036854775807 > 0` (overflow) and `context.now.offset(duration("9223372036854775807ms")) > context.now` | Refuted |
 | PA3 | `check_implies(I, I0)` and `check_implies(I + T, I)` (tighten-only, SP-AQ3) | Holds |
 | PA4 | `check_implies(I, S_k)` for S1 to S6 of the [safety list](#safety-specifications), each `S_k` written as "permit all, then forbid the property" | Holds |
-| PA4s | `check_implies(I - s3.model_network, S3)`: the installation set without its S3 forbid | Refuted |
+| PA4s | A seeded permit of every `network.connect`: `check_implies(I + connect, S3)`, then `check_implies(I - s3.model_network + connect, S3)`. The installation set permits no connection, so removing the S3 forbid alone would still meet S3 | Holds, then refuted |
 | PA8 | `check_implies(U + narrow, U)` with a narrowing forbid, and `check_implies(U + wide, U)` with a permit of `file.write` under `/etc` (SP-AQ8) | Holds, then refuted |
 
 The probe prints one line per query (`category`, `id`, environment, result)
@@ -2009,13 +2011,14 @@ renders. PL3 takes over its rules; PL4a records only that cvc5 runs under it.
 (deny default)
 (allow process-exec (literal (string-append (param "SOLVER_DIR") "/MacOS/cvc5")))
 (allow file-read* file-map-executable (subpath (param "SOLVER_DIR")) (subpath "/usr/lib") (subpath "/System"))
-(allow file-read-metadata (literal "/") ...)    ; the runtime set: ancestors and the fixed literals
-(allow file-read* (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom"))
-(allow sysctl-read)
+(allow file-read-metadata file-read-data (literal "/"))
 ```
 
-The final rule list is the one that the probe shows to be needed; the
-delivery record lists it. A rule that cvc5 does not need is left out.
+This is the minimal list that the probe found (2026-11-04). Each rule was
+removed in turn: without the first, `sandbox-exec` cannot start cvc5; without
+the second, dyld cannot load GMP; without the third, cvc5 aborts at start-up
+(`SIGABRT`, no message). cvc5 needs no device, no `sysctl-read`, no Mach
+lookup and no write, so the profile grants none of them.
 
 #### SV-P6 method
 
@@ -2025,7 +2028,9 @@ and touches `CHUNKS` blocks of 64 MiB (at most 32, so at most 2 GiB). It
 prints one line per block, then waits on its standard input. The parent reads
 the child's `ri_phys_footprint` with `proc_pid_rusage`, closes the pipe, reaps
 the child and prints its status and `ru_maxrss`. The probe ends by the
-child's last block and the closed pipe; it has no timer.
+child's last block and the closed pipe; it has no timer. `probe` runs it
+with no limit, with each limit at 256 MiB, and with `as` and `data` at
+64 GiB, each with 8 blocks.
 
 #### F4: stalled-solver tests for PL3
 
