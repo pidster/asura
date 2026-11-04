@@ -1,0 +1,15 @@
+;; SV-P2 candidate profile for cvc5 (security-policy.md, PL4a implementation
+;; contract, "SV-P2 candidate profile"). SOLVER_DIR is the absolute, resolved
+;; copy directory that holds MacOS/cvc5 and Frameworks/libgmp.10.dylib.
+;; Deny by default: no write, no network, no Mach lookup, no sysctl, no device
+;; and no other program. Each rule below is needed: the probe removed each in
+;; turn and cvc5 then failed to start or aborted (PL4a delivery record).
+(version 1)
+(deny default)
+(allow process-exec (literal (string-append (param "SOLVER_DIR") "/MacOS/cvc5")))
+(allow file-read* file-map-executable
+    (subpath (param "SOLVER_DIR"))
+    (subpath "/usr/lib")
+    (subpath "/System"))
+;; cvc5 reads the root directory at start-up; without it, it aborts (SIGABRT).
+(allow file-read-metadata file-read-data (literal "/"))

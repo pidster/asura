@@ -1,0 +1,27 @@
+[package]
+name = "asura-solver-admission-probe"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+description = "Probe SV-P1: the product-corpus admission queries against one solver command (security-policy.md, PL4a)"
+
+# A separate workspace: the product workspace never builds this probe.
+[workspace]
+
+[dependencies]
+# The versions that asura-policy and the policy engine spike pin.
+cedar-policy = "=4.14.1"
+cedar-policy-symcc = "=0.8.1"
+tokio = { version = "=1.54.1", features = ["rt", "macros", "process"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+correctness = "deny"
+suspicious = "warn"
+complexity = "warn"
+perf = "warn"
+style = "warn"

@@ -7,6 +7,8 @@ probes SV-B1, SV-B2 and SV-P1 of [the solver package](security-policy.md#solver-
 The record itself selects nothing and authorizes no code. The owner answered
 its questions on 2026-11-03 ([owner questions](#owner-questions)): ship GMP as
 a replaceable dylib (SBQ1) and drop LibPoly (SBQ2).
+Packet PL4a built the tracked script on 2026-11-04 and re-ran the checks;
+its results are in the [PL4a delivery record](security-policy.md#pl4a-delivery-record).
 Protocol numbering stays `0.1` and the journal format stays `1`.
 
 Labels follow the [writing standard](../writing-standard.md#status-and-requirements).
@@ -212,8 +214,10 @@ linear integer constraints internally, which need no LibPoly.
 
 **Verified (2026-11-03, macOS 27.0, M4 Max).** The `--no-poly` build gave the
 same answers as the upstream binary ([Q5](#q5-the-built-solver-against-the-upstream-binary)).
-This answers probe SV-P1 for the spike corpus. The product corpus must rerun
-the check (PL-I6).
+This answers probe SV-P1 for the spike corpus. PL4a re-ran the check on the
+product corpus (the PL1 built-in sets) and on the spike corpus with the
+tracked build (2026-11-04): every answer equals the upstream binary's
+([PL4a delivery record](security-policy.md#pl4a-delivery-record)).
 
 ## Q3: GMP cannot be avoided
 
@@ -322,7 +326,7 @@ uses GMP; Yices 2 is GPL-3.0. Neither is a supported SymCC back end.
 | Package: `MacOS/cvc5` and `Frameworks/libgmp.10.dylib`; `install_name_tool -id @rpath/libgmp.10.dylib`, `-change` and `-add_rpath @executable_path/../Frameworks`; ad hoc `codesign -f -s -` | Runs. `MacOS/cvc5` is 24,291,776 bytes, not stripped; the upstream binary is 21.1 MB. Size reduction was not attempted |
 | Replacement test (LGPL §4(d)(1) mechanism) | Copied a different `libgmp.10.dylib` (Homebrew's) into `Frameworks/`, signed it ad hoc, and ran `cvc5`. `DYLD_PRINT_LIBRARIES` shows the replacement loaded; a nonlinear integer query answered `sat` |
 | Offline rebuild (SV-B2) | Pre-fetched GMP, CaDiCaL and SymFPU into one prefix. `configure.sh --no-auto-download` and `make` ran under `sandbox-exec` with `(deny network*)`. Build and install succeeded; the linkage was the same |
-| Host paths | 204 build-directory strings in `cvc5` and 2 in `libgmp.10.dylib`; the upstream binary has 181 user-directory paths. The probe build used no `-ffile-prefix-map`; SV-P5 remains open |
+| Host paths | 204 build-directory strings in `cvc5` and 2 in `libgmp.10.dylib`; the upstream binary has 181 user-directory paths. The probe build used no `-ffile-prefix-map`. The PL4a build adds the maps and linker `-S`: `host-paths` and a scratch-path scan find nothing (SV-P5, 2026-11-04) |
 
 cvc5's own CMake checks a SHA-256 for every file it downloads (`URL_HASH
 SHA256=` in each `Find*.cmake`). With `--auto-download`, it fetched CaDiCaL
@@ -399,6 +403,7 @@ package and the lifecycle.
 | F3 | cvc5 links `libgmp` only; `libgmpxx.4.dylib` is not needed at run time | `Frameworks/libgmpxx.4.dylib` can be left out. The notice and the DMG manifest list one dylib |
 | F4 | A solver can write to standard output while the caller is still writing a query. Z3's error stream filled the 64 KiB pipe, and SymCC's `LocalSolver` then blocked writing standard input. Both processes waited for each other | Asura's adapter must read standard output and standard error while it writes standard input. A full output buffer must refuse the candidate (`solver_failed`), never stall the admission worker. Add a stalled-solver case to PL-I6 |
 | F5 | SymCC emits `(set-logic ALL)`, so cvc5 enables all theories | No effect on answers. A narrower logic is a later performance option, not part of this probe |
+| F6 | Found by PL4a (2026-11-04). The built `cvc5` names the build host once: CaDiCaL's build header embeds `uname -srmn`. cvc5's `--version` prints the build date. Neither is an SG4-O1 needle | CaDiCaL is built with cvc5's fixed flags, so a fix changes how cvc5 builds CaDiCaL. PL4b decides whether a release needs it |
 
 ## Recommendation
 
@@ -461,12 +466,15 @@ and GPL-3.0 texts and the notice ship; Asura's own source is public, so a
 person can rebuild it and sign it with their own identity.
 
 Findings F1 to F5 are requirements of the PL4a build script and its solver
-adapter ([security policy, build](security-policy.md#build)). PL4a is not
-built yet.
+adapter ([security policy, build](security-policy.md#build)). PL4a built the
+script (2026-11-04): it meets F1 to F3 and F5; F4 has a test design for the
+PL3 adapter ([F4 tests](security-policy.md#f4-stalled-solver-tests-for-pl3)).
 
 ## Reproduction
 
-The scratch scripts are not tracked. The steps are:
+The scratch scripts of this probe are not tracked. The tracked
+`tools/release/solver/build` now performs these steps, and
+`tools/release/solver/probe` the comparison. The probe's steps were:
 
 1. Build GMP 6.3.0 into a scratch prefix with the options in the build table.
 2. Run `configure.sh production --static --no-poly --no-pyvenv --auto-download

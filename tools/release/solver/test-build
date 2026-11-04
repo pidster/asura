@@ -1,0 +1,138 @@
+#!/bin/sh
+# Static checks of the solver build (security policy design, PL4a validation
+# map, unit layer: docs/designs/security-policy.md#pl4a-validation-map).
+#
+#   test-build --static
+#
+# Checks the tracked lock, the lock helper's refusals, the archive member
+# check and the build script's refusals. No case uses the network, builds,
+# signs or writes outside a temporary directory.
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C
+export PATH LC_ALL
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+root=$(CDPATH= cd -- "$here/../../.." && pwd -P)
+helper=$here/solver-lock
+lock=$here/solver.lock
+passed=0 failed=0
+pass() { passed=$((passed + 1)); printf 'PASS %s\n' "$*"; }
+bad() { failed=$((failed + 1)); printf 'FAIL %s\n' "$*"; }
+check() { label=$1; shift; if "$@"; then pass "$label"; else bad "$label"; fi; }
+[ "${1:-}" = --static ] || { printf 'usage: test-build --static\n' >&2; exit 2; }
+t=$(mktemp -d "${TMPDIR:-/tmp}/solver-test.XXXXXXXX")
+t=$(CDPATH= cd -- "$t" && pwd -P)
+trap 'rm -rf -- "$t"' EXIT
+
+status_of() { set +e; "$@" > "$t/out" 2>&1; s=$?; set -e; echo "$s"; }
+refuses() { # LABEL STATUS TEXT COMMAND...
+    label=$1 want=$2 text=$3
+    shift 3
+    s=$(status_of "$@")
+    if [ "$s" = "$want" ] && grep -Fq -- "$text" "$t/out"; then
+        pass "refuses: $label"
+    else
+        bad "refuses: $label (status $s: $(head -1 "$t/out"))"
+    fi
+}
+
+# ------------------------------------------------ the tracked lock
+check 'the tracked lock validates' "$helper" validate "$lock"
+check 'entries are the designed set' [ "$("$helper" entries "$lock" | cut -f1 | tr '\n' ' ')" = 'cvc5 gmp cadical symfpu cmake pyparsing tomli cvc5-upstream ' ]
+check 'roles: sources, dependencies, build tools, comparison' [ "$("$helper" entries "$lock" | cut -f1 | while read -r n; do "$helper" entries "$lock" source | cut -f1 | grep -qx "$n" && printf 's'; "$helper" entries "$lock" dependency | cut -f1 | grep -qx "$n" && printf 'd'; "$helper" entries "$lock" build-tool | cut -f1 | grep -qx "$n" && printf 'b'; "$helper" entries "$lock" comparison | cut -f1 | grep -qx "$n" && printf 'c'; done)" = ssddbbbc ]
+check 'publish lists the four source archives' [ "$("$helper" publish "$lock" | tr '\n' ' ')" = 'cvc5 gmp cadical symfpu ' ]
+check 'the licence list names six texts' [ "$("$helper" licences "$lock" | cut -f1 | tr '\n' ' ')" = 'cadical-LICENSE.txt cvc5-COPYING.txt gmp-COPYING.LESSERv3.txt gmp-COPYINGv3.txt minisat-LICENSE.txt symfpu-LICENSE.txt ' ]
+check 'GMP version is 6.3.0 and cvc5 1.3.1' [ "$("$helper" get "$lock" gmp_version) $("$helper" get "$lock" cvc5_version)" = '6.3.0 1.3.1' ]
+check 'deployment target is 27.0' [ "$("$helper" get "$lock" deployment_target)" = 27.0 ]
+check 'the CaDiCaL and SymFPU digests are cvc5 1.3.1 URL_HASH values' [ "$("$helper" entries "$lock" dependency | cut -f5 | tr '\n' ' ')" = '15e1e82f7f9a9da0e97070cb8ac41d5b32139f65d54f72d2ff84849b0466ef92 823aa663fcc2f6844ae5e9ea83ceda4ed393cdb3dadefce9b3c7c41cd0f4f702 ' ]
+
+# ------------------------------------------------ helper refusals
+mutate() { # OUT PYTHON-STATEMENT on variable d
+    /usr/bin/python3 -I -c "import json,sys; d=json.load(open(sys.argv[1])); $2; json.dump(d, open(sys.argv[2], 'w'))" "$lock" "$1"
+}
+mutate "$t/v2.lock" 'd["format_version"] = 2'
+refuses 'format version 2' 1 'unsupported format_version' "$helper" validate "$t/v2.lock"
+mutate "$t/key.lock" 'd["extra"] = 1'
+refuses 'unknown lock key' 1 'unknown lock key: extra' "$helper" validate "$t/key.lock"
+mutate "$t/ekey.lock" 'd["entries"][0]["mirror"] = "x"'
+refuses 'unknown entry key' 1 'unknown entry key: mirror' "$helper" validate "$t/ekey.lock"
+mutate "$t/http.lock" 'd["entries"][1]["url"] = "http://gmplib.org/download/gmp/gmp-6.3.0.tar.bz2"'
+refuses 'non-https URL' 1 'the URL must be https://' "$helper" validate "$t/http.lock"
+mutate "$t/sha.lock" 'd["entries"][1]["sha256"] = d["entries"][1]["sha256"].upper()'
+refuses 'upper-case digest' 1 'sha256 must be 64 lowercase hex digits' "$helper" validate "$t/sha.lock"
+mutate "$t/dup.lock" 'd["entries"][2]["name"] = "gmp"'
+refuses 'duplicate name' 1 'duplicate entry name: gmp' "$helper" validate "$t/dup.lock"
+mutate "$t/size.lock" 'd["entries"][0]["bytes"] = 0'
+refuses 'zero size' 1 'bytes must be a positive integer' "$helper" validate "$t/size.lock"
+mutate "$t/pub.lock" 'd["publish"].append("cmake")'
+refuses 'publishing a build tool' 1 'not a source or dependency entry' "$helper" validate "$t/pub.lock"
+mutate "$t/lic.lock" 'd["licences"]["x.txt"] = ["gmp", "../COPYING"]'
+refuses 'a licence member with ..' 1 'relative member' "$helper" validate "$t/lic.lock"
+
+printf 'abc' > "$t/file"
+good=$(shasum -a 256 "$t/file" | cut -d' ' -f1)
+check 'verify accepts a matching file' "$helper" verify "$t/file" 3 "$good"
+refuses 'verify: wrong size' 1 '3 bytes, the lock says 4' "$helper" verify "$t/file" 4 "$good"
+refuses 'verify: wrong digest' 1 'SHA-256' "$helper" verify "$t/file" 3 0000000000000000000000000000000000000000000000000000000000000000
+
+# ------------------------------------------------ archive member check
+/usr/bin/python3 -I - "$t" <<'EOF'
+import io, sys, tarfile
+t = sys.argv[1]
+def make(name, members):
+    with tarfile.open("%s/%s.tar.gz" % (t, name), "w:gz") as tar:
+        for m, link in members:
+            info = tarfile.TarInfo(m)
+            if link is None:
+                info.size = 1
+                tar.addfile(info, io.BytesIO(b"x"))
+            else:
+                info.type = tarfile.SYMTYPE
+                info.linkname = link
+                tar.addfile(info)
+make("good", [("top/", None), ("top/a", None), ("top/d/l", "../a")])
+make("absolute", [("/top/a", None)])
+make("dotdot", [("top/../x", None)])
+make("outside", [("top/a", None), ("other/b", None)])
+make("link", [("top/l", "../../etc/passwd")])
+make("abslink", [("top/l", "/etc/passwd")])
+EOF
+check 'archive check accepts members under the top level' "$helper" check-archive tar top "$t/good.tar.gz"
+refuses 'archive: absolute member' 1 'absolute member' "$helper" check-archive tar top "$t/absolute.tar.gz"
+refuses 'archive: .. member' 1 "'..' component" "$helper" check-archive tar top "$t/dotdot.tar.gz"
+refuses 'archive: member outside the top level' 1 'member outside top' "$helper" check-archive tar top "$t/outside.tar.gz"
+refuses 'archive: link leaving the top level' 1 'link leaving top' "$helper" check-archive tar top "$t/link.tar.gz"
+refuses 'archive: link with an absolute target' 1 'absolute target' "$helper" check-archive tar top "$t/abslink.tar.gz"
+
+# ------------------------------------------------ script refusals
+build=$here/build
+refuses 'no --scratch' 2 '--scratch DIR is required' "$build"
+refuses 'relative scratch' 2 'must be an absolute path' "$build" --scratch rel/dir
+refuses 'scratch inside the repository' 2 'outside the repository' "$build" --scratch "$root/tools/solver-test"
+refuses 'unknown option' 2 'unknown argument: --frob' "$build" --scratch "$t/s1" --frob
+refuses 'bad --jobs' 2 '--jobs must be a positive integer' "$build" --scratch "$t/s1" --jobs 0
+mkdir -p "$t/s2/solver"
+refuses 'an existing package directory' 1 'preflight:' "$build" --scratch "$t/s2"
+mkdir -p "$t/s3/cache"
+printf 'not gmp' > "$t/s3/cache/gmp-6.3.0.tar.bz2"
+refuses 'a cached file with a wrong digest, before any download' 1 'cached gmp-6.3.0.tar.bz2 does not match the lock' "$build" --scratch "$t/s3"
+check 'the mismatched cache file is kept and nothing else was fetched' \
+    [ "$(ls -A "$t/s3/cache" | tr '\n' ' ')" = 'gmp-6.3.0.tar.bz2 ' ]
+check 'no work directory after a refusal' [ ! -e "$t/s3/work" ] && [ ! -e "$t/s3/solver" ]
+[ ! -e "$root/tools/solver-test" ] && pass 'the repository refusal wrote nothing' || bad 'the repository refusal wrote a directory'
+
+# ------------------------------------------------ notice and profile
+sed 's/@VERSION@/0.0.1/' "$here/NOTICE.txt.in" > "$t/NOTICE.txt"
+check 'the rendered notice passes host-paths' "$root/tools/release/host-paths" --repository "$root" "$t/NOTICE.txt"
+for f in $("$helper" licences "$lock" | cut -f1 | grep -E '^(cvc5|gmp)-'); do
+    check "the notice names $f" grep -Fq "$f" "$t/NOTICE.txt"
+done
+check 'the notice names no LibPoly' sh -c '! grep -qi libpoly "$1"' sh "$t/NOTICE.txt"
+s=$(status_of /usr/bin/sandbox-exec -f "$here/solver.sb" -D "SOLVER_DIR=$t" /usr/bin/true)
+if [ "$s" != 0 ] && grep -q 'Operation not permitted' "$t/out"; then
+    pass 'solver.sb compiles and denies starting another program'
+else
+    bad "solver.sb: status $s: $(head -1 "$t/out")"
+fi
+
+printf '%d passed, %d failed\n' "$passed" "$failed"
+[ "$failed" -eq 0 ]
