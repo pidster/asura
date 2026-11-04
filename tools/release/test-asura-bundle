@@ -257,6 +257,17 @@ host_paths_static_checks() {
     printf '/opt/asura-repo/target/release/build/x/out/a.rs\0/opt/asura-repo\0' > "$h/hits/repository.bin"
     printf 'x/opt/%s/src\0/var/%s\0' "$user" "$user" > "$h/hits/user.bin"
     ln -s "$HOME/elsewhere" "$h/hits/link"
+    # F6 (owner, 2026-11-04): the Mac's host names. Hits: uname -n in the
+    # form of CaDiCaL's build header, LocalHostName in upper case with
+    # .local, and ComputerName. Near misses: a longer name on either side,
+    # and the fixed value asura-build.
+    node=$(uname -n)
+    local_name=$(scutil --get LocalHostName 2>/dev/null || :)
+    computer=$(scutil --get ComputerName 2>/dev/null || :)
+    printf 'Wed Nov 4 03:07:47 GMT 2026 Darwin %s 27.0.0 arm64\0' "$node" > "$h/hits/host-uname.bin"
+    printf 'x\0%s.local\0' "$(printf '%s' "${local_name:-$node}" | tr '[:lower:]' '[:upper:]')" > "$h/hits/host-local.bin"
+    printf 'built on %s\0' "${computer:-$node}" > "$h/hits/host-computer.bin"
+    printf '%s2\0x%s\0%s-b\0Darwin asura-build 27.0.0 arm64\0' "$node" "$node" "$node" > "$h/clean/host-near-misses.bin"
     set +e
     out=$(scan --repository /opt/asura-repo "$h/clean" 2>&1); status=$?
     set -e
@@ -266,13 +277,16 @@ host_paths_static_checks() {
     set -e
     expect_line() { check "host-paths reports $1" sh -c 'printf "%s\n" "$1" | grep -Fqx -- "$2"' sh "$out" "$2"; }
     check 'host-paths: hits exit 1' [ "$status" -eq 1 ]
-    expect_line 'the home in a longer string' 'hits/home.bin: home 1, repository 0, user 1'
-    expect_line 'the home alone' 'hits/home-alone.bin: home 1, repository 0, user 1'
-    expect_line 'the repository path' 'hits/repository.bin: home 0, repository 2, user 0'
-    expect_line 'the user name as a path component' 'hits/user.bin: home 0, repository 0, user 2'
-    expect_line 'a link target' 'hits/link: home 1, repository 0, user 1'
-    check 'host-paths reports only the planted files' [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 5 ]
-    check 'host-paths prints counts, never the matching text' sh -c '! printf "%s\n" "$1" | grep -Fq -e registry -e /opt/' sh "$out"
+    expect_line 'the home in a longer string' 'hits/home.bin: home 1, repository 0, user 1, host 0'
+    expect_line 'the home alone' 'hits/home-alone.bin: home 1, repository 0, user 1, host 0'
+    expect_line 'the repository path' 'hits/repository.bin: home 0, repository 2, user 0, host 0'
+    expect_line 'the user name as a path component' 'hits/user.bin: home 0, repository 0, user 2, host 0'
+    expect_line 'a link target' 'hits/link: home 1, repository 0, user 1, host 0'
+    expect_line 'uname -n in a build header' 'hits/host-uname.bin: home 0, repository 0, user 0, host 1'
+    expect_line 'LocalHostName in upper case, with .local' 'hits/host-local.bin: home 0, repository 0, user 0, host 1'
+    expect_line 'ComputerName' 'hits/host-computer.bin: home 0, repository 0, user 0, host 1'
+    check 'host-paths reports only the planted files' [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 8 ]
+    check 'host-paths prints counts, never the matching text' sh -c '! printf "%s\n" "$1" | grep -Fiq -e registry -e /opt/ -e "$2"' sh "$out" "$node"
     printf '%s/x.rs\0' "$root" > "$h/real-repository.bin"
     set +e
     out=$(scan --repository "$root" "$h/real-repository.bin" 2>&1); status=$?
@@ -291,23 +305,30 @@ host_paths_static_checks() {
     refuses_scan 'a missing path' scan --repository "$root" "$h/none"
     refuses_scan 'no path' scan --repository "$root"
     # asura-release check runs the scanner over the mounted DMG volume: a
-    # planted LICENSE fails it; a clean one passes it.
-    for kind in planted clean; do
+    # planted LICENSE (the home, or the host name) fails it; a clean one
+    # passes it.
+    for kind in planted host clean; do
         a=$h/$kind/Asura-9.9.9-adhoc-unstapled.dmg
         mkdir -p "$h/$kind/tree/Asura.app/Contents"
         printf 'x\n' > "$h/$kind/tree/Asura.app/Contents/Info.plist"
         ln -s /Applications "$h/$kind/tree/Applications"
         printf 'Asura 9.9.9 read-me\n' > "$h/$kind/tree/README.txt"
-        if [ "$kind" = planted ]; then printf 'built in %s/src\n' "$HOME" > "$h/$kind/tree/LICENSE"; else printf 'MIT\n' > "$h/$kind/tree/LICENSE"; fi
+        case $kind in
+            planted) printf 'built in %s/src\n' "$HOME" > "$h/$kind/tree/LICENSE" ;;
+            host) printf 'built on %s\n' "$node" > "$h/$kind/tree/LICENSE" ;;
+            *) printf 'MIT\n' > "$h/$kind/tree/LICENSE" ;;
+        esac
         hdiutil create -quiet -volname Asura -srcfolder "$h/$kind/tree" -fs APFS -format UDZO "$a" > "$h/create.txt" 2>&1 ||
             bad "hdiutil create of the $kind DMG: $(tr '\n' ' ' < "$h/create.txt")"
         codesign --sign - --timestamp=none --identifier org.pidster.asura.dmg "$a" 2>/dev/null || bad "ad hoc signature of the $kind DMG"
         (cd "$h/$kind" && shasum -a 256 "$(basename "$a")" > "$(basename "$a").sha256")
         "$release/asura-release" check --ad-hoc --version 9.9.9 --dmg "$a" > "$h/$kind/check.txt" 2>&1 || :
     done
-    rule='no file holds the account home, the repository path or the user name (SG4-O1)'
+    rule='no file holds the account home, the repository path, the user name or the host name (SG4-O1)'
     check 'check FAILs a DMG whose LICENSE holds the home' grep -Fqx "FAIL $rule" "$h/planted/check.txt"
-    check 'check names the planted file and its counts' grep -Fqx '  LICENSE: home 1, repository 0, user 1' "$h/planted/check.txt"
+    check 'check names the planted file and its counts' grep -Fqx '  LICENSE: home 1, repository 0, user 1, host 0' "$h/planted/check.txt"
+    check 'check FAILs a DMG whose LICENSE holds the host name (F6)' grep -Fqx "FAIL $rule" "$h/host/check.txt"
+    check 'check names the host-name file and its counts' grep -Fqx '  LICENSE: home 0, repository 0, user 0, host 1' "$h/host/check.txt"
     check 'check PASSes the path rule on a clean DMG (the /Applications link is not a hit)' grep -Fqx "PASS $rule" "$h/clean/check.txt"
     check 'check prints no build-host NOTE any more' sh -c '! grep -q "^NOTE .*SG4-O1" "$1" "$2"' sh "$h/planted/check.txt" "$h/clean/check.txt"
     check 'check ejects the volume of each DMG' sh -c '! mount | grep -Fq "$1"' sh "$h/"
@@ -477,6 +498,20 @@ for base, dirs, names in os.walk(sys.argv[1]):
 for line in found:
     print("  " + line)
 sys.exit(1 if found else 0)' "$app" "$HOME" /Users/ "$root" "/$(id -un)/"
+    check 'F6: no file holds a host name of this Mac, in any ASCII case' /usr/bin/python3 -I -c '
+import os, sys
+needles = sorted({n.encode().lower() for n in sys.argv[2:] if n})
+found = []
+for base, dirs, names in os.walk(sys.argv[1]):
+    for name in names:
+        path = os.path.join(base, name)
+        data = (os.readlink(path).encode() if os.path.islink(path) else open(path, "rb").read()).lower()
+        hits = sum(data.count(n) for n in needles)
+        if hits:
+            found.append("%s: host x%d" % (os.path.relpath(path, sys.argv[1]), hits))
+for line in found:
+    print("  " + line)
+sys.exit(1 if found else 0)' "$app" "$(uname -n)" "$(scutil --get LocalHostName 2>/dev/null || :)" "$(scutil --get ComputerName 2>/dev/null || :)"
     commit=$(cd "$root" && rustc -vV | sed -n 's/^commit-hash: //p')
     check 'SG4-O1: asura panic locations name /cargo/registry/src/' sh -c 'LC_ALL=C grep -aq "/cargo/registry/src/index.crates.io-" "$1"' sh "$contents/MacOS/asura"
     check 'SG4-O1: asura standard library locations name /rustc/<commit>/library/' sh -c 'LC_ALL=C grep -aq "/rustc/$2/library/" "$1"' sh "$contents/MacOS/asura" "$commit"
@@ -507,7 +542,7 @@ sys.exit(1 if found else 0)' "$app" "$HOME" /Users/ "$root" "/$(id -un)/"
         check 'check records the pinned rustc of rust-toolchain.toml' grep -Fq \
             "RECORD rustc rustc $(sed -n 's/^channel = "\(.*\)"$/\1/p' "$root/rust-toolchain.toml") " "$log/check.txt"
         check 'SG4-O1: check passes the build-host path rule' \
-            grep -Fqx 'PASS no file holds the account home, the repository path or the user name (SG4-O1)' "$log/check.txt"
+            grep -Fqx 'PASS no file holds the account home, the repository path, the user name or the host name (SG4-O1)' "$log/check.txt"
         # SG4-O1: the same volume repacked with the home planted in LICENSE
         # (outside the signed bundle) fails exactly one check, the rule.
         mkdir "$log/tree" "$log/planted"
@@ -524,7 +559,7 @@ sys.exit(1 if found else 0)' "$app" "$HOME" /Users/ "$root" "/$(id -un)/"
         (cd "$log/planted" && shasum -a 256 "$(basename "$planted")" > "$(basename "$planted").sha256")
         "$release/asura-release" check --ad-hoc --version "$version" --dmg "$planted" > "$log/planted.txt" 2>&1 || :
         check 'SG4-O1: a planted home path fails only the build-host path rule' \
-            [ "$(grep '^FAIL' "$log/planted.txt")" = 'FAIL no file holds the account home, the repository path or the user name (SG4-O1)' ]
+            [ "$(grep '^FAIL' "$log/planted.txt")" = 'FAIL no file holds the account home, the repository path, the user name or the host name (SG4-O1)' ]
         check 'SG4-O1: the report names LICENSE' grep -Fqx '  LICENSE: home 1, repository 0, user 1' "$log/planted.txt"
         rm -rf "$log"
     else

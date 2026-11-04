@@ -1800,7 +1800,8 @@ All PL4a files are under `tools/release/solver/` (the packet's owned paths).
 
 | File | Purpose |
 | --- | --- |
-| `solver.lock` | The lock file: every download with its URL, size and SHA-256, the GMP version, the licence list and the publication list |
+| `solver.lock` | The lock file: every download with its URL, size and SHA-256, the GMP version, the source date, the patches, the licence list and the publication list |
+| `patches/` | The F6 patches to the pinned sources ([build identity](#f6-build-identity)): `cvc5-cadical-patch-step.patch` and `cadical-build-header.patch` |
 | `solver-lock` | The lock helper (`/usr/bin/python3 -I`): validates the lock, verifies a file against an entry, checks an archive's member names, writes the package manifest |
 | `build` | The build script (POSIX `sh`) |
 | `test-build` | Static checks of the lock, the helper and the script's refusals; no network and no build |
@@ -1819,8 +1820,10 @@ versions that `asura-policy` and the spike use (`cedar-policy` 4.14.1,
 
 `solver.lock` is JSON, `format_version` 1. The helper refuses any other
 version, an unknown key, a URL that is not `https://`, a digest that is not
-64 lowercase hex digits, a size that is not a positive integer, or a duplicate
-name.
+64 lowercase hex digits, a size that is not a positive integer, a duplicate
+name, a `source_date_epoch` that is not a positive integer, or a patch whose
+file is not a plain name, whose `entry` is not `cvc5` or `cadical`, or that
+repeats a file or an entry.
 
 | Key | Content |
 | --- | --- |
@@ -1828,6 +1831,8 @@ name.
 | `gmp_version` | `6.3.0`. The script checks the built GMP against it (F2) |
 | `cvc5_version` | `1.3.1`. The script checks `cvc5 --version` against it |
 | `entries` | One object per download: `name`, `role`, `file`, `url`, `bytes`, `sha256`; `top_level` for an archive; `version` for a build tool, which the script checks where the tool reports one (CMake) |
+| `source_date_epoch` | `1758724984` (2025-09-24T14:43:04Z): the newest member time in the `cvc5` source archive, which is the time of the 1.3.1 tag's commit. The `unpack` stage refuses a lock whose value differs from the archive. Every build step runs with `SOURCE_DATE_EPOCH` set to it (F6) |
+| `patches` | One object per patch: `file` (a name under `patches/`), `entry` (the source it changes, `cvc5` or `cadical`) and `sha256`. The `verify` stage refuses a patch whose digest differs |
 | `licences` | Package file name to the entry and the member path it is copied from |
 | `publish` | The entry names that each release publishes as source |
 
@@ -1861,20 +1866,21 @@ before it creates it. It writes only under `DIR`.
 
 | Stage | Network | Work | Ends when |
 | --- | --- | --- | --- |
-| `preflight` | — | macOS 27 or later on arm64; the tools in `/usr/bin` (`clang`, `make`, `m4`, `curl`, `shasum`, `tar`, `unzip`, `otool`, `install_name_tool`, `codesign`, `sandbox-exec`, `python3`); the lock validates; `DIR` is usable | Every condition holds, or the first refusal |
+| `preflight` | — | macOS 27 or later on arm64; the tools in `/usr/bin` (`clang`, `make`, `m4`, `curl`, `shasum`, `tar`, `unzip`, `otool`, `install_name_tool`, `codesign`, `sandbox-exec`, `python3`, `patch`); the lock validates; every patch matches its lock digest; `DIR` is usable | Every condition holds, or the first refusal |
 | `fetch` | Yes | First every cached file is verified; a cached file whose digest differs refuses the run (the operator removes it), so nothing is replaced silently. Then each missing entry except `comparison` is fetched with `curl --proto =https --proto-redir =https --tlsv1.2 --max-filesize BYTES` to a partial file, verified, then renamed | Every entry is cached and verified, or the first failure. A failed file is deleted |
 | `offline` | **Denied** | The script runs itself again under `sandbox-exec` with `(version 1)(allow default)(deny network*)`. Every later stage runs there, so a hidden download fails the build (SV-B2) | The child's exit |
-| `verify` | Denied | Every cached file is verified again | All match, or the first mismatch |
-| `unpack` | Denied | Each tar archive is listed first; each member must lie under the entry's `top_level` with no absolute path and no `..` component. Then it is extracted into a new, empty directory | All archives are extracted, or the first refusal |
+| `verify` | Denied | Every cached file is verified again; every patch in `patches/` must match its lock digest | All match, or the first mismatch |
+| `unpack` | Denied | Each tar archive is listed first; each member must lie under the entry's `top_level` with no absolute path and no `..` component. Then it is extracted into a new, empty directory. The newest member time of the `cvc5` archive must equal `source_date_epoch`. The `cvc5` patch is applied to the extracted cvc5 source with `patch -p1 -t -N -F 0` (no fuzz; a reject fails the stage) | All archives are extracted and patched, or the first refusal |
 | `tools` | Denied | `/usr/bin/python3 -m venv`, then `pip install --no-index --no-deps` of the three wheels from the cache. `cmake --version` must report the locked version | The check passes |
 | `gmp` | Denied | `configure --enable-shared --disable-static --enable-cxx --with-pic`; `make`; `make check` (GMP's test suite: zero failures required); `make install`. Then the F2 check: a C program compiled against the installed `gmp.h` and linked to the built dylib prints `__GNU_MP_VERSION` and `gmp_version`; both must equal `gmp_version`. Then `install_name_tool -id @rpath/libgmp.10.dylib` and an ad hoc signature | Every step passes |
-| `cvc5` | Denied | The CaDiCaL and SymFPU archives are copied into cvc5's external-project download directory (`deps/src`), where its own `URL_HASH` check accepts them without a download. `configure.sh production --static --no-poly --no-pyvenv --no-auto-download` with the F1 arguments: `-DGMP_LIBRARIES` and `-DGMPXX_LIBRARIES` naming the built dylibs and `-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local;/opt/local`. Then `make` and `make install` | Every step passes |
+| `cvc5` | Denied | The CaDiCaL and SymFPU archives are copied into cvc5's external-project download directory (`deps/src`), where its own `URL_HASH` check accepts them without a download. `configure.sh production --static --no-poly --no-pyvenv --no-auto-download` with the F1 arguments: `-DGMP_LIBRARIES` and `-DGMPXX_LIBRARIES` naming the built dylibs and `-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local;/opt/local`, and `-DASURA_CADICAL_PATCH` naming the CaDiCaL patch, which the patched `FindCaDiCaL.cmake` applies as CaDiCaL's `PATCH_COMMAND` after cvc5 extracts the archive. Then `make` and `make install`. Then CaDiCaL's generated `build/build.hpp` must hold the expected `DATE` line ([build identity](#f6-build-identity)) | Every step passes |
 | `package` | Denied | Lay out the package (below), copy the licence texts named by the lock, sign ad hoc, write `manifest.json` | Done |
 | `checks` | Denied | The build checks below | Every check passes, or the first failure |
 
 Environment of every build step: `env -i` with `PATH` set to the Python
 environment, `/usr/bin`, `/bin`, `/usr/sbin` and `/sbin`; `HOME` and
-`TMPDIR` inside `DIR/work`; `MACOSX_DEPLOYMENT_TARGET=27.0`; and no `CFLAGS`,
+`TMPDIR` inside `DIR/work`; `MACOSX_DEPLOYMENT_TARGET=27.0`;
+`SOURCE_DATE_EPOCH` from the lock; and no `CFLAGS`,
 `CPATH`, `LIBRARY_PATH`, `PKG_CONFIG_PATH` or `CMAKE_PREFIX_PATH` from the
 operator. The compiler is `/usr/bin/clang` and `/usr/bin/clang++` (the
 selected Xcode).
@@ -1892,8 +1898,34 @@ scratch path itself, as well as for the SG4-O1 needles, so a path that
 CaDiCaL embeds fails the build instead of passing unnoticed.
 
 The script makes no bit-for-bit reproducibility claim. It pins every input,
-the flags and the tools; the build ID, CaDiCaL's build header (compiler,
-date) and the ad hoc signature can still differ between builds.
+the flags, the tools and the embedded build date and host value
+([build identity](#f6-build-identity)); the build ID, the compiler version
+in CaDiCaL's build header and the ad hoc signature can still differ between
+builds.
+
+#### F6: build identity
+
+Selected design. The owner decided on 2026-11-04 to remove both items of
+finding [F6](solver-build-probes.md#findings-for-the-solver-adapter) from
+the package: the build Mac's host name and the real build date.
+
+| Source of the value | Before | Mechanism | After |
+| --- | --- | --- | --- |
+| cvc5 `Configuration::getCompiledDateTime()` (`__DATE__ " " __TIME__`), printed by `cvc5 --version` | The build time, for example `Nov  4 2026 03:07:22` | `SOURCE_DATE_EPOCH` in the build environment. Apple clang sets `__DATE__` and `__TIME__` from it, in UTC | `Sep 24 2025 14:43:04` |
+| CaDiCaL `scripts/make-build-header.sh`: `DATE` is `date` followed by `uname -srmn` | The build time and the host name, for example `Wed Nov 4 03:07:47 GMT 2026 Darwin <host> 27.0.0 arm64` | `cadical-build-header.patch`: the time is `date -u -r "$SOURCE_DATE_EPOCH"`; the host field is the fixed value `asura-build`; the kernel name, release and machine stay. The script stops with an error when `SOURCE_DATE_EPOCH` is not set, so `make` fails | `Wed Sep 24 14:43:04 UTC 2025 Darwin asura-build 27.0.0 arm64` |
+
+CaDiCaL takes no operator variable for these values, and cvc5 extracts the
+CaDiCaL archive itself after its `URL_HASH` check. The archive therefore
+stays unchanged, and `cvc5-cadical-patch-step.patch` adds one
+`PATCH_COMMAND` to cvc5's `cmake/FindCaDiCaL.cmake`. That command applies
+the file named by `-DASURA_CADICAL_PATCH` with `/usr/bin/patch -p1 -t -N
+-F 0 -V none`. An unset variable or a reject fails the CaDiCaL step and the
+build. The patches change no solver code, flag or option: CaDiCaL's `DATE`
+macro is used only in its version banner, which cvc5 does not print.
+
+The release check rejects a regression: `host-paths` counts the build
+Mac's host names as a fourth needle (SG4-O1, RS11), and BC10 checks the
+fixed values.
 
 #### PL4a package
 
@@ -1919,10 +1951,11 @@ from the template with the release version.
 | BC3 | `otool -D` of the dylib | `@rpath/libgmp.10.dylib`; its own dependencies are `libSystem` only |
 | BC4 | `cvc5 --show-config` and `--version` | Version 1.3.1; `gmp` yes; `poly`, `cln`, `glpk`, `cocoa`, `editline`, `kissat` and `cryptominisat` no; GPL not permitted; LGPL list GMP only |
 | BC5 | Signatures | `codesign --verify --strict` passes for the dylib and `cvc5`; both are ad hoc with the identifiers above |
-| BC6 | Host paths (SV-P5) | `tools/release/host-paths` finds nothing in the package, and no file holds the scratch path `DIR` |
+| BC6 | Host paths (SV-P5) | `tools/release/host-paths` finds nothing in the package (home, repository, user name or host name), and no file holds the scratch path `DIR` |
 | BC7 | Smoke query | `cvc5 --lang smt` answers `sat` to a nonlinear integer query, run from the package |
 | BC8 | Licences and manifest | The `licenses/` files are exactly the lock's list; the manifest digests match the files |
 | BC9 | GMP test suite | `make check` reported no failure (stage `gmp`) |
+| BC10 | Build identity (F6) | `cvc5 --version` names the compile time from `source_date_epoch` (`on Sep 24 2025 14:43:04`); `cvc5` holds CaDiCaL's fixed `DATE` string once; no package file holds the day on which the offline stage started or ended (UTC and local), in the `__DATE__` form or the `date` form, unless it is the source day |
 
 The script prints the size of `cvc5` and of the dylib (AD-31: reported, no
 limit).
@@ -1934,24 +1967,32 @@ Every refusal ends the run with status 1 and leaves no package.
 
 ```mermaid
 flowchart TD
-    Pre["preflight: host, tools, lock, DIR"] -->|"Refused"| Stop["Exit 1, no package"]
+    Pre["preflight: host, tools, lock, patch digests, DIR"] -->|"Refused"| Stop["Exit 1, no package"]
     Pre --> Cache{"Every cached file matches the lock?"}
     Cache -->|"No"| Stop
     Cache -->|"Yes"| Fetch["fetch: missing entries with curl, size bound; verify; rename"]
     Fetch -->|"Size or digest mismatch"| Stop
     Fetch --> Off["offline: sandbox-exec deny network*"]
-    Off --> Ver["verify all cached files again"]
+    Off --> Ver["verify all cached files and patches again"]
+    Ver -->|"Digest mismatch"| Stop
     Ver --> Unp["unpack: member names checked, new directories"]
     Unp -->|"Member outside top level"| Stop
-    Unp --> Tools["tools: venv, pip --no-index, CMake version"]
+    Unp --> Epoch{"F6: newest cvc5 member time equals source_date_epoch?"}
+    Epoch -->|"No"| Stop
+    Epoch -->|"Yes"| P5["Apply the cvc5 patch: CaDiCaL PATCH_COMMAND, no fuzz"]
+    P5 -->|"Reject"| Stop
+    P5 --> Tools["tools: venv, pip --no-index, CMake version"]
     Tools --> Gmp["gmp: configure, make, make check, install"]
     Gmp -->|"Test failure"| Stop
     Gmp --> F2{"F2: built GMP version equals the lock?"}
     F2 -->|"No"| Stop
     F2 -->|"Yes"| Id["Install name @rpath, ad hoc sign"]
-    Id --> Cv["cvc5: deps archives in deps/src; configure --static --no-poly with F1 arguments; make"]
-    Cv --> Pkg["package: layout, licences, ad hoc signatures, manifest"]
-    Pkg --> Chk{"BC1 to BC9 pass?"}
+    Id --> Cv["cvc5: deps archives in deps/src; configure --static --no-poly with F1 arguments and ASURA_CADICAL_PATCH; make with SOURCE_DATE_EPOCH"]
+    Cv -->|"CaDiCaL patch rejected or SOURCE_DATE_EPOCH unset"| Stop
+    Cv --> Hdr{"F6: CaDiCaL build.hpp DATE is the fixed line?"}
+    Hdr -->|"No"| Stop
+    Hdr -->|"Yes"| Pkg["package: layout, licences, ad hoc signatures, manifest"]
+    Pkg --> Chk{"BC1 to BC10 pass?"}
     Chk -->|"No"| Stop
     Chk -->|"Yes"| Done["Exit 0: package and sizes reported"]
 ```
@@ -2095,7 +2136,7 @@ Each release publishes as GitHub release assets, beside the DMG and for as
 long as that DMG is offered: the `publish` entries of the lock (the cvc5,
 GMP, CaDiCaL and SymFPU archives, byte-identical to the cache), and the
 `tools/release/solver/` directory of the release commit (the build script,
-the lock, the helper and the notice template). PL4b uploads them; PL4a only
+the lock, the helper, the F6 patches and the notice template). PL4b uploads them; PL4a only
 lists them. The build-tool wheels and the comparison binary are not
 published.
 
@@ -2130,8 +2171,8 @@ one at a time, and are never part of the service.
 
 | Layer | Evidence |
 | --- | --- |
-| Unit | `test-build --static`: the tracked lock validates and holds the designed entries, licences and publication list; the helper refuses a bad format version, an unknown key, a non-`https` URL, a bad digest and a duplicate name; it refuses a file with a wrong size or digest; the archive check refuses an absolute member, a `..` member and a member outside the top level; the script refuses no `--scratch`, a relative path, a path inside the repository, an existing `DIR/solver`, an unknown option and a cached file with a wrong digest (before any download) |
-| Integration | `build` on the release Mac: every stage and BC1 to BC9 |
+| Unit | `test-build --static`: the tracked lock validates and holds the designed entries, licences and publication list; the helper refuses a bad format version, an unknown key, a non-`https` URL, a bad digest and a duplicate name; it refuses a file with a wrong size or digest; the archive check refuses an absolute member, a `..` member and a member outside the top level; the script refuses no `--scratch`, a relative path, a path inside the repository, an existing `DIR/solver`, an unknown option and a cached file with a wrong digest (before any download). F6: the lock holds `source_date_epoch` 1758724984 and the two patches, whose digests match; each patch changes only its one file, the cvc5 patch only adds the `PATCH_COMMAND`, and the CaDiCaL patch replaces only the `DATE` and `OS` lines with `SOURCE_DATE_EPOCH` and `asura-build` and no `uname -n`; the helper refuses a missing, zero or string epoch, a patch for another entry, two patches for one entry, an unknown patch key, a patch path, and a changed or missing patch; `newest-mtime` reports the newest member time; `check-identity` accepts the locked dates and a build on the source day, and refuses the build day in the `__DATE__` form, in the `date` form and in another package file, a missing or repeated CaDiCaL `DATE`, and a non-numeric time; the script refuses a patch that does not match the lock before any download; `host-paths` fails CaDiCaL's `uname -srmn` form with this Mac's host name and passes the fixed `asura-build` form. `test-asura-bundle --static` holds the scanner's host-name cases (SG-V12) |
+| Integration | `build` on the release Mac: every stage and BC1 to BC10 |
 | End to end | `probe`: SV-P1 on the product and spike corpora through the package's `cvc5`; SV-P2 under the profile from a copy; SV-P3, SV-P5 and SV-P6; the spike's admission test with the package's `cvc5` |
 
 ### PL4a delivery record
@@ -2189,12 +2230,10 @@ failed, 2 pending):
   the same team ID; PL-N2 must show this. The notice's ad hoc route works
   because an ad hoc signature without `-o runtime` has no library
   validation; the notice text needs no change.
-- PL4b, host identity (finding F6, new). The package names the build host:
-  CaDiCaL's build header embeds `uname -srmn` (the host name, once in
-  `cvc5`), and cvc5's `--version` prints the build date. Neither is an
-  SG4-O1 needle, so `host-paths` passes. CaDiCaL takes no operator flags,
-  so removing it needs a change to how cvc5 builds CaDiCaL; PL4b decides
-  whether the release needs it.
+- Host identity (finding F6): **resolved 2026-11-04**, see
+  [F6 delivery](#f6-delivery) below. As first delivered, CaDiCaL's build
+  header embedded `uname -srmn` (the host name, once in `cvc5`), and
+  cvc5's `--version` printed the build date; neither was an SG4-O1 needle.
 - cvc5's `--show-config` says "statically linked against these libraries"
   for GMP. That is cvc5's fixed text; the binary links GMP dynamically
   (BC1).
@@ -2205,7 +2244,7 @@ Runtime, secure timestamp) and their placement (the
 signatures, from the bundle and from the pinned copy; SV-P4 notarisation;
 the rendered `NOTICE.txt` and the licence folder; the release assets of the
 [publication list](#source-publication-and-notice); the digests compiled
-into `asura`; the DMG manifest change; and the F6 decision.
+into `asura`; and the DMG manifest change.
 
 **Checks run:** `test-build --static` (42 passed); `build` (BC1 to BC9);
 `probe` (15 passed, 2 pending); `cargo fmt --check` and `cargo clippy
@@ -2215,6 +2254,43 @@ into `asura`; the DMG manifest change; and the F6 decision.
 No product Rust changed, so the workspace format and clippy passes were not
 needed. F4 has a test design only ([F4](#f4-stalled-solver-tests-for-pl3));
 the adapter is PL3's.
+
+#### F6 delivery
+
+Verified 2026-11-04 on the same reference Mac. Owner decision, 2026-11-04:
+remove both the build Mac's host name and the real build date from the
+package ([F6: build identity](#f6-build-identity)). The rebuild used the
+script with a scratch cache copied from the PL4a run; the script verified
+every cached file against the lock before use, and nothing was downloaded
+except the upstream comparison binary, which `probe` fetched and checked.
+
+| Check | Result |
+| --- | --- |
+| `unpack` | The newest cvc5 member time equals `source_date_epoch` 1758724984; the cvc5 patch applied with no fuzz |
+| `cvc5` | CaDiCaL's `build.hpp`: `DATE "Wed Sep 24 14:43:04 UTC 2025 Darwin asura-build 27.0.0 arm64"`; CaDiCaL and SymFPU taken from the cache by `URL_HASH`; no download |
+| BC1 to BC9 | All pass, with the same results as the PL4a record (BC9: 199 passed, 1 skipped, 0 failed). BC6 now includes the host-name needle |
+| BC10 | `cvc5 --version` prints `on Sep 24 2025 14:43:04`; `cvc5` holds the CaDiCaL `DATE` once; no package file holds the build day |
+| Size | `MacOS/cvc5` 24,291,744 bytes; `Frameworks/libgmp.10.dylib` 450,288 bytes (unchanged) |
+| SV-P1, product corpus | **Pass.** 65 queries (the corpus has grown since the PL4a record); each result equals the upstream 1.3.1 binary's; both solvers 7 `sat`, 8 `unsat`, 0 `unknown`; all expected |
+| SV-P1, spike corpus | **Pass.** 216 of 216 answers equal (7 `sat`, 209 `unsat`), the same query set; both harness runs 0 unexpected; the spike's `admission` test passes with the package's cvc5 |
+| Other probes | `probe`: 15 passed, 0 failed, 2 pending (SV-P3 team-signed, SV-P4), as before |
+
+Scan proof, raw bytes of every package file in any ASCII case, and
+`strings -a` of `cvc5` (counts for the PL4a package, then the F6 package):
+`uname -n` 1 then 0; `LocalHostName` 1 then 0; `ComputerName` 0 then 0;
+`Nov  4 2026` 1 then 0; `Nov 4 ` 1 then 0; ` 2026` 2 then 0. The fixed values
+appear once each in the F6 package: `asura-build`, `Sep 24 2025 14:43:04`
+and `Wed Sep 24 14:43:04 UTC 2025`. The new `host-paths` reports the PL4a
+package (`MacOS/cvc5: home 0, repository 0, user 0, host 1`), so the old
+build would now fail BC6; it passes the existing ad hoc `Asura.app` bundles.
+
+**Checks run:** `test-build --static` (75 passed); `build` (BC1 to BC10);
+`probe` (15 passed, 2 pending); `test-asura-bundle --static` with
+`ASURA_PROTOC` and `ASURA_PROTOC_GEN_SWIFT` set (152 passed). The PL4a-F1
+and SG-F11 diagrams were rendered with the local Mermaid CLI and inspected.
+No Rust changed, so no format or clippy pass was needed. Not run:
+`test-asura-bundle --bundle` on a new dry run, which holds the new
+independent host-name scan of a bundle.
 
 ## Failure handling
 

@@ -45,6 +45,20 @@ check 'GMP version is 6.3.0 and cvc5 1.3.1' [ "$("$helper" get "$lock" gmp_versi
 check 'deployment target is 27.0' [ "$("$helper" get "$lock" deployment_target)" = 27.0 ]
 check 'the CaDiCaL and SymFPU digests are cvc5 1.3.1 URL_HASH values' [ "$("$helper" entries "$lock" dependency | cut -f5 | tr '\n' ' ')" = '15e1e82f7f9a9da0e97070cb8ac41d5b32139f65d54f72d2ff84849b0466ef92 823aa663fcc2f6844ae5e9ea83ceda4ed393cdb3dadefce9b3c7c41cd0f4f702 ' ]
 
+# ------------------------------------------------ F6: source date and patches
+check 'F6: source_date_epoch is the cvc5 1.3.1 commit time (2025-09-24T14:43:04Z)' [ "$("$helper" get "$lock" source_date_epoch)" = 1758724984 ]
+check 'F6: the lock names the cvc5 and cadical patches' [ "$("$helper" patches "$lock" | cut -f1,2 | tr '\t\n' ': ')" = 'cvc5-cadical-patch-step.patch:cvc5 cadical-build-header.patch:cadical ' ]
+check 'F6: every tracked patch matches its lock digest' "$helper" verify-patches "$lock" "$here/patches"
+check 'F6: patches/ holds only the locked patches' [ "$(ls "$here/patches" | tr '\n' ' ')" = 'cadical-build-header.patch cvc5-cadical-patch-step.patch ' ]
+changed() { grep -E '^[-+]' "$here/patches/$1" | grep -Ev '^(---|\+\+\+) '; }
+check 'F6: the cvc5 patch changes only cmake/FindCaDiCaL.cmake' [ "$(grep -E '^(---|\+\+\+) ' "$here/patches/cvc5-cadical-patch-step.patch" | tr '\n' ' ')" = '--- a/cmake/FindCaDiCaL.cmake +++ b/cmake/FindCaDiCaL.cmake ' ]
+check 'F6: the cvc5 patch only adds the CaDiCaL PATCH_COMMAND (no flag or option change)' [ "$(changed cvc5-cadical-patch-step.patch | grep -v '^+ *#' | tr '\n' '|')" = '+    PATCH_COMMAND /usr/bin/patch -p1 -t -N -F 0 -V none -i ${ASURA_CADICAL_PATCH}|' ]
+check 'F6: the CaDiCaL patch changes only scripts/make-build-header.sh' [ "$(grep -E '^(---|\+\+\+) ' "$here/patches/cadical-build-header.patch" | tr '\n' ' ')" = '--- a/scripts/make-build-header.sh +++ b/scripts/make-build-header.sh ' ]
+check 'F6: the CaDiCaL patch replaces only the DATE and OS lines' [ "$(changed cadical-build-header.patch | grep -v '^+#' | cut -c1-12 | tr '\n' '|')" = '-DATE="`date|-OS="`uname |+[ x"$SOURCE|+DATE="$(dat|+OS="`uname |' ]
+check 'F6: the patched header uses SOURCE_DATE_EPOCH and the fixed host asura-build, never uname -n' sh -c \
+    'p=$(grep "^+[^#+]" "$1"); printf "%s\n" "$p" | grep -Fq "date -u -r \"\$SOURCE_DATE_EPOCH\"" && printf "%s\n" "$p" | grep -Fq "\` asura-build \`" && ! printf "%s\n" "$p" | grep -Eq "uname -[a-z]*n"' \
+    sh "$here/patches/cadical-build-header.patch"
+
 # ------------------------------------------------ helper refusals
 mutate() { # OUT PYTHON-STATEMENT on variable d
     /usr/bin/python3 -I -c "import json,sys; d=json.load(open(sys.argv[1])); $2; json.dump(d, open(sys.argv[2], 'w'))" "$lock" "$1"
@@ -67,6 +81,29 @@ mutate "$t/pub.lock" 'd["publish"].append("cmake")'
 refuses 'publishing a build tool' 1 'not a source or dependency entry' "$helper" validate "$t/pub.lock"
 mutate "$t/lic.lock" 'd["licences"]["x.txt"] = ["gmp", "../COPYING"]'
 refuses 'a licence member with ..' 1 'relative member' "$helper" validate "$t/lic.lock"
+mutate "$t/epoch0.lock" 'd["source_date_epoch"] = 0'
+refuses 'F6: source_date_epoch 0' 1 'source_date_epoch must be a positive integer' "$helper" validate "$t/epoch0.lock"
+mutate "$t/epochs.lock" 'd["source_date_epoch"] = "1758724984"'
+refuses 'F6: source_date_epoch as a string' 1 'source_date_epoch must be a positive integer' "$helper" validate "$t/epochs.lock"
+mutate "$t/noepoch.lock" 'del d["source_date_epoch"]'
+refuses 'F6: no source_date_epoch' 1 'missing lock key: source_date_epoch' "$helper" validate "$t/noepoch.lock"
+mutate "$t/pentry.lock" 'd["patches"][0]["entry"] = "gmp"'
+refuses 'F6: a patch for another entry' 1 'the patch entry must be one of cadical, cvc5' "$helper" validate "$t/pentry.lock"
+mutate "$t/pdup.lock" 'd["patches"][1]["entry"] = "cvc5"'
+refuses 'F6: two patches for one entry' 1 'the patch entry must be one of cadical, cvc5' "$helper" validate "$t/pdup.lock"
+mutate "$t/pkey.lock" 'd["patches"][0]["fuzz"] = 2'
+refuses 'F6: an unknown patch key' 1 'a patch must hold exactly entry, file, sha256' "$helper" validate "$t/pkey.lock"
+mutate "$t/pname.lock" 'd["patches"][0]["file"] = "../x.patch"'
+refuses 'F6: a patch path outside patches/' 1 'bad or duplicate patch file' "$helper" validate "$t/pname.lock"
+mutate "$t/psha.lock" 'd["patches"][0]["sha256"] = "0" * 64'
+check 'F6: a lock with another patch digest still validates' "$helper" validate "$t/psha.lock"
+refuses 'F6: verify-patches: wrong digest' 1 'patch cvc5-cadical-patch-step.patch: SHA-256' "$helper" verify-patches "$t/psha.lock" "$here/patches"
+mkdir "$t/patches"
+cp "$here/patches/"*.patch "$t/patches/"
+printf ' ' >> "$t/patches/cadical-build-header.patch"
+refuses 'F6: verify-patches: a changed patch' 1 'patch cadical-build-header.patch: SHA-256' "$helper" verify-patches "$lock" "$t/patches"
+rm "$t/patches/cadical-build-header.patch"
+refuses 'F6: verify-patches: a missing patch' 1 'patch cadical-build-header.patch: not a regular file' "$helper" verify-patches "$lock" "$t/patches"
 
 printf 'abc' > "$t/file"
 good=$(shasum -a 256 "$t/file" | cut -d' ' -f1)
@@ -103,6 +140,55 @@ refuses 'archive: member outside the top level' 1 'member outside top' "$helper"
 refuses 'archive: link leaving the top level' 1 'link leaving top' "$helper" check-archive tar top "$t/link.tar.gz"
 refuses 'archive: link with an absolute target' 1 'absolute target' "$helper" check-archive tar top "$t/abslink.tar.gz"
 
+# ------------------------------------------------ F6: newest member time, build identity
+/usr/bin/python3 -I - "$t" <<'EOF'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1] + "/times.tar.gz", "w:gz") as tar:
+    for name, mtime in (("top/a", 1700000000), ("top/b", 1758724984), ("top/c", 1600000000)):
+        info = tarfile.TarInfo(name)
+        info.size, info.mtime = 1, mtime
+        tar.addfile(info, io.BytesIO(b"x"))
+EOF
+check 'F6: newest-mtime reports the newest member time' [ "$("$helper" newest-mtime "$t/times.tar.gz")" = 1758724984 ]
+cadical='Wed Sep 24 14:43:04 UTC 2025 Darwin asura-build 27.0.0 arm64'
+epoch=1758724984 day=1793761667 # 2026-11-04T03:07:47Z, the PL4a build day
+identity() { # NAME CONTENT: a package whose cvc5 holds CONTENT
+    mkdir -p "$t/id-$1/MacOS"
+    printf "$2" > "$t/id-$1/MacOS/cvc5" # \0 in CONTENT is a NUL byte
+}
+identity clean "x\0$cadical\0on Sep 24 2025 14:43:04\0"
+check 'F6: check-identity accepts the locked dates' "$helper" check-identity "$t/id-clean" "$epoch" "$cadical" "$day" "$day"
+identity cdate "x\0$cadical\0on Nov  4 2026 03:07:22\0"
+refuses 'F6: check-identity: the build day in the __DATE__ form' 1 'MacOS/cvc5 holds the build day in the __DATE__ form 1 times' \
+    "$helper" check-identity "$t/id-cdate" "$epoch" "$cadical" "$day" "$day"
+identity udate "x\0$cadical\0Wed Nov 4 03:07:47 GMT 2026 Darwin asura-build 27.0.0 arm64\0"
+refuses 'F6: check-identity: the build day in the date(1) form' 1 'MacOS/cvc5 holds the build day in the date form 1 times' \
+    "$helper" check-identity "$t/id-udate" "$epoch" "$cadical" "$day" "$day"
+identity none "x\0on Sep 24 2025 14:43:04\0"
+refuses 'F6: check-identity: no CaDiCaL DATE' 1 'holds the CaDiCaL build date 0 times' \
+    "$helper" check-identity "$t/id-none" "$epoch" "$cadical" "$day"
+identity twice "$cadical\0$cadical\0"
+refuses 'F6: check-identity: the CaDiCaL DATE twice' 1 'holds the CaDiCaL build date 2 times' \
+    "$helper" check-identity "$t/id-twice" "$epoch" "$cadical" "$day"
+mkdir -p "$t/id-other/licenses"
+cp -R "$t/id-clean/MacOS" "$t/id-other/"
+printf 'built Nov  4 2026\n' > "$t/id-other/licenses/x.txt"
+refuses 'F6: check-identity scans every package file' 1 'licenses/x.txt holds the build day' \
+    "$helper" check-identity "$t/id-other" "$epoch" "$cadical" "$day"
+check 'F6: check-identity accepts a build on the source day itself' "$helper" check-identity "$t/id-clean" "$epoch" "$cadical" "$epoch"
+refuses 'F6: check-identity: a non-numeric time' 2 'usage: check-identity' "$helper" check-identity "$t/id-clean" "$epoch" "$cadical" today
+
+# ------------------------------------------------ F6: host names (SG4-O1 needle)
+printf 'Wed Nov 4 03:07:47 GMT 2026 Darwin %s 27.0.0 arm64\0' "$(uname -n)" > "$t/uname-header.bin"
+s=$(status_of "$root/tools/release/host-paths" --repository "$root" "$t/uname-header.bin")
+if [ "$s" = 1 ] && grep -Fqx 'uname-header.bin: home 0, repository 0, user 0, host 1' "$t/out"; then
+    pass "F6: host-paths fails CaDiCaL's uname -srmn form with this Mac's host name"
+else
+    bad "F6: host-paths on the uname -srmn form: status $s: $(head -1 "$t/out")"
+fi
+printf '%s\0' "$cadical" > "$t/fixed-header.bin"
+check 'F6: host-paths passes the fixed host value asura-build' "$root/tools/release/host-paths" --repository "$root" "$t/fixed-header.bin"
+
 # ------------------------------------------------ script refusals
 build=$here/build
 refuses 'no --scratch' 2 '--scratch DIR is required' "$build"
@@ -118,6 +204,9 @@ refuses 'a cached file with a wrong digest, before any download' 1 'cached gmp-6
 check 'the mismatched cache file is kept and nothing else was fetched' \
     [ "$(ls -A "$t/s3/cache" | tr '\n' ' ')" = 'gmp-6.3.0.tar.bz2 ' ]
 check 'no work directory after a refusal' [ ! -e "$t/s3/work" ] && [ ! -e "$t/s3/solver" ]
+refuses 'F6: a patch that does not match the lock, before any download' 1 'preflight: a patch does not match the lock' \
+    "$build" --scratch "$t/s4" --lock "$t/psha.lock"
+check 'F6: nothing was fetched after the patch refusal' [ ! -e "$t/s4/cache" ] && [ ! -e "$t/s4/work" ]
 [ ! -e "$root/tools/solver-test" ] && pass 'the repository refusal wrote nothing' || bad 'the repository refusal wrote a directory'
 
 # ------------------------------------------------ notice and profile

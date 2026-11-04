@@ -1,0 +1,16 @@
+--- a/scripts/make-build-header.sh
++++ b/scripts/make-build-header.sh
+@@ -84,8 +84,11 @@
+ LC_TIME="C" # Avoid umlaut in 'DATE'.
+ export LC_TIME
+ # The time and date we compiled the CaDiCaL library.
+-DATE="`date 2>/dev/null|sed -e 's,  *, ,g'`"
+-OS="`uname -srmn 2>/dev/null`"
++# Asura: the time is SOURCE_DATE_EPOCH, not the build time, and the host
++# name is the fixed value asura-build, not 'uname -n'.
++[ x"$SOURCE_DATE_EPOCH" = x ] && die "SOURCE_DATE_EPOCH is not set"
++DATE="$(date -u -r "$SOURCE_DATE_EPOCH" 2>/dev/null|sed -e 's,  *, ,g')"
++OS="`uname -s 2>/dev/null` asura-build `uname -rm 2>/dev/null`"
+ DATE="`echo $DATE $OS|sed -e 's,^ *,,' -e 's, *$,,'`"
+ if [ x"$DATE" = x" " ]
+ then

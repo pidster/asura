@@ -3,14 +3,24 @@
 implementation contract: docs/designs/security-policy.md#lock-file).
 
     solver-lock validate LOCK
-    solver-lock get LOCK KEY                 gmp_version, cvc5_version, deployment_target
+    solver-lock get LOCK KEY                 gmp_version, cvc5_version, deployment_target,
+                                             source_date_epoch, sha256
     solver-lock entries LOCK [ROLE...]       name, file, url, bytes, sha256, top_level, version
+    solver-lock patches LOCK                 file, entry, sha256
     solver-lock licences LOCK                package file, entry, member
     solver-lock publish LOCK                 entry names published with each release
     solver-lock verify FILE BYTES SHA256
+    solver-lock verify-patches LOCK DIR      every patch in DIR matches its digest
     solver-lock check-archive tar|zip TOP_LEVEL FILE
+    solver-lock newest-mtime FILE            the newest member time of a tar archive
+    solver-lock check-identity PACKAGE EPOCH CADICAL_DATE TIME...
     solver-lock manifest PACKAGE LOCK
     solver-lock check-manifest PACKAGE
+
+check-identity (F6, BC10): MacOS/cvc5 holds CADICAL_DATE exactly once, and
+no package file holds the calendar day of any TIME (seconds since the epoch,
+in UTC and in local time) in the __DATE__ form ('Nov  4 2026') or the
+date(1) form ('Wed Nov 4 03:07:47 GMT 2026'), unless that day is EPOCH's.
 
 Lines are tab-separated. Exit 0 on success, 1 on a refusal (one line on
 standard error), 2 on a usage error. The helper reads archives only to list
@@ -22,9 +32,15 @@ import os
 import re
 import sys
 import tarfile
+import time
 import zipfile
 
-TOP_KEYS = {"format_version", "host", "gmp_version", "cvc5_version", "entries", "licences", "publish"}
+TOP_KEYS = {"format_version", "host", "gmp_version", "cvc5_version", "source_date_epoch", "patches",
+            "entries", "licences", "publish"}
+PATCH_KEYS = {"file", "entry", "sha256"}
+PATCH_ENTRIES = {"cvc5", "cadical"}
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 HOST_KEYS = {"os", "os_major", "arch", "deployment_target"}
 ENTRY_KEYS = {"name", "role", "file", "url", "bytes", "sha256", "top_level", "version"}
 ROLES = {"source", "dependency", "build-tool", "comparison"}
@@ -128,6 +144,78 @@ def validate(lock):
     for name in publish:
         if roles.get(name) not in ("source", "dependency"):
             refuse("publish names %r, which is not a source or dependency entry" % (name,))
+    epoch = lock["source_date_epoch"]
+    if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch <= 0:
+        refuse("source_date_epoch must be a positive integer")
+    patches = lock["patches"]
+    if not isinstance(patches, list):
+        refuse("patches must be a list")
+    patch_files, patch_entries = set(), set()
+    for patch in patches:
+        if not isinstance(patch, dict) or set(patch) != PATCH_KEYS:
+            refuse("a patch must hold exactly %s" % ", ".join(sorted(PATCH_KEYS)))
+        if not isinstance(patch["file"], str) or not NAME.match(patch["file"]) or patch["file"] in patch_files:
+            refuse("bad or duplicate patch file: %r" % (patch["file"],))
+        patch_files.add(patch["file"])
+        if patch["entry"] not in PATCH_ENTRIES or patch["entry"] not in names or patch["entry"] in patch_entries:
+            refuse("%s: the patch entry must be one of %s, once each" % (patch["file"], ", ".join(sorted(PATCH_ENTRIES))))
+        patch_entries.add(patch["entry"])
+        if not isinstance(patch["sha256"], str) or not SHA.match(patch["sha256"]):
+            refuse("%s: sha256 must be 64 lowercase hex digits" % patch["file"])
+
+
+def verify_patches(lock, directory):
+    for patch in lock["patches"]:
+        path = os.path.join(directory, patch["file"])
+        if not os.path.isfile(path) or os.path.islink(path):
+            refuse("patch %s: not a regular file" % patch["file"])
+        found = digest(path)
+        if found != patch["sha256"]:
+            refuse("patch %s: SHA-256 %s, the lock says %s" % (patch["file"], found, patch["sha256"]))
+
+
+def newest_mtime(path):
+    try:
+        with tarfile.open(path, "r:*") as archive:
+            times = [m.mtime for m in archive]
+    except (OSError, tarfile.TarError) as error:
+        refuse("%s: not a readable tar archive: %s" % (path, error))
+    if not times:
+        refuse("%s: empty archive" % path)
+    return int(max(times))
+
+
+def day_forms(seconds):
+    """The __DATE__ and date(1) forms of one calendar day, UTC and local."""
+    forms = set()
+    for when in (time.gmtime(seconds), time.localtime(seconds)):
+        month, day, year = MONTHS[when.tm_mon - 1], when.tm_mday, when.tm_year
+        forms.add(("__DATE__", ("%s %2d %d" % (month, day, year)).encode()))
+        forms.add(("date", ("%s %s %d [0-9]{2}:[0-9]{2}:[0-9]{2} [A-Za-z0-9+-]+ %d"
+                            % (DAYS[when.tm_wday], month, day, year)).encode()))
+    return forms
+
+
+def check_identity(package, epoch, cadical_date, times):
+    binary = os.path.join(package, "MacOS", "cvc5")
+    with open(binary, "rb") as handle:
+        count = handle.read().count(cadical_date.encode())
+    if count != 1:
+        refuse("MacOS/cvc5 holds the CaDiCaL build date %d times, not once" % count)
+    allowed = day_forms(epoch)
+    forbidden = set()
+    for seconds in times:
+        forbidden |= day_forms(seconds) - allowed
+    for rel in package_files(package) + [MANIFEST]:
+        path = os.path.join(package, rel)
+        if not os.path.isfile(path):
+            continue
+        with open(path, "rb") as handle:
+            data = handle.read()
+        for label, form in sorted(forbidden):
+            hits = len(re.findall(form if label == "date" else re.escape(form), data))
+            if hits:
+                refuse("%s holds the build day in the %s form %d times" % (rel, label, hits))
 
 
 def member_ok(member):
@@ -241,11 +329,15 @@ def main(argv):
         print(__doc__.strip(), file=sys.stderr)
         return 2
     command, args = argv[0], argv[1:]
-    arity = {"validate": 1, "get": 2, "licences": 1, "publish": 1, "verify": 3,
-             "check-archive": 3, "manifest": 2, "check-manifest": 1}
+    arity = {"validate": 1, "get": 2, "licences": 1, "publish": 1, "verify": 3, "patches": 1,
+             "verify-patches": 2, "check-archive": 3, "newest-mtime": 1, "manifest": 2, "check-manifest": 1}
     if command == "entries":
         if not args:
             print("solver-lock: usage: entries LOCK [ROLE...]", file=sys.stderr)
+            return 2
+    elif command == "check-identity":
+        if len(args) < 4 or not args[1].isdigit() or not all(a.isdigit() for a in args[3:]):
+            print("solver-lock: usage: check-identity PACKAGE EPOCH CADICAL_DATE TIME...", file=sys.stderr)
             return 2
     elif command not in arity or len(args) != arity[command]:
         print("solver-lock: usage error; run without arguments for help", file=sys.stderr)
@@ -260,6 +352,8 @@ def main(argv):
                 print(lock[key])
             elif key == "deployment_target":
                 print(lock["host"]["deployment_target"])
+            elif key == "source_date_epoch":
+                print(lock["source_date_epoch"])
             elif key == "sha256":
                 print(load(args[0])[1])
             else:
@@ -285,8 +379,19 @@ def main(argv):
                 print("solver-lock: verify FILE BYTES SHA256", file=sys.stderr)
                 return 2
             verify(*args)
+        elif command == "patches":
+            lock, _ = load(args[0])
+            for patch in lock["patches"]:
+                print("\t".join([patch["file"], patch["entry"], patch["sha256"]]))
+        elif command == "verify-patches":
+            lock, _ = load(args[0])
+            verify_patches(lock, args[1])
         elif command == "check-archive":
             check_archive(*args)
+        elif command == "newest-mtime":
+            print(newest_mtime(args[0]))
+        elif command == "check-identity":
+            check_identity(args[0], int(args[1]), args[2], [int(a) for a in args[3:]])
         elif command == "manifest":
             manifest(*args)
         elif command == "check-manifest":

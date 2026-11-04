@@ -1,0 +1,11 @@
+--- a/cmake/FindCaDiCaL.cmake
++++ b/cmake/FindCaDiCaL.cmake
+@@ -135,6 +135,8 @@
+     BUILD_IN_SOURCE ON
+     URL https://github.com/arminbiere/cadical/archive/${CaDiCaL_VERSION}.tar.gz
+     URL_HASH SHA256=${CaDiCaL_CHECKSUM}
++    # Asura: apply the locked build-header patch to the extracted archive.
++    PATCH_COMMAND /usr/bin/patch -p1 -t -N -F 0 -V none -i ${ASURA_CADICAL_PATCH}
+     CONFIGURE_COMMAND mkdir -p <SOURCE_DIR>/build
+     # avoid configure script, prepare the makefile manually
+     COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/makefile.in
