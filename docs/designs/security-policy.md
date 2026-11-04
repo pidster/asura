@@ -1079,7 +1079,7 @@ The package and build are in [the solver package](#solver-package-ad-17).
 | End | Normal: the admission worker closes standard input; cvc5 exits on end of input; the platform reaps it. Cancel, shutdown or a protocol fault: the platform sends `SIGKILL` at once and reaps. No grace time and no time limit exist |
 | Failure | Exit, a parse error reply, an unrecognised line or `unknown` refuses the candidate with `solver_failed` or `solver_unknown`. Nothing is retried automatically; the person may submit again |
 | Concurrency | One solver process at a time. Candidates wait in a FIFO of at most 16 with the reason `waiting: proving a policy change (N ahead)` |
-| Memory | No bound is selected. macOS does not enforce `RLIMIT_AS` for this use (unverified; probe SV-P6). The candidate bounds of step 1 limit the query size |
+| Memory | No bound is selected. macOS does not enforce `RLIMIT_AS` for this use (unverified; probe SV-P6, run by PL4a: [method](#sv-p6-method)). The candidate bounds of step 1 limit the query size |
 
 ### SP-S2: solver process
 
@@ -1665,13 +1665,13 @@ signing order) to match.
 
 | Item | Selected |
 | --- | --- |
-| Sources | cvc5 1.3.1 release source and GMP 6.3.0 source, each pinned by URL and SHA-256 in a tracked lock file `tools/release/solver/solver.lock`. Every dependency that the cvc5 build would download (CaDiCaL, SymFPU and others) is fetched by the script into a scratch cache from pinned URLs and digests first; the build then runs offline. Evidence missing: the exact dependency list of cvc5 1.3.1 and whether its CMake checks hashes (SV-B2) |
+| Sources | cvc5 1.3.1 release source and GMP 6.3.0 source, each pinned by URL and SHA-256 in a tracked lock file `tools/release/solver/solver.lock`. Every dependency that the cvc5 build would download (CaDiCaL and SymFPU, [probe SV-B2 evidence](solver-build-probes.md#build-results-sv-b1-sv-b2-evidence)) and every build tool that macOS does not supply (CMake, pyparsing, tomli) is fetched by the script into a scratch cache from pinned URLs and digests first; the build then runs offline. The [PL4a contract](#pl4a-implementation-contract) fixes the lock format and the list |
 | Licences of the build | cvc5 production build, with every GPL option off (no CLN, no GLPK) and without LibPoly (`--no-poly`, owner SBQ2, 2026-11-03). PL4a re-runs SV-P1 on the product corpus; if the answers differ from the upstream binary, the packet stops and reports to the owner |
 | GMP | GMP 6.3.0 built shared as `libgmp.10.dylib` with install name `@rpath/libgmp.10.dylib` (owner SBQ1, 2026-11-03). cvc5 links `libgmp` only, so `libgmpxx` is not shipped ([probe F3](solver-build-probes.md#findings-for-the-solver-adapter)). cvc5's own libraries stay static (BSD-3-Clause); only GMP is dynamic. The probe built this shape (SV-B1 evidence in [the probe](solver-build-probes.md#q5-the-built-solver-against-the-upstream-binary)) |
 | Probe findings F1 to F5 | Requirements of the PL4a build script and its adapter ([findings](solver-build-probes.md#findings-for-the-solver-adapter)): F1, pass `GMP_LIBRARIES` and `GMPXX_LIBRARIES` explicitly, exclude `/opt/homebrew`, and check that `otool -L cvc5` lists exactly `@rpath/libgmp.10.dylib`, `libc++` and `libSystem`; F2, check the GMP version against the lock file in the script; F3, ship one dylib; F4, the SymCC adapter reads standard output and standard error while it writes standard input, and a full output buffer refuses the candidate (`solver_failed`), never stalls the admission worker, with a stalled-solver case in PL-I6; F5, `(set-logic ALL)` is kept |
 | Toolchain | The owner's release Mac, arm64, the pinned Xcode clang, `MACOSX_DEPLOYMENT_TARGET=27.0` |
 | Host paths | The same `-ffile-prefix-map` maps and linker `-S` as the helper build ([build-host paths](release-signing.md#build-host-paths-sg4-o1)); the host-paths scanner covers cvc5 and every dylib |
-| Script | `tools/release/solver/build`: inputs the lock file and a scratch directory; output an unsigned package directory `solver/` with `MacOS/cvc5`, `Frameworks/libgmp*.dylib`, the licence files and a manifest of SHA-256 digests. The same output serves development tests (unsigned) and `asura-bundle` (signed) |
+| Script | `tools/release/solver/build`: inputs the lock file and a scratch directory; output a package directory `solver/` with `MacOS/cvc5`, `Frameworks/libgmp.10.dylib`, the licence files and a manifest of SHA-256 digests. The package is signed ad hoc, because arm64 macOS runs no unsigned Mach-O and `install_name_tool` invalidates the linker's signature ([PL4a contract](#pl4a-package)). The same output serves development tests (ad hoc) and `asura-bundle`, which signs it again with the release identity |
 
 ### Placement and signing
 
@@ -1764,6 +1764,363 @@ scanner rule before the notice ships.
 | Sandbox | cvc5 runs under the solver Seatbelt profile from the installed app (SV-P2) |
 | Proof gate | The admission test suite (SP-AQ1 to SP-AQ8 on the built-in sets and the seeded defects) passes with the bundled, signed cvc5 on the release build |
 | Licence folder | Present, sealed, and the files match the lock file's licence list |
+
+### PL4a implementation contract
+
+Selected, 2026-11-04. This section fixes the details that packet PL4a needs
+and that the sections above leave open. Where it narrows an earlier row, that
+row links here. PL4a changes no product code and no visible behavior: it adds
+an operator build tool, its probes and its records. Owner decisions applied:
+SBQ1 (GMP 6.3.0 as a replaceable `@rpath/libgmp.10.dylib` under LGPL-3.0,
+with the exact source, the build script, the licence texts and a notice
+published with each release), SBQ2 (`--no-poly`, subject to SV-P1 on the
+product corpus), the OQ3 legal position (no legal gate), AD-31 (OQ4: the
+solver's size is reported, with no limit) and AD-32 (OQ5: no replacement
+solver).
+
+#### What PL4a builds and what waits
+
+| Item | PL4a | Later packet |
+| --- | --- | --- |
+| Build | The lock file, the build script, its static checks and the package | PL4b signs the package with the release identity and places it in `Asura.app` |
+| Probes | SV-B1, SV-B2, SV-P1 (product corpus), SV-P2 (ad hoc copy), SV-P3 (ad hoc analogue), SV-P5, SV-P6 | SV-P3 with team signatures and SV-P4 notarisation: PL4b, in PL-N2 |
+| Notice | The notice template and the source-publication list | PL4b renders the notice, ships the licence folder and uploads the release assets |
+| Adapter | The F4 test design ([below](#f4-stalled-solver-tests-for-pl3)) | PL3 writes the adapter and the tests |
+
+#### Files
+
+All PL4a files are under `tools/release/solver/` (the packet's owned paths).
+
+| File | Purpose |
+| --- | --- |
+| `solver.lock` | The lock file: every download with its URL, size and SHA-256, the GMP version, the licence list and the publication list |
+| `solver-lock` | The lock helper (`/usr/bin/python3 -I`): validates the lock, verifies a file against an entry, checks an archive's member names, writes the package manifest |
+| `build` | The build script (POSIX `sh`) |
+| `test-build` | Static checks of the lock, the helper and the script's refusals; no network and no build |
+| `NOTICE.txt.in` | The notice template; `@VERSION@` is the Asura release version |
+| `solver.sb` | The SV-P2 candidate Seatbelt profile, with the parameter `SOLVER_DIR` |
+| `probe` | The probe runner: SV-P1, SV-P2, SV-P3, SV-P5 and SV-P6 on a built package |
+| `admission-probe/` | A Rust package with its own workspace and `Cargo.lock`: runs the product-corpus admission queries of SV-P1 against one solver command |
+| `memory-probe.c` | The SV-P6 fixture: a child that allocates under a resource limit |
+
+The root Cargo workspace does not build `admission-probe`, as for the
+policy engine spike. Its direct dependencies are pinned exactly to the
+versions that `asura-policy` and the spike use (`cedar-policy` 4.14.1,
+`cedar-policy-symcc` 0.8.1, `tokio` 1.54.1).
+
+#### Lock file
+
+`solver.lock` is JSON, `format_version` 1. The helper refuses any other
+version, an unknown key, a URL that is not `https://`, a digest that is not
+64 lowercase hex digits, a size that is not a positive integer, or a duplicate
+name.
+
+| Key | Content |
+| --- | --- |
+| `host` | `os` `macos`, `os_major` 27, `arch` `arm64`, `deployment_target` `27.0` |
+| `gmp_version` | `6.3.0`. The script checks the built GMP against it (F2) |
+| `cvc5_version` | `1.3.1`. The script checks `cvc5 --version` against it |
+| `entries` | One object per download: `name`, `role`, `file`, `url`, `bytes`, `sha256`, and `top_level` for a tar archive |
+| `licences` | Package file name to the entry and the member path it is copied from |
+| `publish` | The entry names that each release publishes as source |
+
+| Entry | Role | Version and source |
+| --- | --- | --- |
+| `cvc5` | `source` | cvc5 1.3.1 release tarball, 9,205,045 bytes, the digest in the [probe record](solver-build-probes.md#downloads) |
+| `gmp` | `source` | GMP 6.3.0 `.tar.bz2`, 2,643,888 bytes |
+| `cadical` | `dependency` | CaDiCaL `rel-2.1.3-elevate`, 732,469 bytes; the digest equals cvc5's `URL_HASH` |
+| `symfpu` | `dependency` | SymFPU `e6ac3af9`, 37,558 bytes; the digest equals cvc5's `URL_HASH` |
+| `cmake` | `build-tool` | The CMake 4.4.4 wheel from PyPI (universal2), 54,404,900 bytes |
+| `pyparsing` | `build-tool` | The pyparsing 3.3.3 wheel, 126,420 bytes |
+| `tomli` | `build-tool` | The tomli 2.5.0 wheel, 14,765 bytes, digest `32a7b79ac57a2e83670ce329ccf675798bc5a2094783a63676866b70503f2e2b` from the PyPI JSON API. cvc5's option generator needs it on Python before 3.11, and the build uses Apple's `/usr/bin/python3` (3.9.6) |
+| `cvc5-upstream` | `comparison` | The upstream `cvc5-macOS-arm64-static.zip`, 35,012,495 bytes, the [spike digest](policy-engine-spike.md#downloads-and-installed-tools). Only `probe` fetches it, into its own scratch directory; `build` never reads it |
+
+#### Build script
+
+Interface: `tools/release/solver/build --scratch DIR [--lock FILE] [--jobs N]`.
+`DIR` must be an absolute path outside the repository. `--lock` defaults to
+the tracked lock. `--jobs` defaults to `sysctl -n hw.ncpu`. Exit status 0
+means the package and every check passed; 1 means a stage failed, with one
+line `solver-build: STAGE: reason`; 2 means a usage error, before any file is
+written. The script writes only under `DIR`.
+
+| Directory | Rule |
+| --- | --- |
+| `DIR/cache` | Downloads. Kept between runs. A cached file is used only when its size and digest match the lock |
+| `DIR/work` | Sources, the Python environment, build trees and logs. Removed and created again at each run |
+| `DIR/solver` | The package. The script refuses to start when it exists |
+
+| Stage | Network | Work | Ends when |
+| --- | --- | --- | --- |
+| `preflight` | — | macOS 27 or later on arm64; the tools in `/usr/bin` (`clang`, `make`, `m4`, `curl`, `shasum`, `tar`, `unzip`, `otool`, `install_name_tool`, `codesign`, `sandbox-exec`, `python3`); the lock validates; `DIR` is usable | Every condition holds, or the first refusal |
+| `fetch` | Yes | First every cached file is verified; a cached file whose digest differs refuses the run (the operator removes it), so nothing is replaced silently. Then each missing entry except `comparison` is fetched with `curl --proto =https --proto-redir =https --tlsv1.2 --max-filesize BYTES` to a partial file, verified, then renamed | Every entry is cached and verified, or the first failure. A failed file is deleted |
+| `offline` | **Denied** | The script runs itself again under `sandbox-exec` with `(version 1)(allow default)(deny network*)`. Every later stage runs there, so a hidden download fails the build (SV-B2) | The child's exit |
+| `verify` | Denied | Every cached file is verified again | All match, or the first mismatch |
+| `unpack` | Denied | Each tar archive is listed first; each member must lie under the entry's `top_level` with no absolute path and no `..` component. Then it is extracted into a new, empty directory | All archives are extracted, or the first refusal |
+| `tools` | Denied | `/usr/bin/python3 -m venv`, then `pip install --no-index --no-deps` of the three wheels from the cache. `cmake --version` must report the locked version | The check passes |
+| `gmp` | Denied | `configure --enable-shared --disable-static --enable-cxx --with-pic`; `make`; `make check` (GMP's test suite: zero failures required); `make install`. Then the F2 check: a C program compiled against the installed `gmp.h` and linked to the built dylib prints `__GNU_MP_VERSION` and `gmp_version`; both must equal `gmp_version`. Then `install_name_tool -id @rpath/libgmp.10.dylib` and an ad hoc signature | Every step passes |
+| `cvc5` | Denied | The CaDiCaL and SymFPU archives are copied into cvc5's external-project download directory (`deps/src`), where its own `URL_HASH` check accepts them without a download. `configure.sh production --static --no-poly --no-pyvenv --no-auto-download` with the F1 arguments: `-DGMP_LIBRARIES` and `-DGMPXX_LIBRARIES` naming the built dylibs and `-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local;/opt/local`. Then `make` and `make install` | Every step passes |
+| `package` | Denied | Lay out the package (below), copy the licence texts named by the lock, sign ad hoc, write `manifest.json` | Done |
+| `checks` | Denied | The build checks below | Every check passes, or the first failure |
+
+Environment of every build step: `env -i` with `PATH` set to the Python
+environment, `/usr/bin`, `/bin`, `/usr/sbin` and `/sbin`; `HOME` and
+`TMPDIR` inside `DIR/work`; `MACOSX_DEPLOYMENT_TARGET=27.0`; and no `CFLAGS`,
+`CPATH`, `LIBRARY_PATH`, `PKG_CONFIG_PATH` or `CMAKE_PREFIX_PATH` from the
+operator. The compiler is `/usr/bin/clang` and `/usr/bin/clang++` (the
+selected Xcode).
+
+Compiler and linker flags (SG4-O1):
+
+| Build | Flags |
+| --- | --- |
+| GMP | `CFLAGS="-O2 -std=gnu99 -ffile-prefix-map=DIR=/solver -fdebug-prefix-map=DIR=/solver"` (`-std=gnu99` as cvc5 sets it, because GMP 6.3.0's configure fails under C23); the same maps in `CXXFLAGS`; `LDFLAGS=-Wl,-S`; `MAKEINFO=true` |
+| cvc5 | `CFLAGS` and `CXXFLAGS` with the same two maps; `LDFLAGS="-Wl,-S -Wl,-rpath,@executable_path/../Frameworks"` |
+
+The probe found that cvc5 builds CaDiCaL with its own fixed flags, which do
+not include the operator's flags. The `checks` stage therefore scans for the
+scratch path itself, as well as for the SG4-O1 needles, so a path that
+CaDiCaL embeds fails the build instead of passing unnoticed.
+
+The script makes no bit-for-bit reproducibility claim. It pins every input,
+the flags and the tools; the build ID, CaDiCaL's build header (compiler,
+date) and the ad hoc signature can still differ between builds.
+
+#### PL4a package
+
+```text
+solver/
+  MacOS/cvc5                     ad hoc, identifier org.pidster.asura.cvc5
+  Frameworks/libgmp.10.dylib     ad hoc, identifier org.pidster.asura.gmp, install name @rpath/libgmp.10.dylib
+  licenses/                      cvc5-COPYING.txt, gmp-COPYING.LESSERv3.txt, gmp-COPYINGv3.txt,
+                                 cadical-LICENSE.txt, symfpu-LICENSE.txt, minisat-LICENSE.txt
+  manifest.json                  SHA-256 and size of every other file; the lock's SHA-256
+```
+
+`libgmpxx` is built, because cvc5's CMake requires it at configure time, but
+it is not packaged (F3). `NOTICE.txt` is not in the package: PL4b renders it
+from the template with the release version.
+
+#### Build checks
+
+| ID | Check | Pass condition |
+| --- | --- | --- |
+| BC1 | `otool -L MacOS/cvc5` (F1) | Exactly `@rpath/libgmp.10.dylib`, `/usr/lib/libc++.1.dylib` and `/usr/lib/libSystem.B.dylib` |
+| BC2 | `otool -l` load commands of `cvc5` | Exactly one `LC_RPATH`, `@executable_path/../Frameworks`; `LC_BUILD_VERSION` platform macOS, minimum 27.0 |
+| BC3 | `otool -D` of the dylib | `@rpath/libgmp.10.dylib`; its own dependencies are `libSystem` only |
+| BC4 | `cvc5 --show-config` and `--version` | Version 1.3.1; `gmp` yes; `poly`, `cln`, `glpk`, `cocoa`, `editline`, `kissat` and `cryptominisat` no; GPL not permitted; LGPL list GMP only |
+| BC5 | Signatures | `codesign --verify --strict` passes for the dylib and `cvc5`; both are ad hoc with the identifiers above |
+| BC6 | Host paths (SV-P5) | `tools/release/host-paths` finds nothing in the package, and no file holds the scratch path `DIR` |
+| BC7 | Smoke query | `cvc5 --lang smt` answers `sat` to a nonlinear integer query, run from the package |
+| BC8 | Licences and manifest | The `licenses/` files are exactly the lock's list; the manifest digests match the files |
+| BC9 | GMP test suite | `make check` reported no failure (stage `gmp`) |
+
+The script prints the size of `cvc5` and of the dylib (AD-31: reported, no
+limit).
+
+#### PL4a-F1: build stages
+
+Selected design. Arrows show the next stage; labelled arrows show a result.
+Every refusal ends the run with status 1 and leaves no package.
+
+```mermaid
+flowchart TD
+    Pre["preflight: host, tools, lock, DIR"] -->|"Refused"| Stop["Exit 1, no package"]
+    Pre --> Cache{"Every cached file matches the lock?"}
+    Cache -->|"No"| Stop
+    Cache -->|"Yes"| Fetch["fetch: missing entries with curl, size bound; verify; rename"]
+    Fetch -->|"Size or digest mismatch"| Stop
+    Fetch --> Off["offline: sandbox-exec deny network*"]
+    Off --> Ver["verify all cached files again"]
+    Ver --> Unp["unpack: member names checked, new directories"]
+    Unp -->|"Member outside top level"| Stop
+    Unp --> Tools["tools: venv, pip --no-index, CMake version"]
+    Tools --> Gmp["gmp: configure, make, make check, install"]
+    Gmp -->|"Test failure"| Stop
+    Gmp --> F2{"F2: built GMP version equals the lock?"}
+    F2 -->|"No"| Stop
+    F2 -->|"Yes"| Id["Install name @rpath, ad hoc sign"]
+    Id --> Cv["cvc5: deps archives in deps/src; configure --static --no-poly with F1 arguments; make"]
+    Cv --> Pkg["package: layout, licences, ad hoc signatures, manifest"]
+    Pkg --> Chk{"BC1 to BC9 pass?"}
+    Chk -->|"No"| Stop
+    Chk -->|"Yes"| Done["Exit 0: package and sizes reported"]
+```
+
+#### Probes
+
+`tools/release/solver/probe --package DIR/solver --scratch DIR2` runs the
+probes on a built package. `DIR2` must be absolute, outside the repository,
+and must not exist. It fetches `cvc5-upstream` into `DIR2` with the lock's
+size bound and digest, and unpacks it after the member check. It prints one
+`PASS`, `FAIL` or `PENDING` line per case and exits 1 when any case fails.
+
+| Probe | Method | Pass condition |
+| --- | --- | --- |
+| SV-B1 | `build` completes; BC1 to BC4 | cvc5 1.3.1 links static cvc5 libraries and the shared GMP only |
+| SV-B2 | The `offline` stage | Every build stage after `fetch` succeeds under `(deny network*)`; the lock lists every download; cvc5's external-project logs show no download |
+| SV-P1 product | `admission-probe` with the product corpus (below), once with the upstream binary and once with the package's `cvc5`, each as `<cvc5> --lang smt` | Each query has the same result (holds, refuted or failed) with both solvers; the solvers' `sat`, `unsat` and `unknown` counts are equal; every result is the expected one |
+| SV-P1 spike | The spike's `admission` binary through a recording wrapper that runs `<cvc5> --lang smt` only, once per solver; then the spike's `admission` test with the package's `cvc5` | Every solver query has the same answer, matched by the digest of its sorted lines (as in the probe); both runs report 0 unexpected results; the test passes |
+| SV-P2 | The package is copied into a new directory under `DIR2`, as the platform will copy it into its run directory. `admission-probe` runs with `sandbox-exec -f solver.sb -D SOLVER_DIR=<copy> <copy>/MacOS/cvc5 --lang smt` | The results equal the unsandboxed run; under the same profile, cvc5 cannot create a file through `(set-option :regular-output-channel "<path>")`, and `/bin/sh` cannot start |
+| SV-P3 (ad hoc analogue) | Copies signed ad hoc with the Hardened Runtime flag (`codesign -o runtime -s -`): (a) the package layout; (b) a copy directory elsewhere; (c) a replaced, interface-compatible GMP (a copy changed by `install_name_tool` and signed ad hoc again), per the LGPL §4(d)(1) mechanism; (d) an unsigned GMP | (a) to (c) answer the smoke query and `DYLD_PRINT_LIBRARIES` names the copy's GMP; (d) does not start. The team-signed case stays `PENDING` for PL4b |
+| SV-P4 | No submission | `PENDING`: Apple's notary service has no offline mode, so the check needs a submission (PL4b) |
+| SV-P5 | `host-paths` and the scratch-path scan on the package | No finding |
+| SV-P6 | `memory-probe` (below); peak footprint of cvc5 on the product corpus from `/usr/bin/time -l` | The record states which limits macOS 27 enforces on a child, and the peak footprint of the corpus run |
+
+`probe` builds `admission-probe` and the spike with `cargo build --offline
+--locked` into `DIR2`. When a crate is not in the local Cargo cache, the run
+stops and reports it; it does not download crates.
+
+#### SV-P1 product corpus
+
+The product corpus is the PL1 built-in sets plus the spike corpus. The spike
+corpus runs through the spike's own harness (above). `admission-probe` runs
+these queries on the product schema `asura-policy/1`
+(`rust/crates/asura-policy/schema/asura.cedarschema`) and the built-in texts
+(`policies/installation.cedar`, `user-default.cedar`, and the test-only
+`installation-test-deny.cedar`). `I` is the installation set, `I0` is `I`
+without its `@intent` forbids, `U` is the default user set, and `T` is the
+test-only forbid. Every query runs once for each request environment of
+`Schema::request_envs` that the policy's action admits, with no time limit.
+
+| ID | Query | Expected |
+| --- | --- | --- |
+| PA1 | `check_never_errors` on each forbid of `I` and `T` | Holds |
+| PA1s | `check_never_errors` on two seeded forbids that can error: `context.port + 9223372036854775807 > 0` (overflow) and `context.now.offset(duration("9223372036854775807ms")) > context.now` | Refuted |
+| PA3 | `check_implies(I, I0)` and `check_implies(I + T, I)` (tighten-only, SP-AQ3) | Holds |
+| PA4 | `check_implies(I, S_k)` for S1 to S6 of the [safety list](#safety-specifications), each `S_k` written as "permit all, then forbid the property" | Holds |
+| PA4s | `check_implies(I - s3.model_network, S3)`: the installation set without its S3 forbid | Refuted |
+| PA8 | `check_implies(U + narrow, U)` with a narrowing forbid, and `check_implies(U + wide, U)` with a permit of `file.write` under `/etc` (SP-AQ8) | Holds, then refuted |
+
+The probe prints one line per query (`category`, `id`, environment, result)
+in a fixed order, then the solver's answer counts. Timing goes to a separate
+line type that the comparison ignores. It exits 0 when every result is the
+expected one, 1 when any is not, and 2 when the solver cannot start. It
+reaches the solver only through `LocalSolver::from_command` with the given
+argument vector, so it passes no `--tlimit`.
+
+#### SV-P2 candidate profile
+
+`solver.sb` is the candidate for the profile that PL3's platform owner
+renders. PL3 takes over its rules; PL4a records only that cvc5 runs under it.
+
+```text
+(version 1)
+(deny default)
+(allow process-exec (literal (string-append (param "SOLVER_DIR") "/MacOS/cvc5")))
+(allow file-read* file-map-executable (subpath (param "SOLVER_DIR")) (subpath "/usr/lib") (subpath "/System"))
+(allow file-read-metadata (literal "/") ...)    ; the runtime set: ancestors and the fixed literals
+(allow file-read* (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom"))
+(allow sysctl-read)
+```
+
+The final rule list is the one that the probe shows to be needed; the
+delivery record lists it. A rule that cvc5 does not need is left out.
+
+#### SV-P6 method
+
+`memory-probe LIMIT MIB CHUNKS` forks a child. The child sets one limit
+(`none`, `as`, `data` or `rss`) to `MIB` MiB with `setrlimit`, then allocates
+and touches `CHUNKS` blocks of 64 MiB (at most 32, so at most 2 GiB). It
+prints one line per block, then waits on its standard input. The parent reads
+the child's `ri_phys_footprint` with `proc_pid_rusage`, closes the pipe, reaps
+the child and prints its status and `ru_maxrss`. The probe ends by the
+child's last block and the closed pipe; it has no timer.
+
+#### F4: stalled-solver tests for PL3
+
+Required behavior for PL3 (the adapter does not exist yet). The adapter in
+`asura-policy-admission` implements SymCC's `Solver` trait over the pipes that
+`asura-platform::solver` hands it. It writes a query while it reads standard
+output and standard error, so neither process can wait on a full pipe. These
+cases join PL-I11 in PL3's validation. Each uses a test solver executable,
+started by the real platform owner with real pipes.
+
+| ID | Initial state | Trigger | Required result |
+| --- | --- | --- | --- |
+| SA-T1 | One candidate in admission; the fixture reads its input and never answers | Admission starts; then the person cancels | The candidate waits with its reason; decisions continue under the active revision; cancel sends `SIGKILL`; the fixture is reaped; the candidate is not admitted (PL-I11) |
+| SA-T2 | The fixture writes 1 MiB to standard output before it reads any input, as Z3 did | The adapter writes a query of 4 MiB | The write completes because the adapter keeps reading; the unrecognised output refuses the candidate `solver_failed`; the fixture is killed and reaped; the admission worker takes the next candidate |
+| SA-T3 | The fixture writes 1 MiB to standard error, then answers correctly | The adapter writes a query of 4 MiB | The query completes with the fixture's answer; the adapter keeps the first 64 KiB of standard error and discards the rest |
+| SA-T4 | The fixture answers `sat` and then a model line of more than 1 MiB | A query that asks for a model | The adapter stops reading at the 1 MiB bound and refuses `solver_failed`; the fixture is killed and reaped |
+| SA-T5 | The fixture exits after reading half of a query | The adapter writes the query | The broken pipe or end of output refuses `solver_failed`; the exit status is recorded; no retry |
+| SA-T6 | A query over the 64 MiB input bound | Admission prepares the query | Refused `solver_failed` before any byte is written |
+| SA-T7 | SA-T2 while 64 decision requesters run | As SA-T2 | Decision p99 stays within PL-B2; the reactor and Inspect stay within 100 ms (PL-I10) |
+
+Unit: the adapter's line reader and bounds with in-memory streams. Integration:
+SA-T1 to SA-T7 with the fixture. End to end: PL-E3 with a fixture that stalls,
+then a cancel from the TUI.
+
+#### PL4a-Q1: SA-T2 pipe handling
+
+Selected design for PL3. Arrows are reads, writes and signals over the three
+pipes.
+
+```mermaid
+sequenceDiagram
+    participant W as Admission worker (adapter)
+    participant P as asura-platform::solver
+    participant S as Test solver fixture
+    W->>P: Start solver
+    P->>S: posix_spawn with three pipes
+    S-->>W: 1 MiB on standard output before reading
+    par Writer
+        W->>S: Query bytes on standard input (4 MiB)
+    and Reader
+        S-->>W: Output lines, drained continuously
+        S-->>W: Standard error, first 64 KiB kept
+    end
+    W->>W: Unrecognised line: refuse solver_failed
+    W->>P: Kill
+    P->>S: SIGKILL
+    P->>P: Reap child
+    P-->>W: Reaped, status recorded
+    W->>W: Take the next candidate
+```
+
+#### Source publication and notice
+
+Each release publishes as GitHub release assets, beside the DMG and for as
+long as that DMG is offered: the `publish` entries of the lock (the cvc5,
+GMP, CaDiCaL and SymFPU archives, byte-identical to the cache), and the
+`tools/release/solver/` directory of the release commit (the build script,
+the lock, the helper and the notice template). PL4b uploads them; PL4a only
+lists them. The build-tool wheels and the comparison binary are not
+published.
+
+`NOTICE.txt.in` holds the fixed notice text above with one change: the
+release location reads "the assets of release v@VERSION@ of the GitHub
+repository pidster/asura". That form names no `/<user>` path component, so it
+passes the SG4-O1 rule (`host-paths` treats the user name alone as a near
+miss).
+
+#### Asynchronous execution and limits
+
+The script and the probes are operator tools. They run on the release Mac,
+one at a time, and are never part of the service.
+
+| Rule | Application |
+| --- | --- |
+| AE-02 | Blocking calls (`curl`, `tar`, `make`, `codesign`, cvc5 runs) run in the operator's shell, one at a time |
+| AE-03 | Each download is bounded by the lock's size (`--max-filesize`); `make` uses `--jobs` processes; `memory-probe` allocates at most 2 GiB |
+| AE-04 | No time bound. Each step ends by its completion or by the operator's interrupt. No solver run has `--tlimit` or `--rlimit` |
+| AE-06 | An interrupt leaves `DIR/work` partial and no `DIR/solver`; the next run removes `DIR/work` and starts again. The cache keeps only verified files |
+
+#### Security
+
+- Every download is untrusted until its size and digest match the lock.
+  Archives are extracted only after the member check, into new directories.
+- The build runs as the operator, with no `sudo`, no Homebrew and no network
+  after `fetch`. It reads no keychain and signs ad hoc only.
+- The probes write only under `DIR2`. They never read `~/.asura`. The SV-P2
+  copy stands in for the platform's run directory.
+
+#### PL4a validation map
+
+| Layer | Evidence |
+| --- | --- |
+| Unit | `test-build --static`: the tracked lock validates and holds the designed entries, licences and publication list; the helper refuses a bad format version, an unknown key, a non-`https` URL, a bad digest and a duplicate name; it refuses a file with a wrong size or digest; the archive check refuses an absolute member, a `..` member and a member outside the top level; the script refuses no `--scratch`, a relative path, a path inside the repository, an existing `DIR/solver`, an unknown option and a cached file with a wrong digest (before any download) |
+| Integration | `build` on the release Mac: every stage and BC1 to BC9 |
+| End to end | `probe`: SV-P1 on the product and spike corpora through the package's `cvc5`; SV-P2 under the profile from a copy; SV-P3, SV-P5 and SV-P6; the spike's admission test with the package's `cvc5` |
 
 ## Failure handling
 
