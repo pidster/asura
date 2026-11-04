@@ -21,7 +21,12 @@ fn intent() -> Intent {
         source: IntentSource::ModelTool,
         name: "exec_cmd".into(),
         digest: "ab".repeat(32),
+        command: None,
     }
+}
+/// The entry program as PL1 knew it: unidentified.
+fn sh() -> ProgramRef {
+    ProgramRef::unidentified(PathRef::ordinary("/bin/sh"))
 }
 fn entry(principal: JobPrincipal, intent: Option<Intent>) -> Request {
     Request {
@@ -336,7 +341,14 @@ fn pl_u4_seeded_defects_are_refused() {
         text: "@id(\"p\") @reason(\"r\")\npermit (principal, action, resource);".into(),
     });
     assert!(Engine::build(&texts).is_err());
+    // A forbid of every action also forbids person network: the AD-7
+    // load check (PL2) refuses it.
     texts.scopes[2].text = ok.into();
+    let error = Engine::build(&texts).err().expect("AD-7 load check");
+    assert!(error.messages[0].contains("AD-7"));
+    texts.scopes[2].text =
+        "@id(\"x\") @reason(\"r\")\nforbid (principal, action == Asura::Action::\"process.exec\", resource);"
+            .into();
     let engine = Engine::build(&texts).unwrap();
     assert_eq!(
         engine.policy_ids(Scope::Workspace),
@@ -370,8 +382,12 @@ fn pl_u5_scope_combinations() {
     assert_eq!(d.primary.as_ref().unwrap().scope, Some(Scope::Installation));
     assert_eq!(reason(&d), "i_reason");
     assert_eq!(d.scopes[1].rules, ["user:u".to_owned()]);
-    // A user scope with no permit: no_permit in the user scope.
-    let d = Engine::build(&user("")).unwrap().decide(&request);
+    // A user scope with no exec permit: no_permit in the user scope. (An
+    // empty user scope fails the AD-7 load check, so it keeps the person
+    // network permit.)
+    assert!(Engine::build(&user("")).is_err());
+    let network = "@id(\"person.network\") @reason(\"person_network\")\npermit (principal, action == Asura::Action::\"network.connect\", resource);";
+    let d = Engine::build(&user(network)).unwrap().decide(&request);
     assert_eq!(d.primary.as_ref().unwrap().scope, Some(Scope::User));
     assert_eq!(reason(&d), "no_permit");
     // Without a user text only the installation scope is evaluated, and
@@ -502,7 +518,7 @@ fn pl_u7_denied_roots_drop_out_and_base_needs_refuse() {
         assert!(!d.allow);
         let p = d.primary.unwrap();
         assert_eq!((p.scope, p.reason.as_str()), (None, "cannot_enforce"), "{text}");
-        let outcome = decide_model1_job(&engine, &principal(), None, NOW, None);
+        let outcome = decide_model1_job(&engine, &principal(), &sh(), None, NOW, None);
         assert_eq!(reason(&outcome.decision), "cannot_enforce");
         assert!(outcome.regions.is_none());
     }
@@ -510,19 +526,26 @@ fn pl_u7_denied_roots_drop_out_and_base_needs_refuse() {
 #[test]
 fn job_decision_digests_and_cache() {
     let engine = builtin();
-    let a = decide_model1_job(&engine, &principal(), Some(&intent()), NOW, None);
+    let a = decide_model1_job(&engine, &principal(), &sh(), Some(&intent()), NOW, None);
     assert!(a.decision.allow);
     assert_eq!(a.regions, Some(Regions::template()));
-    let cached = decide_model1_job(&engine, &principal(), Some(&intent()), NOW + 5, a.regions);
+    let cached = decide_model1_job(
+        &engine,
+        &principal(),
+        &sh(),
+        Some(&intent()),
+        NOW + 5,
+        a.regions,
+    );
     assert_eq!(cached.request_digest, a.request_digest);
     assert_eq!(cached.resource_digest, a.resource_digest);
     let mut other = intent();
     other.digest = "cd".repeat(32);
-    let b = decide_model1_job(&engine, &principal(), Some(&other), NOW, a.regions);
+    let b = decide_model1_job(&engine, &principal(), &sh(), Some(&other), NOW, a.regions);
     assert_ne!(b.request_digest, a.request_digest);
     assert_ne!(b.intent_digest, a.intent_digest);
     assert!(
-        decide_model1_job(&engine, &principal(), None, NOW, None)
+        decide_model1_job(&engine, &principal(), &sh(), None, NOW, None)
             .intent_digest
             .is_none()
     );
@@ -532,7 +555,14 @@ fn job_decision_digests_and_cache() {
         "@id(\"d\") @reason(\"narrow\")\nforbid (principal is Asura::Job, action == Asura::Action::\"process.exec\", resource) when { resource.path == Asura::Path::\"/bin/sh\" };",
     ))
     .unwrap();
-    let d = decide_model1_job(&denying, &principal(), None, NOW, Some(Regions::template()));
+    let d = decide_model1_job(
+        &denying,
+        &principal(),
+        &sh(),
+        None,
+        NOW,
+        Some(Regions::template()),
+    );
     assert!(!d.decision.allow && d.regions.is_none());
     assert_eq!(reason(&d.decision), "narrow");
 }
@@ -603,7 +633,7 @@ fn test_deny_set_refuses_the_model_entry_in_the_installation_scope() {
     let texts = RevisionTexts::builtin_test_deny();
     assert_ne!(texts.digest(), RevisionTexts::builtin().digest());
     let engine = Engine::build(&texts).unwrap();
-    let outcome = decide_model1_job(&engine, &principal(), Some(&intent()), NOW, None);
+    let outcome = decide_model1_job(&engine, &principal(), &sh(), Some(&intent()), NOW, None);
     assert!(!outcome.decision.allow && outcome.regions.is_none());
     let p = outcome.decision.primary.unwrap();
     assert_eq!(p.scope, Some(Scope::Installation));

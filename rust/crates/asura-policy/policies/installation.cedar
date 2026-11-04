@@ -84,3 +84,66 @@ when { principal.origin == Asura::Origin::"model" && !context.via_proxy };
 @explain("model commands never receive a named secret")
 forbid (principal is Asura::Job, action == Asura::Action::"secret_use", resource)
 when { principal.origin == Asura::Origin::"model" };
+
+// PL2 (security-policy.md, built-in set additions in PL2): person jobs.
+
+@id("person.entry") @reason("person_entry")
+permit (principal is Asura::Job, action == Asura::Action::"process.exec", resource is Asura::Program)
+when {
+  principal.origin == Asura::Origin::"person_typed" &&
+  (principal.profile == Asura::Profile::"person-1" ||
+   principal.profile == Asura::Profile::"person-outside-1") &&
+  resource.path == Asura::Path::"/bin/sh"
+};
+
+@id("person.network") @reason("person_network")
+permit (principal is Asura::Job, action == Asura::Action::"network.connect", resource)
+when {
+  principal.origin == Asura::Origin::"person_typed" &&
+  (principal.profile == Asura::Profile::"person-1" ||
+   principal.profile == Asura::Profile::"person-outside-1")
+};
+
+@id("person.secret") @reason("person_secret")
+permit (principal is Asura::Job, action == Asura::Action::"secret_use", resource is Asura::Secret)
+when {
+  principal.origin == Asura::Origin::"person_typed" &&
+  (principal.profile == Asura::Profile::"person-1" ||
+   principal.profile == Asura::Profile::"person-outside-1") &&
+  context.delivery == Asura::Delivery::"raw"
+};
+
+// PL2 hard forbids that state the person environment rules (PE-R1) and the
+// outside switch; the environment builder and the guardian enforce them.
+
+@id("person.env_terminal") @reason("env_not_allowed") @hard("true")
+@explain("person commands receive only the listed terminal variables")
+forbid (principal is Asura::Job, action in Asura::Action::"process.exec.any", resource is Asura::Program)
+when {
+  principal.origin == Asura::Origin::"person_typed" &&
+  !([
+     "LANG", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES",
+     "LC_MONETARY", "LC_NUMERIC", "LC_TIME", "SSH_AUTH_SOCK", "TZ",
+     "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "CARGO_HOME",
+     "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "CARGO_TARGET_DIR", "DEVELOPER_DIR", "SDKROOT",
+     "TOOLCHAINS", "HOMEBREW_PREFIX", "HOMEBREW_CELLAR", "HOMEBREW_REPOSITORY", "GOPATH",
+     "GOROOT", "GOMODCACHE", "GOCACHE", "NVM_DIR", "VOLTA_HOME",
+     "PNPM_HOME", "BUN_INSTALL", "PYENV_ROOT", "VIRTUAL_ENV", "CONDA_PREFIX",
+     "JAVA_HOME", "RBENV_ROOT", "GEM_HOME", "GEM_PATH"
+   ].containsAll(context.env_terminal))
+};
+
+@id("person.env_declared") @reason("env_not_allowed") @hard("true")
+@explain("person commands receive only the project's declared variables")
+forbid (principal is Asura::Job, action in Asura::Action::"process.exec.any", resource is Asura::Program)
+when {
+  principal.origin == Asura::Origin::"person_typed" &&
+  !principal.project.declared_env.containsAll(context.env_declared)
+};
+
+@id("person.outside_switch") @reason("outside_sandbox_off") @hard("true")
+@explain("commands outside the sandbox need the allowOutsideSandbox setting")
+forbid (principal is Asura::Job, action in Asura::Action::"process.exec.any", resource is Asura::Program)
+when {
+  principal.profile == Asura::Profile::"person-outside-1" && !context.outside_switch
+};

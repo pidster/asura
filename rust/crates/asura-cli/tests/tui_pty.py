@@ -4331,6 +4331,41 @@ def person_commands_journey(fixture, source):
               "recall restores command mode, /jobs lists ! and opens the viewer, the viewer from the "
               "log at stdout's end with Home and Tab, the pasted split with a hidden mark runs the "
               "original bytes")
+        # PL-E7 (security-policy.md, PL2): every person job's kind 26 has its
+        # kind 34 after the previous kind 26, and kind 35 comes first.
+        kinds = journal_kinds(fixture)
+        assert 35 in kinds and kinds.count(26) >= 3, kinds
+        assert kinds.index(35) < kinds.index(34), kinds
+        last = -1
+        for at, kind in enumerate(kinds):
+            if kind == 26:
+                assert 34 in kinds[last + 1:at], (at, kinds)
+                assert kinds[at - 1] == 34, (at, kinds)
+                last = at
+        # PL-E7: with the test-only denying set, the sentinel command is
+        # held `policy_denied` and nothing runs; another command still runs.
+        (fixture.root / "home/policy-test-deny").write_bytes(b"")
+        fixture.start()
+        trial = fixture.launch(cwd=sub)
+        trial.resize(120, 40)
+        trial.until(b"Persona", plain=True, limit=10)
+        before = journal_kinds(fixture)
+        offset = len(trial.output)
+        trial.send(b"!")
+        trial.send(b"asura-policy-test-deny; touch denied.out")
+        trial.idle(0.1)
+        harness.enter(trial)
+        # The queue row names the hold reason with spaces.
+        trial.until(b"Held (policy denied)", offset, plain=True, limit=20)
+        assert not (sub / "denied.out").exists()
+        after = journal_kinds(fixture)
+        assert after[len(before):].count(34) == 1 and 26 not in after[len(before):], after[len(before):]
+        quit_tui(trial)
+        trial = None
+        fixture.stop()
+        (fixture.root / "home/policy-test-deny").unlink()
+        print("PASS PL-E7 TUI: each ! job's kind 34 immediately precedes its kind 26; with the "
+              "test-only denying set the sentinel command is held policy_denied and does not run")
     finally:
         if trial is not None:
             trial.close()

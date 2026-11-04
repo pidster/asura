@@ -1320,10 +1320,10 @@ fn j2t_03_w_and_x_entries_and_checkpoint_jobs() {
     // The checkpoint lists the job: kind 26 then kind 27 locators.
     let job = &unsettled(reopened.state())[0];
     let bytes = canonical(reopened.state());
-    // The policy facts follow the jobs: last sequence, no active revision
-    // and no pending kind 34 (13 bytes).
-    let tail = &bytes[bytes.len() - 40 - 13 - 52..bytes.len() - 40 - 13];
-    assert_eq!(&bytes[bytes.len() - 40 - 13..bytes.len() - 40], &[0; 13]);
+    // The policy facts follow the jobs: last sequence, no active revision,
+    // no pending model kind 34 and no pending person kind 34 (17 bytes).
+    let tail = &bytes[bytes.len() - 40 - 17 - 52..bytes.len() - 40 - 17];
+    assert_eq!(&bytes[bytes.len() - 40 - 17..bytes.len() - 40], &[0; 17]);
     assert_eq!(&tail[..4], &1u32.to_be_bytes());
     assert_eq!(&tail[4..28], &job.intent.encode());
     assert_eq!(&tail[28..52], &job.cancel.unwrap().frame.encode());
@@ -2888,4 +2888,139 @@ fn pl_u13_policy_decision_needs_an_open_started_turn() {
         )),
         Err(Failure::Invalid)
     );
+}
+
+/// A kind 34 for a person input (PL2, subject code 2).
+fn person34(
+    input: Id,
+    project: Id,
+    conversation: Id,
+    profile: u8,
+    outcome: PolicyOutcome,
+) -> Record {
+    let Record::PolicyDecision(mut p) =
+        decision34([1; 16], 1, 1, project, conversation, 1, 7, outcome)
+    else {
+        unreachable!()
+    };
+    p.subject = PolicySubject::PersonInput { input };
+    p.origin = 2;
+    p.profile = profile;
+    p.constraint_digest = None;
+    Record::PolicyDecision(p)
+}
+fn decide_input(h: &mut Harness, input: Id, action: InputAction) -> Result<(), Failure> {
+    let request = h.fresh();
+    h.append(Record::InputDecision(InputDecision {
+        request,
+        digest: request_digest(Request::InputDecision { input, action }).unwrap(),
+        input,
+        action,
+    }))
+    .map(|_| ())
+}
+
+/// PL-U13 (PL2, unit, replay): kind 34 subject 2 validation and replay
+/// rules R8 to R10 through the real append path, a roll whose checkpoint
+/// holds a pending person kind 34, and genesis replay.
+#[test]
+fn pl_u13_person_policy_replay_rules_r8_to_r10() {
+    let mut h = Harness::new();
+    let project = h.register(1);
+    let lane = h.fresh();
+    let (first, a) = person31(&mut h, project, lane, true, false);
+    h.append(first).unwrap();
+    // R3: no active revision yet.
+    assert_eq!(
+        h.append(person34(a, project, lane, 2, PolicyOutcome::Run)),
+        Err(Failure::Invalid)
+    );
+    h.append(revision35(1, 0, 7)).unwrap();
+    // Validation: origin and profile belong to the subject; a person `run`
+    // carries no constraint digest.
+    let Record::PolicyDecision(mut wrong) = person34(a, project, lane, 2, PolicyOutcome::Run)
+    else {
+        unreachable!()
+    };
+    wrong.origin = 1;
+    assert_eq!(
+        h.append(Record::PolicyDecision(wrong)),
+        Err(Failure::Invalid)
+    );
+    let Record::PolicyDecision(mut digest) = person34(a, project, lane, 2, PolicyOutcome::Run)
+    else {
+        unreachable!()
+    };
+    digest.constraint_digest = Some([15; 32]);
+    assert_eq!(
+        h.append(Record::PolicyDecision(digest)),
+        Err(Failure::Invalid)
+    );
+    // R8: an unknown input, the wrong profile (`!` is 2), another project.
+    for record in [
+        person34([77; 16], project, lane, 2, PolicyOutcome::Run),
+        person34(a, project, lane, 3, PolicyOutcome::Run),
+        person34(a, [55; 16], lane, 2, PolicyOutcome::Run),
+    ] {
+        assert_eq!(h.append(record), Err(Failure::Invalid));
+    }
+    // R8 and R9: a pending deny refuses the kind 26.
+    h.append(person34(a, project, lane, 2, PolicyOutcome::Deny))
+        .unwrap();
+    assert_eq!(
+        h.state().policy.person_pending(a),
+        Some(PolicyOutcome::Deny)
+    );
+    assert_eq!(h.append(person_intent(a)), Err(Failure::Invalid));
+    // R10: the hold clears it; a held input takes no kind 34.
+    decide_input(&mut h, a, InputAction::Hold).unwrap();
+    assert_eq!(h.state().policy.person_pending(a), None);
+    assert_eq!(
+        h.append(person34(a, project, lane, 2, PolicyOutcome::Run)),
+        Err(Failure::Invalid)
+    );
+    // Resume: decided again; a new decision replaces a pending one (R8).
+    decide_input(&mut h, a, InputAction::Resume).unwrap();
+    h.append(person34(a, project, lane, 2, PolicyOutcome::Deny))
+        .unwrap();
+    h.append(person34(a, project, lane, 2, PolicyOutcome::Run))
+        .unwrap();
+    // The pending decision survives a roll and its checkpoint.
+    h.journal.roll().unwrap();
+    let files = h.files();
+    let reopened = open(files.clone(), false).unwrap();
+    assert_eq!(reopened.state().policy, h.state().policy);
+    assert_eq!(
+        reopened.state().policy.person_pending(a),
+        Some(PolicyOutcome::Run)
+    );
+    assert_eq!(canonical(&genesis(&files)), canonical(h.state()));
+    // R9: the `run` admits the kind 26 and is cleared; the input is no
+    // longer queued, so it takes no further kind 34.
+    h.append(person_intent(a)).unwrap();
+    assert_eq!(h.state().policy.person_pending(a), None);
+    assert_eq!(
+        h.append(person34(a, project, lane, 2, PolicyOutcome::Run)),
+        Err(Failure::Invalid)
+    );
+    // `!!` uses profile 3; a drop clears its pending decision (R10). A
+    // person kind 26 with no kind 34 stays valid.
+    h.append(exited(job_id(&JobOrigin::Person { input: a })))
+        .unwrap();
+    let (second, b) = person31(&mut h, project, lane, false, true);
+    h.append(second).unwrap();
+    assert_eq!(
+        h.append(person34(b, project, lane, 2, PolicyOutcome::Run)),
+        Err(Failure::Invalid)
+    );
+    h.append(person34(b, project, lane, 3, PolicyOutcome::Deny))
+        .unwrap();
+    decide_input(&mut h, b, InputAction::Hold).unwrap();
+    decide_input(&mut h, b, InputAction::Drop).unwrap();
+    assert_eq!(h.state().policy.person_pending(b), None);
+    let (third, c) = person31(&mut h, project, lane, false, false);
+    h.append(third).unwrap();
+    h.append(person_intent(c)).unwrap();
+    let files = h.files();
+    assert_eq!(canonical(&genesis(&files)), canonical(h.state()));
 }

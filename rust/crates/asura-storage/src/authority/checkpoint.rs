@@ -281,6 +281,14 @@ pub fn encode(state: &Replay, census: &Census, runs: &[RunRef]) -> Result<Vec<u8
         w.u32(*ordinal);
         w.byte(*outcome as u8);
     }
+    // PL2: pending person kind 34 records (R8 to R10).
+    let person: Vec<_> = state.policy.person_entries().collect();
+    require(person.len() <= MAX_PENDING_PERSON_DECISIONS)?;
+    w.u32(person.len() as u32);
+    for (input, outcome) in person {
+        w.bytes(input);
+        w.byte(*outcome as u8);
+    }
     let digest: Hash = Sha256::digest(&w.0).into();
     w.bytes(&digest);
     w.bytes(COMMIT);
@@ -652,7 +660,16 @@ pub fn decode(bytes: &[u8], index: &mut dyn Index) -> Result<Checkpoint> {
         require(pending.last_key_value().is_none_or(|(k, _)| *k < key))?;
         pending.insert(key, outcome);
     }
-    state.policy = PolicyReplay::restore(last_seq, active, pending)?;
+    let count = r.u32()? as usize;
+    require(count <= MAX_PENDING_PERSON_DECISIONS)?;
+    let mut person = std::collections::BTreeMap::new();
+    for _ in 0..count {
+        let input: Id = r.array()?;
+        let outcome = PolicyOutcome::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
+        require(person.last_key_value().is_none_or(|(k, _)| *k < input))?;
+        person.insert(input, outcome);
+    }
+    state.policy = PolicyReplay::restore(last_seq, active, pending, person)?;
     r.finish()?;
     state.recompute()?;
     Ok(Checkpoint {

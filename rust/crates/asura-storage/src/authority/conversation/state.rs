@@ -1401,6 +1401,10 @@ impl Replay {
                     InputAction::Drop => input.dropped = true,
                     InputAction::Hold => input.held = true,
                 }
+                // R10 (PL2): a hold or drop clears a pending person kind 34.
+                if p.action != InputAction::Resume {
+                    self.policy.person_settled(p.input);
+                }
                 let (project, conversation) = (input.project, input.conversation);
                 self.order_revision = next(self.order_revision)?;
                 if p.action == InputAction::Drop {
@@ -1470,8 +1474,27 @@ impl Replay {
             Record::PolicyRevision(p) => self.policy.revision(&p)?,
             // Kind 34 (R3, R4): the active revision, an accepted open turn of
             // this owner generation, and an ordinal with no kind 14 yet.
+            // R8 (PL2): a person subject names a queued, unheld, undropped
+            // kind 31 input without a kind 26, with its outside profile.
+            Record::PolicyDecision(p) if p.call().is_none() => {
+                let PolicySubject::PersonInput { input } = p.subject else {
+                    return Err(ReplayError::Corrupt);
+                };
+                let q = self.inputs.get(&input).ok_or(ReplayError::Corrupt)?;
+                let person = q.person.ok_or(ReplayError::Corrupt)?;
+                require(
+                    person.job.is_none()
+                        && !q.dropped
+                        && !q.held
+                        && self.input_status(input) == Some(InputStatus::Queued)
+                        && p.profile == if person.outside_sandbox { 3 } else { 2 }
+                        && p.project == q.project
+                        && p.task_conversation == q.conversation,
+                )?;
+                self.policy.decision(&p)?;
+            }
             Record::PolicyDecision(p) => {
-                let (operation, generation, ordinal) = p.call();
+                let (operation, generation, ordinal) = p.call().ok_or(ReplayError::Corrupt)?;
                 let owner = self.owner_generation;
                 let op = self.operation_mut(operation, generation)?;
                 require(
@@ -2508,6 +2531,8 @@ impl Replay {
         let q = self.inputs.get(&input).ok_or(ReplayError::Corrupt)?;
         let person = q.person.ok_or(ReplayError::Corrupt)?;
         require(person.job.is_none() && !q.dropped && self.input_ready(input))?;
+        // R9 (PL2): a pending person kind 34 must be `run`.
+        self.policy.person_job(input)?;
         let job = self.derive_job(&p, owner, frame, index)?;
         // JR5.
         require(
