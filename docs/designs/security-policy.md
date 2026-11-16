@@ -12,7 +12,10 @@ Packet PL2 is implemented (2026-11-04) under its
 [implementation contract](#pl2-implementation-contract). PL-B1 passes.
 PL-B2 failed its 1.5 ms target; the owner revised it to p99 at most 2.5 ms
 (AD-34, 2026-11-04), and the quiet-machine runs pass it
-([PL2 delivery record](#pl2-delivery-record)). Later packets are not
+([PL2 delivery record](#pl2-delivery-record)). Packet PL3 is implemented (2026-11-16) under its
+[contract](#pl3-implementation-contract); PL-B1 and PL-B2 failed on a
+busy machine, as the pre-PL3 build did in the same session, and are
+reported to the owner ([PL3 delivery record](#pl3-delivery-record)). Later packets are not
 implemented. Protocol numbering stays `0.1` and the
 journal format stays `1` until release 1.0.0; schemas change in place.
 
@@ -158,7 +161,7 @@ attributes or enforce.
 | Intent features of a command | Existing tokenizer `asura-platform::exec_cmd::split`, extended with a feature extractor | Extended |
 | Job admission, queues, slots, revocation | Existing job controller | New start conditions and reasons |
 | Decision, revision and approval records | Existing authority writer and replay in `asura-storage` | New kinds 34, 35, 36 |
-| Admitted policy texts | Existing retained payload store, pinned | New payload class |
+| Admitted policy texts | New policy text store `~/.asura/policy/admitted/` ([PL3 policy text store](#pl3-policy-text-store)) | New |
 | `/status` policy line | Existing service observer | New field |
 | Audit events | Existing audit store | New events |
 | Solver build, signing, notice and release checks | Release tooling under `tools/release/` | New script and checks |
@@ -509,7 +512,7 @@ use of a reserved annotation refuses the candidate.
 | Repository | `<project root>/.asura/policy.cedar`, read through the retained project descriptor | Anyone who can commit | Untrusted until the person admits it; forbid-only |
 | Remote host | Reserved for D5 | — | — |
 
-The active text of a scope is its admitted copy in the pinned payload store,
+The active text of a scope is its admitted copy in the policy text store,
 never the file on disk. A later change to a source file has no effect until
 the person admits it again. `/status` reports an admitted scope whose source
 file changed after admission.
@@ -528,7 +531,7 @@ versions, the solver digest and the digest of the admission results.
 
 Selected design. Boxes are logical records; lines show references with their
 cardinality. Physical storage: the authority journal holds the records, and
-the pinned payload store holds the policy texts.
+the policy text store holds the policy texts ([PL3](#pl3-policy-text-store)).
 
 ```mermaid
 classDiagram
@@ -865,6 +868,7 @@ without its generated grants.
 | SP-AQ6 | Task envelope containment `check_implies(U0 + E, U0 + S_E)` for each envelope `E` | Holds | Spike AQ5, PES-M18 |
 | SP-AQ7 | Soundness of each compiled constraint set: `check_implies(S_C, P_s)` for each applicable scope `s`, where `S_C` permits exactly the regions the constraint set allows | Holds | Research 5.2 |
 | SP-AQ8 | Change difference `check_implies(P_new, P_old)` per changed scope | Reported to the person | Spike AQ7 |
+| SP-AQ9 | AD-7 person network: `network.connect` by a `person_typed` job of each person profile is allowed for every `Domain` and `Address`, `ip`, `port` and `via_proxy`, in every scope ([PL3 admission](#pl3-admission)) | Holds | Coordinator requirement, 2026-11-04 |
 
 #### Safety specifications
 
@@ -1019,7 +1023,7 @@ Kind 35 `PolicyRevision` records `activated`, `superseded`, `revoked` and
 `rejected` events with the manifest (at most 8 KiB). Kind 36 `PolicyGrant`
 records approval and envelope requests, answers and ends (at most 8 KiB). No
 record holds a secret value, a command line or a path string; display text
-lives in the pinned payload store with the policy text.
+lives in the policy text store with the policy text.
 
 ### Restart recovery and rollback
 
@@ -1027,7 +1031,7 @@ Selected.
 
 1. Replay builds, for each scope, the last `activated` revision that no
    later record supersedes or revokes, and the open kind 36 grants.
-2. The owner loads each scope text from the pinned payload store and checks
+2. The owner loads each scope text from the policy text store and checks
    its digest. A missing or mismatched payload makes that scope
    `scope_unavailable`; its requests deny with a repair reason.
 3. The owner strict-validates each text against the running schema. A
@@ -1084,7 +1088,7 @@ The package and build are in [the solver package](#solver-package-ad-17).
 | End | Normal: the admission worker closes standard input; cvc5 exits on end of input; the platform reaps it. Cancel, shutdown or a protocol fault: the platform sends `SIGKILL` at once and reaps. No grace time and no time limit exist |
 | Failure | Exit, a parse error reply, an unrecognised line or `unknown` refuses the candidate with `solver_failed` or `solver_unknown`. Nothing is retried automatically; the person may submit again |
 | Concurrency | One solver process at a time. Candidates wait in a FIFO of at most 16 with the reason `waiting: proving a policy change (N ahead)` |
-| Memory | No bound is selected. macOS does not enforce `RLIMIT_AS` for this use (unverified; probe SV-P6, run by PL4a: [method](#sv-p6-method)). The candidate bounds of step 1 limit the query size |
+| Memory | A supervised footprint bound of 1 GiB, sampled at least every 10 ms (pacing), because macOS 27 accepts no usable `setrlimit` limit (SV-P6, [PL3 solver memory bound](#pl3-solver-memory-bound)). The candidate bounds of step 1 limit the query size |
 
 ### SP-S2: solver process
 
@@ -1571,9 +1575,9 @@ Selected changes to the [tool job controller](tool-job-controller.md):
 | --- | --- |
 | Start input | `submit` takes the `JobDecision` (revision, constraint set, digest). The controller passes the constraint set to the slot worker and the guardian |
 | Start condition 0 `approval` | Before the existing conditions 1–8. Reason text `waiting: approval needed: <reason>`. Model jobs only, from PL7 |
-| Start condition 0b `policy_recheck` | A queued entry whose decision revision is older than the dispatch revision. Reason text `waiting: re-checking policy` |
+| Start condition 0b `policy_recheck` | A queued entry whose decision revision is older than the dispatch revision. Reason text `waiting: re-checking policy`; kind 29 block reason 10 (PL3, [PL3-F3](#pl3-f3-recheck-at-slot-grant)) |
 | Revocation trigger | Fills the existing row "Execution grant revoked for a project or principal": the policy owner revokes after a re-evaluation denies |
-| Job reasons | 21 `enforcement_mismatch`, fixed by PL1, the packet that first writes it. Proposed, numbered by the packet that first writes each: `policy_revoked`, `approval_denied`, `policy_changed`, `classifier_revoked` |
+| Job reasons | 21 `enforcement_mismatch`, fixed by PL1, the packet that first writes it; 22 `policy_revoked` and 23 `policy_changed`, fixed by PL3. Proposed, numbered by the packet that first writes each: `approval_denied`, `classifier_revoked` |
 | Kind 14 field 10 | `denied` 2 `policy_denied`, 3 `policy_unavailable`; `busy` 4 `policy_busy` (fixed by PL1), with the [policy refusal field](#kind-14-additions) |
 | Guardian argv | `--asura-exec-cmd-guardian JOBHEX PROFILE CONSTRAINTS COMMAND` ([constraint set](#constraint-set)); notice kind 3 reason 10 `enforcement_mismatch` |
 | Order at a model call | Grant check, EX11 setting, secret refusals and rewrite (unchanged), then the policy decision, then job admission |
@@ -2472,8 +2476,8 @@ a byte-equal Seatbelt profile.
 
 | Item | PL1 | Later |
 | --- | --- | --- |
-| Scope sources | The installation set and the default user set, both compiled into `asura` from `asura-policy/policies/installation.cedar` and `user-default.cedar`. Source identity `builtin` | PL3 creates and admits `~/.asura/policy/user.cedar`; PL5 adds workspace and repository |
-| Payload store | Not used: a built-in text is sealed by the code signature and named by its SHA-256 in kind 35 | PL3 pins admitted texts |
+| Scope sources | The installation set and the default user set, both compiled into `asura` from `asura-policy/policies/installation.cedar` and `user-default.cedar`. Source identity `builtin` | PL3 admits user text that the person submits ([PL3 contract](#pl3-implementation-contract)); the editable `~/.asura/policy/user.cedar` waits for the policy editing UX (D6); PL5 adds workspace and repository |
+| Payload store | Not used: a built-in text is sealed by the code signature and named by its SHA-256 in kind 35 | PL3 keeps admitted texts in the [policy text store](#pl3-policy-text-store) |
 | Admission | None. No solver, no lints, no proofs. The golden tests fix the compiled output of the built-in sets | PL3 |
 | Requests | Model `exec_cmd` job decisions only: the entry `process.exec` and the `model-1` region requests | PL2 person commands and `secret_use` |
 | Intent | `source = model_tool`, `name = "exec_cmd"`, `digest` = SHA-256 of the stored (rewritten) command. `command` is absent | PL2 adds the feature extractor and `command` |
@@ -3149,7 +3153,8 @@ host, address and port, not a sample. Admission proves, for each scope and
 for both person profiles, that `network.connect` by a `person_typed` job is
 allowed for every `Domain` and `Address` resource and every `ip`, `port` and
 `via_proxy` value, and refuses the candidate otherwise. The sampled load
-check stays only until that proof runs.
+check stays only until that proof runs. PL3 delivers the proof as SP-AQ9
+and removes the load check ([PL3 admission](#pl3-admission)).
 
 ### Kind 34 in PL2
 
@@ -3309,6 +3314,682 @@ prints its verdict against 2.5 ms.
 
 SP-P1 is answered ([SP-P1 result](#sp-p1-result)).
 
+## PL3 implementation contract
+
+Selected, 2026-11-16. This section fixes the details that packet PL3 needs
+and that the sections above leave open. Where it narrows an earlier
+section, that section links here. PL3 adds admission, proofs and the
+revision lifecycle for the user scope. With the shipped sets and no
+admitted candidate, every decision stays as in PL2: the `model-1` profile
+stays byte-equal and the person profiles keep their guardian profiles.
+
+### What PL3 builds and what waits
+
+| Item | PL3 | Later |
+| --- | --- | --- |
+| Candidates | User-scope text from the person (`PolicyCandidateSubmit`, at most 61,440 bytes so that one control frame holds it); rollback to an earlier activated user text; reproving at restart | PL5 submits workspace and repository candidates. The admission crate already admits their texts (forbid-only), for the release-gate tests |
+| Admission steps | Steps 1 to 8 of [admission steps](#admission-steps), in the [PL3 form](#pl3-admission) | The grant-removal fast path waits for the first generated grant (PL7): PL3 has none |
+| Proofs | SP-AQ1, SP-AQ2 (lint), SP-AQ3, SP-AQ5 (lint, shown by a counterexample), SP-AQ7 in its [PL3 form](#pl3-compile-step), SP-AQ8 and the new SP-AQ9 (AD-7) | SP-AQ4 runs on the installation set in the release-gate tests; SP-AQ6 is PL8; the general SP-AQ7 is PL6 |
+| Solver | The development and test package that `tools/release/solver/build` writes, found by the [test-support rule](#pl3-solver-source). A build without `test-support` has no solver: `solver: none`, and a candidate that needs proofs is refused `solver_failed` | PL4b bundles the team-signed solver and compiles its digests into `asura` |
+| Memory bound | The [supervised footprint bound](#pl3-solver-memory-bound) (SV-P6 answered) | — |
+| Texts | Admitted texts in the [policy text store](#pl3-policy-text-store) | — |
+| Lifecycle | [Activation with revision fencing](#pl3-activation-and-fencing), rechecks of queued, starting and running jobs, kind 35 `activated` and `rejected`, [restart and reproving](#pl3-restart-and-reproving), [rollback](#pl3-rollback), cancel | PL5 revokes lower scopes; kind 35 `superseded` and `revoked` are not written (an `activated` record's previous sequence states the supersession) |
+| Kind 36 | The [codec, replay and restart rule](#kind-36-in-pl3) for approval grants | PL7 writes approval requests and answers; PL8 adds envelope events |
+| Control | `PolicyCandidateSubmit`, `PolicyRollback`, `PolicyCancel`, `PolicyReply`, and the candidate result in `PolicyStatus`; CLI `asura policy`; TUI `/policy` ([PL3 control and presentation](#pl3-control-and-presentation)) | `PolicyExplain` (PL5); approvals (PL7) |
+| Audit | `policy.revision_activated`, `policy.revision_rejected`, `policy.decision_denied`, `policy.solver_failed`, `policy.worker_failed` | Approval and envelope events (PL7, PL8) |
+| AD-7 | SP-AQ9 proves person network for every host, address and port in every admitted scope. The [PL2 sampled load check](#pl2-ad-7-load-check) is removed | — |
+| Editable source file | Not created. The person names any file to admit | The policy editing UX (D6) |
+
+### PL3 admission
+
+Selected. The crate `asura-policy-admission` owns the admission of one
+candidate. It depends on `asura-policy`, `cedar-policy =4.14.1` and
+`cedar-policy-symcc =0.8.1`. It does no I/O of its own: it reaches the
+solver through an injected [solver pipe](#pl3-solver-adapter) and checks
+path literals through an injected literal check. Its tests that need a
+real solver use `asura-platform` as a dev-dependency only; the production
+dependency direction of [ownership](#ownership) is unchanged.
+
+The admission of one candidate is a synchronous call on the admission
+worker thread. SymCC's `Solver` futures never wait: the adapter does its
+pipe work inside each call and returns a ready future. The crate drives
+each future with one poll and a no-op waker; a future that is not ready
+is a protocol fault (`solver_failed`, cause `protocol`).
+
+Inputs: the candidate (scope and text), the installation text, the
+default user text, the active text of the candidate's scope (absent for a
+first admission of that scope) and the cancel flag. Output: `Ready` with
+the parsed scope set, or `Rejected` with a reason code, at most 8 detail
+lines and at most 8 counterexamples; in both cases the query records and
+the admission digest.
+
+| Step | PL3 rule | Refusal |
+| --- | --- | --- |
+| 1 Bounds | Text at most 256 KiB; at most 512 policies; the revision with this scope set at most 2,048 policies | `candidate_too_large` |
+| 2 Parse | `PolicySet::from_str`; no templates; `@id`, `@reason`, `@explain` well formed; no reserved annotation; `@hard` only in the installation text | `candidate_parse` |
+| 3 Strict validation | A1 and A2: no error and no warning | `candidate_invalid` |
+| 4 Lints | Tighten-only (SP-AQ2): a policy reads `context.intent` exactly when it carries `@intent("true")`, reads `context.risk` exactly when it carries `@classifier("true")`, and such a policy is a `forbid`. A read is found by walking the policy's JSON form for an attribute access or `has` test on `context` with the name `intent` or `risk`. Forbid-only (SP-AQ5): a workspace or repository text holds no `permit`. Literals: every `Path::"…"` literal is lexically canonical ([PL2 canonical paths](#pl2-canonical-paths), step 1); a literal that exists must already be its canonical spelling, which the injected literal check reports | `candidate_lint` |
+| 5 Proofs | SP-AQ1, SP-AQ3 and SP-AQ9 below | `proof_failed`, `solver_failed`, `solver_unknown` |
+| 6 Compile | The [PL3 compile step](#pl3-compile-step) | `cannot_enforce` |
+| 7 Change difference | SP-AQ8 both ways against the active text of the scope (below) | — |
+| 8 Ready | The admission worker pins the text in the [text store](#pl3-policy-text-store) before it replies | `storage_unavailable` |
+
+Each refusal names the policies it concerns as `<scope>:<id>` in its detail
+lines. A tighten-only lint failure on a `permit` and a forbid-only lint
+failure still refuse at step 4, but when a solver is available the
+matching proof runs first, so that the refusal is shown by a
+counterexample (spike PES-M16 and PES-M17): SP-AQ3 for the tighten-only
+case, and `check_always_denies` on the author's lower-scope text without
+the baseline permit for the forbid-only case.
+
+Proof queries. Each runs once in every request environment of
+`Schema::request_envs` that the policies concerned apply to (12 for the
+product schema), with no time limit; its closures are the solver's reply,
+the cancel flag and the [memory bound](#pl3-solver-memory-bound). `P` is
+the candidate scope set (with the baseline permit for a lower scope).
+
+| ID | PL3 query | Pass condition |
+| --- | --- | --- |
+| SP-AQ1 | `check_never_errors_with_counterexample` for each `forbid` of `P` | Holds in every environment the forbid applies to |
+| SP-AQ3 | `check_implies_with_counterexample(P, P0)`, where `P0` is `P` without its `@intent` and `@classifier` policies | Holds in every environment |
+| SP-AQ9 | AD-7 person network: `check_implies_with_counterexample(N_p, P)` for each person profile `p`, where `N_p` is `permit (principal is Asura::Job, action == Asura::Action::"network.connect", resource) when { principal.origin == Asura::Origin::"person_typed" && principal.profile == Asura::Profile::"p" };`, in the `Domain` and `Address` environments. The resource, `ip`, `port`, `via_proxy`, `now`, intent and risk stay symbolic, so the proof covers every host, address and port | Holds for both profiles in both environments |
+| SP-AQ8 | `check_implies_with_counterexample(P, P_old)` (does the change permit anything new?) and `check_implies(P_old, P)` (does it keep everything?), in every environment | Reported, never a refusal. The first gives at most one counterexample per environment and at most 8 in all; the second decides whether activation must recheck live decisions |
+
+Counterexamples are rendered by the crate from SymCC's concrete request:
+the action, the principal and resource entity UIDs with the attributes
+that the query reads, and the context, as printable ASCII with other bytes
+escaped, at most 512 bytes each. They go to the person in `PolicyStatus`
+only, never to a model, a journal record or an audit event.
+
+The admission digest is the SHA-256 of `asura-policy-admission/1`, a zero
+byte, the candidate text digest, then for every query in the order run its
+ID, environment and outcome. At most 4,096 queries run for one candidate;
+one more refuses it `candidate_too_large`.
+
+### PL3 compile step
+
+Selected: the PL3 form of SP-AQ7. In PL3 the `model-1` compiler of
+[PL1](#constraint-set) is the only compiled backend, and the person
+profiles are not compiled until PL6. A user policy is therefore
+admissible only when every effect it changes is one that PL3 enforces
+exactly. Two checks prove it. Both apply to every admitted scope; for the
+installation set they run in the release-gate tests.
+
+**(a) `model-1` regions at root granularity.** The PL1 compiler decides
+each template root by one request at the root itself. That is sound only
+when, for each root and region class, the scope allows the whole subtree
+or never allows the root. For each pair below the crate proves
+`check_implies(S_rc, P)` (full); when that fails it proves
+`check_disjoint(R_rc, P)` (the root itself is never allowed). Failing both
+refuses the candidate `cannot_enforce` with the counterexample of the
+first query.
+
+| Class | Roots | `S_rc` permits, for a model-origin job (`principal.origin == model`) of profile `model-1` with no `intent` and no `risk` in the context |
+| --- | --- | --- |
+| Read | The nine template roots | `file.read` of every `resource in R`, except an `asura_state` path outside `principal.scratch` (the guardian's fixed state deny rule) |
+| Execute | The nine template roots | `process.exec` of every `Program` with `resource.path in R` and `identity_known == false`, except an `asura_state` path outside the scratch |
+| Write | Project root and scratch | `file.write`, `file.create` and `file.delete` (one pair each) of every `resource in R`, except an `asura_state` path outside the scratch and an `implicit_exec` path (the guardian's fixed implicit-execution deny rule) |
+
+`R` is `Asura::Path::"/bin"` and the other system roots, or
+`principal.project.root` and `principal.scratch`. `R_rc` permits the same
+action for `resource == R` (for execute, `resource.path == R`), with the
+same principal condition. The origin condition matters: without it the
+installation's person forbids refute the regions for a `person_typed` job
+of profile `model-1`, a combination the entity loader never builds. The
+runtime set literals and the base needs are decided per job by the
+compiler, so they need no proof.
+
+**(b) Effects PL3 does not enforce stay as the default user set has
+them.** For each environment below, the crate proves that `P` and the
+default user set `U_d` decide the restricted requests alike:
+`check_equivalent_with_counterexample(P + X, U_d + X)`, where `X` is one
+generated `forbid` that denies every request outside the restriction. A
+difference refuses `cannot_enforce`.
+
+| Environment | Restriction (the requests PL3 does not enforce) |
+| --- | --- |
+| `process.exec.ask`, `process.exec.approved` | Every request (the approval step is PL7; replay refuses `ask` until then) |
+| `mach.lookup` | Every request (the guardian's fixed runtime set) |
+| `context.egress` | Every request (the context composer decides later) |
+| `file.read`, `file.write`, `file.create`, `file.delete` | `principal.profile` is `person-1` or `person-outside-1` |
+| `process.exec` | `principal.profile` is `person-1` or `person-outside-1`, and the context has no `intent` (the person region requests; the entry always carries its intent) |
+
+Effects that PL3 enforces exactly and that a user policy may therefore
+change: the entry `process.exec` of every job (with intent), `secret_use`,
+`network.connect` of model jobs (their profile has no network), and the
+`model-1` regions at root granularity. `network.connect` of person jobs may
+change only within SP-AQ9, which keeps it allowed.
+
+### PL3-F1: admission of one candidate
+
+Selected design. Arrows show the order of steps for one candidate; every
+refusal ends the candidate with its reason, and the active revision stays
+unchanged. The loop over queries is bounded by 4,096.
+
+```mermaid
+flowchart TD
+    In["Candidate: scope and text"] --> B{"Step 1: within the text, policy and revision bounds?"}
+    B -->|"No"| R1["Rejected: candidate_too_large"]
+    B -->|"Yes"| Pa{"Step 2: parses; annotations well formed; no reserved annotation?"}
+    Pa -->|"No"| R2["Rejected: candidate_parse"]
+    Pa -->|"Yes"| V{"Step 3: strict validation with no error and no warning?"}
+    V -->|"No"| R3["Rejected: candidate_invalid"]
+    V -->|"Yes"| L{"Step 4: tighten-only, forbid-only and literal lints pass?"}
+    L -->|"No"| Show["Solver available: run SP-AQ3 or SP-AQ5 for a counterexample"]
+    Show --> R4["Rejected: candidate_lint, with the counterexample when found"]
+    L -->|"Yes"| Q["Step 5: next proof query: SP-AQ1, SP-AQ3, SP-AQ9"]
+    Q --> Cnt{"Query count at most 4,096?"}
+    Cnt -->|"No"| R1
+    Cnt -->|"Yes"| Ans{"Solver answer"}
+    Ans -->|"Refuted"| R5["Rejected: proof_failed, with the counterexample"]
+    Ans -->|"Unknown"| R6["Rejected: solver_unknown"]
+    Ans -->|"Fault, cancel or memory bound"| R7["Rejected: solver_failed with its cause, or Cancelled"]
+    Ans -->|"Holds, more queries"| Q
+    Ans -->|"Holds, last query"| C["Step 6: compile checks (a) and (b)"]
+    C -->|"A check fails"| R8["Rejected: cannot_enforce, with the counterexample"]
+    C -->|"All hold"| D["Step 7: change difference both ways; at most 8 examples"]
+    D --> Pin{"Step 8: text pinned in the text store?"}
+    Pin -->|"No"| R9["Rejected: storage_unavailable"]
+    Pin -->|"Yes"| Ready["Ready: scope set, widening examples, narrowing flag, admission digest"]
+```
+
+### PL3 solver adapter
+
+Selected, meeting finding F4 and the [F4 test design](#f4-stalled-solver-tests-for-pl3).
+The adapter in `asura-policy-admission` implements SymCC's `Solver` trait
+over an injected solver pipe, so the crate never depends on
+`asura-platform`.
+
+| Item | Rule |
+| --- | --- |
+| Pipe | One method, `exchange(input, output)`: it writes all of `input` to the solver's standard input while it passes every chunk read from standard output and standard error to `output`, which answers `more`, `answered` or `fault`. It returns when the input is written and the answer is complete, at once on `fault`, or with an end: `closed` (end of output or a broken pipe, with the exit status when reaped), `cancelled`, `memory_bound` or `io` |
+| Query buffer | `smtlib_input()` is an in-memory buffer. A write that would take it over 64 MiB fails, so SymCC's query fails and the candidate is refused `solver_failed`, cause `input_bound`, before any byte reaches the pipe (SA-T6) |
+| `check_sat` | The buffer plus `(check-sat)` in one exchange. The answer is one line: `sat`, `unsat`, `unknown` or `(error "…")`. Any other line is `protocol` |
+| `check_sat_with_model` | After `sat`, a second exchange of `(get-model)`. The answer is a line `(`, then lines up to a line `)`. The model is at most 1 MiB in all; more stops the reading at once and refuses `output_bound` (SA-T4) |
+| Extra output | Output that arrives after a complete answer, or before a query, is drained and counted, not kept. Any such byte makes the exchange a `protocol` fault once the input is written, so a solver that writes first never stalls the write (SA-T2) |
+| Standard error | The first 64 KiB is kept for the log line of a failure; the rest is drained and counted (SA-T3). It never reaches a model |
+| Unknown | `unknown` refuses `solver_unknown`; a parse error reply refuses `solver_failed`, cause `protocol` |
+| Failure | Every fault ends the process at once: the admission worker asks the platform to kill and reap it. Nothing is retried |
+
+### PL3 platform solver
+
+Selected. `asura-platform::solver` owns the solver process. Every call runs
+on the admission worker thread, never on the reactor.
+
+| Step | Rule |
+| --- | --- |
+| Package | A directory with `manifest.json` (at most 64 KiB) that lists 1 to 4 regular files by path, size and SHA-256. Paths are `MacOS/<name>` or `Frameworks/<name>`, one of them `MacOS/cvc5`. The package digest is the [Hub bundle digest encoding](release-signing.md#hub-bundle-digest-encoding) over the listed files; kind 35 records it as the solver digest |
+| Copy | A new private directory `<run>/solver-<32 hex>/` under the validated run directory, with `MacOS/` and `Frameworks/`. Each file is copied exclusively with the model helper's verified copy (re-read, SHA-256 against the manifest, fingerprint unchanged). A mismatch refuses `digest_mismatch`; any other copy failure refuses `copy_failed`. The copy is removed after the reap |
+| Profile | The [SV-P2 profile](#sv-p2-candidate-profile) with `SOLVER_DIR` replaced by the copy directory's `F_GETPATH` spelling, quoted with the guardian's quoting helper |
+| Spawn | `posix_spawn` of `/usr/bin/sandbox-exec -p PROFILE <copy>/MacOS/cvc5 --lang smt` with three pipes, `POSIX_SPAWN_CLOEXEC_DEFAULT`, and the environment `LANG=C`, `LC_ALL=C`. The parent ends are nonblocking and the write end has no `SIGPIPE` (`F_SETNOSIGPIPE`). A refusal is `spawn_failed`. No `--tlimit` and no `--rlimit` |
+| Exchange | One `poll` loop over standard input (while input remains), standard output, standard error and a cancel pipe. Reads take at most 64 KiB per call and writes at most what the pipe accepts, so neither process can wait on the other ([PL3-F2](#pl3-f2-solver-exchange)) |
+| Cancel | A cloneable cancel handle sets a flag and writes one byte to the cancel pipe. The loop sees it at once and returns `cancelled` |
+| Finish | Close standard input; drain and count output; reap with `waitpid(WNOHANG)` at each wake and each memory sample. Cancel or the memory bound sends `SIGKILL` |
+| Kill | `SIGKILL` to the unreaped child, then a blocking `waitpid` on the admission worker (the kill ends it); the copy is removed |
+| Drop | A process not yet reaped is killed and reaped, and the copy removed; this is a safety net, not the normal settlement |
+
+#### PL3 solver memory bound
+
+Selected; SV-P6 is answered. macOS 27 accepts no usable `setrlimit` memory
+limit (PL4a delivery record), so the platform supervises the footprint. At
+every wake of the exchange or finish loop, and at least every 10 ms while
+the solver runs, it reads `ri_phys_footprint` with
+`proc_pid_rusage(pid, RUSAGE_INFO_V2)`. Above 1 GiB it kills and reaps
+the solver, and the candidate is refused `solver_failed`, cause
+`memory_bound`. The bound is 1 GiB: about 125 times the 8.6 MB peak of the
+product corpus (SV-P6), and small beside the reference Mac's memory. The
+10 ms interval is pacing under AE-04: it only samples and ends nothing; a
+size above the bound ends the work, which is a known-size closure. Between
+two samples the solver can grow past the bound by what it allocates in
+10 ms. The test fixture, which touches 2 GiB in under 100 ms, measured it
+(2026-11-16): at 100 ms the footprint reached 2,150,418,256 bytes against a
+256 MiB bound (1.88 GB over), so the interval was lowered; at 10 ms it
+reached 332,153,384 bytes (63.7 MB over, one 64 MiB block). Tests may set a
+lower bound through the platform API; the service uses the constant.
+
+#### PL3 solver source
+
+Selected. Production builds in PL3 have no solver source. A
+`test-support` build reads one package, found by one rule with no search,
+no `PATH` lookup and no second location:
+
+1. When the scratch home of a scratch runtime holds the file
+   `policy-test-solver`, its content (one absolute path, at most 1,024
+   bytes) names the package directory. Tests use it for the stalled-solver
+   fixtures.
+2. Otherwise the package is `<helper directory>/solver`, where the helper
+   directory is the one the model helper uses
+   ([helper directory for Cargo test executables](release-signing.md#helper-directory-for-cargo-test-executables)):
+   for a Cargo test executable, the Cargo profile directory,
+   `target/debug/`.
+
+The development package is the `solver/` directory of a
+`tools/release/solver/build --scratch DIR` run, copied once into
+`target/debug/solver/`. The owner reads the manifest at its start on the
+admission worker. With no package the solver state is `none`; with an
+unreadable manifest it is `unavailable`. A test that needs the real
+solver fails when the package is absent: an absent solver is a gap, never
+a pass (PL-I6).
+
+#### PL3-F2: solver exchange
+
+Selected design. Arrows show one turn of the exchange loop; the loop ends
+only on the listed closures. No time limit ends it.
+
+```mermaid
+flowchart TD
+    Start["exchange(input, output)"] --> Poll["poll: stdin while input remains, stdout, stderr, cancel pipe; 10 ms pacing"]
+    Poll --> Mem{"Footprint above 1 GiB?"}
+    Mem -->|"Yes"| EM["End: memory_bound; caller kills and reaps"]
+    Mem -->|"No"| Can{"Cancel byte or flag?"}
+    Can -->|"Yes"| EC["End: cancelled; caller kills and reaps"]
+    Can -->|"No"| W["Write what stdin accepts"]
+    W -->|"Broken pipe"| ECl["End: closed, with the exit status once reaped"]
+    W --> Rd["Read at most 64 KiB from each ready output"]
+    Rd -->|"End of stdout before the answer"| ECl
+    Rd --> Out{"output(stream, bytes)"}
+    Out -->|"fault: line or model over 1 MiB"| EF["End: fault; caller kills and reaps"]
+    Out -->|"more"| Poll
+    Out -->|"answered"| Done{"All input written?"}
+    Done -->|"No"| Poll
+    Done -->|"Yes"| Ok["Return: answer complete"]
+```
+
+### PL3 policy text store
+
+Selected, replacing the "retained payload store" row of
+[ownership](#ownership): the job payload store's identities, quota and
+recovery are per job, while admitted policy texts are small, kept for
+every revision (SP-R13) and named by digest.
+
+| Item | Rule |
+| --- | --- |
+| Layout | `~/.asura/policy/admitted/<64 hex>`: the SHA-256 of the text. Directories 0700, files 0600, opened through the validated Asura home descriptor with no symbolic link followed, as the payload directories are. The authority scan of `~/.asura` names `policy` as a known entry, as it names `payloads` |
+| Owners | `asura-platform::policy_text_io` (descriptor primitives) and `asura-storage::policy_texts` (digest naming and checks) |
+| Write | On the admission worker only: an existing file with the right digest is reused; otherwise a new exclusive temporary name, the text, `fsync`, `rename` to the digest name, `fsync` of the directory |
+| Read | On the admission worker only, at restart and for rollback: at most 256 KiB plus one byte read; the digest must match. A missing file is `missing`, another digest is `mismatch` |
+| Bound | At most 4,096 texts (at most 1 GiB). A write at the bound fails, and the candidate is refused `storage_unavailable` |
+| Deletion | None: every activated revision stays explainable (SP-R13) |
+
+### PL3 activation and fencing
+
+Selected, refining [atomic activation and launch](#atomic-activation-and-launch).
+
+| Item | Rule |
+| --- | --- |
+| Generation | Each revision that the owner installs on its workers has an owner-local generation, starting at 1. The dispatch generation is the revision new decisions use. Every `JobDecision` carries the generation it was decided under |
+| Install | The owner sends `install(generation, texts)` to every worker. A worker builds the new engine and keeps the older one: requests sent before the install use the older engine, because a worker's channel is in order. A worker drops every engine older than the generation of the request it takes |
+| Append | When every live worker has installed the revision, the owner offers kind 35 `activated` to the conversation owner, the one journal appender. Its sequence is the replay's last kind 35 sequence plus 1 and its previous sequence is the replay's active one, read when the record is built |
+| Commit | In the reactor step of the commit: the dispatch generation becomes the new one; `policy.revision_activated` is audited; and, unless step 7 proved that the change only widens (`check_implies(P_old, P)` holds in every environment), the owner starts the rechecks below |
+| Stale decision | A decision whose generation is not the dispatch generation when its kind 34 would be appended is decided again, with no record. So every kind 34 names the replay's active revision (R3) |
+| Rechecks | Queued starts: the [slot grant check](#pl3-f3-recheck-at-slot-grant). Starting jobs (slot granted, command not yet confirmed started) decided under an older generation: cancelled, reason 23 `policy_changed`. Running jobs: each one's decision request is decided again (at most 64) |
+| Recheck record | Kind 34 subject 3 (the job ID), decided under the new revision, appended before the controller acts on it |
+| Recheck outcome | Allowed: a queued start proceeds with the new decision's constraint set; a running `model-1` job continues only when its running constraint set is inside the new one, root set by root set. Otherwise the job is revoked through the existing revocation path, reason 22 `policy_revoked`, and a running job whose regions narrowed is recorded `deny` with reason `regions_narrowed` |
+| Journal failure | A failed kind 35 append refuses the candidate `storage_unavailable`; the workers keep the unused engine until a newer generation reaches them; the dispatch revision is unchanged |
+| Rejection | A refused candidate appends kind 35 `rejected` (its sequence is the next one; the active revision does not change) and audits `policy.revision_rejected`. A cancelled candidate appends nothing |
+
+The startup revision keeps the PL1 rule: when the replay's active revision
+differs from it, the conversation owner appends its kind 35 `activated`
+before the first kind 34 under it. Admitted revisions never take that path,
+because their kind 35 commits before they dispatch.
+
+### PL3-Q1: activation with fencing and rechecks
+
+Selected design. Solid arrows are messages or calls; dashed arrows are
+replies or events. The recheck part runs only when the change does not
+only widen.
+
+```mermaid
+sequenceDiagram
+    participant A as Admission worker
+    participant O as Policy owner (reactor)
+    participant W as Workers
+    participant C as Conversation owner
+    participant J as Authority writer
+    participant K as Job controller
+    A-->>O: Ready(candidate, scope set, narrowing flag)
+    O->>W: install(g+1, texts)
+    W-->>O: installed(g+1) from every worker
+    O->>C: Offer kind 35 activated
+    C->>J: Append kind 35 (seq = last + 1)
+    J-->>C: Committed
+    C->>O: committed(seq)
+    O->>O: Dispatch generation becomes g+1, audit revision_activated
+    opt The change narrows
+        O->>K: Cancel Starting jobs decided under g, reason policy_changed
+        O->>W: Decide each running job again under g+1
+        W-->>O: Decisions
+        O->>C: Kind 34 subject 3 for each
+        C->>J: Append kind 34
+        J-->>C: Committed
+        C->>K: Continue, or revoke with policy_revoked
+    end
+    Note over K: A queued start decided under g waits at slot grant: re-checking policy
+```
+
+### PL3-F3: recheck at slot grant
+
+Selected design, refining start condition 0b of the
+[job controller interface](#job-controller-and-exec_cmd). Arrows show the
+check for one queued start; the wait ends on the recheck's reply, the
+job's cancel, revocation or shutdown.
+
+```mermaid
+flowchart TD
+    Head["Queue head at slot grant"] --> Same{"Decision generation equals the dispatch generation?"}
+    Same -->|"Yes"| Rest["Conditions 1 to 9 as before"]
+    Same -->|"No"| Wait["Block: policy_recheck, waiting: re-checking policy; offer the job for recheck once per generation"]
+    Wait --> Dec["Policy owner decides the stored request under the dispatch generation"]
+    Dec -->|"Stale generation"| Dec
+    Dec --> Rec["Kind 34 subject 3 appended"]
+    Rec -->|"Run"| New["Fence and constraint set replaced; next grant step"]
+    New --> Same
+    Rec -->|"Deny"| Rev["Settled not_started, reason policy_revoked"]
+    Wait -->|"Cancel, revocation or shutdown"| End["Settled with that reason"]
+```
+
+### PL3 restart and reproving
+
+Selected, refining [restart recovery and rollback](#restart-recovery-and-rollback).
+
+1. Replay keeps the last `activated` kind 35 as the active manifest, the
+   last 64 activated revisions' user text digest and source (for
+   rollback), and the open kind 36 approval grants. The checkpoint stores
+   them.
+2. The owner starts its workers on the built-in texts but dispatches
+   nothing until the conversation owner hands it these replay facts.
+3. With no active manifest, or one whose every scope has source `builtin`
+   and the running build's text digest, the startup revision is the
+   built-in one.
+4. Otherwise the admission worker reads each `person` text from the text
+   store and strict-validates it ([SP-F4](#sp-f4-restart-of-one-scope)).
+   A missing or mismatched text, or a validation failure, makes the user
+   scope unavailable.
+5. When the recorded schema digest, Cedar versions or solver digest
+   differ from the running build, or the installation text differs, the
+   user scope is reproving: the owner queues the stored text at the head
+   of the admission queue with origin `reprove`. Requests wait in their
+   agent queues meanwhile. Success activates a new revision; a refusal or
+   no solver makes the scope unavailable.
+6. An unavailable user scope refuses every decision with `scope_unavailable`
+   for the user scope (`unavailable`, so no kind 34). The person repairs
+   it by admitting a text or by rollback.
+7. Each open kind 36 approval request ends with kind 36 `cancelled`, cause
+   `restart`, appended by the conversation owner after the restore.
+
+### PL3 rollback
+
+Selected. `PolicyRollback` names the user scope and an activated revision
+sequence among the last 64. The owner queues a candidate with origin
+`rollback`: the built-in default text for source `builtin`, or the stored
+text read from the text store on the admission worker. It passes every
+admission step and activates as a new revision. An unknown sequence is
+refused `unknown_revision` before any queueing.
+
+### Kind 35 in PL3
+
+PL3 writes `activated` and `rejected`. Replay rules (each violation is
+`Corrupt`):
+
+| Rule | Check |
+| --- | --- |
+| R1 | Unchanged: every kind 35 sequence is the last plus 1, and its previous sequence is the active one (0 for the first) |
+| R2 | `superseded` and `revoked` are refused until the packet that writes them |
+| R11 | `rejected` keeps the active revision. `activated` makes it active and enters the recent list |
+| R12 | A scope set's source is `builtin` or `person`. A `person` set names a text digest; `builtin` is valid only for the installation and user scopes. The installation scope may also be `builtin-test-deny`, which the test-only denying set records |
+
+### Kind 34 subject 3
+
+Subject code 3 is a job recheck: the 16-byte job ID. The origin is 1 or 2
+and the profile 1 to 3. A `run` of profile 1 has a constraint digest;
+others have none. Replay rule R13: the record names the active revision
+(R3); it adds no pending entry, because no kind 14 or kind 26 follows it.
+
+### Kind 36 in PL3
+
+Kind 36 `PolicyGrant`, at most 8 KiB, holds: the grant ID (16 random
+bytes); the kind (1 approval; 2 envelope is refused until PL8); the event
+(1 requested, 2 granted, 3 denied, 4 cancelled, 5 ended); the task
+(conversation and agent); the job ID; the request, constraint and intent
+digests (requested only); an optional expiry in milliseconds (granted
+only); a cause for `cancelled` and `ended` (1 restart, 2 person, 3 job
+settled, 4 narrowing revision, 5 expiry); and the active revision
+sequence. No record holds a command, a path or a policy text.
+
+Replay rule R14: `requested` opens a grant (at most 256 open); `granted`,
+`denied` and `cancelled` need an open `requested` grant; `ended` and
+`cancelled` may follow `granted`; `denied`, `cancelled` and `ended` close
+it. PL3 writes only the restart `cancelled`; PL7 writes the others.
+
+### PL3 control and presentation
+
+Selected, refining the [control API](#control-api-protocol-01-schema-change-in-place).
+Protocol numbering stays `0.1`; the messages are added in place.
+
+| Message | Content | Reply |
+| --- | --- | --- |
+| `PolicyCandidateSubmit` | Request ID, scope (2 user), text (at most 61,440 bytes) | `PolicyReply` at once: the candidate ID and its position, or an error |
+| `PolicyRollback` | Request ID, scope (2 user), revision sequence | `PolicyReply`, as above |
+| `PolicyCancel` | Request ID, candidate ID | `PolicyReply`: the candidate ID, or `not_found` |
+| `PolicyReply` | Candidate ID (16 bytes), position (0 to 16), error | — |
+
+Errors: `busy` (16 candidates wait), `scope_invalid` (not the user scope in
+PL3), `text_invalid` (empty, too long or not UTF-8), `unknown_revision`,
+`not_found`, `unavailable` (the owner is closing). The result is not a
+reply: `PolicyStatus` gains the admission queue length and the current or
+last candidate (ID, state 1 queued, 2 proving, 3 activated, 4 rejected,
+5 cancelled; position; reason; at most 8 detail lines and 8
+counterexamples of at most 512 bytes each; the activated sequence; the
+widening flag with at most 8 examples; the query count and the proof
+time), and `recent`, the last 4 finished candidates, newest first, so a
+client sees its result when the next candidate starts in the same reactor
+step. `PolicyStatus.user` gains 3 `reproving`, and `solver` uses 2
+`available` and 3 `unavailable`.
+
+CLI (the person's terminal, exit status 0 activated, 1 refused or
+cancelled, 2 usage, 3 service absent): `asura policy status [--json]`;
+`asura policy admit --scope user FILE` (the CLI reads the file, at most
+61,440 bytes); `asura policy rollback --scope user REVISION`;
+`asura policy cancel CANDIDATE`. `admit` and `rollback` wait for the
+candidate's result through `ObserveService`, with no time limit; an
+interrupt ends the wait and the candidate continues.
+
+TUI commands: `/policy` shows the policy line and the last candidate;
+`/policy admit FILE`, `/policy rollback REVISION` and `/policy cancel`. The
+fixed texts:
+
+```text
+policy: candidate 3f9c0a12 queued (position 1)
+policy: proving candidate 3f9c0a12
+policy: revision 4 active: user scope changed (widens: 2 examples)
+policy: candidate 3f9c0a12 refused: proof_failed
+  user:no-net: person network forbidden (AD-7)
+  counterexample: network.connect principal=Asura::Job::"..." resource=Asura::Address::"..." context={...}
+policy: candidate 3f9c0a12 cancelled
+```
+
+The `/status` line uses the solver words `none`, `available` and
+`unavailable`, and `user reproving` while the user scope is reproving.
+
+### PL3 audit events
+
+| Event | Fields |
+| --- | --- |
+| `policy.revision_activated` | Sequence, the scopes changed, widening (yes or no), the solver digest |
+| `policy.revision_rejected` | Scope, reason code |
+| `policy.decision_denied` | Action group, primary scope and reason code, rule ID, project; emitted when a `deny` kind 34 commits |
+| `policy.solver_failed` | Cause: `unavailable`, `digest_mismatch`, `copy_failed`, `spawn_failed`, `closed`, `protocol`, `input_bound`, `output_bound`, `memory_bound`, `io` |
+| `policy.worker_failed` | The worker index |
+
+### PL3-S1: owner revision states
+
+Selected design, extending [PL1-S1](#pl1-s1-policy-owner-states). States
+belong to the owner for one service run. Arrows name the event; guards
+are in brackets.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Restoring: Service start, workers build the built-in texts
+    Restoring --> Loading: Replay facts handed over [an admitted user text is active]
+    Restoring --> Active: Replay facts handed over [built-in revision]
+    Loading --> Active: Texts read and valid [digests as recorded]
+    Loading --> Reproving: Texts read and valid [schema, Cedar, solver or installation changed]
+    Loading --> UserUnavailable: Text missing, mismatched or invalid
+    Reproving --> Active: Admission passed, kind 35 activated committed
+    Reproving --> UserUnavailable: Admission refused, or no solver
+    UserUnavailable --> Active: The person admits a text or rolls back
+    Active --> Installing: Candidate ready
+    Installing --> Activating: Every worker installed the new generation
+    Activating --> Active: Kind 35 committed, dispatch generation advanced
+    Activating --> Active: Kind 35 append failed, candidate refused
+    Restoring --> Closing: Shutdown
+    Loading --> Closing: Shutdown
+    Active --> Closing: Shutdown
+    Installing --> Closing: Shutdown
+    Activating --> Closing: Shutdown
+    Reproving --> Closing: Shutdown
+    UserUnavailable --> Closing: Shutdown
+    Closing --> [*]: Solver killed and reaped, every thread joined
+```
+
+Requests wait in their agent queues in `Restoring`, `Loading` and
+`Reproving`, and are refused `scope_unavailable` for the user scope in
+`UserUnavailable`. Worker loss in any state keeps the PL1 rule.
+
+### PL3-D1: candidate and revision data
+
+Selected design. Boxes are typed values of the admission crate and the
+owner; lines show ownership with cardinality.
+
+```mermaid
+classDiagram
+    class Candidate {
+        id: 16 bytes
+        scope
+        origin: person, rollback or reprove
+        text
+    }
+    class Admission {
+        outcome: ready or rejected
+        reason, details at most 8
+        counterexamples at most 8
+        widening examples at most 8
+        narrowing: bool
+        admission digest
+    }
+    class QueryRecord {
+        id: SP-AQ1 to SP-AQ9 or compile
+        environment
+        outcome, time
+    }
+    class Revision {
+        generation
+        texts per scope
+        digest
+        solver digest
+        admission digest
+    }
+    class SolverRun {
+        package digest
+        copy directory
+        peak footprint
+        exit status
+    }
+    Candidate "1" --> "1" Admission : admitted as
+    Admission "1" --> "0..4096" QueryRecord : ran
+    Admission "1" --> "0..1" SolverRun : used
+    Admission "1" --> "0..1" Revision : ready becomes
+```
+
+### PL3 asynchronous execution and limits
+
+| Rule | Application |
+| --- | --- |
+| AE-01 | The owner's reactor steps move typed values only: queue rotation, activation, fencing and recheck routing |
+| AE-02 | Blocking work runs on the admission worker thread `asura-policy-admission`: SymCC compilation, the solver copy, spawn, pipes and reap, manifest and text store reads and writes. Evaluation stays on the workers |
+| AE-03 | Admission queue 16 candidates; one admission and one solver process at a time; 4,096 queries; 64 MiB input per query; 1 MiB model; 64 KiB standard error; 1 GiB solver footprint; 4,096 stored texts; 64 rechecks per activation; 8 counterexamples |
+| AE-04 | No time bound. A proof ends on the solver's answer, the person's cancel, shutdown or the memory bound. The 10 ms footprint sample is pacing that ends nothing |
+| AE-05 | Nothing is retried. A refused or cancelled candidate leaves the active revision unchanged; a stale decision is decided again with no record |
+| AE-06 | Shutdown cancels the admission (the solver is killed and reaped and its copy removed), joins the admission thread and then the workers. A lost admission thread is joined and replaced; its candidate is refused `solver_failed`, cause `io` |
+| AE-07 | SA-T1 to SA-T7, PL-I11 and PL-I13 below |
+
+### PL3 validation map
+
+| ID | PL3 evidence |
+| --- | --- |
+| PL-U11 | Admission crate unit tests: each step's refusal; the tighten-only lint finds reads through `.intent`, `has intent` and `["intent"]`, and refuses an unannotated read, an annotation without a read and an annotated `permit`; forbid-only; reserved annotations; lexical and spelled literals through a stub check |
+| PL-U13 | Kind 35 `rejected` and the recent list (R11, R12); kind 34 subject 3 (R13); kind 36 codec and replay (R14) with every `Corrupt` case; checkpoint round trips |
+| Adapter unit | The line reader and bounds with in-memory streams: answer shapes, error replies, the 1 MiB model bound, standard error kept to 64 KiB, extra output, the 64 MiB query bound, a pending future |
+| PL-I6 | Real solver (the development package): SP-AQ1 to SP-AQ9 and the compile checks on the built-in sets hold; SP-AQ4 S1 to S6 hold on the installation set (the release-gate suite); fails when the package is absent |
+| PL-I7 (PL3 cases) | Real solver, each refused and shown by a counterexample: a CL-1 violation (an `@intent` permit, refused by the lint and shown by SP-AQ3); a scope widening (a repository `permit`, refused by the lint and shown by SP-AQ5); an AD-7 forbid of one address and port for person jobs (`proof_failed`); a forbid that can error (`proof_failed`); a model write forbid on `vendor/` under the project root (`cannot_enforce`); a permit of person file writes (`cannot_enforce`; a person file forbid changes nothing, because the default user set permits no person file effect) |
+| SA-T1 to SA-T6 | Platform and service integration with the test solver fixture (a test-support executable copied as `MacOS/cvc5`, its mode in `Frameworks/fixture.mode`), started by the real platform owner with real pipes under the solver profile |
+| SA-T7 | SA-T2 while 64 decision requesters run: decisions keep completing and no owner step takes 100 ms in the debug test; the release bench keeps a stalled (SA-T1) admission in flight for the whole run, because a flooding solver ends within the first decisions, and records decision p99 against PL-B2 |
+| Memory | The fixture allocates past a lowered bound: killed, reaped, `memory_bound`, overshoot recorded |
+| PL-I5 | Restart: an admitted revision restores; a damaged text makes the user scope unavailable; a changed solver digest makes it reproving and requests wait, then it reactivates as a new revision |
+| PL-I8 | Activation race: a narrowing revision activates while jobs are queued, starting and running; queued rechecked, starting cancelled `policy_changed`, running revoked `policy_revoked` when denied; a widening revision causes no recheck |
+| PL-I11 | Stalled solver: admission waits, decisions continue, cancel kills and reaps it |
+| PL-I13 | Shutdown during admission and during decisions settles with no orphan solver and no copy left |
+| Rollback | Rollback to revision 1 restores the built-in user text as a new revision; an unknown revision is refused |
+| PL-E3 | PTY journey (`--policy`): `/policy admit` of a user forbid; the next model call is denied with scope `user`; `/policy rollback` restores it; `/status` shows the revision and `solver: available` |
+| Budgets | PL-B1 and PL-B2 re-measured by the median of three runs; the admission proof times of the built-in sets and the seeded cases recorded (spike PES-M13 and PES-M18 as the guide) |
+
+### PL3 delivery record
+
+Verified, 2026-11-16, on the reference Mac (Apple M4 Max, 16 cores,
+macOS 27), with the cvc5 package that `tools/release/solver/build` wrote
+(the GMP archive was fetched from the GNU mirror `ftp.gnu.org` because
+`gmplib.org` did not answer; its size and SHA-256 equal the lock, and the
+build checks BC1 to BC10 passed). Packet PL3 is delivered for its scope
+except the budgets below, which go to the owner.
+
+**Proofs** (release `admission-bench`, 5 rounds, real cvc5; 1-minute load
+about 10):
+
+| Item | Result |
+| --- | --- |
+| Every query (1,745) | median 0.2 ms, p95 12.6 ms, slowest 36.6 ms (PES-M13: median at most 2 s, p95 at most 20 s) |
+| By category, median / slowest | SP-AQ1 0.0 / 15.8 ms; SP-AQ3 0.1 / 7.6 ms; SP-AQ4 0.2 / 16.1 ms; SP-AQ8 0.1 / 20.8 ms; SP-AQ9 0.8 / 16.5 ms; compile (a) 8.7 / 36.6 ms; compile (b) 0.1 / 11.6 ms |
+| Release-gate proofs of the built-in sets (150 queries) | median 454.6 ms, slowest 821.2 ms; every query holds |
+| Default user text (61 queries) | median 187.5 ms; ready |
+| A narrowing user forbid (74 queries) | median 253.1 ms; ready, narrows |
+| A widening change (61 queries) | median 180.0 ms; ready, one example |
+| AD-7 forbid of 192.0.2.1:443 (3 queries) | median 19.1 ms; refused `proof_failed` with a counterexample |
+
+Every admission is inside the PES-M18 guide (median at most 5 s, slowest
+at most 30 s). The seeded refusals of PL-I7 each come with a
+counterexample: the `@intent` permit (lint, shown by SP-AQ3), the
+repository permit (lint, shown by SP-AQ5), the AD-7 forbid and the
+can-error forbid (`proof_failed`), the `vendor/` model write forbid and a
+person file-write permit (`cannot_enforce`).
+
+**Budgets** (median of three, worst run recorded). The machine was busier
+than at the PL2 record: the 1-minute load was 2.6 to 12.6 during the runs.
+The unchanged pre-PL3 build (`c1c08d3`) was measured in the same session,
+alternating run by run, so the comparison shows the cost of PL3:
+
+| Budget | PL3 three runs | Pre-PL3 three runs | Verdict |
+| --- | --- | --- | --- |
+| PL-B1 p50 at most 150 µs | 154.7, 157.8, 161.5 µs; median 157.8 µs; worst 161.5 µs | 163.3, 169.2, 162.4 µs; median 163.3 µs | **Fail** on this machine state; PL3 is not slower than the pre-PL3 build |
+| PL-B2 p99 at most 2.5 ms | 13.23, 13.30, 10.86 ms; median 13.23 ms; worst 13.30 ms | 13.84, 56.00, 10.96 ms; median 13.84 ms | **Fail** on this machine state; PL3 is not slower than the pre-PL3 build |
+| PL-B4 startup at most 200 ms | 92.2, 47.6, 49.3 ms | — | **Pass** |
+| PL-B5 | 0 allows in 1,000,000 malformed requests in each run; deterministic | — | **Pass** |
+| SA-T7 (PL-B2 with a stalled admission in flight) | p99 14.5, 174.8, 29.2 ms; longest owner step 4.7 to 38.7 ms | — | Recorded; fails PL-B2 as the plain PL-B2 does |
+
+The PL2 record measured PL-B2 p99 2.024 ms on a quiet machine with the
+same pre-PL3 code. The PL-B1 and PL-B2 failures therefore reflect the
+machine, not the packet; under the [budget rule](#performance-budgets)
+they go to the owner, and a re-measurement on a quiet machine is needed
+for a verdict.
+
+**Memory bound:** at a 10 ms sample, the fixture that touches 2 GiB
+overshot a 256 MiB bound by 63.7 MB ([PL3 solver memory
+bound](#pl3-solver-memory-bound)).
+
+**Not verified:** the TUI command `/policy cancel` and the CLI
+`asura policy` commands end to end (unit and argument tests only); the
+production build with no solver source (`solver: none`) end to end; the
+team-signed solver (PL4b).
+
 ## Delivery packets
 
 Selected order. Each packet updates this design first if its implementation
@@ -3319,7 +4000,7 @@ needs a change. Owned paths are exclusive while a packet runs.
 | PL1 | The policy owner; schema v1; built-in installation and default user sets; deny-on-any-error wrapper; installation and user scopes; region compiler for `model-1`; model exec_cmd job decisions by effect envelope with the command as intent; constraint set to the guardian (byte-equal profile); kinds 34 and 35; `/status` line; denial text | `rust/crates/asura-policy/**` (new, with `AGENTS.md`), `rust/crates/asura-service/src/policy.rs` and `policy/**`, the exec_cmd decision point in `conversation.rs` and `tools.rs`, the guardian profile input in `asura-platform/src/exec_cmd/guardian.rs`, kinds 34–35 in `asura-storage/src/authority/**`, `Cargo.toml`, `Cargo.lock` | This design | PL-U1–U8, U13; PL-I1–I4, I10, I12; PL-E1, E2; PL-B1–B5 recorded |
 | PL2 | Canonicaliser, program identity, intent extractor; person command decisions; named secret `secret_use` | `asura-platform/src/project_identity.rs`, new `asura-platform/src/code_identity.rs`, `exec_cmd/split.rs` (and `split/intent*`), person dispatch in `conversation.rs` and `conversation/person_command.rs`, `asura-service/src/policy.rs` and `policy/**`, `conversation/policy_call.rs`, `asura-policy` request types and built-in sets, kind 34 subject 2 in `asura-storage/src/authority/**` | PL1 | PL-U9, U10, U13; PL-I15; PL-N1; PL-E7; PL-B1, B2 re-measured |
 | PL4a | Solver build script and lock file; unsigned package for tests; probe findings F1 to F5 as script and adapter requirements | `tools/release/solver/**` | The solver build probes (SBQ1, SBQ2); SV-P1 re-run on the product corpus | Script builds offline; SV probes recorded |
-| PL3 | Admission worker, SymCC solver adapter, platform solver process, lints, proofs, change difference, lifecycle with user-scope admission, rollback, restart reproving, control messages, audit | `rust/crates/asura-policy-admission/**` (new), `asura-platform/src/solver.rs`, `asura-service/src/policy/admission*`, control messages in `asura-control`, kind 35 events | PL1, PL4a | PL-U11; PL-I5–I8, I11, I13; PL-E3; the AD-7 person network proof over every host and port ([PL2 AD-7 load check](#pl2-ad-7-load-check)) |
+| PL3 | Admission worker, SymCC solver adapter, platform solver process, lints, proofs, change difference, lifecycle with user-scope admission, rollback, restart reproving, control messages, audit ([PL3 contract](#pl3-implementation-contract)) | `rust/crates/asura-policy-admission/**` (new), `asura-platform/src/solver.rs`, `policy_text_io.rs` and the solver fixture, `asura-storage` policy texts and kinds 34 to 36, `asura-service/src/policy.rs` and `policy/**`, the recheck start condition in the job controller, `conversation/policy_call.rs` and the policy control handler, control messages in `asura-control`, the client, the CLI and TUI `/policy` commands | PL1, PL4a | PL-U11, U13; PL-I5–I8, I11, I13; SA-T1–T7; PL-E3; SP-AQ9, the AD-7 person network proof over every host and port ([PL2 AD-7 load check](#pl2-ad-7-load-check)) |
 | PL4b | Bundle placement, signing, notice, licence folder, release checks | `tools/release/asura-bundle`, `tools/release/asura-release`, `tools/release/host-paths`, `docs/designs/release-signing.md` (first), DMG `LICENSE` | PL4a, PL3 | PL-N2; release proof gate |
 | PL5 | Workspace and repository scopes, forbid-only lint, baseline permit, `rel` literals | `asura-service/src/policy/scopes*`, `asura-policy` lints, repository source read | PL3 | PL-U5, U6; PL-I7; PL-E4 |
 | PL6 | Compiler for `person-1` and lower-scope narrowings; EPG deny rules moved into the compiler; SP-AQ7 soundness proofs | `asura-policy` compiler, `guardian.rs`, `path_guard` interface | PL5 | PL-I9; EV-E |
@@ -3403,7 +4084,7 @@ Probes to run in the named packet, before the code that depends on them.
 | SV-P3 | Does the Hardened Runtime cvc5 load the team-signed GMP through `@rpath`, from the bundle and from the pinned copy? | PL4b (PL4a showed that library validation refuses an ad hoc GMP) |
 | SV-P4 | Does notarisation accept the bundle with no issue for cvc5 and the dylibs? | PL4b |
 | SV-P5 | Is the host-paths scan clean for the solver files? | PL4a: yes for the package; PL4b: in the bundle |
-| SV-P6 | Is there a usable memory bound for a child process on macOS 27? | PL3 |
+| SV-P6 | Is there a usable memory bound for a child process on macOS 27? | PL4a: no `setrlimit` limit is usable; PL3 selects a supervised footprint bound ([PL3 solver memory bound](#pl3-solver-memory-bound)) |
 | SP-P1 | Which spelling does a path walk give across firmlinks, `/private` aliases and case-insensitive volumes? Answered by PL2 ([SP-P1 result](#sp-p1-result)) | PL2 |
 | SP-P2 | Per-request entity slices: does PL-B1 hold on the product schema? Answered by PL1: no ([delivery record](#pl1-delivery-record)) | PL1 |
 | ER-1 to ER-3, ES-1 to ES-5, NE-1, NE-2, VM-1 | [Live enforcement research](#live-enforcement-later-proposed) | Later designs |
@@ -3424,5 +4105,14 @@ SP-P1 probe, the person command, environment and named secret designs and
 the installed Security framework headers. Diagrams PL2-F1, PL2-F2, PL2-Q1
 and PL2-D1 were rendered with the same Mermaid CLI at scale 2 into a
 temporary directory outside the repository and inspected.
+
+Recorded on 2026-11-16 for the PL3 contract: written from the PL1 and PL2
+code, the PL4a delivery record and probes, the installed
+`cedar-policy-symcc` 0.8.1 source (the `Solver` trait, `LocalSolver`'s
+answer parsing and its `--tlimit=60000`, `ResetMode`, the counterexample
+`Env`) and the control frame limit of 64 KiB. Diagrams PL3-F1, PL3-F2,
+PL3-Q1, PL3-F3, PL3-S1 and PL3-D1 were rendered with the same Mermaid CLI
+at scale 2 into a temporary directory outside the repository and
+inspected.
 
 Return to the [design index](README.md).
