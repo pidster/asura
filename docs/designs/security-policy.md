@@ -14,8 +14,9 @@ PL-B2 failed its 1.5 ms target; the owner revised it to p99 at most 2.5 ms
 (AD-34, 2026-11-04), and the quiet-machine runs pass it
 ([PL2 delivery record](#pl2-delivery-record)). Packet PL3 is implemented (2026-11-16) under its
 [contract](#pl3-implementation-contract); PL-B1 and PL-B2 failed for
-PL3 and the pre-PL3 build alike, PL-B2's tail more often for PL3, and are
-reported to the owner ([PL3 delivery record](#pl3-delivery-record)). Later packets are not
+PL3 and the pre-PL3 build alike on a busy machine, PL3 within noise of
+its base after profiling, and are reported to the owner
+([PL3 delivery record](#pl3-delivery-record)). Later packets are not
 implemented. Protocol numbering stays `0.1` and the
 journal format stays `1` until release 1.0.0; schemas change in place.
 
@@ -3996,6 +3997,44 @@ PL-B2 cannot be excluded on this machine. Its cause is not found: the
 decision path adds only the generation check and the stored request,
 and moving the request instead of copying it did not change the result.
 Under the [budget rule](#performance-budgets) both go to the owner.
+
+Profile (owner decision, 2026-11-16: profile first, then merge). The
+PL-B2 bench takes an iteration count, `ASURA_PL_B2_ITERATIONS` (the
+measured decisions times 20,000; a count, never a time limit). The
+pre-PL3 build got the same count for this run only. Each build ran
+400,000 decisions under `sample` (15 s, 1 ms interval):
+
+| Thread | PL3 busy share | Pre-PL3 busy share |
+| --- | --- | --- |
+| Eight evaluation workers | 96 to 99 % each | 95 to 99 % each |
+| Owner loop (the bench's reactor stand-in) | 64 % | 62 % |
+| Attribute reader | 51 % | 45 % |
+| Admission thread (PL3 only) | 0 %: blocked on its channel for every sample | — |
+
+The top of stack is the same in both: Cedar hashing and entity building,
+`malloc` and `free`, and the attribute reader's code-identity fingerprint
+of `/bin/sh` (`openat`, `getattrlist`, `fstat`). No PL3 frame is hot: the
+generation check, the stored request, the admission thread and the
+solver's memory sampler do not appear in the busy samples, and the bench
+has no recheck and no journal append. The workers are saturated, so a
+decision waits for the 7 others queued on its worker. Two observations
+for later work, both in the pre-PL3 code too: the attribute reader's
+refresh after every dispatch takes about half a core beside the
+saturated workers, and the latency is CPU-bound by the eight workers.
+
+Long alternating runs, each 100,000 decisions and each started below a
+1-minute load of 3 (2.36 to 2.97; the 5-minute load stayed 4.3 to 6.9):
+
+| Runs | PL3 | Pre-PL3 |
+| --- | --- | --- |
+| Long, p99 | 18.72, 11.51, 13.87 ms; median 13.87 ms | 31.49, 21.29, 14.28 ms; median 21.29 ms |
+| Long, p50 | 4.52, 4.27, 4.13 ms; median 4.27 ms | 5.90, 4.13, 4.05 ms; median 4.13 ms |
+| Standard (20,000), p99 | 33.57, 17.67, 14.67 ms; median 17.67 ms; worst 33.57 ms | 16.95, 67.30, 11.30 ms; median 16.95 ms |
+
+With the longer runs PL3 is within noise of its base; the earlier
+difference in short runs was sampling noise. PL-B2 still fails for both
+on this machine, because the 5-minute load never fell below 3; the
+verdict stays the owner's.
 
 **Memory bound:** at a 10 ms sample, the fixture that touches 2 GiB
 overshot a 256 MiB bound by 63.7 MB ([PL3 solver memory

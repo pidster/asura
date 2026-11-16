@@ -1718,8 +1718,9 @@ mod tests {
         reader: &asura_platform::events::WakeReader,
         warm: usize,
         measured: usize,
-    ) -> (Vec<Duration>, Duration) {
+    ) -> (Vec<Duration>, Duration, Duration) {
         use std::os::fd::AsRawFd;
+        let called = Instant::now();
         let wait = |reader: &asura_platform::events::WakeReader| {
             let mut fd = libc::pollfd {
                 fd: reader.as_raw_fd(),
@@ -1734,6 +1735,7 @@ mod tests {
             wait(reader);
             owner.poll();
         }
+        let ready = called.elapsed();
         let mut outstanding: Vec<(Ticket, Instant)> = Vec::new();
         let mut next = 0u32;
         let projects: Vec<(String, u64, u64)> = (0..40)
@@ -1783,7 +1785,17 @@ mod tests {
             }
         }
         samples.sort();
-        (samples, longest)
+        (samples, longest, ready)
+    }
+    /// The bench's iteration count: `ASURA_PL_B2_ITERATIONS` times the
+    /// 20,000 measured decisions (default 1), so a run lasts long enough
+    /// to profile. A count, never a time limit.
+    fn bench_iterations() -> usize {
+        std::env::var("ASURA_PL_B2_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| (1..=1000).contains(n))
+            .unwrap_or(1)
     }
     fn percentile(samples: &[Duration], p: f64) -> Duration {
         samples[((samples.len() as f64 * p) as usize).min(samples.len() - 1)]
@@ -1807,8 +1819,10 @@ mod tests {
             Some(sender),
             workers,
         );
-        let (samples, _) = closed_loop(&mut owner, &reader, 2_000, 20_000);
-        let startup = started.elapsed();
+        let built = started.elapsed();
+        let (samples, _, ready) =
+            closed_loop(&mut owner, &reader, 2_000, 20_000 * bench_iterations());
+        let startup = built + ready;
         let budget = Duration::from_micros(2_500);
         let p99 = percentile(&samples, 0.99);
         println!(
@@ -1879,7 +1893,7 @@ mod tests {
         let (id, _) = owner
             .submit_candidate(ap::Scope::User, format!("{}\n// change\n", default_text()))
             .unwrap();
-        let (samples, longest) = closed_loop(&mut owner, &reader, 0, 2_000);
+        let (samples, longest, _) = closed_loop(&mut owner, &reader, 0, 2_000);
         assert_eq!(samples.len(), 2_000);
         assert!(
             longest < Duration::from_millis(100),
@@ -1911,7 +1925,7 @@ mod tests {
         owner
             .submit_candidate(ap::Scope::User, format!("{}\n// change\n", default_text()))
             .unwrap();
-        let (samples, longest) = closed_loop(&mut owner, &reader, 2_000, 20_000);
+        let (samples, longest, _) = closed_loop(&mut owner, &reader, 2_000, 20_000);
         let p99 = percentile(&samples, 0.99);
         println!(
             "SA-T7 workers={workers} requesters=64 decisions={} p50={:?} p99={:?} max={:?} longest_owner_step={longest:?} (a stalled admission in flight); budget p99 <= 2.5 ms: {}",
