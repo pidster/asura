@@ -560,7 +560,7 @@ sys.exit(1 if found else 0)' "$app" "$(uname -n)" "$(scutil --get LocalHostName 
         "$release/asura-release" check --ad-hoc --version "$version" --dmg "$planted" > "$log/planted.txt" 2>&1 || :
         check 'SG4-O1: a planted home path fails only the build-host path rule' \
             [ "$(grep '^FAIL' "$log/planted.txt")" = 'FAIL no file holds the account home, the repository path, the user name or the host name (SG4-O1)' ]
-        check 'SG4-O1: the report names LICENSE' grep -Fqx '  LICENSE: home 1, repository 0, user 1' "$log/planted.txt"
+        check 'SG4-O1: the report names LICENSE' grep -Fqx '  LICENSE: home 1, repository 0, user 1, host 0' "$log/planted.txt"
         rm -rf "$log"
     else
         bad "no dry-run DMG beside the bundle: $dmg"
