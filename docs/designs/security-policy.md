@@ -13,8 +13,8 @@ Packet PL2 is implemented (2026-11-04) under its
 PL-B2 failed its 1.5 ms target; the owner revised it to p99 at most 2.5 ms
 (AD-34, 2026-11-04), and the quiet-machine runs pass it
 ([PL2 delivery record](#pl2-delivery-record)). Packet PL3 is implemented (2026-11-16) under its
-[contract](#pl3-implementation-contract); PL-B1 and PL-B2 failed on a
-busy machine, as the pre-PL3 build did in the same session, and are
+[contract](#pl3-implementation-contract); PL-B1 and PL-B2 failed for
+PL3 and the pre-PL3 build alike, PL-B2's tail more often for PL3, and are
 reported to the owner ([PL3 delivery record](#pl3-delivery-record)). Later packets are not
 implemented. Protocol numbering stays `0.1` and the
 journal format stays `1` until release 1.0.0; schemas change in place.
@@ -3976,10 +3976,26 @@ alternating run by run, so the comparison shows the cost of PL3:
 | SA-T7 (PL-B2 with a stalled admission in flight) | p99 14.5, 174.8, 29.2 ms; longest owner step 4.7 to 38.7 ms | — | Recorded; fails PL-B2 as the plain PL-B2 does |
 
 The PL2 record measured PL-B2 p99 2.024 ms on a quiet machine with the
-same pre-PL3 code. The PL-B1 and PL-B2 failures therefore reflect the
-machine, not the packet; under the [budget rule](#performance-budgets)
-they go to the owner, and a re-measurement on a quiet machine is needed
-for a verdict.
+same pre-PL3 code.
+
+Re-measurement (coordinator, 2026-11-16): release builds; each run started
+only when the 1-minute load average was below 3 (2.22 to 2.94 at the
+starts; the 5-minute average stayed 3.8 to 5.7 because of other work on
+the Mac); PL3 and the pre-PL3 build alternated run by run.
+
+| Budget | PL3 | Pre-PL3 | Verdict |
+| --- | --- | --- | --- |
+| PL-B1 p50 at most 150 µs | 152.7, 198.1, 174.1 µs; median 174.1 µs; worst 198.1 µs | 163.9, 190.3, 171.9 µs; median 171.9 µs | **Fail**; PL3 and its base are within noise |
+| PL-B2 p99 at most 2.5 ms, first three pairs | 44.54, 19.07, 73.05 ms; median 44.54 ms; worst 73.05 ms | 12.37, 8.24, 62.07 ms; median 12.37 ms | **Fail** |
+| PL-B2, nine more pairs after the owner stopped copying each request into its reply | p99 median 47.19 ms (7.92 to 66.39); p50 median 5.42 ms | p99 median 10.58 ms (7.02 to 89.64); p50 median 4.10 ms | **Fail**; PL3's p99 is higher than its base's in 7 of the 9 pairs |
+
+PL-B1 is within noise. PL-B2 fails for both builds, far above the PL2
+quiet figure, and both builds show runs with a p99 of 50 ms or more; but
+PL3's p99 is higher more often, so a PL3 tail-latency regression of
+PL-B2 cannot be excluded on this machine. Its cause is not found: the
+decision path adds only the generation check and the stored request,
+and moving the request instead of copying it did not change the result.
+Under the [budget rule](#performance-budgets) both go to the owner.
 
 **Memory bound:** at a 10 ms sample, the fixture that touches 2 GiB
 overshot a 256 MiB bound by 63.7 MB ([PL3 solver memory

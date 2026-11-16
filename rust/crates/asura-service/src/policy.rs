@@ -190,7 +190,8 @@ impl InFlight {
                 Some(_) => ap::ProfileKind::Person1,
             },
             generation,
-            request: Some(Box::new(request.clone())),
+            // Moved in at dispatch, so a decision costs no request copy.
+            request: None,
         }
     }
 }
@@ -784,7 +785,7 @@ impl PolicyOwner {
                 let Some(at) = w.in_flight.iter().position(|f| f.ticket == ticket) else {
                     return;
                 };
-                let flight = w.in_flight.remove(at);
+                let mut flight = w.in_flight.remove(at);
                 let digest = if flight.generation == self.dispatch.generation {
                     self.dispatch.digest
                 } else {
@@ -832,7 +833,7 @@ impl PolicyOwner {
                             now_ms: flight.now_ms,
                             project: flight.project,
                             task: flight.task,
-                            request: flight.request.clone(),
+                            request: flight.request.take(),
                         };
                         self.ready.insert(ticket, decision);
                         return;
@@ -874,7 +875,7 @@ impl PolicyOwner {
                     now_ms: flight.now_ms,
                     project: flight.project,
                     task: flight.task,
-                    request: flight.request.clone(),
+                    request: flight.request.take(),
                 };
                 self.ready.insert(ticket, decision);
             }
@@ -1004,7 +1005,7 @@ impl PolicyOwner {
             {
                 let _ = sender.try_send(ToWorker::Panic);
             }
-            let flight = InFlight::of(q.ticket, &q.request, &root, generation);
+            let mut flight = InFlight::of(q.ticket, &q.request, &root, generation);
             let message = ToWorker::Decide {
                 ticket: q.ticket,
                 generation,
@@ -1029,7 +1030,10 @@ impl PolicyOwner {
                 None => false,
             };
             match sent {
-                true => worker.in_flight.push(flight),
+                true => {
+                    flight.request = Some(Box::new(q.request));
+                    worker.in_flight.push(flight);
+                }
                 false => {
                     // The worker cannot take it now (a test fault filled its
                     // channel, or it ended): requeue at the front; the next
