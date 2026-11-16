@@ -442,7 +442,7 @@ impl Store {
         &self,
         request: impl FnOnce(SyncSender<T>) -> Request,
     ) -> Result<Ticket<T>, Refused> {
-        let admitted = self.shared.outstanding.fetch_update(
+        let admitted = self.shared.outstanding.try_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |outstanding| (outstanding < QUEUE_BOUND).then_some(outstanding + 1),

@@ -144,7 +144,7 @@ impl Guard {
         let sender = self.sender.as_ref().ok_or(Refused::Stopped)?;
         if self
             .outstanding
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < QUEUE_BOUND).then_some(n + 1)
             })
             .is_err()

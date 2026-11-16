@@ -56,7 +56,7 @@ mod host {
         fn getsid(pid: i32) -> i32;
         fn fcntl(fd: i32, command: i32, ...) -> i32;
         fn signal(signal: i32, handler: usize) -> usize;
-        fn write(fd: i32, bytes: *const u8, count: usize) -> isize;
+        fn write(fd: i32, bytes: *const std::ffi::c_void, count: usize) -> isize;
     }
     extern "C" fn interrupted(signal: i32) {
         INTERRUPTED.store(signal, Ordering::Relaxed);
@@ -72,7 +72,7 @@ mod host {
     }
     pub fn write_bytes(fd: i32, bytes: &[u8]) -> io::Result<usize> {
         // SAFETY: bytes remains valid for this syscall; caller holds fd throughout.
-        let count = unsafe { write(fd, bytes.as_ptr(), bytes.len()) };
+        let count = unsafe { write(fd, bytes.as_ptr().cast(), bytes.len()) };
         if count < 0 {
             Err(io::Error::last_os_error())
         } else {
