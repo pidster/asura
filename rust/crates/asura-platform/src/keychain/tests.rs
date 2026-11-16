@@ -994,12 +994,18 @@ mod scratch_keychain {
 
     fn fixture_binary() -> PathBuf {
         let exe = std::env::current_exe().expect("test executable");
-        let profile = exe
-            .parent()
-            .and_then(Path::parent)
-            .expect("target profile directory");
         // A test-support `[[bin]]`: `cargo test` with the feature builds it
-        // beside the test executables' `deps` directory.
+        // in the target profile directory. Cargo 1.100's build-dir layout
+        // puts this unit test executable in
+        // `<profile>/build/asura-platform/<hash>/out/`.
+        let build = exe.ancestors().nth(4).expect("build directory");
+        assert_eq!(
+            build.file_name(),
+            Some("build".as_ref()),
+            "{} is not in <profile>/build/<package>/<hash>/out/",
+            exe.display()
+        );
+        let profile = build.parent().expect("target profile directory");
         let fixture = profile.join("keychain_fixture");
         assert!(
             fixture.is_file(),

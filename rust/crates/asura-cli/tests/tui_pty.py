@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production TUI journeys using only an isolated CLI fixture executable.
 
-Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--context-views|--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer|--thinking|--jobs|--job-viewer|--job-retention|--execution-setting|--job-notices|--person-commands|--person-outside|--person-model|--person-restart|--person-secrets|--person-named|--path-guard|--policy]
+Usage: python3 tui_pty.py target/debug/build/asura-cli/HASH/out/lifecycle-HASH [--context-views|--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer|--thinking|--jobs|--job-viewer|--job-retention|--execution-setting|--job-notices|--person-commands|--person-outside|--person-model|--person-restart|--person-secrets|--person-named|--path-guard|--policy]
 The job journeys (--jobs, --job-viewer, --job-retention, --execution-setting)
 need a service that lists CAPABILITY_JOBS; they run after packet J34-E.
 --job-notices needs the J5 job notice; it runs after packet J5-E.
