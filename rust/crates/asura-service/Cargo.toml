@@ -18,6 +18,7 @@ tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 asura-platform = { path = "../asura-platform" }
 asura-control = { path = "../asura-control" }
 asura-policy = { path = "../asura-policy" }
+asura-policy-admission = { path = "../asura-policy-admission" }
 
 [dev-dependencies]
 asura-storage = { path = "../asura-storage", features = ["embedded-memory", "test-support"] }
@@ -94,6 +95,12 @@ test = false
 [[test]]
 name = "person_command_flow"
 path = "tests/person_command_flow.rs"
+harness = false
+required-features = ["test-support"]
+
+[[test]]
+name = "policy_flow"
+path = "tests/policy_flow.rs"
 harness = false
 required-features = ["test-support"]
 

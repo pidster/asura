@@ -701,6 +701,7 @@ impl H {
             person: None,
             constraints: (profile == Profile::Model1)
                 .then(asura_platform::exec_cmd::template_for_test),
+            policy: None,
         };
         let job = origin.job_id();
         self.env

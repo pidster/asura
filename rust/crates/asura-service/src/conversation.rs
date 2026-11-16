@@ -10,7 +10,9 @@ mod named_secrets;
 mod notice;
 mod path_guard;
 mod person_command;
+mod policy_admin;
 mod policy_call;
+pub(crate) use policy_call::revision_record;
 mod response;
 use crate::model_owner::{ModelOwner, PackageIdentity};
 use crate::{job_control, job_text, sensors, tools};
@@ -138,6 +140,9 @@ pub(crate) fn handles(request: &pb::Envelope) -> bool {
                 | Body::SecretPut(_)
                 | Body::SecretList(_)
                 | Body::SecretRemove(_)
+                | Body::PolicyCandidateSubmit(_)
+                | Body::PolicyRollback(_)
+                | Body::PolicyCancel(_)
         )
     ) || request.body.as_ref().is_some_and(job_control::handles)
 }
@@ -432,6 +437,7 @@ fn submit_exec(
     registration: Option<journal::ProjectRegistered>,
     boundary: asura_platform::StateBoundary,
     constraints: Option<asura_platform::exec_cmd::Constraints>,
+    fence: Option<crate::job_controller::PolicyFence>,
     now: Instant,
 ) {
     use crate::job_controller::{Admission, AgentKey, BusyReason, Origin, StartRequest};
@@ -495,6 +501,7 @@ fn submit_exec(
         stored_command: stored_command.clone(),
         person: None,
         constraints: Some(constraints),
+        policy: fence,
     };
     match controller.submit(request, now) {
         Admission::Accepted { job } | Admission::Existing { job } => {
@@ -832,6 +839,12 @@ enum Job {
     PolicyRevision,
     /// Kind 34 of the active exec_cmd call (PL1).
     PolicyDecision,
+    /// A policy lifecycle record: kind 35 `activated` or `rejected`, or a
+    /// kind 36 restart cancel (PL3).
+    PolicyLifecycle(crate::policy::Commit),
+    /// A job recheck's kind 34 subject 3 (PL3-F3): the job, whether it was
+    /// running, and the decision.
+    PolicyRecheck(journal::Id, bool, Box<crate::policy::JobDecision>),
     ToolResult,
     /// One kind 24 response segment (response-text-transfer.md).
     ResponseText,
@@ -885,6 +898,8 @@ pub(crate) struct Owner {
     audit_records: Arc<Vec<asura_storage::audit::Record>>,
     audit_health: asura_storage::audit::Health,
     audit_emitter: Option<crate::audit::Emitter>,
+    /// The policy lifecycle and rechecks (PL3).
+    policy_admin: policy_admin::PolicyAdmin,
     /// Commands waiting, in order, for the serialized journal ticket. They wait
     /// with no timer (J1-0); beyond 32 they are `conversation_busy`.
     foreground: VecDeque<pb::Envelope>,
@@ -979,6 +994,7 @@ impl Owner {
             create_recovery: None,
             audit_health: audit_tools::unavailable(),
             audit_emitter: None,
+            policy_admin: policy_admin::PolicyAdmin::default(),
             foreground: VecDeque::new(),
             dispatching_foreground: false,
             sensor_owner: None,
@@ -1597,10 +1613,7 @@ impl Owner {
     fn start_policy(&mut self) {
         if self.policy.is_none() && !self.closing {
             self.policy = Some(crate::policy::PolicyOwner::start(
-                self.runtime
-                    .asura_home_path()
-                    .to_string_lossy()
-                    .into_owned(),
+                self.runtime.clone(),
                 self.wake.clone(),
                 self.policy_test_deny,
             ));
@@ -1790,6 +1803,12 @@ impl Owner {
             Some(Body::PathGuardList(_) | Body::PathGuardApprove(_) | Body::PathGuardRevoke(_))
         ) {
             return self.path_request(request);
+        }
+        if matches!(
+            request.body,
+            Some(Body::PolicyCandidateSubmit(_) | Body::PolicyRollback(_) | Body::PolicyCancel(_))
+        ) {
+            return self.policy_request(request);
         }
         if let Some(Body::AuditRead(query)) = request.body.as_ref() {
             let project = id(&query.project_id);
@@ -2649,6 +2668,34 @@ impl Owner {
                 }
                 return self.path_dispatch_done(input, result, now);
             }
+            Job::PolicyLifecycle(commit) => {
+                if let Ok(value) = &result {
+                    self.replay = value.replay.clone();
+                }
+                if let Err(
+                    cause @ (writer::Error::OutcomeUnconfirmed
+                    | writer::Error::RepairRequired
+                    | writer::Error::Unavailable),
+                ) = &result
+                {
+                    self.unavailable = Some(storage_error(*cause));
+                }
+                return self.policy_lifecycle_done(commit, result.is_ok());
+            }
+            Job::PolicyRecheck(job, running, decision) => {
+                if let Ok(value) = &result {
+                    self.replay = value.replay.clone();
+                }
+                if let Err(
+                    cause @ (writer::Error::OutcomeUnconfirmed
+                    | writer::Error::RepairRequired
+                    | writer::Error::Unavailable),
+                ) = &result
+                {
+                    self.unavailable = Some(storage_error(*cause));
+                }
+                return self.policy_recheck_done(job, running, decision, result.is_ok());
+            }
             Job::PathControl(key) => {
                 if let Ok(value) = &result {
                     self.replay = value.replay.clone();
@@ -2921,7 +2968,10 @@ impl Owner {
         self.replay = value.replay.clone();
         match job {
             // Handled before the result is taken.
-            Job::PathDispatch(_) | Job::PathControl(_) => {}
+            Job::PathDispatch(_)
+            | Job::PathControl(_)
+            | Job::PolicyLifecycle(_)
+            | Job::PolicyRecheck(..) => {}
             Job::PersonQueue(submit) => self.person_queued(*submit, Ok(value)),
             Job::PersonLookup(submit) => self.person_looked_up(*submit, value),
             Job::PersonRead(input) => self.person_read(input, value, now),
@@ -3277,8 +3327,11 @@ impl Owner {
             // next step appends its kind 34.
             Job::PolicyRevision => {}
             Job::PolicyDecision => {
-                if let Some(tool) = self.active.as_mut().and_then(|a| a.tool.as_mut()) {
-                    policy_call::recorded(&mut tool.policy);
+                if let Some(tool) = self.active.as_mut().and_then(|a| a.tool.as_mut())
+                    && let Some(event) = policy_call::recorded(&mut tool.policy)
+                    && let Some(emitter) = &self.audit_emitter
+                {
+                    let _ = emitter.try_emit(event);
                 }
             }
             Job::ToolIntent => {
@@ -4187,6 +4240,7 @@ impl Owner {
         if let Some(policy) = &mut self.policy {
             policy.poll();
         }
+        self.policy_step();
         self.forward_journal_quota();
         self.log_journal_status();
         if let Some(result) = self.pending.as_mut().and_then(|(ticket, _)| ticket.poll()) {
@@ -4764,6 +4818,7 @@ impl Owner {
                     // before job admission. Kind 35 and kind 34 commit
                     // before this call's kind 14.
                     let mut constraints = None;
+                    let mut fence = None;
                     if execution
                         && let Some((location, device, inode)) = registration
                             .as_ref()
@@ -4771,10 +4826,7 @@ impl Owner {
                     {
                         let policy = self.policy.get_or_insert_with(|| {
                             crate::policy::PolicyOwner::start(
-                                self.runtime
-                                    .asura_home_path()
-                                    .to_string_lossy()
-                                    .into_owned(),
+                                self.runtime.clone(),
                                 self.wake.clone(),
                                 self.policy_test_deny,
                             )
@@ -4853,6 +4905,7 @@ impl Owner {
                             policy_call::Next::Ready(decision) => {
                                 if decision.run {
                                     constraints = decision.constraints;
+                                    fence = policy_call::fence_of(&decision);
                                 } else {
                                     use journal::{ToolDecision as D, ToolDecisionReason as R};
                                     tool.record.decision = D::Denied;
@@ -4880,6 +4933,7 @@ impl Owner {
                             registration,
                             self.runtime.state_boundary(),
                             constraints,
+                            fence,
                             now,
                         );
                     }

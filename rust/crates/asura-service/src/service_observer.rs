@@ -113,7 +113,7 @@ impl Observer {
         request.body = Some(Body::ServiceObservation(pb::ServiceObservation {
             secret_store: self.secret_store,
             llamacpp: self.llamacpp.clone(),
-            policy: self.policy,
+            policy: self.policy.clone(),
             revision: Some(self.revision),
             pending: Some(pending),
             status: Some(self.status),

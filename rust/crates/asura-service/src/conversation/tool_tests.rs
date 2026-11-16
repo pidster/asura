@@ -99,6 +99,7 @@ impl Fixture {
                 audit_records: Arc::new(Vec::new()),
                 audit_health: audit_tools::unavailable(),
                 audit_emitter: None,
+                policy_admin: Default::default(),
                 sensor_owner: None,
                 sensor_seeded: false,
                 journal_quota: None,

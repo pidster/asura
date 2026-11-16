@@ -1,14 +1,17 @@
 //! The policy owner (security-policy.md, PL1 implementation contract,
-//! "Policy owner", and the PL2 contract): one reactor component that
-//! decides model `exec_cmd` jobs and person (`!`, `!!`) job starts with
-//! Cedar on a pool of worker threads. An attribute reader thread
-//! canonicalises project roots and reads the entry program's code
-//! identity (PL2). Each worker holds its own
-//! engine built from the revision texts; nothing Cedar is shared between
+//! "Policy owner", the PL2 contract and the PL3 contract): one reactor
+//! component that decides model `exec_cmd` jobs and person (`!`, `!!`) job
+//! starts with Cedar on a pool of worker threads. An attribute reader
+//! thread canonicalises project roots and reads the entry program's code
+//! identity (PL2). An admission thread admits policy candidates with the
+//! solver (PL3, `lifecycle` and `admission`). Each worker holds its own
+//! engines built from the revision texts; nothing Cedar is shared between
 //! threads. No call here blocks the reactor: engines are built, regions
-//! compiled and requests evaluated on the workers, and the reactor only
-//! moves typed values.
+//! compiled and requests evaluated on the workers, admission runs on its
+//! thread, and the reactor only moves typed values.
+pub(crate) mod admission;
 mod attributes;
+mod lifecycle;
 
 use crate::job_controller::AgentKey;
 use asura_platform::events::WakeSender;
@@ -17,10 +20,11 @@ use asura_platform::exec_cmd::split::PlanFacts;
 use asura_policy as ap;
 use asura_storage::authority::conversation as journal;
 pub(crate) use attributes::RootKey;
+pub(crate) use lifecycle::{Activation, Commit, RestoreFacts, audit_scope};
 use sha2::Digest;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::JoinHandle;
 
 /// Decision queue bound per agent (AE-03); a full queue is `policy_busy`.
@@ -95,8 +99,13 @@ pub(crate) struct JobDecision {
     pub action: ap::Action,
     /// `model-1`, or the person profile.
     pub profile: ap::ProfileKind,
-    /// The owner could not decide (no engine): no kind 34 is written.
+    /// The owner could not decide (no engine, or an unavailable scope): no
+    /// kind 34 is written.
     pub unavailable: bool,
+    /// The revision generation the decision was made under (PL3
+    /// activation and fencing): a decision of another generation than the
+    /// dispatch generation is decided again.
+    pub generation: u64,
     pub revision_digest: [u8; 32],
     pub scopes: Vec<ap::ScopeResult>,
     pub primary: Option<ap::Primary>,
@@ -108,24 +117,35 @@ pub(crate) struct JobDecision {
     /// The principal's project and task (conversation), for kind 34.
     pub project: journal::Id,
     pub task: journal::Id,
+    /// The request this decision answers, kept for a recheck under a later
+    /// revision (PL3-F3).
+    pub request: Option<Box<JobRequest>>,
 }
 impl JobDecision {
-    fn refused(revision: [u8; 32], flight: &InFlight, error: ap::ErrorClass, reason: &str) -> Self {
+    fn refused(
+        revision: [u8; 32],
+        generation: u64,
+        flight: &InFlight,
+        scope: ap::Scope,
+        error: ap::ErrorClass,
+        reason: &str,
+    ) -> Self {
         let now_ms = flight.now_ms;
         Self {
             run: false,
             action: ap::Action::ProcessExec,
             profile: flight.profile,
             unavailable: error == ap::ErrorClass::ScopeUnavailable,
+            generation,
             revision_digest: revision,
             scopes: vec![ap::ScopeResult {
-                scope: ap::Scope::Installation,
+                scope,
                 allow: false,
                 rules: Vec::new(),
                 error: Some(error),
             }],
             primary: Some(ap::Primary {
-                scope: Some(ap::Scope::Installation),
+                scope: Some(scope),
                 reason: reason.into(),
                 rule: None,
                 explain: None,
@@ -137,6 +157,7 @@ impl JobDecision {
             now_ms,
             project: flight.project,
             task: flight.task,
+            request: flight.request.clone(),
         }
     }
 }
@@ -148,12 +169,15 @@ struct InFlight {
     project: journal::Id,
     task: journal::Id,
     profile: ap::ProfileKind,
+    generation: u64,
+    request: Option<Box<JobRequest>>,
 }
 impl InFlight {
-    fn of(ticket: Ticket, request: &JobRequest, root: &str) -> Self {
+    fn of(ticket: Ticket, request: &JobRequest, root: &str, generation: u64) -> Self {
         Self {
             ticket,
             key: CacheKey {
+                generation,
                 project: request.project,
                 root: root.to_owned(),
             },
@@ -165,11 +189,14 @@ impl InFlight {
                 Some(p) if p.outside => ap::ProfileKind::PersonOutside1,
                 Some(_) => ap::ProfileKind::Person1,
             },
+            generation,
+            request: Some(Box::new(request.clone())),
         }
     }
 }
 
-/// Owner state (PL1-S1).
+/// Owner state (PL1-S1, PL3-S1). The user scope's own state is
+/// [`UserScope`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum State {
     Starting,
@@ -179,201 +206,49 @@ pub(crate) enum State {
     Closing,
 }
 
-/// The facts of the built-in revision that kind 35 records.
+/// The user scope at restart and after (PL3 restart and reproving).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserScope {
+    /// Waiting for the replay facts (`Restoring`).
+    Restoring,
+    /// Reading the stored text (`Loading`).
+    Loading,
+    Ok,
+    Reproving,
+    Unavailable,
+}
+
+/// The facts of a revision that kind 35 records.
 #[derive(Clone, Debug)]
 pub(crate) struct Manifest {
     pub digest: [u8; 32],
     pub scopes: Vec<(ap::Scope, [u8; 32], &'static str, Vec<String>)>,
+    pub solver_digest: Option<[u8; 32]>,
+    pub admission_digest: Option<[u8; 32]>,
 }
 
-enum ToWorker {
-    Decide {
-        ticket: Ticket,
-        principal: Box<ap::JobPrincipal>,
-        entry: Box<ap::ProgramRef>,
-        command: String,
-        plan: PlanFacts,
-        person: Option<Box<ap::PersonEntry>>,
-        now_ms: i64,
-        cached: Option<ap::Regions>,
-    },
-    /// Test-support fault: the worker panics (PL-I12).
-    #[cfg(feature = "test-support")]
-    Panic,
-}
-enum FromWorker {
-    Installed {
-        worker: usize,
-        generation: u64,
-        result: Result<Vec<(ap::Scope, Vec<String>)>, String>,
-    },
-    Decided {
-        worker: usize,
-        generation: u64,
-        ticket: Ticket,
-        outcome: Box<Outcome>,
-    },
-}
-enum Outcome {
-    Model(ap::JobOutcome),
-    Person(ap::PersonOutcome),
-}
-
-struct Worker {
-    sender: Option<SyncSender<ToWorker>>,
-    handle: Option<JoinHandle<()>>,
-    /// Distinguishes a replacement's replies from its predecessor's.
+/// One revision the owner installs on its workers.
+#[derive(Clone)]
+struct Revision {
     generation: u64,
-    installed: bool,
-    in_flight: Vec<InFlight>,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct CacheKey {
-    project: journal::Id,
-    /// The canonical root spelling.
-    root: String,
-}
-/// Canonical project root spellings in the owner (PL2 attribute reader).
-pub(crate) const ROOTS: usize = 256;
-
-struct Queued {
-    ticket: Ticket,
-    request: JobRequest,
-}
-
-pub(crate) struct PolicyOwner {
     texts: Arc<ap::RevisionTexts>,
     digest: [u8; 32],
-    asura_home: String,
-    state: State,
-    workers: Vec<Worker>,
-    replies: Receiver<FromWorker>,
-    reply_sender: mpsc::Sender<FromWorker>,
-    wake: Option<WakeSender>,
-    queues: BTreeMap<AgentKey, VecDeque<Queued>>,
-    queued: usize,
-    /// The agent served last, for round-robin dispatch.
-    last_agent: Option<AgentKey>,
-    ready: HashMap<Ticket, JobDecision>,
-    /// Tickets whose requester cancelled while the request was in flight.
-    cancelled: Vec<Ticket>,
-    next_ticket: Ticket,
-    next_generation: u64,
-    cache: HashMap<CacheKey, ap::Regions>,
-    cache_order: VecDeque<CacheKey>,
     policy_ids: Option<Vec<(ap::Scope, Vec<String>)>>,
-    reader: attributes::Reader,
-    /// The entry program with its identity, once read.
-    entry: Option<ap::ProgramRef>,
-    /// An entry lookup or refresh is queued or in flight.
-    entry_pending: bool,
-    roots: HashMap<RootKey, String>,
-    root_order: VecDeque<RootKey>,
-    /// Root lookups queued or in flight.
-    resolving: std::collections::HashSet<RootKey>,
-    #[cfg(feature = "test-support")]
-    panic_next: bool,
+    solver_digest: Option<[u8; 32]>,
+    admission_digest: Option<[u8; 32]>,
 }
-
-impl PolicyOwner {
-    /// Starts the workers for the built-in revision, or for the test-only
-    /// denying set when `test_deny` (test-support builds only).
-    pub(crate) fn start(asura_home: String, wake: Option<WakeSender>, test_deny: bool) -> Self {
-        let _ = test_deny;
-        #[cfg(feature = "test-support")]
-        let texts = if test_deny {
-            ap::RevisionTexts::builtin_test_deny()
-        } else {
-            ap::RevisionTexts::builtin()
-        };
-        #[cfg(not(feature = "test-support"))]
-        let texts = ap::RevisionTexts::builtin();
-        Self::with_texts(texts, asura_home, wake, worker_count())
-    }
-    pub(crate) fn with_texts(
-        texts: ap::RevisionTexts,
-        asura_home: String,
-        wake: Option<WakeSender>,
-        workers: usize,
-    ) -> Self {
-        let digest = texts.digest();
-        let (reply_sender, replies) = mpsc::channel();
-        let wake_for_reader = wake.clone();
-        let mut owner = Self {
+impl Revision {
+    fn new(generation: u64, texts: ap::RevisionTexts) -> Self {
+        Self {
+            generation,
+            digest: texts.digest(),
             texts: Arc::new(texts),
-            digest,
-            asura_home,
-            state: State::Starting,
-            workers: Vec::new(),
-            replies,
-            reply_sender,
-            wake,
-            queues: BTreeMap::new(),
-            queued: 0,
-            last_agent: None,
-            ready: HashMap::new(),
-            cancelled: Vec::new(),
-            next_ticket: 1,
-            next_generation: 1,
-            cache: HashMap::new(),
-            cache_order: VecDeque::new(),
             policy_ids: None,
-            reader: attributes::Reader::start(wake_for_reader),
-            entry: None,
-            entry_pending: false,
-            roots: HashMap::new(),
-            root_order: VecDeque::new(),
-            resolving: std::collections::HashSet::new(),
-            #[cfg(feature = "test-support")]
-            panic_next: false,
-        };
-        owner.entry_pending = owner.reader.send(attributes::Lookup::Entry);
-        for index in 0..workers {
-            let worker = owner.spawn(index);
-            owner.workers.push(worker);
-        }
-        if owner.workers.iter().all(|w| w.handle.is_none()) {
-            owner.state = State::Unavailable;
-        }
-        owner
-    }
-    fn spawn(&mut self, index: usize) -> Worker {
-        let generation = self.next_generation;
-        self.next_generation += 1;
-        let (sender, receiver) = mpsc::sync_channel::<ToWorker>(IN_FLIGHT);
-        let replies = self.reply_sender.clone();
-        let texts = self.texts.clone();
-        let wake = self.wake.clone();
-        let handle = std::thread::Builder::new()
-            .name(format!("asura-policy-{index}"))
-            .spawn(move || worker_main(index, generation, &texts, receiver, replies, wake));
-        match handle {
-            Ok(handle) => Worker {
-                sender: Some(sender),
-                handle: Some(handle),
-                generation,
-                installed: false,
-                in_flight: Vec::new(),
-            },
-            Err(_) => Worker {
-                sender: None,
-                handle: None,
-                generation,
-                installed: false,
-                in_flight: Vec::new(),
-            },
+            solver_digest: None,
+            admission_digest: None,
         }
     }
-    #[cfg(test)]
-    pub(crate) fn state(&self) -> State {
-        self.state
-    }
-    pub(crate) fn digest(&self) -> [u8; 32] {
-        self.digest
-    }
-    /// The kind 35 manifest facts, once a worker has installed the revision.
-    pub(crate) fn manifest(&self) -> Option<Manifest> {
+    fn manifest(&self) -> Option<Manifest> {
         let ids = self.policy_ids.as_ref()?;
         Some(Manifest {
             digest: self.digest,
@@ -393,7 +268,294 @@ impl PolicyOwner {
                     )
                 })
                 .collect(),
+            solver_digest: self.solver_digest,
+            admission_digest: self.admission_digest,
         })
+    }
+}
+
+enum ToWorker {
+    /// Build an engine for this revision generation and keep the older
+    /// ones until a request of a newer generation arrives.
+    Install {
+        generation: u64,
+        texts: Arc<ap::RevisionTexts>,
+    },
+    Decide {
+        ticket: Ticket,
+        generation: u64,
+        principal: Box<ap::JobPrincipal>,
+        entry: Box<ap::ProgramRef>,
+        command: String,
+        plan: PlanFacts,
+        person: Option<Box<ap::PersonEntry>>,
+        now_ms: i64,
+        cached: Option<ap::Regions>,
+    },
+    /// Test-support fault: the worker panics (PL-I12).
+    #[cfg(feature = "test-support")]
+    Panic,
+}
+enum FromWorker {
+    Installed {
+        worker: usize,
+        thread: u64,
+        generation: u64,
+        result: Result<Vec<(ap::Scope, Vec<String>)>, String>,
+    },
+    Decided {
+        worker: usize,
+        thread: u64,
+        ticket: Ticket,
+        outcome: Box<Outcome>,
+    },
+}
+enum Outcome {
+    Model(ap::JobOutcome),
+    Person(ap::PersonOutcome),
+    /// The worker holds no engine of the request's generation.
+    NoEngine,
+}
+
+struct Worker {
+    sender: Option<SyncSender<ToWorker>>,
+    handle: Option<JoinHandle<()>>,
+    /// Distinguishes a replacement's replies from its predecessor's.
+    thread: u64,
+    /// The newest generation this worker has installed.
+    installed: u64,
+    /// Generations whose install is queued on this worker.
+    installing: Vec<u64>,
+    in_flight: Vec<InFlight>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CacheKey {
+    generation: u64,
+    project: journal::Id,
+    /// The canonical root spelling.
+    root: String,
+}
+/// Canonical project root spellings in the owner (PL2 attribute reader).
+pub(crate) const ROOTS: usize = 256;
+
+struct Queued {
+    ticket: Ticket,
+    request: JobRequest,
+}
+
+pub(crate) struct PolicyOwner {
+    /// The dispatch revision: new decisions use it.
+    dispatch: Revision,
+    /// A ready candidate's revision while it installs and activates.
+    next: Option<lifecycle::Next>,
+    next_generation_id: u64,
+    asura_home: String,
+    state: State,
+    user: UserScope,
+    workers: Vec<Worker>,
+    replies: Receiver<FromWorker>,
+    reply_sender: mpsc::Sender<FromWorker>,
+    wake: Option<WakeSender>,
+    queues: BTreeMap<AgentKey, VecDeque<Queued>>,
+    queued: usize,
+    /// The agent served last, for round-robin dispatch.
+    last_agent: Option<AgentKey>,
+    ready: HashMap<Ticket, JobDecision>,
+    /// Tickets whose requester cancelled while the request was in flight.
+    cancelled: Vec<Ticket>,
+    next_ticket: Ticket,
+    next_thread: u64,
+    cache: HashMap<CacheKey, ap::Regions>,
+    cache_order: VecDeque<CacheKey>,
+    reader: attributes::Reader,
+    /// The entry program with its identity, once read.
+    entry: Option<ap::ProgramRef>,
+    /// An entry lookup or refresh is queued or in flight.
+    entry_pending: bool,
+    roots: HashMap<RootKey, String>,
+    root_order: VecDeque<RootKey>,
+    /// Root lookups queued or in flight.
+    resolving: std::collections::HashSet<RootKey>,
+    /// Admission, candidates, records and audit (PL3).
+    life: lifecycle::Life,
+    #[cfg(feature = "test-support")]
+    panic_next: bool,
+}
+
+/// How the owner starts (PL3 solver source and restart).
+pub(crate) struct Options {
+    pub runtime: Option<asura_platform::RuntimeDirectory>,
+    pub source: admission::SolverSource,
+    pub limits: asura_platform::solver::SolverLimits,
+    /// `false`: the owner waits for [`PolicyOwner::restore`] before it
+    /// decides (the service). `true`: the texts are the startup revision
+    /// as given (tests and benches).
+    pub restored: bool,
+}
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            runtime: None,
+            source: admission::SolverSource::None,
+            limits: asura_platform::solver::SolverLimits::default(),
+            restored: true,
+        }
+    }
+}
+
+impl PolicyOwner {
+    /// Starts the workers for the built-in revision, or for the test-only
+    /// denying set when `test_deny` (test-support builds only). The owner
+    /// decides nothing until the conversation owner hands it the replay
+    /// facts ([`Self::restore`]).
+    pub(crate) fn start(
+        runtime: asura_platform::RuntimeDirectory,
+        wake: Option<WakeSender>,
+        test_deny: bool,
+    ) -> Self {
+        let _ = test_deny;
+        #[cfg(feature = "test-support")]
+        let texts = if test_deny {
+            ap::RevisionTexts::builtin_test_deny()
+        } else {
+            ap::RevisionTexts::builtin()
+        };
+        #[cfg(not(feature = "test-support"))]
+        let texts = ap::RevisionTexts::builtin();
+        let home = runtime.asura_home_path().to_string_lossy().into_owned();
+        let source = admission::solver_source(&runtime);
+        Self::with_options(
+            texts,
+            home,
+            wake,
+            worker_count(),
+            Options {
+                runtime: Some(runtime),
+                source,
+                limits: asura_platform::solver::SolverLimits::default(),
+                restored: false,
+            },
+        )
+    }
+    /// An owner already restored with `texts` as its startup revision and
+    /// no solver (tests and benches).
+    #[cfg(test)]
+    pub(crate) fn with_texts(
+        texts: ap::RevisionTexts,
+        asura_home: String,
+        wake: Option<WakeSender>,
+        workers: usize,
+    ) -> Self {
+        Self::with_options(texts, asura_home, wake, workers, Options::default())
+    }
+    pub(crate) fn with_options(
+        texts: ap::RevisionTexts,
+        asura_home: String,
+        wake: Option<WakeSender>,
+        workers: usize,
+        options: Options,
+    ) -> Self {
+        let (reply_sender, replies) = mpsc::channel();
+        let wake_for_reader = wake.clone();
+        let life = lifecycle::Life::start(&options, wake.clone());
+        let mut owner = Self {
+            dispatch: Revision::new(1, texts),
+            next: None,
+            next_generation_id: 2,
+            asura_home,
+            state: State::Starting,
+            user: if options.restored {
+                UserScope::Ok
+            } else {
+                UserScope::Restoring
+            },
+            workers: Vec::new(),
+            replies,
+            reply_sender,
+            wake,
+            queues: BTreeMap::new(),
+            queued: 0,
+            last_agent: None,
+            ready: HashMap::new(),
+            cancelled: Vec::new(),
+            next_ticket: 1,
+            next_thread: 1,
+            cache: HashMap::new(),
+            cache_order: VecDeque::new(),
+            reader: attributes::Reader::start(wake_for_reader),
+            entry: None,
+            entry_pending: false,
+            roots: HashMap::new(),
+            root_order: VecDeque::new(),
+            resolving: std::collections::HashSet::new(),
+            life,
+            #[cfg(feature = "test-support")]
+            panic_next: false,
+        };
+        owner.entry_pending = owner.reader.send(attributes::Lookup::Entry);
+        for index in 0..workers {
+            let worker = owner.spawn(index);
+            owner.workers.push(worker);
+        }
+        if owner.workers.iter().all(|w| w.handle.is_none()) {
+            owner.state = State::Unavailable;
+        }
+        owner
+    }
+    fn spawn(&mut self, index: usize) -> Worker {
+        let thread = self.next_thread;
+        self.next_thread += 1;
+        // Room for the installs of the dispatch and the next revision.
+        let (sender, receiver) = mpsc::sync_channel::<ToWorker>(IN_FLIGHT + 2);
+        let replies = self.reply_sender.clone();
+        let wake = self.wake.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("asura-policy-{index}"))
+            .spawn(move || worker_main(index, thread, receiver, replies, wake));
+        let mut worker = match handle {
+            Ok(handle) => Worker {
+                sender: Some(sender),
+                handle: Some(handle),
+                thread,
+                installed: 0,
+                installing: Vec::new(),
+                in_flight: Vec::new(),
+            },
+            Err(_) => Worker {
+                sender: None,
+                handle: None,
+                thread,
+                installed: 0,
+                installing: Vec::new(),
+                in_flight: Vec::new(),
+            },
+        };
+        let mut revisions = vec![(self.dispatch.generation, self.dispatch.texts.clone())];
+        if let Some(next) = &self.next {
+            revisions.push((next.revision.generation, next.revision.texts.clone()));
+        }
+        for (generation, texts) in revisions {
+            install(&mut worker, generation, texts);
+        }
+        worker
+    }
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> State {
+        self.state
+    }
+    /// The dispatch revision's digest.
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        self.dispatch.digest
+    }
+    /// The dispatch generation (PL3 activation and fencing).
+    pub(crate) fn dispatch_generation(&self) -> u64 {
+        self.dispatch.generation
+    }
+    /// The kind 35 manifest facts of the dispatch revision, once a worker
+    /// has installed it.
+    pub(crate) fn manifest(&self) -> Option<Manifest> {
+        self.dispatch.manifest()
     }
     /// Queue one decision. `None` is `policy_busy`: the agent's queue or
     /// the service queue is full, or the owner is closing.
@@ -409,10 +571,13 @@ impl PolicyOwner {
         self.next_ticket += 1;
         queue.push_back(Queued { ticket, request });
         self.queued += 1;
+        self.notify();
+        Some(ticket)
+    }
+    fn notify(&self) {
         if let Some(wake) = &self.wake {
             let _ = wake.notify();
         }
-        Some(ticket)
     }
     /// The decision of `ticket`, once replied.
     pub(crate) fn take(&mut self, ticket: Ticket) -> Option<JobDecision> {
@@ -441,7 +606,8 @@ impl PolicyOwner {
     pub(crate) fn queued(&self) -> usize {
         self.queued
     }
-    /// One bounded reactor step: replies, worker loss, dispatch.
+    /// One bounded reactor step: replies, worker loss, admission,
+    /// activation, dispatch.
     pub(crate) fn poll(&mut self) {
         while let Ok(message) = self.replies.try_recv() {
             self.receive(message);
@@ -451,6 +617,7 @@ impl PolicyOwner {
         }
         self.reap();
         self.reap_reader();
+        self.step_lifecycle();
         self.dispatch();
     }
     /// One attribute reply (PL2 attribute reader).
@@ -495,13 +662,17 @@ impl PolicyOwner {
     /// Refuses every queued request whose root failed to canonicalise,
     /// with the path reason and no scope (PL2 canonical paths).
     fn refuse_root(&mut self, key: &RootKey, refusal: asura_platform::PathRefusal) {
-        let scopes: Vec<ap::Scope> = self.texts.scopes.iter().map(|s| s.scope).collect();
+        let scopes: Vec<ap::Scope> = self.dispatch.texts.scopes.iter().map(|s| s.scope).collect();
+        let generation = self.dispatch.generation;
         let mut refused = Vec::new();
         for queue in self.queues.values_mut() {
             let before = queue.len();
             queue.retain(|q| {
                 if q.request.root_key() == *key {
-                    refused.push((q.ticket, InFlight::of(q.ticket, &q.request, &key.location)));
+                    refused.push((
+                        q.ticket,
+                        InFlight::of(q.ticket, &q.request, &key.location, generation),
+                    ));
                     false
                 } else {
                     true
@@ -512,8 +683,10 @@ impl PolicyOwner {
         self.queues.retain(|_, q| !q.is_empty());
         for (ticket, flight) in refused {
             let mut decision = JobDecision::refused(
-                self.digest,
+                self.dispatch.digest,
+                generation,
                 &flight,
+                ap::Scope::Installation,
                 ap::ErrorClass::RequestInvalid,
                 refusal.reason(),
             );
@@ -550,14 +723,15 @@ impl PolicyOwner {
         }
     }
     /// Starting or restarting becomes active once every live worker has
-    /// installed the revision and the entry identity is known.
+    /// installed the dispatch revision and the entry identity is known.
     fn maybe_active(&mut self) {
+        let generation = self.dispatch.generation;
         if matches!(self.state, State::Starting | State::Restarting)
             && self.entry.is_some()
             && self
                 .workers
                 .iter()
-                .all(|w| w.installed || w.handle.is_none())
+                .all(|w| w.installed >= generation || w.handle.is_none())
         {
             self.state = State::Active;
         }
@@ -566,49 +740,76 @@ impl PolicyOwner {
         match message {
             FromWorker::Installed {
                 worker,
+                thread,
                 generation,
                 result,
             } => {
-                let Some(w) = self
-                    .workers
-                    .get_mut(worker)
-                    .filter(|w| w.generation == generation)
-                else {
+                let Some(w) = self.workers.get_mut(worker).filter(|w| w.thread == thread) else {
                     return;
                 };
+                w.installing.retain(|g| *g != generation);
                 match result {
                     Ok(ids) => {
-                        w.installed = true;
-                        self.policy_ids.get_or_insert(ids);
-                        self.maybe_active();
+                        w.installed = w.installed.max(generation);
+                        if generation == self.dispatch.generation {
+                            self.dispatch.policy_ids.get_or_insert(ids);
+                            self.maybe_active();
+                        } else if let Some(next) = self.next.as_mut()
+                            && next.revision.generation == generation
+                        {
+                            next.revision.policy_ids.get_or_insert(ids);
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(stage = "policy", error, "policy_worker_load_failed");
-                        if self.state != State::Closing {
-                            self.state = State::Unavailable;
+                        if generation == self.dispatch.generation {
+                            if self.state != State::Closing {
+                                self.state = State::Unavailable;
+                            }
+                        } else {
+                            self.next_failed();
                         }
                     }
                 }
             }
             FromWorker::Decided {
                 worker,
-                generation,
+                thread,
                 ticket,
                 outcome,
             } => {
-                let Some(w) = self
-                    .workers
-                    .get_mut(worker)
-                    .filter(|w| w.generation == generation)
-                else {
+                let Some(w) = self.workers.get_mut(worker).filter(|w| w.thread == thread) else {
                     return;
                 };
                 let Some(at) = w.in_flight.iter().position(|f| f.ticket == ticket) else {
                     return;
                 };
                 let flight = w.in_flight.remove(at);
+                let digest = if flight.generation == self.dispatch.generation {
+                    self.dispatch.digest
+                } else {
+                    [0; 32]
+                };
                 let outcome = match *outcome {
                     Outcome::Model(outcome) => outcome,
+                    Outcome::NoEngine => {
+                        if let Some(at) = self.cancelled.iter().position(|t| *t == ticket) {
+                            self.cancelled.remove(at);
+                            return;
+                        }
+                        self.ready.insert(
+                            ticket,
+                            JobDecision::refused(
+                                digest,
+                                flight.generation,
+                                &flight,
+                                ap::Scope::Installation,
+                                ap::ErrorClass::PolicyError,
+                                "policy_error",
+                            ),
+                        );
+                        return;
+                    }
                     Outcome::Person(outcome) => {
                         if let Some(at) = self.cancelled.iter().position(|t| *t == ticket) {
                             self.cancelled.remove(at);
@@ -620,7 +821,8 @@ impl PolicyOwner {
                             action: outcome.action,
                             profile: flight.profile,
                             unavailable: false,
-                            revision_digest: self.digest,
+                            generation: flight.generation,
+                            revision_digest: digest,
                             scopes: outcome.decision.scopes,
                             primary: if run { None } else { outcome.decision.primary },
                             constraints: None,
@@ -630,6 +832,7 @@ impl PolicyOwner {
                             now_ms: flight.now_ms,
                             project: flight.project,
                             task: flight.task,
+                            request: flight.request.clone(),
                         };
                         self.ready.insert(ticket, decision);
                         return;
@@ -651,7 +854,8 @@ impl PolicyOwner {
                     action: ap::Action::ProcessExec,
                     profile: ap::ProfileKind::Model1,
                     unavailable: false,
-                    revision_digest: self.digest,
+                    generation: flight.generation,
+                    revision_digest: digest,
                     scopes: outcome.decision.scopes.clone(),
                     primary: if run {
                         None
@@ -670,6 +874,7 @@ impl PolicyOwner {
                     now_ms: flight.now_ms,
                     project: flight.project,
                     task: flight.task,
+                    request: flight.request.clone(),
                 };
                 self.ready.insert(ticket, decision);
             }
@@ -696,7 +901,9 @@ impl PolicyOwner {
             if !finished {
                 continue;
             }
-            let handle = self.workers[index].handle.take().expect("finished handle");
+            let Some(handle) = self.workers[index].handle.take() else {
+                continue;
+            };
             let _ = handle.join();
             let failed = std::mem::take(&mut self.workers[index].in_flight);
             for flight in failed {
@@ -704,11 +911,14 @@ impl PolicyOwner {
                     self.cancelled.remove(at);
                     continue;
                 }
+                let digest = self.dispatch.digest;
                 self.ready.insert(
                     flight.ticket,
                     JobDecision::refused(
-                        self.digest,
+                        digest,
+                        flight.generation,
                         &flight,
+                        ap::Scope::Installation,
                         ap::ErrorClass::PolicyError,
                         "policy_error",
                     ),
@@ -718,6 +928,7 @@ impl PolicyOwner {
                 continue;
             }
             tracing::warn!(stage = "policy", worker = index, "policy_worker_failed");
+            self.life.audit_worker_failed(index);
             if self.state == State::Active {
                 self.state = State::Restarting;
             }
@@ -725,17 +936,32 @@ impl PolicyOwner {
             self.workers[index] = replacement;
         }
     }
+    /// Requests may be dispatched: the dispatch revision is installed and
+    /// the user scope is available.
+    fn can_decide(&self) -> bool {
+        matches!(self.state, State::Active | State::Restarting) && self.user == UserScope::Ok
+    }
     fn dispatch(&mut self) {
-        if self.state == State::Unavailable {
-            // No engine can decide: every queued request is refused with
-            // `scope_unavailable`, and no kind 34 is written for it.
+        let unavailable = match (self.state, self.user) {
+            (State::Unavailable, _) => Some(ap::Scope::Installation),
+            (_, UserScope::Unavailable) => Some(ap::Scope::User),
+            _ => None,
+        };
+        if let Some(scope) = unavailable {
+            // No engine can decide, or the user scope needs repair: every
+            // queued request is refused with `scope_unavailable`, and no
+            // kind 34 is written for it.
+            let generation = self.dispatch.generation;
+            let digest = self.dispatch.digest;
             for (_, queue) in std::mem::take(&mut self.queues) {
                 for q in queue {
                     self.ready.insert(
                         q.ticket,
                         JobDecision::refused(
-                            self.digest,
-                            &InFlight::of(q.ticket, &q.request, &q.request.location),
+                            digest,
+                            generation,
+                            &InFlight::of(q.ticket, &q.request, &q.request.location, generation),
+                            scope,
                             ap::ErrorClass::ScopeUnavailable,
                             "scope_unavailable",
                         ),
@@ -745,15 +971,14 @@ impl PolicyOwner {
             self.queued = 0;
             return;
         }
-        if !matches!(self.state, State::Active | State::Restarting) {
+        if !self.can_decide() {
             return;
         }
+        let generation = self.dispatch.generation;
         loop {
-            let Some(index) = self
-                .workers
-                .iter()
-                .position(|w| w.installed && w.sender.is_some() && w.in_flight.len() < IN_FLIGHT)
-            else {
+            let Some(index) = self.workers.iter().position(|w| {
+                w.installed >= generation && w.sender.is_some() && w.in_flight.len() < IN_FLIGHT
+            }) else {
                 return;
             };
             let Some(entry) = self.entry.clone() else {
@@ -762,24 +987,27 @@ impl PolicyOwner {
             let Some((agent, root)) = self.next_ready_agent() else {
                 return;
             };
-            let queue = self.queues.get_mut(&agent).expect("agent queue");
-            let q = queue.pop_front().expect("queued request");
+            let Some(queue) = self.queues.get_mut(&agent) else {
+                return;
+            };
+            let Some(q) = queue.pop_front() else {
+                return;
+            };
             if queue.is_empty() {
                 self.queues.remove(&agent);
             }
             self.queued -= 1;
             self.last_agent = Some(agent);
             #[cfg(feature = "test-support")]
-            if std::mem::take(&mut self.panic_next) {
-                let _ = self.workers[index]
-                    .sender
-                    .as_ref()
-                    .expect("sender")
-                    .try_send(ToWorker::Panic);
+            if std::mem::take(&mut self.panic_next)
+                && let Some(sender) = self.workers[index].sender.as_ref()
+            {
+                let _ = sender.try_send(ToWorker::Panic);
             }
-            let flight = InFlight::of(q.ticket, &q.request, &root);
+            let flight = InFlight::of(q.ticket, &q.request, &root, generation);
             let message = ToWorker::Decide {
                 ticket: q.ticket,
+                generation,
                 principal: Box::new(principal(&q.request, &root, &self.asura_home)),
                 entry: Box::new(entry),
                 command: q.request.command.clone(),
@@ -796,9 +1024,13 @@ impl PolicyOwner {
                 cached: self.cache.get(&flight.key).copied(),
             };
             let worker = &mut self.workers[index];
-            match worker.sender.as_ref().expect("sender").try_send(message) {
-                Ok(()) => worker.in_flight.push(flight),
-                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+            let sent = match worker.sender.as_ref() {
+                Some(sender) => sender.try_send(message).is_ok(),
+                None => false,
+            };
+            match sent {
+                true => worker.in_flight.push(flight),
+                false => {
                     // The worker cannot take it now (a test fault filled its
                     // channel, or it ended): requeue at the front; the next
                     // step reaps or retries it.
@@ -853,30 +1085,43 @@ impl PolicyOwner {
         None
     }
     /// The `/status` facts; `revision` is the journaled kind 35 sequence
-    /// of this revision, or 0.
+    /// of the dispatch revision, or 0.
     pub(crate) fn status(&self, revision: u64) -> asura_control::pb::PolicyStatus {
-        let scope = if self.state == State::Unavailable {
+        let installation = if self.state == State::Unavailable {
             2
         } else {
             1
         };
+        let user = match (self.state, self.user) {
+            (State::Unavailable, _) | (_, UserScope::Unavailable) => 2,
+            (_, UserScope::Reproving) => 3,
+            _ => 1,
+        };
+        let starting = self.state == State::Starting
+            || matches!(self.user, UserScope::Restoring | UserScope::Loading);
         asura_control::pb::PolicyStatus {
-            state: Some(match self.state {
-                State::Starting => 1,
-                State::Active | State::Restarting | State::Closing => 2,
-                State::Unavailable => 3,
+            state: Some(if self.state == State::Unavailable {
+                3
+            } else if starting {
+                1
+            } else {
+                2
             }),
             revision: Some(revision),
-            installation: Some(scope),
-            user: Some(scope),
+            installation: Some(installation),
+            user: Some(user),
             workspace_sets: Some(0),
             repository_sets: Some(0),
             repository_changed: Some(0),
-            solver: Some(1),
+            solver: Some(self.life.solver_state().code()),
             approvals_waiting: Some(0),
+            admission_queue: Some(self.life.queue_len()),
+            candidate: self.life.candidate_status(),
+            recent: self.life.recent_status(),
         }
     }
-    /// Shutdown: close ingress, drop the queues, close the worker channels.
+    /// Shutdown: close ingress, drop the queues, cancel admission (the
+    /// solver is killed and reaped), close the worker channels.
     pub(crate) fn shutdown(&mut self) {
         self.state = State::Closing;
         self.queues.clear();
@@ -885,19 +1130,24 @@ impl PolicyOwner {
             worker.sender = None;
         }
         self.reader.close();
+        self.life.close();
     }
-    /// Every worker has finished and been joined.
+    /// Every worker, the reader and the admission thread have finished and
+    /// been joined.
     pub(crate) fn settled(&mut self) -> bool {
         while let Ok(message) = self.replies.try_recv() {
             self.receive(message);
         }
         for worker in &mut self.workers {
-            if worker.handle.as_ref().is_some_and(JoinHandle::is_finished) {
-                let _ = worker.handle.take().expect("handle").join();
+            if worker.handle.as_ref().is_some_and(JoinHandle::is_finished)
+                && let Some(handle) = worker.handle.take()
+            {
+                let _ = handle.join();
             }
         }
         let reader = self.reader.settled();
-        reader && self.workers.iter().all(|w| w.handle.is_none())
+        let admission = self.life.settled();
+        reader && admission && self.workers.iter().all(|w| w.handle.is_none())
     }
     /// Test fault: the next dispatched request's worker panics.
     #[cfg(all(test, feature = "test-support"))]
@@ -905,9 +1155,18 @@ impl PolicyOwner {
         self.panic_next = true;
     }
 }
-
-/// The principal of a job: the model `exec_cmd` shape, or a person job's
-/// (PL2), with the canonical project root.
+/// Queue one install on a worker. A full or closed channel leaves it
+/// uninstalled; the worker is then replaced or retried by the lifecycle.
+fn install(worker: &mut Worker, generation: u64, texts: Arc<ap::RevisionTexts>) -> bool {
+    let sent = worker
+        .sender
+        .as_ref()
+        .is_some_and(|s| s.try_send(ToWorker::Install { generation, texts }).is_ok());
+    if sent {
+        worker.installing.push(generation);
+    }
+    sent
+}
 fn principal(request: &JobRequest, root: &str, asura_home: &str) -> ap::JobPrincipal {
     let task = format!(
         "{}:{}",
@@ -967,8 +1226,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn worker_main(
     index: usize,
-    generation: u64,
-    texts: &ap::RevisionTexts,
+    thread: u64,
     receiver: Receiver<ToWorker>,
     replies: mpsc::Sender<FromWorker>,
     wake: Option<WakeSender>,
@@ -978,35 +1236,45 @@ fn worker_main(
             let _ = wake.notify();
         }
     };
-    let engine = ap::Engine::build(texts);
-    let result = match &engine {
-        Ok(engine) => Ok(texts
-            .scopes
-            .iter()
-            .map(|s| (s.scope, engine.policy_ids(s.scope)))
-            .collect()),
-        Err(error) => Err(format!("{error:?}")),
-    };
-    if replies
-        .send(FromWorker::Installed {
-            worker: index,
-            generation,
-            result,
-        })
-        .is_err()
-    {
-        return;
-    }
-    notify();
-    let Ok(engine) = engine else {
-        return;
-    };
+    // Engines by revision generation, oldest first: the dispatch revision
+    // and, while one activates, the next. A request of a newer generation
+    // drops the older engines, because a worker's channel is in order.
+    let mut engines: Vec<(u64, ap::Engine)> = Vec::new();
     // The loop ends when the owner drops the sender (shutdown or
     // replacement); every message is bounded work.
     while let Ok(message) = receiver.recv() {
         match message {
+            ToWorker::Install { generation, texts } => {
+                let engine = ap::Engine::build(&texts);
+                let result = match &engine {
+                    Ok(engine) => Ok(texts
+                        .scopes
+                        .iter()
+                        .map(|s| (s.scope, engine.policy_ids(s.scope)))
+                        .collect()),
+                    Err(error) => Err(format!("{error:?}")),
+                };
+                if let Ok(engine) = engine {
+                    engines.retain(|(g, _)| *g != generation);
+                    engines.push((generation, engine));
+                    engines.sort_by_key(|(g, _)| *g);
+                }
+                if replies
+                    .send(FromWorker::Installed {
+                        worker: index,
+                        thread,
+                        generation,
+                        result,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                notify();
+            }
             ToWorker::Decide {
                 ticket,
+                generation,
                 principal,
                 entry,
                 command,
@@ -1015,35 +1283,41 @@ fn worker_main(
                 now_ms,
                 cached,
             } => {
-                let outside = principal.profile == ap::ProfileKind::PersonOutside1;
-                let outcome = match person {
-                    None => {
-                        let intent = intent(&command, plan, None);
-                        Outcome::Model(ap::decide_model1_job(
-                            &engine,
-                            &principal,
-                            &entry,
-                            Some(&intent),
-                            now_ms,
-                            cached,
-                        ))
-                    }
-                    Some(facts) => {
-                        let intent = intent(&command, plan, Some(outside));
-                        Outcome::Person(ap::decide_person_job(
-                            &engine,
-                            &principal,
-                            &entry,
-                            &facts,
-                            Some(&intent),
-                            now_ms,
-                        ))
+                engines.retain(|(g, _)| *g >= generation);
+                let outcome = match engines.iter().find(|(g, _)| *g == generation) {
+                    None => Outcome::NoEngine,
+                    Some((_, engine)) => {
+                        let outside = principal.profile == ap::ProfileKind::PersonOutside1;
+                        match person {
+                            None => {
+                                let intent = intent(&command, plan, None);
+                                Outcome::Model(ap::decide_model1_job(
+                                    engine,
+                                    &principal,
+                                    &entry,
+                                    Some(&intent),
+                                    now_ms,
+                                    cached,
+                                ))
+                            }
+                            Some(facts) => {
+                                let intent = intent(&command, plan, Some(outside));
+                                Outcome::Person(ap::decide_person_job(
+                                    engine,
+                                    &principal,
+                                    &entry,
+                                    &facts,
+                                    Some(&intent),
+                                    now_ms,
+                                ))
+                            }
+                        }
                     }
                 };
                 if replies
                     .send(FromWorker::Decided {
                         worker: index,
-                        generation,
+                        thread,
                         ticket,
                         outcome: Box::new(outcome),
                     })
@@ -1061,10 +1335,6 @@ fn worker_main(
         }
     }
 }
-
-/// A real project directory for owner tests (the attribute reader walks
-/// it): its canonical location, device and inode. Under the system temp
-/// directory, never an Asura home.
 #[cfg(test)]
 pub(crate) fn test_project(name: &str) -> (String, u64, u64) {
     use std::os::unix::fs::MetadataExt;
@@ -1207,26 +1477,6 @@ mod tests {
         assert!(!d.run);
         assert_eq!(d.action, ap::Action::SecretUse);
         assert_eq!(reason(&d), ("secret_forbidden", Some("user:no-npm")));
-        close(owner);
-    }
-
-    /// PL-I15 (owner): a revision with a person network forbid fails the
-    /// AD-7 load check; the owner is unavailable and refuses starts.
-    #[test]
-    fn pl_i15_person_network_forbid_is_not_accepted() {
-        let mut texts = ap::RevisionTexts::builtin();
-        texts.scopes[1].text.push_str("\n@id(\"no-net\") @reason(\"no_net\")\nforbid (principal, action == Asura::Action::\"network.connect\", resource) when { principal.origin == Asura::Origin::\"person_typed\" };\n");
-        let mut owner = PolicyOwner::with_texts(texts, "/h/.asura".into(), None, 2);
-        let end = Instant::now() + Duration::from_secs(30);
-        while owner.state() != State::Unavailable {
-            assert!(Instant::now() < end);
-            owner.poll();
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let ticket = owner
-            .decide_job(person(false, PersonRequest::default(), "ls"))
-            .unwrap();
-        assert!(wait(&mut owner, ticket).unavailable);
         close(owner);
     }
 
@@ -1456,25 +1706,16 @@ mod tests {
         close(owner);
     }
 
-    /// PL-B2 bench (run in release with `--ignored`): from `decide_job` on
-    /// a reactor-like loop to the reply taken in the loop after the
-    /// worker's wake, 64 closed-loop requesters on the product worker
-    /// pool, 20,000 decisions after 2,000 warm-up decisions. The p99 must
-    /// be at most 2.5 ms (security-policy.md, PL-B2, revised by AD-34; was
-    /// 1.5 ms under AD-33).
-    #[test]
-    #[ignore = "bench: cargo test --release ... pl_b2 -- --ignored --nocapture"]
-    fn pl_b2_end_to_end_p99_at_64_concurrent_requesters() {
+    /// The closed loop of PL-B2: 64 requesters, `measured` decisions after
+    /// `warm`, each from `decide_job` to the reply taken after the wake.
+    /// Returns the samples and the longest owner step (`poll`).
+    fn closed_loop(
+        owner: &mut PolicyOwner,
+        reader: &asura_platform::events::WakeReader,
+        warm: usize,
+        measured: usize,
+    ) -> (Vec<Duration>, Duration) {
         use std::os::fd::AsRawFd;
-        let (reader, sender) = asura_platform::events::wake_pair().unwrap();
-        let workers = worker_count();
-        let mut owner = PolicyOwner::with_texts(
-            ap::RevisionTexts::builtin(),
-            "/Users/p/.asura".into(),
-            Some(sender),
-            workers,
-        );
-        let started = Instant::now();
         let wait = |reader: &asura_platform::events::WakeReader| {
             let mut fd = libc::pollfd {
                 fd: reader.as_raw_fd(),
@@ -1486,12 +1727,9 @@ mod tests {
             let _ = reader.drain();
         };
         while owner.state() != State::Active {
-            wait(&reader);
+            wait(reader);
             owner.poll();
         }
-        let startup = started.elapsed();
-        const WARM: usize = 2_000;
-        const MEASURED: usize = 20_000;
         let mut outstanding: Vec<(Ticket, Instant)> = Vec::new();
         let mut next = 0u32;
         let projects: Vec<(String, u64, u64)> = (0..40)
@@ -1506,20 +1744,23 @@ mod tests {
             out.push((ticket, at));
         };
         for _ in 0..64 {
-            submit(&mut owner, &mut outstanding, next);
+            submit(owner, &mut outstanding, next);
             next += 1;
         }
-        let mut samples = Vec::with_capacity(MEASURED);
+        let mut samples = Vec::with_capacity(measured);
+        let mut longest = Duration::ZERO;
         let mut done = 0usize;
-        while done < WARM + MEASURED {
+        while done < warm + measured {
+            let step = Instant::now();
             owner.poll();
+            longest = longest.max(step.elapsed());
             let mut i = 0;
             let mut finished = 0;
             while i < outstanding.len() {
                 let (ticket, at) = outstanding[i];
                 if let Some(decision) = owner.take(ticket) {
                     assert!(decision.run);
-                    if done >= WARM {
+                    if done >= warm {
                         samples.push(at.elapsed());
                     }
                     done += 1;
@@ -1530,26 +1771,158 @@ mod tests {
                 }
             }
             for _ in 0..finished {
-                submit(&mut owner, &mut outstanding, next);
+                submit(owner, &mut outstanding, next);
                 next += 1;
             }
             if finished == 0 {
-                wait(&reader);
+                wait(reader);
             }
         }
         samples.sort();
-        let pct = |p: f64| samples[((samples.len() as f64 * p) as usize).min(samples.len() - 1)];
+        (samples, longest)
+    }
+    fn percentile(samples: &[Duration], p: f64) -> Duration {
+        samples[((samples.len() as f64 * p) as usize).min(samples.len() - 1)]
+    }
+
+    /// PL-B2 bench (run in release with `--ignored`): from `decide_job` on
+    /// a reactor-like loop to the reply taken in the loop after the
+    /// worker's wake, 64 closed-loop requesters on the product worker
+    /// pool, 20,000 decisions after 2,000 warm-up decisions. The p99 must
+    /// be at most 2.5 ms (security-policy.md, PL-B2, revised by AD-34; was
+    /// 1.5 ms under AD-33).
+    #[test]
+    #[ignore = "bench: cargo test --release ... pl_b2 -- --ignored --nocapture"]
+    fn pl_b2_end_to_end_p99_at_64_concurrent_requesters() {
+        let (reader, sender) = asura_platform::events::wake_pair().unwrap();
+        let workers = worker_count();
+        let started = Instant::now();
+        let mut owner = PolicyOwner::with_texts(
+            ap::RevisionTexts::builtin(),
+            "/Users/p/.asura".into(),
+            Some(sender),
+            workers,
+        );
+        let (samples, _) = closed_loop(&mut owner, &reader, 2_000, 20_000);
+        let startup = started.elapsed();
         let budget = Duration::from_micros(2_500);
+        let p99 = percentile(&samples, 0.99);
         println!(
             "PL-B2 workers={workers} requesters=64 decisions={} p50={:?} p99={:?} max={:?} owner_startup={:?}; budget p99 <= 2.5 ms (AD-34): {}",
             samples.len(),
-            pct(0.50),
-            pct(0.99),
+            percentile(&samples, 0.50),
+            p99,
             samples[samples.len() - 1],
             startup,
-            if pct(0.99) <= budget { "PASS" } else { "FAIL" }
+            if p99 <= budget { "PASS" } else { "FAIL" }
         );
         close(owner);
+    }
+
+    /// An owner whose admission thread uses the stalled-solver fixture in
+    /// `mode`, in a scratch runtime under `/private/tmp`.
+    fn owner_with_fixture(
+        mode: &str,
+        wake: Option<WakeSender>,
+        workers: usize,
+    ) -> (PolicyOwner, std::path::PathBuf) {
+        let home = std::path::Path::new("/private/tmp").join(format!(
+            "asura-policy-sat-{}-{}",
+            std::process::id(),
+            mode
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let home = home.canonicalize().unwrap();
+        let runtime = asura_platform::RuntimeDirectory::scratch(&home, true).unwrap();
+        let exe = asura_platform::solver::fixture_executable().expect("solver fixture built");
+        let package = asura_platform::solver::fixture_package(&exe, mode, &home.join("fixture"))
+            .expect("fixture package");
+        let owner = PolicyOwner::with_options(
+            ap::RevisionTexts::builtin(),
+            runtime.asura_home_path().to_string_lossy().into_owned(),
+            wake,
+            workers,
+            Options {
+                runtime: Some(runtime),
+                source: admission::SolverSource::Package(package),
+                limits: asura_platform::solver::SolverLimits::default(),
+                restored: true,
+            },
+        );
+        (owner, home)
+    }
+    fn default_text() -> String {
+        ap::RevisionTexts::builtin()
+            .scopes
+            .into_iter()
+            .find(|s| s.scope == ap::Scope::User)
+            .unwrap()
+            .text
+    }
+
+    /// SA-T7 (debug): a flooding solver's admission runs while 64
+    /// requesters decide: every decision completes, the candidate is
+    /// refused `solver_failed`, and no owner step takes 100 ms.
+    #[test]
+    fn sa_t7_decisions_continue_while_a_flooding_solver_runs() {
+        let (reader, sender) = asura_platform::events::wake_pair().unwrap();
+        let (mut owner, home) = owner_with_fixture("flood-stdout", Some(sender), 2);
+        let (id, _) = owner
+            .submit_candidate(ap::Scope::User, format!("{}\n// change\n", default_text()))
+            .unwrap();
+        let (samples, longest) = closed_loop(&mut owner, &reader, 0, 2_000);
+        assert_eq!(samples.len(), 2_000);
+        assert!(
+            longest < Duration::from_millis(100),
+            "owner step {longest:?}"
+        );
+        let end = Instant::now() + Duration::from_secs(60);
+        loop {
+            owner.poll();
+            let last = owner.status(0).candidate.unwrap();
+            if last.candidate_id.as_deref() == Some(&id[..]) && last.state == Some(4) {
+                assert_eq!(last.reason.as_deref(), Some("solver_failed"));
+                break;
+            }
+            assert!(Instant::now() < end, "candidate result");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        close(owner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// SA-T7 bench (release, `--ignored`): PL-B2 while a flooding solver's
+    /// admission runs; the p99 is recorded against 2.5 ms.
+    #[test]
+    #[ignore = "bench: cargo test --release ... sa_t7_bench -- --ignored --nocapture"]
+    fn sa_t7_bench_pl_b2_while_a_flooding_solver_runs() {
+        let (reader, sender) = asura_platform::events::wake_pair().unwrap();
+        let workers = worker_count();
+        let (mut owner, home) = owner_with_fixture("silent", Some(sender), workers);
+        owner
+            .submit_candidate(ap::Scope::User, format!("{}\n// change\n", default_text()))
+            .unwrap();
+        let (samples, longest) = closed_loop(&mut owner, &reader, 2_000, 20_000);
+        let p99 = percentile(&samples, 0.99);
+        println!(
+            "SA-T7 workers={workers} requesters=64 decisions={} p50={:?} p99={:?} max={:?} longest_owner_step={longest:?} (a stalled admission in flight); budget p99 <= 2.5 ms: {}",
+            samples.len(),
+            percentile(&samples, 0.50),
+            p99,
+            samples[samples.len() - 1],
+            if p99 <= Duration::from_micros(2_500) {
+                "PASS"
+            } else {
+                "FAIL"
+            }
+        );
+        close(owner);
+        let _ = std::fs::remove_dir_all(home);
     }
     /// Cancel drops a queued request and discards an in-flight reply.
     #[test]

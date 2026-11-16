@@ -162,6 +162,19 @@ pub(crate) struct StartRequest {
     /// The policy decision's constraint set for `model-1` (PL1); `None`
     /// for the person profiles.
     pub constraints: Option<asura_platform::exec_cmd::Constraints>,
+    /// The policy decision's revision fence and its request (PL3 activation
+    /// and fencing). `None` only in controller unit tests.
+    pub policy: Option<PolicyFence>,
+}
+
+/// The revision generation a start was decided under, with the request
+/// that decides it again (security-policy.md, PL3-F3).
+#[derive(Clone, Debug)]
+pub(crate) struct PolicyFence {
+    pub generation: u64,
+    pub request: Box<crate::policy::JobRequest>,
+    /// The constraint set the job starts or runs with (`model-1`).
+    pub constraints: Option<asura_platform::exec_cmd::Constraints>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -431,6 +444,9 @@ struct Job {
     capture_closed: bool,
     /// A model job's kind 32 `model_changed` (P5).
     path_record: PathRecord,
+    /// The policy fence (PL3); the generation last offered for recheck.
+    policy: Option<PolicyFence>,
+    recheck_offered: u64,
 }
 impl Job {
     fn new(
@@ -486,6 +502,8 @@ impl Job {
             released: false,
             capture_closed: false,
             path_record: PathRecord::None,
+            policy: None,
+            recheck_offered: 0,
         }
     }
     /// Profile `person-outside-1`: a `!!` job (PCR25 audit flag).
@@ -581,6 +599,9 @@ pub(crate) struct JobController {
     /// a `!!` job's slot is granted, before `SlotPort::start` (PCM switch
     /// check). Absent: the default, `true`.
     outside_switch: Option<Box<dyn Fn() -> bool>>,
+    /// The policy owner's dispatch generation (PL3-F3). Absent: no fence
+    /// check (controller unit tests).
+    policy: Option<Box<dyn Fn() -> u64>>,
 }
 
 impl JobController {
@@ -633,6 +654,7 @@ impl JobController {
             done: VecDeque::new(),
             execution: None,
             outside_switch: None,
+            policy: None,
         }
     }
 
@@ -748,6 +770,7 @@ impl JobController {
             stored_command,
             person,
             constraints,
+            policy,
         } = request;
         let mut job = Job::new(
             id,
@@ -758,6 +781,7 @@ impl JobController {
             JobState::Queued,
         );
         job.profile = profile;
+        job.policy = policy;
         job.excerpt = journal::command_excerpt(&stored_command);
         job.body = Some(Body {
             scope,
@@ -1090,6 +1114,97 @@ impl JobController {
     /// The owner's EX11 effective value of a project, read when a slot is
     /// granted to a model-origin queue head. The owner keeps the one copy
     /// of the setting; the closure reads it.
+    /// The policy owner's dispatch generation, read at slot grant
+    /// (PL3-F3). The closure reads a shared value and never blocks.
+    pub(crate) fn set_policy(&mut self, check: Box<dyn Fn() -> u64>) {
+        self.policy = Some(check);
+        self.dirty = true;
+    }
+    /// Queued starts decided under another generation than `current` that
+    /// have not been offered for recheck under it: each is offered once per
+    /// generation, with its request (PL3-F3).
+    pub(crate) fn take_rechecks(&mut self, current: u64) -> Vec<(Id, crate::policy::JobRequest)> {
+        let mut out = Vec::new();
+        for job in self.jobs.values_mut() {
+            if job.state != JobState::Queued || job.recheck_offered == current {
+                continue;
+            }
+            if let Some(fence) = &job.policy
+                && fence.generation != current
+            {
+                job.recheck_offered = current;
+                out.push((job.id, (*fence.request).clone()));
+            }
+        }
+        out
+    }
+    /// Running jobs decided under an older generation than `current`, with
+    /// their requests and constraint sets, for re-evaluation (PL3).
+    pub(crate) fn live_rechecks(
+        &mut self,
+        current: u64,
+    ) -> Vec<(
+        Id,
+        crate::policy::JobRequest,
+        Option<asura_platform::exec_cmd::Constraints>,
+    )> {
+        let mut out = Vec::new();
+        for job in self.jobs.values_mut() {
+            if !matches!(job.state, JobState::Running | JobState::CapturePaused)
+                || job.recheck_offered == current
+            {
+                continue;
+            }
+            if let Some(fence) = &job.policy
+                && fence.generation < current
+            {
+                job.recheck_offered = current;
+                out.push((job.id, (*fence.request).clone(), fence.constraints));
+            }
+        }
+        out
+    }
+    /// A recheck allowed the job under `generation`: a queued start takes
+    /// the new constraint set; a running job keeps its profile.
+    pub(crate) fn rechecked(
+        &mut self,
+        job: Id,
+        generation: u64,
+        constraints: Option<asura_platform::exec_cmd::Constraints>,
+    ) {
+        let Some(entry) = self.jobs.get_mut(&job) else {
+            return;
+        };
+        let queued = entry.state == JobState::Queued;
+        if let Some(fence) = entry.policy.as_mut() {
+            fence.generation = generation;
+            if queued {
+                fence.constraints = constraints;
+            }
+        }
+        if queued && let Some(body) = entry.body.as_mut() {
+            body.constraints = constraints;
+        }
+        self.dirty = true;
+    }
+    /// Revokes one job with a service reason (`policy_revoked`,
+    /// `policy_changed`): a queued start settles `not_started`, a live job
+    /// gets `T`.
+    pub(crate) fn revoke_job(&mut self, job: Id, reason: JobReason) {
+        self.revoke_where(|j| j.id == job, None, reason);
+    }
+    /// Cancels every `Starting` job decided under an older generation than
+    /// `current` (PL3 activation, reason `policy_changed`).
+    pub(crate) fn revoke_starting_before(&mut self, current: u64, reason: JobReason) {
+        self.revoke_where(
+            |j| {
+                j.state == JobState::Starting
+                    && j.policy.as_ref().is_some_and(|f| f.generation < current)
+            },
+            None,
+            reason,
+        );
+    }
     pub(crate) fn set_execution(&mut self, check: Box<dyn Fn(Id) -> bool>) {
         self.execution = Some(check);
         self.dirty = true;
@@ -1749,6 +1864,13 @@ impl JobController {
         head: &Job,
         payloads: &dyn PayloadPort,
     ) -> Result<(), Option<BlockReason>> {
+        // Condition 0b (PL3-F3): a start decided under an older revision
+        // waits for its recheck.
+        if let (Some(fence), Some(current)) = (&head.policy, &self.policy)
+            && fence.generation != current()
+        {
+            return Err(Some(BlockReason::PolicyRecheck));
+        }
         if self.recovering {
             return Err(Some(BlockReason::Recovering));
         }

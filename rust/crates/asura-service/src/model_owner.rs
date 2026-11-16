@@ -37,7 +37,7 @@ pub(crate) struct Selection {
 /// `<profile>/build/<package>/<hash>/out/` uses `<profile>/`, so one
 /// development package there serves every test executable. Only the path is
 /// inspected; there is no search and no second location.
-fn helper_directory(executable: &Path) -> Option<&Path> {
+pub(crate) fn helper_directory(executable: &Path) -> Option<&Path> {
     let directory = executable.parent()?;
     #[cfg(any(test, feature = "test-support"))]
     if let Some(profile) = cargo_profile_directory(directory) {
