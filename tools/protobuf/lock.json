@@ -4,7 +4,7 @@
     "os": "macos",
     "os_major": 27,
     "arch": "aarch64",
-    "xcode_build": "27A266a",
+    "xcode_build": "27A9275",
     "swift_version": "6.4",
     "rust_version": "1.100.0",
     "cargo_version": "1.100.0"
