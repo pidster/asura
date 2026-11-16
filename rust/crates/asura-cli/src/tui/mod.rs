@@ -12,6 +12,7 @@ mod jobs;
 mod models;
 mod observation;
 mod path_guard;
+mod policy;
 mod project_admin;
 mod project_pages;
 mod queue;
@@ -59,6 +60,7 @@ pub(crate) fn run(
     let mut queue_worker = queue::Worker::default();
     let mut project_admin_worker = project_admin::Worker::default();
     let mut path_guard_worker = path_guard::Worker::default();
+    let mut policy_worker = policy::Worker::default();
     let mut secrets_worker = secrets::Worker::default();
     let mut project_page_worker = project_pages::Worker::default();
     let mut context_worker = context::Worker::default();
@@ -72,6 +74,8 @@ pub(crate) fn run(
     project_admin_worker.set_notice(router.notice(Source::Conversation));
     // `/paths` shares the conversation source; the router has no free bit.
     path_guard_worker.set_notice(router.notice(Source::Conversation));
+    // `/policy` shares the conversation source too.
+    policy_worker.set_notice(router.notice(Source::Conversation));
     // `/secrets` shares the conversation source too.
     secrets_worker.set_notice(router.notice(Source::Conversation));
     project_page_worker.set_notice(router.notice(Source::Conversation));
@@ -147,6 +151,9 @@ pub(crate) fn run(
             if app.take_path_guard_cancel() {
                 path_guard_worker.cancel();
             }
+            if app.take_policy_cancel() {
+                policy_worker.cancel();
+            }
             if app.take_secrets_cancel() {
                 secrets_worker.cancel();
             }
@@ -206,6 +213,12 @@ pub(crate) fn run(
                 && let Some(update) = path_guard_worker.poll()
             {
                 app.path_guard_finished(update);
+                dirty = true;
+            }
+            if has(Source::Conversation)
+                && let Some(update) = policy_worker.poll()
+            {
+                app.policy_finished(update);
                 dirty = true;
             }
             if has(Source::Conversation)
@@ -281,6 +294,7 @@ pub(crate) fn run(
                         || project_admin_worker.running()
                         || project_page_worker.running()
                         || path_guard_worker.running()
+                        || policy_worker.running()
                         || secrets_worker.running(),
                 ),
                 (Source::Queue, queue_worker.running()),
@@ -358,6 +372,17 @@ pub(crate) fn run(
                     app.path_guard_finished(path_guard::Update {
                         request,
                         outcome: path_guard::Outcome::Definite(error),
+                    });
+                }
+                dirty = true;
+            }
+            if !policy_worker.running()
+                && let Some(request) = app.take_policy_request()
+            {
+                if let Err(error) = policy_worker.submit(resolve, request.clone()) {
+                    app.policy_finished(policy::Update {
+                        request,
+                        outcome: policy::Outcome::Definite(error),
                     });
                 }
                 dirty = true;
@@ -483,6 +508,7 @@ pub(crate) fn run(
     queue_worker.disconnect();
     project_admin_worker.cancel();
     path_guard_worker.cancel();
+    policy_worker.cancel();
     secrets_worker.cancel();
     project_page_worker.cancel();
     config_worker.cancel();

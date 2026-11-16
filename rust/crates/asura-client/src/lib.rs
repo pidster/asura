@@ -786,6 +786,21 @@ impl Client {
             _ => Err(Error::Protocol),
         }
     }
+    /// One policy request (security-policy.md, PL3 control and
+    /// presentation): submit a candidate, roll back or cancel. Each queues
+    /// or cancels durable work, so a lost wait is `OutcomeUnconfirmed` and
+    /// the caller never repeats it. The candidate's result is not this
+    /// reply: it arrives in the observed `PolicyStatus.candidate`.
+    pub fn policy(
+        &mut self,
+        request: PolicyRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<pb::PolicyReply> {
+        match self.mutation(request.into_body(), cancelled)? {
+            pb::envelope::Body::PolicyReply(reply) => Ok(reply),
+            _ => Err(Error::Protocol),
+        }
+    }
     /// Stores a named secret (named-secrets.md, control API). Not a
     /// journal mutation, but its effect is durable: only `cancelled` or a
     /// lost connection ends the wait, as `OutcomeUnconfirmed`, and the
@@ -1218,9 +1233,41 @@ impl PathGuardRequest {
     }
 }
 
+/// One policy request: envelope fields 77, 78 and 79.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PolicyRequest {
+    Submit(pb::PolicyCandidateSubmit),
+    Rollback(pb::PolicyRollback),
+    Cancel(pb::PolicyCancel),
+}
+impl PolicyRequest {
+    fn into_body(self) -> pb::envelope::Body {
+        match self {
+            Self::Submit(v) => pb::envelope::Body::PolicyCandidateSubmit(v),
+            Self::Rollback(v) => pb::envelope::Body::PolicyRollback(v),
+            Self::Cancel(v) => pb::envelope::Body::PolicyCancel(v),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn policy_requests_map_to_fields_77_to_79() {
+        assert!(matches!(
+            PolicyRequest::Submit(pb::PolicyCandidateSubmit::default()).into_body(),
+            pb::envelope::Body::PolicyCandidateSubmit(_)
+        ));
+        assert!(matches!(
+            PolicyRequest::Rollback(pb::PolicyRollback::default()).into_body(),
+            pb::envelope::Body::PolicyRollback(_)
+        ));
+        assert!(matches!(
+            PolicyRequest::Cancel(pb::PolicyCancel::default()).into_body(),
+            pb::envelope::Body::PolicyCancel(_)
+        ));
+    }
     #[test]
     fn path_guard_requests_map_to_fields_69_71_72() {
         let list = PathGuardRequest::List(pb::PathGuardList {

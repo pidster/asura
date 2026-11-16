@@ -735,50 +735,8 @@ pub(super) fn secret_store_lines(status: Option<&pb::SecretStoreStatus>) -> Vec<
     lines
 }
 
-/// The `/status` policy line (security-policy.md, `/status` in PL1). It
-/// reads the last observation only; nothing is shown before one arrives.
-pub(super) fn policy_line(status: Option<&pb::PolicyStatus>) -> Option<String> {
-    let status = status?;
-    let scope = |state: Option<u32>| {
-        if state == Some(1) {
-            "ok"
-        } else {
-            "unavailable"
-        }
-    };
-    Some(match status.state {
-        Some(1) => "policy: starting".into(),
-        Some(2) => {
-            let revision = match status.revision {
-                Some(n) if n > 0 => n.to_string(),
-                _ => "pending".into(),
-            };
-            let changed = match status.repository_changed.unwrap_or(0) {
-                0 => String::new(),
-                n => format!(" ({n} changed, not admitted)"),
-            };
-            let solver = match status.solver {
-                Some(2) => "available",
-                Some(3) => "unavailable",
-                _ => "none",
-            };
-            let approvals = status.approvals_waiting.unwrap_or(0);
-            format!(
-                "policy: revision {revision} · installation {} · user {} · workspace {} · repository {}{changed} · solver: {solver} · {approvals} approval{} waiting",
-                scope(status.installation),
-                scope(status.user),
-                status.workspace_sets.unwrap_or(0),
-                status.repository_sets.unwrap_or(0),
-                if approvals == 1 { "" } else { "s" },
-            )
-        }
-        _ => format!(
-            "policy: unavailable · installation {} · user {}",
-            scope(status.installation),
-            scope(status.user)
-        ),
-    })
-}
+/// The `/status` policy line, shared with `asura policy status`.
+pub(super) use crate::policy_text::policy_line;
 
 /// `/status` lines for llama.cpp (llamacpp-backend.md, status). They read
 /// the last observation only; nothing is shown while the mode is off.
@@ -1224,6 +1182,7 @@ impl App {
     pub(in super::super) fn set_policy(&mut self, status: Option<pb::PolicyStatus>) {
         if status.is_some() {
             self.person.policy = status;
+            self.policy_observed();
         }
     }
     /// The last observed llama.cpp facts; contention keeps the previous.
@@ -2083,6 +2042,8 @@ pub(super) struct Person {
     pub deferred: Option<JobCommand>,
     /// `/paths` and the held entries' decisions (execution-path-guard.md).
     pub paths: super::path_guard::Paths,
+    /// `/policy` requests and the shown candidate (security-policy.md, PL3).
+    pub policy_ui: super::policy::PolicyUi,
     /// The launch report was shown (PE-R7).
     pub reported: bool,
     /// `/secrets` (named-secrets.md).
@@ -3284,6 +3245,9 @@ mod tests {
             repository_changed: Some(0),
             solver: Some(1),
             approvals_waiting: Some(0),
+            admission_queue: Some(0),
+            candidate: None,
+            recent: Vec::new(),
         };
         assert_eq!(
             policy_line(Some(&active)).unwrap(),
@@ -3295,7 +3259,7 @@ mod tests {
             repository_sets: Some(1),
             repository_changed: Some(1),
             approvals_waiting: Some(1),
-            ..active
+            ..active.clone()
         };
         assert_eq!(
             policy_line(Some(&changed)).unwrap(),
@@ -3303,18 +3267,38 @@ mod tests {
         );
         let starting = pb::PolicyStatus {
             state: Some(1),
-            ..active
+            ..active.clone()
         };
         assert_eq!(policy_line(Some(&starting)).unwrap(), "policy: starting");
         let down = pb::PolicyStatus {
             state: Some(3),
             installation: Some(2),
             user: Some(2),
-            ..active
+            ..active.clone()
         };
         assert_eq!(
             policy_line(Some(&down)).unwrap(),
             "policy: unavailable · installation unavailable · user unavailable"
+        );
+        // PL3: solver words and the reproving user scope.
+        let reproving = pb::PolicyStatus {
+            revision: Some(4),
+            user: Some(3),
+            solver: Some(2),
+            ..active.clone()
+        };
+        assert_eq!(
+            policy_line(Some(&reproving)).unwrap(),
+            "policy: revision 4 · installation ok · user reproving · workspace 0 · repository 0 · solver: available · 0 approvals waiting"
+        );
+        let failed = pb::PolicyStatus {
+            solver: Some(3),
+            ..active
+        };
+        assert!(
+            policy_line(Some(&failed))
+                .unwrap()
+                .contains("solver: unavailable")
         );
         assert_eq!(policy_line(None), None);
     }

@@ -1,5 +1,7 @@
 #[path = "llamacpp_cli.rs"]
 mod llamacpp_cli;
+#[path = "policy_cli.rs"]
+mod policy_cli;
 #[path = "sensors_cli.rs"]
 mod sensors_cli;
 use asura_client::{Client, Error as ClientError};
@@ -35,6 +37,8 @@ enum Command {
     },
     /// `asura llamacpp …` (llamacpp-backend.md).
     Llamacpp(llamacpp_cli::Command),
+    /// `asura policy …` (security-policy.md, PL3).
+    Policy(policy_cli::Command),
 }
 fn parse(args: &[String]) -> Result<Command, ()> {
     let words: Vec<_> = args.iter().map(String::as_str).collect();
@@ -60,6 +64,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
             })
         }
         ["llamacpp", rest @ ..] => llamacpp_cli::parse(rest).map(Command::Llamacpp).ok_or(()),
+        ["policy", rest @ ..] => policy_cli::parse(rest).map(Command::Policy).ok_or(()),
         ["--help" | "-h"] => Ok(Command::Help),
         ["--version"] => Ok(Command::Version),
         ["service", "start"] => Ok(Command::Start),
@@ -451,8 +456,9 @@ pub fn entry_with_logs(
     match parsed.map(|(command, _)| command) {
         Ok(Command::Help) => {
             println!(
-                "Asura\nUsage:\n  asura (interactive TUI)\n  asura --version\n  asura service start [--logs DIR]\n  asura service status --json [--logs DIR]\n  asura service stop [--logs DIR]\n  asura service run [--logs DIR]\n  asura installation status [--json] [--logs DIR]\n  asura init\n  asura project add PATH\n  asura project list\n  asura sensors PROJECT_ID [OFFSET REVISION]\n{}",
-                llamacpp_cli::USAGE
+                "Asura\nUsage:\n  asura (interactive TUI)\n  asura --version\n  asura service start [--logs DIR]\n  asura service status --json [--logs DIR]\n  asura service stop [--logs DIR]\n  asura service run [--logs DIR]\n  asura installation status [--json] [--logs DIR]\n  asura init\n  asura project add PATH\n  asura project list\n  asura sensors PROJECT_ID [OFFSET REVISION]\n{}\n{}",
+                llamacpp_cli::USAGE,
+                policy_cli::USAGE
             );
             0
         }
@@ -480,6 +486,7 @@ pub fn entry_with_logs(
                 &mut std::io::stdout(),
             )
         }
+        Ok(Command::Policy(command)) => policy_cli::run(resolve, command),
         Ok(Command::Version) => {
             println!("{}", env!("CARGO_PKG_VERSION"));
             0

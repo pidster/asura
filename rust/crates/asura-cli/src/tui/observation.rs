@@ -249,7 +249,7 @@ impl Worker {
     }
     /// The policy facts of the last successful observation.
     pub(super) fn policy(&self) -> Option<asura_control::pb::PolicyStatus> {
-        *self.policy.try_lock().ok()?
+        self.policy.try_lock().ok()?.clone()
     }
     /// The llama.cpp facts of the last successful observation.
     pub(super) fn llamacpp(&self) -> Option<asura_control::pb::LlamaCppStatus> {

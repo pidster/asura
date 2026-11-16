@@ -4,6 +4,7 @@ use std::fmt;
 mod audit_query;
 pub mod jobs;
 pub mod path_guard;
+pub mod policy;
 pub mod secrets;
 mod sensor_query;
 pub mod thinking;
@@ -275,12 +276,26 @@ fn policy_status(v: &pb::PolicyStatus) -> bool {
     v.state.is_some_and(|s| (1..=3).contains(&s))
         && v.revision.is_some()
         && scope(v.installation)
-        && scope(v.user)
+        // PL3: the user scope may be 3 `reproving`.
+        && v.user.is_some_and(|s| (1..=3).contains(&s))
         && sets(v.workspace_sets)
         && sets(v.repository_sets)
         && sets(v.repository_changed)
         && v.solver.is_some_and(|s| (1..=3).contains(&s))
         && v.approvals_waiting.is_none_or(|n| n <= 512)
+        && v.admission_queue
+            .is_none_or(|n| n <= policy::MAX_ADMISSION_QUEUE)
+        && v.candidate.as_ref().is_none_or(policy::candidate_valid)
+        && v.recent.len() <= policy::MAX_RECENT_CANDIDATES
+        && v.recent.iter().all(|c| {
+            policy::candidate_valid(c)
+                && c.state.is_some_and(|s| {
+                    matches!(
+                        s,
+                        policy::state::ACTIVATED | policy::state::REJECTED | policy::state::CANCELLED
+                    )
+                })
+        })
 }
 /// Validates domain shape and direction. Attachment state stays with its owner.
 pub fn validate_semantics(
@@ -321,6 +336,7 @@ pub fn validate_semantics(
             | Body::ObserveService(_)
     ) || jobs::is_request(body)
         || path_guard::is_request(body)
+        || policy::is_request(body)
         || secrets::is_request(body);
     if request != (direction == Direction::ClientToServer) {
         return Err(ProtocolError::WrongDirection);
@@ -507,6 +523,7 @@ pub fn validate_semantics(
         body if conversation::handles(body) => conversation::valid(body),
         body if jobs::handles(body) => jobs::valid(body),
         body if path_guard::handles(body) => path_guard::valid(body),
+        body if policy::handles(body) => policy::valid(body),
         body if secrets::handles(body) => secrets::valid(body),
         Body::Stop(v) => v.expected_epoch == envelope.service_epoch,
         Body::Error(v) => {
@@ -701,43 +718,65 @@ mod person_command_tests {
             repository_changed: Some(0),
             solver: Some(1),
             approvals_waiting: Some(0),
+            admission_queue: Some(16),
+            candidate: Some(policy::tests_candidate()),
+            recent: vec![policy::tests_candidate(); policy::MAX_RECENT_CANDIDATES],
         };
+        // PL3: at most 4 recent candidates, each finished.
+        let mut five = full.clone();
+        five.recent.push(policy::tests_candidate());
+        assert!(!policy_status(&five));
+        let mut queued = full.clone();
+        queued.recent[0].state = Some(policy::state::QUEUED);
+        queued.recent[0].reason = None;
+        assert!(!policy_status(&queued));
         let mut value = observation(None);
         let Some(Body::ServiceObservation(observed)) = value.body.as_mut() else {
             unreachable!()
         };
-        observed.policy = Some(full);
+        observed.policy = Some(full.clone());
         assert!(validate_semantics(&value, Direction::ServerToClient).is_ok());
         assert!(round_trips(&value));
         for changed in [
             pb::PolicyStatus {
                 state: None,
-                ..full
+                ..full.clone()
             },
             pb::PolicyStatus {
                 state: Some(4),
-                ..full
+                ..full.clone()
             },
             pb::PolicyStatus {
                 revision: None,
-                ..full
+                ..full.clone()
             },
             pb::PolicyStatus {
                 installation: Some(3),
-                ..full
+                ..full.clone()
             },
-            pb::PolicyStatus { user: None, ..full },
+            pb::PolicyStatus {
+                user: None,
+                ..full.clone()
+            },
+            pb::PolicyStatus {
+                user: Some(4),
+                ..full.clone()
+            },
+            pb::PolicyStatus {
+                admission_queue: Some(17),
+                ..full.clone()
+            },
             pb::PolicyStatus {
                 workspace_sets: Some(1025),
-                ..full
+                ..full.clone()
             },
             pb::PolicyStatus {
                 solver: Some(0),
-                ..full
+                ..full.clone()
             },
             pb::PolicyStatus {
                 approvals_waiting: Some(513),
-                ..full
+                ..full.clone()
             },
         ] {
             let Some(Body::ServiceObservation(observed)) = value.body.as_mut() else {
