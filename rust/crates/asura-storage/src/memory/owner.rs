@@ -141,7 +141,7 @@ impl Memory {
     ) -> Result<(Self, Pending<Binding>)> {
         let claim = Claim::acquire(&root)?;
         let generation = GENERATION
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Error::Unavailable)?;
         let (sender, receiver) = mpsc::sync_channel(8);
         let (reply, response) = mpsc::sync_channel(1);
@@ -270,7 +270,7 @@ impl Memory {
         }
         let counter = self
             .counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Error::Unavailable)?;
         let (reply, receiver) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));

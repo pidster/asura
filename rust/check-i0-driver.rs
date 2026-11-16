@@ -56,7 +56,7 @@ mod host {
         fn getsid(pid: i32) -> i32;
         fn fcntl(fd: i32, command: i32, ...) -> i32;
         fn signal(signal: i32, handler: usize) -> usize;
-        fn write(fd: i32, bytes: *const u8, count: usize) -> isize;
+        fn write(fd: i32, bytes: *const std::ffi::c_void, count: usize) -> isize;
     }
     extern "C" fn interrupted(signal: i32) {
         INTERRUPTED.store(signal, Ordering::Relaxed);
@@ -72,7 +72,7 @@ mod host {
     }
     pub fn write_bytes(fd: i32, bytes: &[u8]) -> io::Result<usize> {
         // SAFETY: bytes remains valid for this syscall; caller holds fd throughout.
-        let count = unsafe { write(fd, bytes.as_ptr(), bytes.len()) };
+        let count = unsafe { write(fd, bytes.as_ptr().cast(), bytes.len()) };
         if count < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -1663,10 +1663,10 @@ fn bootstrap_check(root: &Path, rustc: &Path, run: WorktreeRun, started: Instant
         }
         let identity = String::from_utf8_lossy(&outcome.output);
         let mut fields = identity.split_whitespace();
-        if fields.next() != Some("cargo") || fields.next() != Some("1.98.0") {
+        if fields.next() != Some("cargo") || fields.next() != Some("1.100.0") {
             return Err(Failure::new(
                 "toolchain_unavailable",
-                "installed Cargo 1.98.0 required",
+                "installed Cargo 1.100.0 required",
             ));
         }
         emit(1, &outcome.output, Instant::now() + GRACE)?;
@@ -1787,7 +1787,7 @@ fn run() -> Result<()> {
             cleanup?;
             reporting?;
             emit(1, format!(
-                "PASS PB0.1 driver: {:.3}s; Rust 1.98.0; no Cargo dependencies or tool downloads\n",
+                "PASS PB0.1 driver: {:.3}s; Rust 1.100.0; no Cargo dependencies or tool downloads\n",
                 started.elapsed().as_secs_f64()
             ).as_bytes(), Instant::now() + GRACE)?;
             Ok(())
@@ -2877,7 +2877,7 @@ let package = Package(name: "NativeDeadline")
         let bin = temp.0.join("toolchains/mock/bin");
         fs::create_dir_all(&bin).unwrap();
         let compiler = bin.join("rustc");
-        fs::write(&compiler, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'rustc 1.98.0 (fixture)'; exit 0; fi\necho $$ > \"$ASURA_TEST_COMPILER_PIDFILE\"\ntrap '' TERM\nwhile :; do /bin/sleep 1; done\n").unwrap();
+        fs::write(&compiler, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'rustc 1.100.0 (fixture)'; exit 0; fi\necho $$ > \"$ASURA_TEST_COMPILER_PIDFILE\"\ntrap '' TERM\nwhile :; do /bin/sleep 1; done\n").unwrap();
         fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700)).unwrap();
         let pidfile = temp.0.join("compiler.pid");
         let mut command = Command::new(root().join("scripts/check-i0-toolchain"));

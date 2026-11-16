@@ -786,7 +786,7 @@ impl WriterClient {
 
         let limit = if control { QUEUE_SLOTS } else { ORDINARY_SLOTS };
         self.count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 if n < limit { Some(n + 1) } else { None }
             })
             .map_err(|_| Error::Busy)?;

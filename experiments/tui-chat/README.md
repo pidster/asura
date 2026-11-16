@@ -28,7 +28,7 @@ without installing an extension, loading a Skill, or running real work.
 
 ## Run the prototype
 
-Build and run from this directory with Rust 1.98.0:
+Build and run from this directory with Rust 1.100.0:
 
 ```sh
 cargo run --locked

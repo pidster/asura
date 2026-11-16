@@ -24,7 +24,7 @@ The design holds the budgets and the [results](../../docs/designs/policy-engine-
 
 ## Checks
 
-Run from this directory with Rust 1.98.0:
+Run from this directory with Rust 1.100.0:
 
 ```sh
 cargo fmt --all --check

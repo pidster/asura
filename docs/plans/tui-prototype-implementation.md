@@ -23,10 +23,10 @@ execution is permitted at runtime. Terminal input/output is the only external I/
 Native terminal selection and copying use the terminal's own controls; do not
 enable mouse capture or write the clipboard from the application.
 
-Use Rust 1.98.0, edition 2024, Ratatui 0.30.2, Crossterm 0.29.0 and rat-text 3.1.0.
+Use Rust 1.100.0, edition 2024, Ratatui 0.30.2, Crossterm 0.29.0 and rat-text 3.1.0.
 Pin direct dependencies and commit the generated Cargo.lock with the experiment
-when publication is authorized. Use the installed stable compiler reporting 1.98.0;
-do not alter global toolchains. Package `rust-version` is 1.98.
+when publication is authorized. Use the installed stable compiler reporting 1.100.0;
+do not alter global toolchains. Package `rust-version` is 1.100.
 Use rat-text without default clipboard features. Allow its matching Ratatui
 core/widgets/bridge dependencies. Use unicode-segmentation 1.12.0 for boundaries
 in bounded layout measurements, unicode-display-width 0.3.0 for the editor's

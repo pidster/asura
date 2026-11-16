@@ -211,7 +211,7 @@ verified binding.
 Control protocol 0.1 requires matching client and service binaries. A mismatch
 reports `incompatible_protocol` and leaves that service running.
 
-Build with installed Rust 1.98.0 and an explicit protoc 36.2 executable verified
+Build with installed Rust 1.100.0 and an explicit protoc 36.2 executable verified
 against the pinned archive in `tools/protobuf/lock.json`:
 
 ```sh
@@ -247,7 +247,7 @@ Missing prerequisites fail the test. Native inference has its separate journey.
 
 The approved [PB0.0–PB0.3 packet](docs/plans/protobuf-bootstrap-implementation.md)
 provides the first build check on macOS 27 with Apple silicon and an installed
-Rust 1.98.0 compiler:
+Rust 1.100.0 compiler:
 
 ```sh
 scripts/check-i0-toolchain --check driver
@@ -264,7 +264,7 @@ scripts/check-i0-toolchain --check bootstrap
 ```
 
 This runs a locked, offline build, Clippy and bootstrap tests. It requires
-the complete installed Rust 1.98.0 toolchain and reviewed Cargo inputs at
+the complete installed Rust 1.100.0 toolchain and reviewed Cargo inputs at
 `.build/asura-deps/cargo/work`. It does not acquire missing dependencies.
 
 ### Scoped cache preparation

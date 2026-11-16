@@ -2,7 +2,7 @@
 name = "asura-solver-admission-probe"
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.100"
 license = "MIT"
 publish = false
 description = "Probe SV-P1: the product-corpus admission queries against one solver command (security-policy.md, PL4a)"

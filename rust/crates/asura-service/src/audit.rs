@@ -73,7 +73,7 @@ impl Shared {
     fn dropped(&self, count: u64) {
         let _ = self
             .dropped
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
                 Some(old.saturating_add(count))
             });
         self.completion.notify();
