@@ -21,7 +21,14 @@ schemas and runtime mechanisms remain with their governing designs.
 | Thinking level | The person's model reasoning setting: model default, off, low, medium or high; see [thinking level](designs/thinking-level.md) |
 | Thinking text | A model's reasoning output for a turn; journaled and shown folded, never sent back to the model |
 | Message tray | Bounded area above the input showing submitted messages and their observed states, with access to full text |
-| Task | A unit of user-requested work with goals, limits and completion criteria |
+| Task | A unit of user-requested work with a goal, an owner agent and a recorded end; it belongs to one conversation and spans turns; see the [task entity design](designs/task-entity.md) (proposed) |
+| Current task | The one task of an agent in `active` or `claimed`; each new turn of the agent binds to it |
+| Open task | A task in `proposed`, `active`, `claimed` or `ending` |
+| Task binding | The link from a turn (its kind 21 task field) or a model job (through its turn) to a task; person jobs are never bound |
+| Task proposal | A task that the model drafted; it stays `proposed` until the person accepts or declines it |
+| Completion claim | The model's statement that its task is done; only the person's confirmation ends the task |
+| Child task | A task that a parent agent creates for a subagent under its own task's authority; designed with the subagent design (TK6) |
+| Task owner | The orchestrator module that owns task IDs, kind 37 transitions, binding, the dispatch fence and the ending procedure |
 | Plan | A versioned graph of intended work, dependencies and completion criteria |
 | Plan work item, proposed | An identified piece of planned work; it may link to an accepted task after admission |
 | Work dependency, proposed | A prerequisite and explicit satisfaction condition that controls readiness of planned work |
