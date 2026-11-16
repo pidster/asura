@@ -25,7 +25,7 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P) || fail invalid_root
 [ "$(/usr/bin/uname -m)" = arm64 ] || fail unsupported_architecture
 [ "$(/usr/bin/sw_vers -productVersion | /usr/bin/cut -d . -f 1)" = 27 ] || fail unsupported_os
 pin=$(/usr/bin/sed -n 's/^channel = "\([^"]*\)"$/\1/p' "$root/rust-toolchain.toml")
-[ "$pin" = 1.98.0 ] || fail invalid_toolchain_pin
+[ "$pin" = 1.100.0 ] || fail invalid_toolchain_pin
 set -m 2>/dev/null || fail 'supervision_unavailable: shell has no monitor mode'
 tmp=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/asura-driver.XXXXXXXX") || fail temporary_directory
 child= watcher= group_verified=0 interrupted=0
@@ -141,7 +141,7 @@ for candidate in "$rustup_base"/toolchains/*/bin/rustc; do
 done
 if [ -z "$compiler" ]; then
     /bin/rm -rf "$tmp"
-    fail 'toolchain_unavailable: installed Rust 1.98.0 required; no download attempted'
+    fail 'toolchain_unavailable: installed Rust 1.100.0 required; no download attempted'
 fi
 if ! compiler_step 120 "$compiler" --edition=2024 -D warnings "$root/rust/check-i0-driver.rs" -o "$tmp/driver"; then
     report_file "$tmp/compiler.log"

@@ -56,10 +56,10 @@ The initial compiler launcher keeps its separate process-group watchdog. Existin
 launcher tests remain required; this session mechanism does not extend its scope.
 
 The selected qualification baseline is macOS 27.0 build `26A428`, Apple silicon,
-Xcode `27A266a`, Swift 6.4, Rust/Cargo 1.98.0, protoc 36.2 and SwiftProtobuf 1.38.1.
+Xcode `27A266a`, Swift 6.4, Rust/Cargo 1.100.0, protoc 36.2 and SwiftProtobuf 1.38.1.
 Use the fixed commands and environment in the bootstrap/preparation contracts.
 The tool lock digest is
-`0c614780b4e7a792485de20bba11bcbb499a68e91ac5216290cdd706fbacecb6`;
+`2ccdf932db74026e824d23e1016ac223463d590b9a4c15c0f4786fd482f487ea`;
 the reviewed Cargo lock digest is
 `302a34ab4c96f1f67f1f9917bd49ce4f92239dcee55b8fc5dfd9da8538a64774`.
 These identify the reviewed inputs, not an already successful cleanup build.

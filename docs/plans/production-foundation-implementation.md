@@ -23,7 +23,7 @@ local service, reusable client and explicit lifecycle CLI. This packet creates
 no authority journal, graph store, registry, Git observer, TUI, task or model.
 It does not copy the synthetic experiment into production.
 
-The proposed qualification tuple is Rust/Cargo 1.98.0, edition 2024, macOS 27
+The proposed qualification tuple is Rust/Cargo 1.100.0, edition 2024, macOS 27
 and Apple silicon. Use the installed Xcode 27 SDK. The
 [Protobuf bootstrap](../designs/protobuf-toolchain-bootstrap.md) owns its Swift
 and generator qualification. Foundation proposes `libc` 0.2.189. Local control
@@ -288,7 +288,7 @@ cargo test --locked -p asura-platform -p asura-control -p asura-client -p asura-
 cargo build --locked -p asura-cli
 ```
 
-Use the physical installed Rust 1.98.0 toolchain binaries when a rustup component
+Use the physical installed Rust 1.100.0 toolchain binaries when a rustup component
 proxy is unavailable. In the recorded run, the installed `stable` toolchain also
 reported 1.98.0 and supplied Clippy; the named `1.98.0` component proxy did not.
 The primary used that matching physical toolchain, not a different Rust version.
