@@ -187,6 +187,25 @@ The setting changes `execution.enabled` and `execution.projects.ID` in
 | `/paths approve all` | Approve every implicit-execution file that the list shows as not approved or changed |
 | `/paths revoke PATH` | Remove the approval of PATH |
 
+## Policy commands
+
+| Command | Action |
+| --- | --- |
+| `/policy` | Show the policy line and the last policy change; `/policy admit`, `/policy rollback` and `/policy cancel` change your user policy |
+
+| Form | Action |
+| --- | --- |
+| `/policy` | Show the active revision, the solver state and the last candidate with its result |
+| `/policy admit FILE` | Submit the Cedar text in FILE (at most 61,440 bytes) as your user policy. Asura checks and proves it first; it takes effect only if every check passes, and a refusal shows why, with a counterexample when one exists |
+| `/policy rollback REVISION` | Submit your user policy of an earlier revision again; it passes the same checks and becomes a new revision |
+| `/policy cancel` | Stop the check of the candidate that is waiting or being proved; the active policy does not change |
+
+The same actions are on the command line: `asura policy status [--json]`,
+`asura policy admit --scope user FILE`, `asura policy rollback --scope user
+REVISION` and `asura policy cancel CANDIDATE`. `admit` and `rollback` wait
+for the result with no time limit; Ctrl-C ends the wait and the check
+continues.
+
 ## Named secret commands
 
 | Command | Action |

@@ -592,6 +592,12 @@ model not_started outside_sandbox_off: result: not started: running outside the 
 model exited enforcement_mismatch: result: exit 101; then stopped: the sandbox profile did not match the policy decision
 model cancelled enforcement_mismatch: result: cancelled: the sandbox profile did not match the policy decision
 model not_started enforcement_mismatch: result: not started: the sandbox profile did not match the policy decision
+model exited policy_revoked: result: exit 101; then stopped: a policy change revoked this job
+model cancelled policy_revoked: result: cancelled: a policy change revoked this job
+model not_started policy_revoked: result: not started: a policy change revoked this job
+model exited policy_changed: result: exit 101; then stopped: the policy changed before the job started
+model cancelled policy_changed: result: cancelled: the policy changed before the job started
+model not_started policy_changed: result: not started: the policy changed before the job started
 person exited none: result: exit 0
 person signalled none: result: signal 9
 person interrupted restart: result: interrupted by a service restart; effects unknown
@@ -659,6 +665,12 @@ person not_started outside_sandbox_off: result: not started: running outside the
 person exited enforcement_mismatch: result: exit 101; then stopped: the sandbox profile did not match the policy decision
 person cancelled enforcement_mismatch: result: stopped: the sandbox profile did not match the policy decision
 person not_started enforcement_mismatch: result: not started: the sandbox profile did not match the policy decision
+person exited policy_revoked: result: exit 101; then stopped: a policy change revoked this job
+person cancelled policy_revoked: result: stopped: a policy change revoked this job
+person not_started policy_revoked: result: not started: a policy change revoked this job
+person exited policy_changed: result: exit 101; then stopped: the policy changed before the job started
+person cancelled policy_changed: result: stopped: the policy changed before the job started
+person not_started policy_changed: result: not started: the policy changed before the job started
 person-outside exited none: result: exit 0
 person-outside signalled none: result: signal 9
 person-outside interrupted restart: result: interrupted by a service restart; effects unknown
@@ -726,8 +738,14 @@ person-outside not_started outside_sandbox_off: result: not started: running out
 person-outside exited enforcement_mismatch: result: exit 101; then stopped: the sandbox profile did not match the policy decision
 person-outside cancelled enforcement_mismatch: result: stopped: the sandbox profile did not match the policy decision
 person-outside not_started enforcement_mismatch: result: not started: the sandbox profile did not match the policy decision
+person-outside exited policy_revoked: result: exit 101; then stopped: a policy change revoked this job
+person-outside cancelled policy_revoked: result: stopped: a policy change revoked this job
+person-outside not_started policy_revoked: result: not started: a policy change revoked this job
+person-outside exited policy_changed: result: exit 101; then stopped: the policy changed before the job started
+person-outside cancelled policy_changed: result: stopped: the policy changed before the job started
+person-outside not_started policy_changed: result: not started: the policy changed before the job started
 "#,
-        "486e586b1ae22e0daced6e77fdd0955128313ac6ee1c79b00bde60126ee14114",
+        "f1134d65b9caa37ced35ee51f0489f91bd16a88c528a44deba4cf4d447babe57",
     );
 }
 

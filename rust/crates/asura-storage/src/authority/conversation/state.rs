@@ -1177,7 +1177,11 @@ impl Replay {
                         if matches!(p.author, RetentionAuthor::Person { .. })
                 ) || matches!(
                     &record,
-                    Record::ExecutionPath(_) | Record::PolicyRevision(_)
+                    Record::ExecutionPath(_) | Record::PolicyRevision(_) | Record::PolicyGrant(_)
+                ) || matches!(
+                    &record,
+                    Record::PolicyDecision(p)
+                        if matches!(p.subject, PolicySubject::JobRecheck { .. })
                 );
                 require(
                     reconciliation
@@ -1472,6 +1476,12 @@ impl Replay {
             Record::ExecutionPath(p) => self.execution_path(*p, frame, index)?,
             // Kind 35 (R1, R2): independent of any operation.
             Record::PolicyRevision(p) => self.policy.revision(&p)?,
+            // Kind 36 (R14): independent of any operation.
+            Record::PolicyGrant(p) => self.policy.grant(&p)?,
+            // Kind 34 subject 3 (R13): the active revision only.
+            Record::PolicyDecision(p) if matches!(p.subject, PolicySubject::JobRecheck { .. }) => {
+                self.policy.decision(&p)?;
+            }
             // Kind 34 (R3, R4): the active revision, an accepted open turn of
             // this owner generation, and an ordinal with no kind 14 yet.
             // R8 (PL2): a person subject names a queued, unheld, undropped

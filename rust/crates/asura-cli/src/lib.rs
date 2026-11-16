@@ -3,3 +3,4 @@ pub mod app;
 pub mod tui;
 
 mod conversation;
+mod policy_text;

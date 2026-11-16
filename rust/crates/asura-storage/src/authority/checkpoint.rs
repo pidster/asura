@@ -264,31 +264,10 @@ pub fn encode(state: &Replay, census: &Census, runs: &[RunRef]) -> Result<Vec<u8
         locator(&mut w, &job.intent);
         locator(&mut w, &job.cancel.map_or(Locator::NONE, |c| c.frame));
     }
-    // Kinds 34 and 35 (PL1): the last kind 35 sequence, the active
-    // revision and the pending kind 34 outcomes in key order.
-    w.u64(state.policy.last_seq);
-    w.byte(u8::from(state.policy.active.is_some()));
-    if let Some((seq, digest)) = state.policy.active {
-        w.u64(seq);
-        w.bytes(&digest);
-    }
-    let pending: Vec<_> = state.policy.pending_entries().collect();
-    require(pending.len() <= MAX_PENDING_POLICY_DECISIONS)?;
-    w.u32(pending.len() as u32);
-    for ((operation, generation, ordinal), outcome) in pending {
-        w.bytes(operation);
-        w.u64(*generation);
-        w.u32(*ordinal);
-        w.byte(*outcome as u8);
-    }
-    // PL2: pending person kind 34 records (R8 to R10).
-    let person: Vec<_> = state.policy.person_entries().collect();
-    require(person.len() <= MAX_PENDING_PERSON_DECISIONS)?;
-    w.u32(person.len() as u32);
-    for (input, outcome) in person {
-        w.bytes(input);
-        w.byte(*outcome as u8);
-    }
+    // Kinds 34 to 36 (PL1 to PL3): the last kind 35 sequence, the active
+    // revision and manifest, the recent revisions, the pending kind 34
+    // outcomes in key order and the open kind 36 grants.
+    state.policy.write_checkpoint(&mut w)?;
     let digest: Hash = Sha256::digest(&w.0).into();
     w.bytes(&digest);
     w.bytes(COMMIT);
@@ -645,31 +624,7 @@ pub fn decode(bytes: &[u8], index: &mut dyn Index) -> Result<Checkpoint> {
         let cancel = read_locator(&mut r)?;
         state.load_job(intent, cancel, index)?;
     }
-    let last_seq = r.u64()?;
-    let active = if r.flag()? {
-        Some((r.u64()?, r.array()?))
-    } else {
-        None
-    };
-    let count = r.u32()? as usize;
-    require(count <= MAX_PENDING_POLICY_DECISIONS)?;
-    let mut pending = std::collections::BTreeMap::new();
-    for _ in 0..count {
-        let key: (Id, u64, u32) = (r.array()?, r.u64()?, r.u32()?);
-        let outcome = PolicyOutcome::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
-        require(pending.last_key_value().is_none_or(|(k, _)| *k < key))?;
-        pending.insert(key, outcome);
-    }
-    let count = r.u32()? as usize;
-    require(count <= MAX_PENDING_PERSON_DECISIONS)?;
-    let mut person = std::collections::BTreeMap::new();
-    for _ in 0..count {
-        let input: Id = r.array()?;
-        let outcome = PolicyOutcome::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
-        require(person.last_key_value().is_none_or(|(k, _)| *k < input))?;
-        person.insert(input, outcome);
-    }
-    state.policy = PolicyReplay::restore(last_seq, active, pending, person)?;
+    state.policy = PolicyReplay::read_checkpoint(&mut r)?;
     r.finish()?;
     state.recompute()?;
     Ok(Checkpoint {

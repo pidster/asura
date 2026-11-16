@@ -111,6 +111,7 @@ impl Harness {
             person: None,
             constraints: matches!(origin, Origin::Model { .. })
                 .then(asura_platform::exec_cmd::template_for_test),
+            policy: None,
         }
     }
     fn submit(&mut self, origin: Origin, agent: AgentKey, project: Id) -> Admission {
@@ -2260,4 +2261,97 @@ fn epg_model_change_follows_kind_28_and_waits_at_the_quota() {
     h.script(quiet, settle_events(Exit::Exited(0), 0));
     h.script(quiet, [SlotEvent::ScratchCleaned]);
     assert_eq!(kinds(&h.commit()), [28]);
+}
+
+/// PL3-F3 (security-policy.md): a start decided under an older revision
+/// waits at slot grant with `policy_recheck`, is offered for recheck once
+/// per generation, and starts after an allowing recheck; a denied recheck
+/// settles it `not_started` with `policy_revoked`. A narrowing activation
+/// cancels a `Starting` job with `policy_changed` and offers running jobs
+/// for re-evaluation; a denied re-evaluation stops the job.
+#[test]
+fn pl3_recheck_at_slot_grant() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let mut h = Harness::new(limits(8, 8, 8));
+    let generation = Rc::new(Cell::new(1u64));
+    let read = generation.clone();
+    h.ctl.set_policy(Box::new(move || read.get()));
+    let fenced = |h: &mut Harness, n: u8, g: u64| {
+        let mut request = h.request(model(n), conversation(n), P1, 1);
+        request.policy = Some(PolicyFence {
+            generation: g,
+            request: Box::new(crate::policy::test_request("recheck", 1, 1, "true")),
+            constraints: Some(asura_platform::exec_cmd::template_for_test()),
+        });
+        let Admission::Accepted { job } = h.ctl.submit(request, h.now) else {
+            panic!("start refused");
+        };
+        h.commit();
+        job
+    };
+    // Decided and started under generation 1.
+    let running = fenced(&mut h, 1, 1);
+    let starting = fenced(&mut h, 2, 1);
+    assert_eq!(h.started(), [running, starting]);
+    h.script(running, [SlotEvent::Spawned]);
+    assert_eq!(h.state(running), Some(JobState::Running));
+    assert_eq!(h.state(starting), Some(JobState::Starting));
+    // Generation 2 activates: queued starts of generation 1 wait.
+    generation.set(2);
+    let allowed = fenced(&mut h, 3, 1);
+    let denied = fenced(&mut h, 4, 1);
+    assert_eq!(h.reason(allowed), Some(BlockReason::PolicyRecheck));
+    assert_eq!(
+        h.text(allowed).as_deref(),
+        Some("waiting: re-checking policy")
+    );
+    let offered: Vec<Id> = h.ctl.take_rechecks(2).into_iter().map(|(j, _)| j).collect();
+    assert_eq!(offered.len(), 2);
+    assert!(offered.contains(&allowed) && offered.contains(&denied));
+    assert!(
+        h.ctl.take_rechecks(2).is_empty(),
+        "offered once per generation"
+    );
+    h.ctl.rechecked(
+        allowed,
+        2,
+        Some(asura_platform::exec_cmd::template_for_test()),
+    );
+    h.commit();
+    assert!(h.started().contains(&allowed));
+    h.ctl.revoke_job(denied, JobReason::PolicyRevoked);
+    let records = h.commit();
+    let s = settled(&records)
+        .into_iter()
+        .find(|s| s.job == denied)
+        .expect("denied settles");
+    assert_eq!(
+        (s.outcome, s.reason),
+        (Outcome::NotStarted, JobReason::PolicyRevoked)
+    );
+    // The narrowing activation: the starting job is cancelled; the running
+    // one is offered once, and its denial stops it.
+    h.ctl.revoke_starting_before(2, JobReason::PolicyChanged);
+    let live: Vec<Id> = h
+        .ctl
+        .live_rechecks(2)
+        .into_iter()
+        .map(|(j, _, _)| j)
+        .collect();
+    assert_eq!(live, [running]);
+    assert!(h.ctl.live_rechecks(2).is_empty());
+    h.ctl.revoke_job(running, JobReason::PolicyRevoked);
+    assert!(h.stops().contains(&(running, StopKind::Term)));
+    let records = h.commit();
+    assert!(
+        cancels(&records)
+            .iter()
+            .any(|c| c.job == starting && c.reason == JobReason::PolicyChanged)
+    );
+    assert!(
+        cancels(&records)
+            .iter()
+            .any(|c| c.job == running && c.reason == JobReason::PolicyRevoked)
+    );
 }

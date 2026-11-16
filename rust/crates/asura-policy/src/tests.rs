@@ -341,11 +341,10 @@ fn pl_u4_seeded_defects_are_refused() {
         text: "@id(\"p\") @reason(\"r\")\npermit (principal, action, resource);".into(),
     });
     assert!(Engine::build(&texts).is_err());
-    // A forbid of every action also forbids person network: the AD-7
-    // load check (PL2) refuses it.
+    // A forbid of every action loads: admission (SP-AQ9) refuses a person
+    // network forbid, not the engine (PL3).
     texts.scopes[2].text = ok.into();
-    let error = Engine::build(&texts).err().expect("AD-7 load check");
-    assert!(error.messages[0].contains("AD-7"));
+    assert!(Engine::build(&texts).is_ok());
     texts.scopes[2].text =
         "@id(\"x\") @reason(\"r\")\nforbid (principal, action == Asura::Action::\"process.exec\", resource);"
             .into();
@@ -383,9 +382,9 @@ fn pl_u5_scope_combinations() {
     assert_eq!(reason(&d), "i_reason");
     assert_eq!(d.scopes[1].rules, ["user:u".to_owned()]);
     // A user scope with no exec permit: no_permit in the user scope. (An
-    // empty user scope fails the AD-7 load check, so it keeps the person
-    // network permit.)
-    assert!(Engine::build(&user("")).is_err());
+    // empty user scope loads; admission refuses it by SP-AQ9, so the test
+    // keeps the person network permit as an admitted text would.)
+    assert!(Engine::build(&user("")).is_ok());
     let network = "@id(\"person.network\") @reason(\"person_network\")\npermit (principal, action == Asura::Action::\"network.connect\", resource);";
     let d = Engine::build(&user(network)).unwrap().decide(&request);
     assert_eq!(d.primary.as_ref().unwrap().scope, Some(Scope::User));
@@ -648,4 +647,61 @@ fn test_deny_set_refuses_the_model_entry_in_the_installation_scope() {
         compile_model1(&engine, &principal(), NOW),
         Ok(Regions::template())
     );
+}
+
+/// PL3: `check_scope_text` names the admission step that failed, and the
+/// policy literal rule refuses non-canonical and alias spellings.
+#[test]
+fn text_faults_name_the_step_and_literals_are_lexical() {
+    let schema = crate::parse_schema().expect("schema");
+    let fault = |text: &str| {
+        crate::check_scope_text(&schema, Scope::User, text)
+            .err()
+            .map(|(f, _)| f)
+    };
+    assert_eq!(
+        fault(&" ".repeat(MAX_SCOPE_TEXT_BYTES + 1)),
+        Some(crate::TextFault::TooLarge)
+    );
+    assert_eq!(
+        fault("permit (principal, action, resource"),
+        Some(crate::TextFault::Parse)
+    );
+    assert_eq!(
+        fault("@reason(\"x\") permit (principal, action, resource);"),
+        Some(crate::TextFault::Parse)
+    );
+    assert_eq!(
+        fault("@id(\"a\") @reason(\"x\") @hard(\"true\") forbid (principal, action, resource);"),
+        Some(crate::TextFault::Parse)
+    );
+    assert_eq!(
+        fault(
+            "@id(\"a\") @reason(\"x\") permit (principal, action, resource) when { principal.nope };"
+        ),
+        Some(crate::TextFault::Invalid)
+    );
+    assert_eq!(
+        fault("@id(\"a\") @reason(\"x\") forbid (principal, action, resource);"),
+        None
+    );
+    for ok in ["/", "/Users/p/x", "/private/tmp/x"] {
+        assert!(crate::lexically_canonical_literal(ok), "{ok}");
+    }
+    for bad in [
+        "",
+        "x",
+        "/a/",
+        "/a//b",
+        "/a/./b",
+        "/a/../b",
+        "/tmp/x",
+        "/var",
+        "/etc/hosts",
+        "/a\nb",
+    ] {
+        assert!(!crate::lexically_canonical_literal(bad), "{bad:?}");
+    }
+    let deep = format!("/{}b", "a/".repeat(64));
+    assert!(!crate::lexically_canonical_literal(&deep));
 }

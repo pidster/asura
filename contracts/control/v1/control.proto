@@ -78,6 +78,13 @@ message Envelope {
     SecretList secret_list = 74;
     SecretRemove secret_remove = 75;
     SecretReply secret_reply = 76;
+    // Security policy PL3 (security-policy.md, PL3 control and presentation).
+    // Submit, Rollback and Cancel are replied to with PolicyReply at once; the
+    // candidate's result is in ServiceObservation.policy.candidate.
+    PolicyCandidateSubmit policy_candidate_submit = 77;
+    PolicyRollback policy_rollback = 78;
+    PolicyCancel policy_cancel = 79;
+    PolicyReply policy_reply = 80;
   }
   // Removed operations: direct ConversationSubmit (22) and its reply (23), and
   // the target-bearing ConversationEnqueue (35). Conversation input uses the queue.
@@ -104,12 +111,52 @@ message PolicyStatus {
   optional uint32 state = 1;              // 1 starting, 2 active, 3 unavailable
   optional uint64 revision = 2;           // journaled kind 35 sequence; 0 before the first activation
   optional uint32 installation = 3;       // scope state: 1 ok, 2 unavailable
-  optional uint32 user = 4;               // scope state: 1 ok, 2 unavailable
+  optional uint32 user = 4;               // scope state: 1 ok, 2 unavailable, 3 reproving (PL3)
   optional uint32 workspace_sets = 5;     // admitted workspace sets, 0-1024
   optional uint32 repository_sets = 6;    // admitted repository sets, 0-1024
   optional uint32 repository_changed = 7; // repository sources changed since admission
   optional uint32 solver = 8;             // 1 none, 2 available, 3 unavailable
   optional uint32 approvals_waiting = 9;  // open approval requests
+  optional uint32 admission_queue = 10;   // candidates waiting, 0-16 (PL3)
+  optional PolicyCandidate candidate = 11; // the current or last candidate (PL3)
+  repeated PolicyCandidate recent = 12;    // the last 4 finished candidates, newest first (PL3)
+}
+// One policy candidate (security-policy.md, PL3 control and presentation).
+// Lines go to the person only, never to a model.
+message PolicyCandidate {
+  optional bytes candidate_id = 1;
+  optional uint32 state = 2;              // 1 queued, 2 proving, 3 activated, 4 rejected, 5 cancelled
+  optional uint32 scope = 3;              // 2 user in PL3
+  optional uint32 position = 4;           // queue position, 0-16
+  optional string reason = 5;             // refusal reason code, [a-z0-9_]{1,48}
+  repeated string details = 6;            // at most 8 lines of at most 512 bytes
+  repeated string counterexamples = 7;    // at most 8 of at most 512 bytes
+  optional uint64 revision = 8;           // the activated kind 35 sequence
+  optional bool widening = 9;
+  repeated string widening_examples = 10; // at most 8 of at most 512 bytes
+  optional uint32 queries = 11;           // proof queries run, 0-4096
+  optional uint64 proof_ms = 12;
+}
+// scope: 2 user (PL3). text: at most 61,440 bytes of UTF-8.
+message PolicyCandidateSubmit {
+  optional bytes request_id = 1;
+  optional uint32 scope = 2;
+  optional string text = 3;
+}
+message PolicyRollback {
+  optional bytes request_id = 1;
+  optional uint32 scope = 2;
+  optional uint64 revision = 3;
+}
+message PolicyCancel {
+  optional bytes request_id = 1;
+  optional bytes candidate_id = 2;
+}
+// error: busy, scope_invalid, text_invalid, unknown_revision, not_found, unavailable.
+message PolicyReply {
+  optional bytes candidate_id = 1;
+  optional uint32 position = 2;
+  optional string error = 3;
 }
 message LlamaCppStatus {
   optional uint32 mode = 1;        // 1 off, 2 asura, 3 llama-app, 4 url

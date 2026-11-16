@@ -920,6 +920,7 @@ impl JobHarness {
             stored_command: stored,
             person: None,
             constraints: Some(asura_platform::exec_cmd::template_for_test()),
+            policy: None,
         };
         let admission = self
             .owner

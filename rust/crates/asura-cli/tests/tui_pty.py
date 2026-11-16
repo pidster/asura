@@ -3894,11 +3894,20 @@ def policy_journey(fixture, source):
     """--policy: PL-E1 (security-policy.md, PL1): a scripted model's
     exec_cmd runs as before under the policy owner; /status shows the policy
     line; the journal holds kind 35 and kind 34 before the call's kind 14.
+    PL-E3 (PL3): `/policy admit` of a user forbid activates revision 2 with
+    the development cvc5 package; the next model call is denied with scope
+    `user`; `/policy rollback 1` restores the built-in user text as
+    revision 3 and the command runs again.
     PL-E2: with the test-only denying set (a `policy-test-deny` file in the
     scratch home, test-support build), the model receives the policy denial
     text, the TUI shows it, and nothing runs."""
     harness = JobsHarness(fixture, source)
     project = harness.project("policy")
+    # PL3 solver source: the development package beside the service
+    # executable (security-policy.md, PL3 solver source).
+    solver = development_package(source) / "solver"
+    assert (solver / "manifest.json").is_file(), "Copy the cvc5 package into the Cargo profile directory"
+    shutil.copytree(solver, fixture.root / "solver", symlinks=False)
     trial = None
     try:
         fixture.start()
@@ -3914,13 +3923,46 @@ def policy_journey(fixture, source):
             trial.read(0.05)
         assert (project / "policy.txt").read_text() == "policy-ok"
         harness.command(trial, "/status",
-                        "policy: revision 1 · installation ok · user ok · workspace 0 · repository 0 · solver: none · 0 approvals waiting")
+                        "policy: revision 1 · installation ok · user ok · workspace 0 · repository 0 · solver: available · 0 approvals waiting")
         trial.send(b"\x1b")
         trial.idle(0.2)
         kinds = journal_kinds(fixture)
         assert 35 in kinds and 34 in kinds, kinds
         assert kinds.index(35) < kinds.index(34) < len(kinds) - 1 and kinds[kinds.index(34) + 1] == 14, kinds
         assert kinds.count(35) == 1, kinds
+        # PL-E3 (PL3): admit a user forbid, see the user denial, roll back.
+        default = (Path(__file__).resolve().parents[2]
+                   / "asura-policy/policies/user-default.cedar").read_text()
+        forbid = (default + '\n@id("no-printf") @reason("printf_denied") @intent("true")\n'
+                  '@explain("the user policy denies printf")\n'
+                  'forbid (principal is Asura::Job, action == Asura::Action::"process.exec", resource)\n'
+                  'when { principal.origin == Asura::Origin::"model" && context has intent && '
+                  'context.intent has command && context.intent.command.first_tool == "printf" };\n')
+        policy_file = fixture.root / "user-policy.cedar"
+        policy_file.write_text(forbid)
+        harness.command(trial, f"/policy admit {policy_file}",
+                        "policy: revision 2 active: user scope changed", limit=120)
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        harness.script[:] = [("exec_cmd", {"command": "printf user > user.txt"}), "USER-DENIED-DONE"]
+        trial.send(b"Try the user-denied command.\r")
+        trial.until(b"USER-DENIED-DONE", plain=True, limit=40, reject="Incomplete response")
+        text = "denied: policy: user: printf_denied: the user policy denies printf; do not retry"
+        assert any(m.endswith(text) for m in harness.tool_messages), harness.tool_messages[-2:]
+        assert not (project / "user.txt").exists()
+        harness.command(trial, "/policy rollback 1",
+                        "policy: revision 3 active: user scope changed", limit=120)
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        harness.script[:] = [("exec_cmd", {"command": "printf back > back.txt"}), "ROLLED-BACK"]
+        trial.send(b"Run it again.\r")
+        trial.until(b"ROLLED-BACK", plain=True, limit=40, reject="Incomplete response")
+        end = time.monotonic() + 10
+        while not (project / "back.txt").exists():
+            assert time.monotonic() < end, "the command did not run after rollback"
+            trial.read(0.05)
+        print("PASS PL-E3 TUI: /policy admit of a user forbid denies the next model call with "
+              "scope user; /policy rollback 1 restores it as revision 3")
         trial.send(b"\x01/quit\r")
         trial.finish()
         trial = None
@@ -3941,7 +3983,7 @@ def policy_journey(fixture, source):
         trial.until(b"denied: policy: installation", plain=True, limit=10)
         assert not (project / "denied.txt").exists()
         kinds = journal_kinds(fixture)
-        assert kinds[-1] != 26 and kinds.count(34) == 2, kinds
+        assert kinds[-1] != 26 and kinds.count(34) == 4, kinds
         trial.send(b"\x01/quit\r")
         trial.finish()
         trial = None

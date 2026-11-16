@@ -2055,6 +2055,11 @@ impl Owner {
             person: Some(launch),
             // Person profiles have no compiled constraint set until PL6.
             constraints: None,
+            policy: self
+                .persons
+                .policy
+                .get(&record.input)
+                .and_then(super::policy_call::fence),
         };
         let Some(controller) = self.jobs.controller() else {
             return Dispatch::Ready(record);
@@ -2100,15 +2105,11 @@ impl Owner {
         let input = record.input;
         let mut stage = self.persons.policy.remove(&input).unwrap_or_default();
         let wake = self.wake.clone();
-        let home = self
-            .runtime
-            .asura_home_path()
-            .to_string_lossy()
-            .into_owned();
+        let runtime = self.runtime.clone();
         let test_deny = self.policy_test_deny;
         let owner = self
             .policy
-            .get_or_insert_with(|| crate::policy::PolicyOwner::start(home, wake, test_deny));
+            .get_or_insert_with(|| crate::policy::PolicyOwner::start(runtime, wake, test_deny));
         let (revision, last_seq) = self
             .replay
             .as_ref()
@@ -2184,8 +2185,12 @@ impl Owner {
     /// A person policy append committed (kind 35, or the kind 34 when
     /// `decision`).
     pub(super) fn person_policy_recorded(&mut self, input: Id, decision: bool) {
-        if decision && let Some(stage) = self.persons.policy.get_mut(&input) {
-            super::policy_call::recorded(stage);
+        if decision
+            && let Some(stage) = self.persons.policy.get_mut(&input)
+            && let Some(event) = super::policy_call::recorded(stage)
+            && let Some(emitter) = &self.audit_emitter
+        {
+            let _ = emitter.try_emit(event);
         }
     }
 

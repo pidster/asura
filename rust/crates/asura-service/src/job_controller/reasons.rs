@@ -23,6 +23,9 @@ pub(crate) enum BlockReason {
     PendingInstalls,
     Quota,
     DiskSpace,
+    /// Condition 0b (PL3-F3): the decision's revision is older than the
+    /// dispatch revision.
+    PolicyRecheck,
 }
 impl BlockReason {
     pub(crate) fn audit(self) -> record::JobBlockReason {
@@ -37,6 +40,7 @@ impl BlockReason {
             Self::PendingInstalls => A::PendingInstalls,
             Self::Quota => A::Quota,
             Self::DiskSpace => A::DiskSpace,
+            Self::PolicyRecheck => A::PolicyRecheck,
         }
     }
     /// The kind 29 state block reason (codes 1 to 9 in condition order).
@@ -51,6 +55,7 @@ impl BlockReason {
             Self::PendingInstalls => JobBlockReason::PendingInstalls,
             Self::Quota => JobBlockReason::Quota,
             Self::DiskSpace => JobBlockReason::DiskSpace,
+            Self::PolicyRecheck => JobBlockReason::PolicyRecheck,
         }
     }
 }
@@ -102,6 +107,7 @@ pub(crate) fn block_text(reason: BlockReason, counts: &Counts) -> String {
         ),
         BlockReason::Quota => "waiting: output quota full".into(),
         BlockReason::DiskSpace => "waiting: disk space low".into(),
+        BlockReason::PolicyRecheck => "waiting: re-checking policy".into(),
     }
 }
 
@@ -146,6 +152,8 @@ pub(crate) fn audit_reason(reason: JobReason) -> record::JobReason {
         JobReason::ExecutionOff => A::ExecutionOff,
         JobReason::OutsideSandboxOff => A::OutsideSandboxOff,
         JobReason::EnforcementMismatch => A::EnforcementMismatch,
+        JobReason::PolicyRevoked => A::PolicyRevoked,
+        JobReason::PolicyChanged => A::PolicyChanged,
     }
 }
 

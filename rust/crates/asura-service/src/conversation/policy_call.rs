@@ -43,15 +43,22 @@ pub(super) fn step(
     last_seq: u64,
     subject: journal::PolicySubject,
 ) -> Next {
+    let mut request = Some(request);
     loop {
         match std::mem::take(stage) {
-            Stage::Idle => match owner.decide_job(request()) {
-                Some(ticket) => {
-                    *stage = Stage::Waiting(ticket);
+            Stage::Idle => {
+                // A stale decision returns here once; the next step asks again.
+                let Some(request) = request.take() else {
                     return Next::Wait;
+                };
+                match owner.decide_job(request()) {
+                    Some(ticket) => {
+                        *stage = Stage::Waiting(ticket);
+                        return Next::Wait;
+                    }
+                    None => return Next::Busy,
                 }
-                None => return Next::Busy,
-            },
+            }
             Stage::Waiting(ticket) => match owner.take(ticket) {
                 Some(decision) => *stage = Stage::Decided(Box::new(decision)),
                 None => {
@@ -60,6 +67,13 @@ pub(super) fn step(
                 }
             },
             Stage::Decided(decision) => {
+                // PL3 revision fencing: a decision made under another
+                // generation than the dispatch one is decided again, with
+                // no record, so every kind 34 names the active revision.
+                if !decision.unavailable && decision.generation != owner.dispatch_generation() {
+                    *stage = Stage::Idle;
+                    continue;
+                }
                 if decision.unavailable {
                     *stage = Stage::Recorded(decision.clone());
                     return Next::Ready(decision);
@@ -93,11 +107,31 @@ pub(super) fn step(
     }
 }
 
-/// The kind 34 commit: the decision is recorded.
-pub(super) fn recorded(stage: &mut Stage) {
-    if let Stage::Decided(decision) = std::mem::take(stage) {
-        *stage = Stage::Recorded(decision);
+/// The revision fence of a recorded `run` decision, which the job
+/// controller checks at slot grant (PL3-F3).
+pub(super) fn fence(stage: &Stage) -> Option<crate::job_controller::PolicyFence> {
+    match stage {
+        Stage::Recorded(decision) if decision.run => fence_of(decision),
+        _ => None,
     }
+}
+pub(super) fn fence_of(decision: &JobDecision) -> Option<crate::job_controller::PolicyFence> {
+    Some(crate::job_controller::PolicyFence {
+        generation: decision.generation,
+        request: decision.request.clone()?,
+        constraints: decision.constraints,
+    })
+}
+
+/// The kind 34 commit: the decision is recorded.
+/// Returns the `policy.decision_denied` audit event of a committed `deny`.
+pub(super) fn recorded(stage: &mut Stage) -> Option<asura_storage::audit::Event> {
+    if let Stage::Decided(decision) = std::mem::take(stage) {
+        let event = (!decision.run).then(|| super::policy_admin::denied_event(&decision));
+        *stage = Stage::Recorded(decision);
+        return event;
+    }
+    None
 }
 
 /// The requester's cancel.
@@ -116,7 +150,7 @@ fn error_code(error: Option<ap::ErrorClass>) -> u8 {
 }
 
 /// Kind 34 for one decision (security-policy.md, kinds 34 and 35 in PL1).
-fn decision_record(
+pub(super) fn decision_record(
     decision: &JobDecision,
     revision_seq: u64,
     subject: journal::PolicySubject,
@@ -161,8 +195,9 @@ fn decision_record(
     }))
 }
 
-/// Kind 35 `activated` for the running build's built-in revision.
-fn revision_record(
+/// Kind 35 `activated` for a revision: the startup revision before its
+/// first decision (PL1), or an admitted one at activation (PL3).
+pub(crate) fn revision_record(
     manifest: &crate::policy::Manifest,
     seq: u64,
     previous_seq: u64,
@@ -175,8 +210,8 @@ fn revision_record(
         schema_digest: ap::schema_digest(),
         cedar_lang: ap::cedar_lang(),
         cedar_sdk: ap::CEDAR_SDK.into(),
-        solver_digest: None,
-        admission_digest: None,
+        solver_digest: manifest.solver_digest,
+        admission_digest: manifest.admission_digest,
         scopes: manifest
             .scopes
             .iter()

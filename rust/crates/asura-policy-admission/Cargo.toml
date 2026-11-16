@@ -1,0 +1,32 @@
+[package]
+name = "asura-policy-admission"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Asura's policy admission: lints, SymCC proofs over an injected solver pipe, compile checks and change differences (security-policy.md, PL3)"
+
+[dependencies]
+asura-policy = { path = "../asura-policy" }
+cedar-policy = "=4.14.1"
+cedar-policy-symcc = "=0.8.1"
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+# The AsyncWrite trait of SymCC's Solver interface only; no runtime.
+tokio = { version = "=1.52.1", default-features = false }
+
+[dev-dependencies]
+# Real-solver tests reach cvc5 through the platform's solver process owner.
+# A dev-dependency only: the production dependency direction is unchanged.
+asura-platform = { path = "../asura-platform", features = ["test-support"] }
+
+# The proof time bench (PES-M13 and PES-M18 style): an example, because it
+# reaches the solver through the platform dev-dependency.
+[[example]]
+name = "admission-bench"
+path = "examples/admission-bench.rs"
+test = false
+
+[lints.rust]
+unsafe_code = "forbid"

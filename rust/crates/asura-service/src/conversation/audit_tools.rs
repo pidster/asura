@@ -188,7 +188,12 @@ pub(super) fn read(
                 | Event::SecretStoreNamedPut { .. }
                 | Event::SecretStoreNamedGet { .. }
                 | Event::SecretStoreNamedDelete { .. }
-                | Event::SecretStoreNamedList { .. } => continue,
+                | Event::SecretStoreNamedList { .. }
+                | Event::PolicyRevisionActivated { .. }
+                | Event::PolicyRevisionRejected { .. }
+                | Event::PolicyDecisionDenied { .. }
+                | Event::PolicySolverFailed { .. }
+                | Event::PolicyWorkerFailed { .. } => continue,
             }
             let Ok(line) = std::str::from_utf8(&bytes) else {
                 continue;

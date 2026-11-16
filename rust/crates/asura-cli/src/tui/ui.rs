@@ -8,6 +8,7 @@ mod markdown;
 mod paging;
 mod path_guard;
 mod person;
+mod policy;
 mod secrets;
 mod thinking;
 use super::editor::{CommandHeader, Editor, MAX_DRAFT_BYTES};
@@ -111,7 +112,7 @@ const GAUGE_AMBER: Color = Color::Rgb(0xF2, 0xB9, 0x50);
 /// The TUI commands: completion, help and dispatch. `/jobs`, `/job` and
 /// `/execution` (tool-job-controller.md, J4 TUI; execution-setting.md)
 /// take arguments and dispatch before the no-argument check.
-const LOCAL_COMMANDS: [&str; 21] = [
+const LOCAL_COMMANDS: [&str; 22] = [
     "/help",
     "/quit",
     "/exit",
@@ -132,6 +133,7 @@ const LOCAL_COMMANDS: [&str; 21] = [
     "/execution",
     "/status",
     "/paths",
+    "/policy",
     "/secrets",
 ];
 
@@ -2055,6 +2057,11 @@ impl App {
             if clear {
                 self.editor = Editor::new();
             }
+        } else if self.policy_stop() {
+            // A `/policy` wait has no time bound; /cancel and Escape stop it.
+            if clear {
+                self.editor = Editor::new();
+            }
         } else if self.secrets_stop() {
             // A `/secrets` wait has no time bound; /cancel and Escape stop it.
             if clear {
@@ -2425,6 +2432,10 @@ impl App {
         }
         if name == "/paths" {
             self.paths_command(draft);
+            return false;
+        }
+        if name == "/policy" {
+            self.policy_command(draft);
             return false;
         }
         if name == "/secrets" {

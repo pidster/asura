@@ -131,8 +131,7 @@ pub(crate) fn read_policy_refusal(r: &mut Reader<'_>) -> Result<Option<PolicyRef
     Ok(Some(value))
 }
 
-/// What a kind 34 decides about. Code 3 (job recheck) is reserved for a
-/// later packet.
+/// What a kind 34 decides about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolicySubject {
     /// Code 1: one model tool call.
@@ -143,6 +142,9 @@ pub enum PolicySubject {
     },
     /// Code 2 (PL2): one person command start, named by its input.
     PersonInput { input: Id },
+    /// Code 3 (PL3): a recheck of one queued, starting or running job
+    /// after an activation (security-policy.md, kind 34 subject 3).
+    JobRecheck { job: Id },
 }
 /// Pending person kind 34 records (R8 to R10): the service decision queue
 /// bound.
@@ -230,6 +232,14 @@ impl PolicyDecision {
                     && self.task_agent == 0,
                 false,
             ),
+            // Subject 3: a model job of profile 1 carries a constraint set
+            // exactly with `run`; a person job never does (until PL6).
+            PolicySubject::JobRecheck { job } => (
+                job != [0; 16]
+                    && ((self.origin == 1 && self.profile == 1)
+                        || (self.origin == 2 && matches!(self.profile, 2 | 3))),
+                self.profile == 1,
+            ),
         };
         let scopes = (1..=MAX_POLICY_SCOPES).contains(&self.scopes.len())
             && self.scopes.windows(2).all(|w| w[0].scope < w[1].scope)
@@ -276,7 +286,7 @@ impl PolicyDecision {
                 generation,
                 ordinal,
             } => Some((operation, generation, ordinal)),
-            PolicySubject::PersonInput { .. } => None,
+            PolicySubject::PersonInput { .. } | PolicySubject::JobRecheck { .. } => None,
         }
     }
 }
@@ -306,6 +316,10 @@ pub(crate) fn write_policy_decision(w: &mut Writer, p: &PolicyDecision) -> Resul
         PolicySubject::PersonInput { input } => {
             w.byte(2);
             w.bytes(&input);
+        }
+        PolicySubject::JobRecheck { job } => {
+            w.byte(3);
+            w.bytes(&job);
         }
     }
     w.byte(p.action);
@@ -347,6 +361,7 @@ pub(crate) fn read_policy_decision(r: &mut Reader<'_>) -> Result<PolicyDecision>
             ordinal: r.u32()?,
         },
         2 => PolicySubject::PersonInput { input: r.array()? },
+        3 => PolicySubject::JobRecheck { job: r.array()? },
         _ => return Err(ReplayError::Corrupt),
     };
     let action = r.byte()?;
@@ -409,8 +424,8 @@ pub(crate) fn read_policy_decision(r: &mut Reader<'_>) -> Result<PolicyDecision>
     Ok(value)
 }
 
-/// A kind 35 event. Replay accepts only `Activated` until the packet that
-/// writes the others (R2).
+/// A kind 35 event. Replay accepts `Activated` and (PL3) `Rejected`;
+/// `Superseded` and `Revoked` wait for the packet that writes them (R2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolicyRevisionEvent {
     Activated = 1,
@@ -561,8 +576,178 @@ pub(crate) fn read_policy_revision(r: &mut Reader<'_>) -> Result<PolicyRevision>
     Ok(value)
 }
 
-/// The policy facts replay keeps (R1 to R7): the last kind 35 sequence,
-/// the active revision and the kind 34 records that wait for their kind 14.
+/// The kind 36 payload bound.
+pub const MAX_POLICY_GRANT_PAYLOAD: usize = 8192;
+/// Open kind 36 grants (security-policy.md, limits: 256 generated grants).
+pub const MAX_OPEN_POLICY_GRANTS: usize = 256;
+/// Activated revisions replay keeps for rollback (PL3 rollback).
+pub const MAX_RECENT_POLICY_REVISIONS: usize = 64;
+
+/// A kind 36 grant kind. `Envelope` is refused by replay until PL8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyGrantKind {
+    Approval = 1,
+    Envelope = 2,
+}
+impl PolicyGrantKind {
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Approval,
+            2 => Self::Envelope,
+            _ => return None,
+        })
+    }
+}
+/// A kind 36 event (security-policy.md, kind 36 in PL3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyGrantEvent {
+    Requested = 1,
+    Granted = 2,
+    Denied = 3,
+    Cancelled = 4,
+    Ended = 5,
+}
+impl PolicyGrantEvent {
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Requested,
+            2 => Self::Granted,
+            3 => Self::Denied,
+            4 => Self::Cancelled,
+            5 => Self::Ended,
+            _ => return None,
+        })
+    }
+}
+/// The cause codes of a kind 36 `cancelled` or `ended`.
+pub mod grant_cause {
+    pub const NONE: u8 = 0;
+    pub const RESTART: u8 = 1;
+    pub const PERSON: u8 = 2;
+    pub const JOB_SETTLED: u8 = 3;
+    pub const NARROWING: u8 = 4;
+    pub const EXPIRY: u8 = 5;
+}
+/// Kind 36 `PolicyGrant`, at most 8 KiB. No command, path or policy text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyGrant {
+    pub grant: Id,
+    pub kind: PolicyGrantKind,
+    pub event: PolicyGrantEvent,
+    pub task_conversation: Id,
+    pub task_agent: u32,
+    pub job: Id,
+    /// Present exactly with `requested`.
+    pub request_digest: Option<Hash>,
+    /// Optional with `requested`, absent otherwise.
+    pub constraint_digest: Option<Hash>,
+    /// Optional with `requested`, absent otherwise.
+    pub intent_digest: Option<Hash>,
+    /// Optional with `granted`, absent otherwise.
+    pub expiry_ms: Option<u64>,
+    /// 1 to 5 with `cancelled` and `ended`, 0 otherwise.
+    pub cause: u8,
+    /// The active revision sequence when written.
+    pub revision_seq: u64,
+}
+impl PolicyGrant {
+    pub(crate) fn validate(&self) -> Result<()> {
+        use PolicyGrantEvent as E;
+        let fields = match self.event {
+            E::Requested => {
+                self.request_digest.is_some() && self.expiry_ms.is_none() && self.cause == 0
+            }
+            E::Granted => {
+                self.request_digest.is_none()
+                    && self.constraint_digest.is_none()
+                    && self.intent_digest.is_none()
+                    && self.cause == 0
+            }
+            E::Denied => self.no_facts() && self.cause == 0,
+            E::Cancelled | E::Ended => self.no_facts() && (1..=5).contains(&self.cause),
+        };
+        require(
+            self.grant != [0; 16]
+                && self.task_conversation != [0; 16]
+                && self.job != [0; 16]
+                && self.revision_seq >= 1
+                && fields,
+        )
+    }
+    fn no_facts(&self) -> bool {
+        self.request_digest.is_none()
+            && self.constraint_digest.is_none()
+            && self.intent_digest.is_none()
+            && self.expiry_ms.is_none()
+    }
+}
+pub(crate) fn write_policy_grant(w: &mut Writer, p: &PolicyGrant) -> Result<()> {
+    p.validate()?;
+    w.bytes(&p.grant);
+    w.byte(p.kind as u8);
+    w.byte(p.event as u8);
+    w.bytes(&p.task_conversation);
+    w.u32(p.task_agent);
+    w.bytes(&p.job);
+    option_hash(w, p.request_digest.as_ref());
+    option_hash(w, p.constraint_digest.as_ref());
+    option_hash(w, p.intent_digest.as_ref());
+    w.byte(u8::from(p.expiry_ms.is_some()));
+    if let Some(expiry) = p.expiry_ms {
+        w.u64(expiry);
+    }
+    w.byte(p.cause);
+    w.u64(p.revision_seq);
+    Ok(())
+}
+pub(crate) fn read_policy_grant(r: &mut Reader<'_>) -> Result<PolicyGrant> {
+    let grant = r.array()?;
+    let kind = PolicyGrantKind::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
+    let event = PolicyGrantEvent::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
+    let value = PolicyGrant {
+        grant,
+        kind,
+        event,
+        task_conversation: r.array()?,
+        task_agent: r.u32()?,
+        job: r.array()?,
+        request_digest: read_option_hash(r)?,
+        constraint_digest: read_option_hash(r)?,
+        intent_digest: read_option_hash(r)?,
+        expiry_ms: if r.flag()? { Some(r.u64()?) } else { None },
+        cause: r.byte()?,
+        revision_seq: r.u64()?,
+    };
+    value.validate()?;
+    Ok(value)
+}
+
+/// One activated revision kept for rollback: its sequence and digest and
+/// the user scope's text digest and source identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecentRevision {
+    pub seq: u64,
+    pub digest: Hash,
+    pub user_text: Hash,
+    pub user_source: String,
+}
+
+/// The source identities a kind 35 scope set may name (R12). The
+/// test-only denying installation set (`builtin-test-deny`) exists only
+/// in test-support builds, but replay accepts its records in every build.
+fn valid_source(scope: u8, source: &str) -> bool {
+    match source {
+        "person" => true,
+        "builtin" => matches!(scope, 1 | 2),
+        "builtin-test-deny" => scope == 1,
+        _ => false,
+    }
+}
+
+/// The policy facts replay keeps (R1 to R14): the last kind 35 sequence,
+/// the active revision with its manifest, the recent activated revisions,
+/// the kind 34 records that wait for their kind 14 or kind 26, and the
+/// open kind 36 grants.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PolicyReplay {
     /// The last kind 35 sequence; 0 before the first.
@@ -573,35 +758,65 @@ pub struct PolicyReplay {
     /// Person kind 34 records that wait for their kind 26, hold or drop
     /// (R8 to R10).
     pub(crate) person: BTreeMap<Id, PolicyOutcome>,
+    /// The last `activated` kind 35 (PL3 restart).
+    pub(crate) manifest: Option<PolicyRevision>,
+    /// The last 64 activated revisions, oldest first (PL3 rollback).
+    pub(crate) recent: Vec<RecentRevision>,
+    /// Open kind 36 grants: the latest record of each (R14).
+    pub(crate) grants: BTreeMap<Id, PolicyGrant>,
 }
 impl PolicyReplay {
     /// The active revision, if any.
     pub fn active(&self) -> Option<(u64, Hash)> {
         self.active
     }
+    /// The last `activated` kind 35: the active revision's manifest.
+    pub fn active_manifest(&self) -> Option<&PolicyRevision> {
+        self.manifest.as_ref()
+    }
+    /// The last 64 activated revisions, oldest first.
+    pub fn recent(&self) -> &[RecentRevision] {
+        &self.recent
+    }
+    /// The open kind 36 grants, by grant ID: the latest record of each.
+    pub fn open_grants(&self) -> impl Iterator<Item = &PolicyGrant> {
+        self.grants.values()
+    }
     /// The kind 34 outcome that waits for the call's kind 14.
     pub fn pending(&self, operation: Id, generation: u64, ordinal: u32) -> Option<PolicyOutcome> {
         self.pending.get(&(operation, generation, ordinal)).copied()
     }
-    /// The pending entries in key order (checkpoint encoding).
-    pub(crate) fn pending_entries(
-        &self,
-    ) -> impl Iterator<Item = (&(Id, u64, u32), &PolicyOutcome)> {
-        self.pending.iter()
-    }
-    /// R1 and R2 for one kind 35.
+    /// R1, R2, R11 and R12 for one kind 35.
     pub(crate) fn revision(&mut self, p: &PolicyRevision) -> Result<()> {
         require(
-            p.event == PolicyRevisionEvent::Activated
-                && Some(p.seq) == self.last_seq.checked_add(1)
-                && p.previous_seq == self.active.map_or(0, |(seq, _)| seq),
+            matches!(
+                p.event,
+                PolicyRevisionEvent::Activated | PolicyRevisionEvent::Rejected
+            ) && Some(p.seq) == self.last_seq.checked_add(1)
+                && p.previous_seq == self.active.map_or(0, |(seq, _)| seq)
+                && p.scopes.iter().all(|s| valid_source(s.scope, &s.source)),
         )?;
         self.last_seq = p.seq;
-        self.active = Some((p.seq, p.digest));
+        if p.event == PolicyRevisionEvent::Activated {
+            self.active = Some((p.seq, p.digest));
+            if let Some(user) = p.scopes.iter().find(|s| s.scope == 2) {
+                if self.recent.len() >= MAX_RECENT_POLICY_REVISIONS {
+                    self.recent.remove(0);
+                }
+                self.recent.push(RecentRevision {
+                    seq: p.seq,
+                    digest: p.digest,
+                    user_text: user.text_digest,
+                    user_source: user.source.clone(),
+                });
+            }
+            self.manifest = Some(p.clone());
+        }
         Ok(())
     }
-    /// R3 and the pending half of R4 for one kind 34; the caller checks the
-    /// call's turn and ordinal, or (R8) the person input's state.
+    /// R3, R13 and the pending half of R4 for one kind 34; the caller
+    /// checks the call's turn and ordinal, or (R8) the person input's
+    /// state.
     pub(crate) fn decision(&mut self, p: &PolicyDecision) -> Result<()> {
         require(
             p.outcome != PolicyOutcome::Ask
@@ -624,7 +839,47 @@ impl PolicyReplay {
                 }
                 self.person.insert(input, p.outcome);
             }
+            // R13: a recheck adds no pending entry.
+            (None, PolicySubject::JobRecheck { .. }) => {}
             (None, PolicySubject::ModelCall { .. }) => return Err(ReplayError::Corrupt),
+        }
+        Ok(())
+    }
+    /// R14 for one kind 36.
+    pub(crate) fn grant(&mut self, p: &PolicyGrant) -> Result<()> {
+        use PolicyGrantEvent as E;
+        require(
+            p.kind == PolicyGrantKind::Approval
+                && self.active.map(|(seq, _)| seq) == Some(p.revision_seq),
+        )?;
+        let open = self.grants.get(&p.grant);
+        match p.event {
+            E::Requested => {
+                require(open.is_none())?;
+                if self.grants.len() >= MAX_OPEN_POLICY_GRANTS {
+                    return Err(ReplayError::Limit);
+                }
+            }
+            event => {
+                let open = open.ok_or(ReplayError::Corrupt)?;
+                let state = matches!(
+                    (open.event, event),
+                    (E::Requested, E::Granted | E::Denied | E::Cancelled)
+                        | (E::Granted, E::Ended | E::Cancelled)
+                );
+                require(
+                    state
+                        && open.kind == p.kind
+                        && open.job == p.job
+                        && open.task_conversation == p.task_conversation
+                        && open.task_agent == p.task_agent,
+                )?;
+            }
+        }
+        if matches!(p.event, E::Denied | E::Cancelled | E::Ended) {
+            self.grants.remove(&p.grant);
+        } else {
+            self.grants.insert(p.grant, p.clone());
         }
         Ok(())
     }
@@ -673,31 +928,167 @@ impl PolicyReplay {
         }
         Ok(())
     }
-    /// Restores checkpointed facts; `seq` and `active` are checked.
-    pub(crate) fn restore(
-        last_seq: u64,
-        active: Option<(u64, Hash)>,
-        pending: BTreeMap<(Id, u64, u32), PolicyOutcome>,
-        person: BTreeMap<Id, PolicyOutcome>,
-    ) -> Result<Self> {
-        require(
-            active.is_none_or(|(seq, _)| seq >= 1 && seq <= last_seq)
-                && (last_seq == 0) == active.is_none()
-                && pending.len() <= MAX_PENDING_POLICY_DECISIONS
-                && pending.values().all(|o| *o != PolicyOutcome::Ask)
-                && person.len() <= MAX_PENDING_PERSON_DECISIONS
-                && person.values().all(|o| *o != PolicyOutcome::Ask)
-                && (person.is_empty() || active.is_some()),
-        )?;
-        Ok(Self {
+    /// The checkpoint encoding of every policy fact.
+    pub(crate) fn write_checkpoint(&self, w: &mut Writer) -> Result<()> {
+        w.u64(self.last_seq);
+        w.byte(u8::from(self.active.is_some()));
+        if let Some((seq, digest)) = self.active {
+            w.u64(seq);
+            w.bytes(&digest);
+        }
+        require(self.pending.len() <= MAX_PENDING_POLICY_DECISIONS)?;
+        w.u32(self.pending.len() as u32);
+        for ((operation, generation, ordinal), outcome) in &self.pending {
+            w.bytes(operation);
+            w.u64(*generation);
+            w.u32(*ordinal);
+            w.byte(*outcome as u8);
+        }
+        // PL2: pending person kind 34 records (R8 to R10).
+        require(self.person.len() <= MAX_PENDING_PERSON_DECISIONS)?;
+        w.u32(self.person.len() as u32);
+        for (input, outcome) in &self.person {
+            w.bytes(input);
+            w.byte(*outcome as u8);
+        }
+        // PL3: the active manifest, the recent revisions and the open
+        // grants.
+        w.byte(u8::from(self.manifest.is_some()));
+        if let Some(manifest) = &self.manifest {
+            write_policy_revision(w, manifest)?;
+        }
+        require(self.recent.len() <= MAX_RECENT_POLICY_REVISIONS)?;
+        w.u32(self.recent.len() as u32);
+        for r in &self.recent {
+            w.u64(r.seq);
+            w.bytes(&r.digest);
+            w.bytes(&r.user_text);
+            w.string(&r.user_source, MAX_POLICY_ID)?;
+        }
+        require(self.grants.len() <= MAX_OPEN_POLICY_GRANTS)?;
+        w.u32(self.grants.len() as u32);
+        for grant in self.grants.values() {
+            write_policy_grant(w, grant)?;
+        }
+        Ok(())
+    }
+    /// Restores checkpointed facts with their consistency checks.
+    pub(crate) fn read_checkpoint(r: &mut Reader<'_>) -> Result<Self> {
+        let last_seq = r.u64()?;
+        let active = if r.flag()? {
+            Some((r.u64()?, r.array()?))
+        } else {
+            None
+        };
+        let count = r.u32()? as usize;
+        require(count <= MAX_PENDING_POLICY_DECISIONS)?;
+        let mut pending = BTreeMap::new();
+        for _ in 0..count {
+            let key: (Id, u64, u32) = (r.array()?, r.u64()?, r.u32()?);
+            let outcome = PolicyOutcome::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
+            require(pending.last_key_value().is_none_or(|(k, _)| *k < key))?;
+            pending.insert(key, outcome);
+        }
+        let count = r.u32()? as usize;
+        require(count <= MAX_PENDING_PERSON_DECISIONS)?;
+        let mut person = BTreeMap::new();
+        for _ in 0..count {
+            let input: Id = r.array()?;
+            let outcome = PolicyOutcome::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
+            require(person.last_key_value().is_none_or(|(k, _)| *k < input))?;
+            person.insert(input, outcome);
+        }
+        let manifest = if r.flag()? {
+            Some(read_policy_revision(r)?)
+        } else {
+            None
+        };
+        let count = r.u32()? as usize;
+        require(count <= MAX_RECENT_POLICY_REVISIONS)?;
+        let mut recent: Vec<RecentRevision> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let entry = RecentRevision {
+                seq: r.u64()?,
+                digest: r.array()?,
+                user_text: r.array()?,
+                user_source: r.bounded_string(MAX_POLICY_ID)?,
+            };
+            require(
+                recent.last().is_none_or(|last| last.seq < entry.seq)
+                    && valid_source(2, &entry.user_source),
+            )?;
+            recent.push(entry);
+        }
+        let count = r.u32()? as usize;
+        require(count <= MAX_OPEN_POLICY_GRANTS)?;
+        let mut grants: BTreeMap<Id, PolicyGrant> = BTreeMap::new();
+        for _ in 0..count {
+            let grant = read_policy_grant(r)?;
+            require(
+                grants
+                    .last_key_value()
+                    .is_none_or(|(k, _)| *k < grant.grant)
+                    && grant.kind == PolicyGrantKind::Approval
+                    && matches!(
+                        grant.event,
+                        PolicyGrantEvent::Requested | PolicyGrantEvent::Granted
+                    ),
+            )?;
+            grants.insert(grant.grant, grant);
+        }
+        Self::restore(Restored {
             last_seq,
             active,
             pending,
             person,
+            manifest,
+            recent,
+            grants,
         })
     }
-    /// The pending person entries in input order (checkpoint encoding).
-    pub(crate) fn person_entries(&self) -> impl Iterator<Item = (&Id, &PolicyOutcome)> {
-        self.person.iter()
+    /// Restores checkpointed facts; `seq`, `active` and the manifest are
+    /// checked against each other.
+    pub(crate) fn restore(f: Restored) -> Result<Self> {
+        let manifest_ok = match (&f.manifest, f.active) {
+            (None, None) => true,
+            (Some(m), Some((seq, digest))) => {
+                m.event == PolicyRevisionEvent::Activated && m.seq == seq && m.digest == digest
+            }
+            _ => false,
+        };
+        require(
+            f.active
+                .is_none_or(|(seq, _)| seq >= 1 && seq <= f.last_seq)
+                && (f.last_seq > 0 || f.active.is_none())
+                && manifest_ok
+                && f.recent.len() <= MAX_RECENT_POLICY_REVISIONS
+                && f.recent.last().is_none_or(|r| r.seq <= f.last_seq)
+                && f.pending.len() <= MAX_PENDING_POLICY_DECISIONS
+                && f.pending.values().all(|o| *o != PolicyOutcome::Ask)
+                && f.person.len() <= MAX_PENDING_PERSON_DECISIONS
+                && f.person.values().all(|o| *o != PolicyOutcome::Ask)
+                && (f.person.is_empty() || f.active.is_some())
+                && f.grants.len() <= MAX_OPEN_POLICY_GRANTS
+                && (f.grants.is_empty() || f.active.is_some()),
+        )?;
+        Ok(Self {
+            last_seq: f.last_seq,
+            active: f.active,
+            pending: f.pending,
+            person: f.person,
+            manifest: f.manifest,
+            recent: f.recent,
+            grants: f.grants,
+        })
     }
+}
+/// The checkpointed policy facts before their checks.
+pub(crate) struct Restored {
+    pub last_seq: u64,
+    pub active: Option<(u64, Hash)>,
+    pub pending: BTreeMap<(Id, u64, u32), PolicyOutcome>,
+    pub person: BTreeMap<Id, PolicyOutcome>,
+    pub manifest: Option<PolicyRevision>,
+    pub recent: Vec<RecentRevision>,
+    pub grants: BTreeMap<Id, PolicyGrant>,
 }

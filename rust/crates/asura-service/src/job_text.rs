@@ -517,6 +517,7 @@ pub(crate) fn block_reason_text(reason: JobBlockReason, numbers: [u8; 3]) -> Str
         }
         JobBlockReason::Quota => "waiting: output quota full".into(),
         JobBlockReason::DiskSpace => "waiting: disk space low".into(),
+        JobBlockReason::PolicyRecheck => "waiting: re-checking policy".into(),
     }
 }
 
@@ -601,6 +602,8 @@ pub(crate) fn stop_reason_text(reason: JobReason) -> &'static str {
         JobReason::ExecutionOff => "the person turned execution off",
         JobReason::OutsideSandboxOff => "running outside the sandbox is turned off",
         JobReason::EnforcementMismatch => "the sandbox profile did not match the policy decision",
+        JobReason::PolicyRevoked => "a policy change revoked this job",
+        JobReason::PolicyChanged => "the policy changed before the job started",
         // Reasons 0-5 have no reason text of their own.
         JobReason::None
         | JobReason::ModelCancel

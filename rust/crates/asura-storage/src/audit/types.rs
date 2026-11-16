@@ -266,6 +266,8 @@ pub enum JobBlockReason {
     PendingInstalls,
     Quota,
     DiskSpace,
+    /// Start condition 0b (PL3): waiting for a policy recheck.
+    PolicyRecheck,
 }
 /// The guardian profile token of a job (person-command-mode.md, profiles).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,6 +477,12 @@ pub enum JobReason {
     /// The guardian's profile digest differed from the decision's; the
     /// command never started (security-policy.md, PL1).
     EnforcementMismatch = 21,
+    /// A recheck under a newly activated policy revision denied the job
+    /// (security-policy.md, PL3).
+    PolicyRevoked = 22,
+    /// A starting job decided under an older policy revision was cancelled
+    /// when a narrowing revision activated (PL3).
+    PolicyChanged = 23,
 }
 impl JobReason {
     /// Whether kind 27 allows this reason for `requester` (reason table).
@@ -492,6 +500,8 @@ impl JobReason {
                     | R::Quota
                     | R::Enospc
                     | R::ExecutionOff
+                    | R::PolicyRevoked
+                    | R::PolicyChanged
             ),
         }
     }
@@ -923,6 +933,74 @@ pub enum Event {
         truncated: bool,
         listings: u32,
     },
+    /// A policy revision activated (security-policy.md, PL3 audit events).
+    /// `scopes` names the scopes the revision changed; `solver_digest` is
+    /// the solver package digest of its admission, as 64 lowercase hex.
+    #[serde(rename = "policy.revision_activated")]
+    PolicyRevisionActivated {
+        seq: u64,
+        scopes: Vec<PolicyScope>,
+        widening: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        solver_digest: Option<String>,
+    },
+    /// A policy candidate was refused, with its reason code.
+    #[serde(rename = "policy.revision_rejected")]
+    PolicyRevisionRejected { scope: PolicyScope, reason: String },
+    /// A `deny` kind 34 committed. Never a command, path or policy text:
+    /// the reason code and the global rule ID only.
+    #[serde(rename = "policy.decision_denied")]
+    PolicyDecisionDenied {
+        action_group: PolicyActionGroup,
+        scope: PolicyScope,
+        reason: String,
+        rule: String,
+        #[serde(with = "id")]
+        project: Id,
+    },
+    /// An admission's solver failed.
+    #[serde(rename = "policy.solver_failed")]
+    PolicySolverFailed { cause: PolicySolverCause },
+    /// A policy worker thread ended with requests in flight.
+    #[serde(rename = "policy.worker_failed")]
+    PolicyWorkerFailed { worker: u32 },
+}
+/// A policy scope in a `policy.*` event; `none` for a refusal with no
+/// scope (`request_invalid`, `cannot_enforce`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyScope {
+    None,
+    Installation,
+    User,
+    Workspace,
+    Repository,
+}
+/// The action group of a policy decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyActionGroup {
+    File,
+    Process,
+    Network,
+    Secret,
+    Mach,
+    Egress,
+}
+/// The cause of a `policy.solver_failed` event (PL3 audit events).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicySolverCause {
+    Unavailable,
+    DigestMismatch,
+    CopyFailed,
+    SpawnFailed,
+    Closed,
+    Protocol,
+    InputBound,
+    OutputBound,
+    MemoryBound,
+    Io,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Record {
@@ -1220,6 +1298,36 @@ impl Event {
                     && Self::status_rule(*reply, *status, session)
                     && [kept, failed, unrecognized].iter().all(|n| **n <= 257)
             }
+            Self::PolicyRevisionActivated {
+                seq,
+                scopes,
+                solver_digest,
+                ..
+            } => {
+                *seq >= 1
+                    && (1..=4).contains(&scopes.len())
+                    && scopes.windows(2).all(|w| (w[0] as u8) < (w[1] as u8))
+                    && !scopes.contains(&PolicyScope::None)
+                    && solver_digest.as_ref().is_none_or(|d| {
+                        d.len() == 64 && d.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                    })
+            }
+            Self::PolicyRevisionRejected { scope, reason } => {
+                *scope != PolicyScope::None
+                    && crate::authority::conversation::valid_policy_reason(reason)
+            }
+            Self::PolicyDecisionDenied {
+                reason,
+                rule,
+                project,
+                ..
+            } => {
+                nonzero(project)
+                    && crate::authority::conversation::valid_policy_reason(reason)
+                    && (rule.is_empty() || crate::authority::conversation::valid_policy_rule(rule))
+            }
+            Self::PolicySolverFailed { .. } => true,
+            Self::PolicyWorkerFailed { worker } => *worker < 64,
         };
         if valid { Ok(()) } else { Err(Error::Invalid) }
     }
@@ -1280,14 +1388,20 @@ impl Event {
         // Code 19 `execution_off` follows the cancel reasons 1-8; code 20
         // `outside_sandbox_off` is a slot-grant refusal and code 21
         // `enforcement_mismatch` a setup refusal (job reason codes).
-        let process_reason = code <= 10 || *reason == JobReason::ExecutionOff;
-        let cancel_reason = (1..=8).contains(&code) || *reason == JobReason::ExecutionOff;
+        // Codes 22 `policy_revoked` and 23 `policy_changed` (PL3) are
+        // service revocations, like 19.
+        let service = matches!(
+            reason,
+            JobReason::ExecutionOff | JobReason::PolicyRevoked | JobReason::PolicyChanged
+        );
+        let process_reason = code <= 10 || service;
+        let cancel_reason = (1..=8).contains(&code) || service;
         let outcome_rules = match outcome {
             JobOutcome::Exited => process_reason && *exit_kind == JobExitKind::Exited && ran,
             JobOutcome::Signalled => process_reason && *exit_kind == JobExitKind::Signalled && ran,
             JobOutcome::Cancelled => cancel_reason && *exit_kind != JobExitKind::Unknown && ran,
             JobOutcome::NotStarted => {
-                ((1..=7).contains(&code) || (12..=21).contains(&code))
+                ((1..=7).contains(&code) || (12..=23).contains(&code))
                     && no_process
                     && *capture_state == JobCaptureState::NotStarted
             }
