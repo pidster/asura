@@ -5,6 +5,7 @@ use pb::envelope::Body;
 use std::{
     collections::VecDeque,
     io::{self, Read, Write},
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -29,6 +30,34 @@ pub(crate) struct Selection {
     pub model_capabilities: Option<u32>,
     /// The llama.cpp relay token sent in Hello field 24 (llamacpp-backend.md).
     pub endpoint_token: Option<Vec<u8>>,
+}
+/// The directory that holds `asura-model`: the canonical service executable's
+/// directory. Test builds add one case (release signing, "Helper directory
+/// for Cargo test executables"): a Cargo test executable in
+/// `<profile>/build/<package>/<hash>/out/` uses `<profile>/`, so one
+/// development package there serves every test executable. Only the path is
+/// inspected; there is no search and no second location.
+fn helper_directory(executable: &Path) -> Option<&Path> {
+    let directory = executable.parent()?;
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(profile) = cargo_profile_directory(directory) {
+        return Some(profile);
+    }
+    Some(directory)
+}
+/// `<profile>` when `directory` is `<profile>/build/<package>/<hash>/out`.
+#[cfg(any(test, feature = "test-support"))]
+fn cargo_profile_directory(directory: &Path) -> Option<&Path> {
+    if directory.file_name()? != "out" {
+        return None;
+    }
+    let build = directory.ancestors().nth(3)?;
+    if build.file_name()? != "build" {
+        return None;
+    }
+    build
+        .parent()
+        .filter(|profile| profile.file_name().is_some())
 }
 /// Package resources the selected provider needs beside the helper copy.
 /// MLX needs `mlx.metallib`; MLX and Core AI load Hub tokenizers, which read
@@ -289,8 +318,7 @@ impl ModelOwner {
                 // in `Asura.app/Contents/MacOS/`; the platform owner derives
                 // the resource directory from this path (release signing, SG1).
                 let executable = std::env::current_exe()?.canonicalize()?;
-                let helper = executable
-                    .parent()
+                let helper = helper_directory(&executable)
                     .ok_or(asura_platform::Error::Unavailable)?
                     .join("asura-model");
                 ModelProcess::spawn_with_resources(
@@ -1148,6 +1176,61 @@ impl ModelOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_directory_is_the_profile_only_for_a_cargo_test_executable() {
+        for (executable, directory) in [
+            // Cargo 1.100 build-dir layout: test executables use the profile.
+            (
+                "/repo/target/debug/build/asura-service/0123abcd/out/conversation_flow-0123abcd",
+                Some("/repo/target/debug"),
+            ),
+            (
+                "/repo/target/release/build/asura-cli/ff00/out/lifecycle-ff00",
+                Some("/repo/target/release"),
+            ),
+            // Every other layout keeps the production rule: beside the executable.
+            (
+                "/Applications/Asura.app/Contents/MacOS/asura",
+                Some("/Applications/Asura.app/Contents/MacOS"),
+            ),
+            ("/repo/target/debug/asura", Some("/repo/target/debug")),
+            (
+                "/private/tmp/home/package/conversation_flow",
+                Some("/private/tmp/home/package"),
+            ),
+            (
+                "/repo/target/debug/deps/conversation_flow-0123abcd",
+                Some("/repo/target/debug/deps"),
+            ),
+            // Near misses: wrong final component, wrong depth, no `build`.
+            (
+                "/repo/target/debug/build/asura-service/0123abcd/output/x",
+                Some("/repo/target/debug/build/asura-service/0123abcd/output"),
+            ),
+            (
+                "/repo/target/debug/build/0123abcd/out/x",
+                Some("/repo/target/debug/build/0123abcd/out"),
+            ),
+            (
+                "/repo/target/debug/builds/asura-service/0123abcd/out/x",
+                Some("/repo/target/debug/builds/asura-service/0123abcd/out"),
+            ),
+            // `build` at the root has no profile directory above it.
+            (
+                "/build/asura-service/0123abcd/out/x",
+                Some("/build/asura-service/0123abcd/out"),
+            ),
+            ("asura", Some("")),
+            ("/", None),
+        ] {
+            assert_eq!(
+                helper_directory(Path::new(executable)),
+                directory.map(Path::new),
+                "{executable}"
+            );
+        }
+    }
 
     #[test]
     fn hub_bundle_is_required_for_mlx_and_coreai_only() {

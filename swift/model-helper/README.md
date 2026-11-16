@@ -24,9 +24,13 @@ Before a standard SwiftPM build, the root build owner must:
    of unchanged inputs gives the same digest.
 5. Assemble helper/binary/manifest identities according to the D2 contract.
    Place `asura-model`, `mlx.metallib` and `swift-transformers_Hub.bundle`
-   (from the same SwiftPM build directory) beside the service executable,
-   and beside the test binaries for native journeys. Do not ship the other
-   SwiftPM resource bundles; no code reads them.
+   (from the same SwiftPM build directory) beside the service executable.
+   For Cargo tests, place one copy in the Cargo profile directory,
+   `target/debug/`. Every test executable in
+   `target/debug/build/<package>/<hash>/out/` reads the package there; do not
+   copy it beside each test executable
+   ([test executables](../../docs/designs/release-signing.md#helper-directory-for-cargo-test-executables)).
+   Do not ship the other SwiftPM resource bundles; no code reads them.
 6. Write `.build/model-tools/package-identity.txt` as five lowercase hex
    SHA-256 lines (the helper digest covers the embedded plist and the
    signature, so hash the linked executable as built): build ID, `model.proto`, `asura-model`, `mlx.metallib` and

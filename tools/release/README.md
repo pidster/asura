@@ -141,11 +141,18 @@ check` runs the same scanner on the mounted DMG volume. To scan a bundle yoursel
 
 The script also rewrites the ignored generated Swift sources and
 `.build/model-tools/package-identity.txt`. Later Cargo builds embed this
-package's identity. To run native tests against it, place the files from
-`package/` beside the test binaries (helper README, step 5). Since Cargo
-1.100, each test binary is in its own directory,
-`target/debug/build/<package>/<hash>/out/`; `cargo test --no-run` prints
-each path.
+package's identity. To run native tests against it, copy the files from
+`package/` once into the Cargo profile directory (helper README, step 5):
+
+```sh
+ditto .build/bundles/dry-run-1/package target/debug
+```
+
+Since Cargo 1.100, each test executable is in its own directory,
+`target/debug/build/<package>/<hash>/out/`. In test builds the service maps
+that directory to `target/debug/` and reads the helper there
+([design](../../docs/designs/release-signing.md#helper-directory-for-cargo-test-executables)).
+Do not copy the package beside each test executable.
 
 ## Helper App Sandbox and end-to-end check of the bundle layout
 
