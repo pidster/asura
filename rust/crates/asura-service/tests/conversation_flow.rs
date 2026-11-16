@@ -1792,6 +1792,25 @@ fn provider_submit(
 }
 
 /// Relative path and bytes of every file in a small resource bundle, sorted.
+/// The development package directory: the Cargo profile directory above this
+/// test executable's `<profile>/build/<package>/<hash>/out/`, where the
+/// service finds the helper in test builds (release signing, "Helper
+/// directory for Cargo test executables").
+fn development_package() -> Result<PathBuf> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let build = exe.ancestors().nth(4).ok_or("build directory")?;
+    if build.file_name() != Some("build".as_ref()) {
+        return Err(format!(
+            "{} is not in <profile>/build/<package>/<hash>/out/",
+            exe.display()
+        )
+        .into());
+    }
+    Ok(build
+        .parent()
+        .ok_or("target profile directory")?
+        .to_path_buf())
+}
 fn bundle_files(root: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
     let mut files = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -1926,10 +1945,7 @@ fn native_mlx() -> Result<()> {
             .map(|entry| entry.path().join("mlx.metallib"))
             .find(|path| path.is_file())
             .ok_or("native helper did not retain its private Metal resource")?;
-        let packaged = std::env::current_exe()?
-            .parent()
-            .ok_or("test binary parent")?
-            .join("mlx.metallib");
+        let packaged = development_package()?.join("mlx.metallib");
         assert_eq!(
             fs::read(copied)?,
             fs::read(packaged)?,
@@ -1941,10 +1957,7 @@ fn native_mlx() -> Result<()> {
             .map(|entry| entry.path().join(asura_platform::HUB_BUNDLE_NAME))
             .find(|path| path.is_dir())
             .ok_or("native helper did not retain its private Hub bundle")?;
-        let packaged = std::env::current_exe()?
-            .parent()
-            .ok_or("test binary parent")?
-            .join(asura_platform::HUB_BUNDLE_NAME);
+        let packaged = development_package()?.join(asura_platform::HUB_BUNDLE_NAME);
         assert_eq!(
             bundle_files(&copied)?,
             bundle_files(&packaged)?,
@@ -1996,10 +2009,7 @@ fn native_mlx() -> Result<()> {
         // SG-V10: a relocated package whose Hub bundle does not match the
         // embedded `hub_bundle_sha256`, or lacks it, never spawns the helper.
         stage = "relocated package";
-        let built = std::env::current_exe()?
-            .parent()
-            .ok_or("test binary parent")?
-            .to_path_buf();
+        let built = development_package()?;
         let package = fixture.home.join("package");
         fs::create_dir(&package)?;
         let relocated = package.join("conversation_flow");

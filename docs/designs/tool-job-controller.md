@@ -1981,7 +1981,8 @@ and `--test capture_flow` (each takes case names; `capture_flow native` runs
 only when named), `cargo test -p asura-platform --all-features --test
 exec_cmd_process`, and `python3 rust/crates/asura-cli/tests/tui_pty.py
 <lifecycle fixture> --exec-cmd-capture` with a fixture built by
-`cargo test --all-features` and the helper beside it. The `--exec-cmd-capture`
+`cargo test --all-features` and the development package in `target/debug/`
+([test executables](release-signing.md#helper-directory-for-cargo-test-executables)). The `--exec-cmd-capture`
 PTY mode runs in the default lifecycle gate; the CLI's
 test build enables the service `test-support` gates it needs. Only
 `capture_flow native` stays opt-in: it needs the host's system model, whose

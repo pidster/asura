@@ -589,7 +589,9 @@ The script also leaves the signed helper, `mlx.metallib`, the Hub bundle and
 (resources beside the helper). Steps 2 and 6 rewrite the generated Swift
 sources and `.build/model-tools/package-identity.txt`, as the manual package
 step does. Later Cargo builds therefore embed this package's identity, and
-native tests use `<out>/package/` beside the test binaries.
+native tests use the files of `<out>/package/` copied once into the Cargo
+profile directory, `target/debug/`
+([test executables](#helper-directory-for-cargo-test-executables)).
 
 Time: no step has a time bound (RS8). `notarytool --wait` ends with the
 service's reply or an operator cancel (Ctrl-C). Stapling retries end with
@@ -666,6 +668,92 @@ flowchart TD
     Side --> Copy["Verified copy beside the helper copy (SG-F3)"]
     R --> Copy
 ```
+
+#### Helper directory for Cargo test executables
+
+Selected (engineering, 2026-11-16, Rust 1.100.0 move). Cargo 1.100 always
+uses its build-directory layout. Each test executable is now in its own
+directory, `<profile>/build/<package>/<hash>/out/<name>-<hash>`; the old
+shared `<profile>/deps/` directory is gone. Final binaries such as `asura`
+and `keychain_fixture` stay in `<profile>/`. The native tests run the test
+executable itself as the service, so the production rule ("beside the
+canonical executable") needed a copy of the package beside each of the 42
+test executables. Measured: `cargo test --workspace --all-features --no-run`
+with Rust 1.100.0 printed every test executable under
+`target/debug/build/<package>/<hash>/out/` (2026-11-16).
+
+Rule: in a build with `cfg(test)` or the `asura-service` feature
+`test-support`, `model_owner::helper_directory` maps a canonical executable
+whose directory is `<profile>/build/<package>/<hash>/out` to `<profile>`.
+Every other path keeps the production rule. The developer therefore places
+one development package in `target/<profile>/` (`target/debug/` for
+`cargo test`), and every test executable reads it there.
+
+- Production lookup does not change. A build without `test-support` compiles
+  only the production rule. `asura-bundle` builds `-p asura-cli` without
+  features, so `Asura.app` and the DMG never contain this case.
+- The rule inspects only the path: exact component names `out` and `build`,
+  at fixed depths, and a profile directory with a name. There is no search,
+  no fallback to the executable's directory, no environment variable and no
+  second location. A missing or wrong package fails as before:
+  `model_helper_unavailable` before spawn.
+- Identity checks do not change. The platform owner still copies the helper,
+  `mlx.metallib` and the Hub bundle from that directory, checks each copy
+  against the digests that `package-identity.txt` embedded at build time
+  ([SG-F3](#sg-f3-hub-bundle-preparation)), and refuses a symbolic link. The
+  resource directory follows the helper path
+  ([resource directory](#resource-directory-inside-the-bundle)), so it is
+  also `<profile>/`.
+- Test support that reads or copies the package uses the same directory:
+  `development_package` in `conversation_flow` and in `tui_pty.py`, which
+  copies the helper beside its relocated `asura-fixture`. Each refuses an
+  executable that is not in `<profile>/build/<package>/<hash>/out/`.
+- A relocated copy of a test executable (the SG-V10 relocated-package case
+  and `Fixture::use_bundle`) is outside the build directory, so it still
+  proves the production rule.
+- Asynchronous execution: the rule is a pure path computation on the
+  existing `asura-model-prepare` thread. It adds no blocking call, file access
+  or wait.
+
+Rejected:
+
+| Option | Reason |
+| --- | --- |
+| Copy the package beside each test executable | 42 copies; every rebuild of the package or new test hash needs them again. Missing copies fail as `model_helper_unavailable` |
+| `ASURA_TEST_MODEL_PACKAGE` read by test support | The service child resolves the helper, not the test harness, so the service code would read the variable. It is inherited by every child, must be set by every journey and adds a second source |
+| Test support copies or links the package into each `out/` directory | Writes into Cargo's build directory, and copies go stale when the package changes. Symbolic links fail the platform's no-link check |
+
+##### SG-F15: helper directory resolution
+
+Selected design. Arrows show the next test on the canonical service
+executable path; labels show the result. The test-build branch exists only
+with `cfg(test)` or `test-support`.
+
+```mermaid
+flowchart TD
+    E["Canonical service executable"] --> T{"Built with cfg(test) or test-support?"}
+    T -->|No: production| Beside["Helper directory: the executable's directory"]
+    T -->|Yes| O{"Executable directory named out?"}
+    O -->|No| Beside
+    O -->|Yes| B{"Three levels above out named build?"}
+    B -->|No| Beside
+    B -->|Yes| P{"Parent of build has a name?"}
+    P -->|No| Beside
+    P -->|Yes| Prof["Helper directory: the profile directory above build"]
+    Beside --> H["asura-model in the helper directory; resources by SG-F5"]
+    Prof --> H
+    H --> V{"Copies match the embedded digests and are not links?"}
+    V -->|No| U["model_helper_unavailable before spawn"]
+    V -->|Yes| S["Spawn the verified helper copy"]
+```
+
+Validation:
+
+| Layer | Evidence |
+| --- | --- |
+| Unit | `model_owner::tests::helper_directory_is_the_profile_only_for_a_cargo_test_executable`: build-directory test executables in `debug` and `release`; `Asura.app`, `target/debug/asura`, a relocated copy and an old `deps/` path keep the production rule; near misses (`output`, missing package level, `builds`, `build` at the root) keep it too |
+| Integration | `cargo test --workspace --all-features --no-fail-fast --locked` with one package copy in `target/debug/` and none elsewhere: every native target reaches the helper |
+| End-to-end | `conversation_flow --native-exec-cmd-tools` with the same single copy; the native MLX journey compares the private resource copies with the profile directory's package, and its SG-V10 relocated-package case still proves the production rule |
 
 ### SG4 release promotion and formula
 
@@ -2593,7 +2681,8 @@ assets to the account home's `~/.asura`.
 - `conversation_flow` has one bundle-layout owner, `Fixture::use_bundle`.
   `--bundle-sandbox` uses it. `exec_cmd_journey::run` uses it when
   `ASURA_TEST_BUNDLE` is set and not empty. Without that variable, the
-  journeys keep the helper beside the test binary.
+  journeys use the development package in the Cargo profile directory
+  ([test executables](#helper-directory-for-cargo-test-executables)).
 - The variant claims the shipped list plus the one read-only absolute-path
   exception `/private/tmp/`, under the probe identifier. The tracked
   entitlement lists do not change, and `--static` still refuses an
@@ -2601,8 +2690,8 @@ assets to the account home's `~/.asura`.
 - The journey binary embeds the variant's digest, and `package-identity.txt`
   is restored at exit. The restore now writes a new modification time
   (`cp`, not `cp -p`). Otherwise Cargo keeps the variant digest in the next
-  build, and the helper beside the test binaries then fails the identity
-  check.
+  build, and the development helper in the profile directory then fails the
+  identity check.
 - The probe container's `Data` directory is removed at exit, as for
   `--sandbox`. Any Core AI cache that the sandboxed helper creates inside the
   container is removed with it.

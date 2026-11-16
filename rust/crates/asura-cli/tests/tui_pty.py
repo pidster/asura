@@ -33,6 +33,16 @@ import termios
 import time
 import unicodedata
 
+
+def development_package(source):
+    """The Cargo profile directory above the lifecycle executable's
+    <profile>/build/<package>/<hash>/out/, which holds the one development
+    package copy (release-signing.md#helper-directory-for-cargo-test-executables)."""
+    build = Path(os.path.realpath(source)).parents[3]
+    assert build.name == "build", f"{source} is not in <profile>/build/<package>/<hash>/out/"
+    return build.parent
+
+
 DEADLINE = time.monotonic() + 52
 CLEANUP = False
 CLEANUP_DEADLINE = None
@@ -565,8 +575,8 @@ def config_commands(fixture):
 
 def models_command(fixture, source=None):
     if source is not None:
-        helper = source.parent / "asura-model"
-        assert helper.is_file(), "Build the verified inventory helper beside the fixture"
+        helper = development_package(source) / "asura-model"
+        assert helper.is_file(), "Build the verified inventory helper in the Cargo profile directory"
         shutil.copyfile(helper, fixture.root / "asura-model")
         (fixture.root / "asura-model").chmod(0o700)
     fixture.start()
@@ -1174,8 +1184,8 @@ def queue_history_admission(fixture, source):
 
 def queue_history_with_provider(fixture, source, endpoint):
     # The oracle is durable admission, never generated text or native availability.
-    helper = source.parent / "asura-model"
-    assert helper.is_file(), "Build the packaged helper beside the lifecycle fixture"
+    helper = development_package(source) / "asura-model"
+    assert helper.is_file(), "Build the packaged helper in the Cargo profile directory"
     shutil.copyfile(helper, fixture.root / "asura-model")
     (fixture.root / "asura-model").chmod(0o700)
     result = fixture.command("--seed-queue-history")
@@ -1319,8 +1329,8 @@ def native_conversation(fixture, source):
         return (prompt >= 0 and "Activity · Complete" in screen[prompt:]
                 and "↵ send" in screen and "Pending local" not in screen
                 and "Queued messages:" not in screen)
-    helper = source.parent / "asura-model"
-    assert helper.is_file(), "Build the verified native helper beside the fixture executable"
+    helper = development_package(source) / "asura-model"
+    assert helper.is_file(), "Build the verified native helper in the Cargo profile directory"
     shutil.copyfile(helper, fixture.root / "asura-model")
     (fixture.root / "asura-model").chmod(0o700)
     project = fixture.root / "project"
@@ -1412,7 +1422,7 @@ def composer_interactions(fixture, source):
     # user's Ollama daemon or race with another process taking an unused port.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as endpoint_guard:
         endpoint_guard.bind(("127.0.0.1", 0))
-        shutil.copyfile(source.parent / "asura-model", fixture.root / "asura-model")
+        shutil.copyfile(development_package(source) / "asura-model", fixture.root / "asura-model")
         (fixture.root / "asura-model").chmod(0o700)
         # Let the service create its private authority/runtime tree first. Creating
         # all parents via mkdir(parents=True) would give .asura the default 0755 mode.
@@ -1508,7 +1518,7 @@ def rich_activity(fixture, source, multipass=False):
     """Real service/helper tools and TUI; deterministic local provider, no weights."""
     import threading
 
-    shutil.copyfile(source.parent / "asura-model", fixture.root / "asura-model")
+    shutil.copyfile(development_package(source) / "asura-model", fixture.root / "asura-model")
     (fixture.root / "asura-model").chmod(0o700)
     project = fixture.root / "project"
     project.mkdir(mode=0o700)
@@ -1684,7 +1694,7 @@ def thinking_level(fixture, source):
     model default, which removes the key; an invalid level keeps the draft."""
     import threading
 
-    shutil.copyfile(source.parent / "asura-model", fixture.root / "asura-model")
+    shutil.copyfile(development_package(source) / "asura-model", fixture.root / "asura-model")
     (fixture.root / "asura-model").chmod(0o700)
     project = fixture.root / "project"
     project.mkdir(mode=0o700)
@@ -1839,7 +1849,7 @@ def exec_cmd_capture(fixture, source):
     that waits queued with its reason (AQ1, J3T-07)."""
     import threading
 
-    shutil.copyfile(source.parent / "asura-model", fixture.root / "asura-model")
+    shutil.copyfile(development_package(source) / "asura-model", fixture.root / "asura-model")
     (fixture.root / "asura-model").chmod(0o700)
     project = fixture.root / "project"
     project.mkdir(mode=0o700)
@@ -2103,7 +2113,7 @@ def tool_call_records(fixture, source):
     call interrupted with its name and arguments; nothing runs again)."""
     import threading
 
-    shutil.copyfile(source.parent / "asura-model", fixture.root / "asura-model")
+    shutil.copyfile(development_package(source) / "asura-model", fixture.root / "asura-model")
     (fixture.root / "asura-model").chmod(0o700)
     project = fixture.root / "project"
     project.mkdir(mode=0o700)
@@ -2330,7 +2340,7 @@ def waiting_steps(fixture, source):
     ends on an observed screen state or the journey work budget."""
     import threading
 
-    shutil.copyfile(source.parent / "asura-model", fixture.root / "asura-model")
+    shutil.copyfile(development_package(source) / "asura-model", fixture.root / "asura-model")
     (fixture.root / "asura-model").chmod(0o700)
     project = fixture.root / "project"
     project.mkdir(mode=0o700)
@@ -2474,7 +2484,7 @@ def queue_steer(fixture, source):
     screen state or the journey work budget."""
     import threading
 
-    shutil.copyfile(source.parent / "asura-model", fixture.root / "asura-model")
+    shutil.copyfile(development_package(source) / "asura-model", fixture.root / "asura-model")
     (fixture.root / "asura-model").chmod(0o700)
     project = fixture.root / "project"
     project.mkdir(mode=0o700)
@@ -2623,7 +2633,7 @@ def queue_steer(fixture, source):
 def long_observation(fixture, source):
     import threading
 
-    helper = source.parent / "asura-model"
+    helper = development_package(source) / "asura-model"
     shutil.copyfile(helper, fixture.root / "asura-model")
     (fixture.root / "asura-model").chmod(0o700)
     project = fixture.root / "project"
@@ -2737,8 +2747,8 @@ def long_observation(fixture, source):
 
 def long_conversation(fixture, source):
     """CC-E1: a real conversation past the former 16-turn failure keeps answering."""
-    helper = source.parent / "asura-model"
-    assert helper.is_file(), "Build the verified native helper beside the fixture executable"
+    helper = development_package(source) / "asura-model"
+    assert helper.is_file(), "Build the verified native helper in the Cargo profile directory"
     shutil.copyfile(helper, fixture.root / "asura-model")
     (fixture.root / "asura-model").chmod(0o700)
     project = fixture.root / "project"
@@ -3304,7 +3314,7 @@ class JobsHarness:
 
     def __init__(self, fixture, source):
         import threading
-        shutil.copyfile(source.parent / "asura-model", fixture.root / "asura-model")
+        shutil.copyfile(development_package(source) / "asura-model", fixture.root / "asura-model")
         (fixture.root / "asura-model").chmod(0o700)
         self.fixture = fixture
         self.script = []
