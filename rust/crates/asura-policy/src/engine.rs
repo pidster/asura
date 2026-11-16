@@ -36,7 +36,8 @@ impl std::fmt::Display for LoadError {
 }
 impl std::error::Error for LoadError {}
 
-pub(crate) fn parse_schema() -> Result<Schema, String> {
+/// The product schema `asura-policy/1`, parsed.
+pub fn parse_schema() -> Result<Schema, String> {
     Schema::from_cedarschema_str(crate::schema_text())
         .map(|(schema, _)| schema)
         .map_err(|e| format!("schema: {e}"))
@@ -246,60 +247,6 @@ impl Engine {
             },
             authorizer: Authorizer::new(),
         })
-        .and_then(|engine| engine.check_person_network().map(|()| engine))
-    }
-
-    /// The AD-7 load check (security-policy.md, PL2 AD-7 load check): a
-    /// `person_typed` job of each person profile may connect to a sample
-    /// address and domain, with and without the proxy, in every scope.
-    fn check_person_network(&self) -> Result<(), LoadError> {
-        use crate::request::{Origin, PathClass, ProfileKind};
-        for profile in [ProfileKind::Person1, ProfileKind::PersonOutside1] {
-            let principal = JobPrincipal {
-                job: "ad7-check".into(),
-                origin: Origin::PersonTyped,
-                profile,
-                project: "ad7-check".into(),
-                project_root: PathRef {
-                    path: "/ad7-check/project".into(),
-                    class: PathClass::Ordinary,
-                    in_project: true,
-                    rel: String::new(),
-                },
-                task: "ad7-check:0".into(),
-                scratch: PathRef::ordinary("/ad7-check/scratch"),
-                cache_roots: Vec::new(),
-                developer_dir: None,
-                declared_env: Vec::new(),
-            };
-            for resource in [
-                Resource::Address("192.0.2.1".into()),
-                Resource::Domain("example.com".into()),
-            ] {
-                for via_proxy in [false, true] {
-                    let request = Request {
-                        principal: principal.clone(),
-                        action: Action::NetworkConnect,
-                        resource: resource.clone(),
-                        context: Context::Connect {
-                            now_ms: 0,
-                            ip: "192.0.2.1".into(),
-                            port: 443,
-                            via_proxy,
-                            intent: None,
-                        },
-                    };
-                    let decision = self.decide(&request);
-                    if !decision.allow {
-                        return Err(LoadError {
-                            scope: decision.primary.and_then(|p| p.scope),
-                            messages: vec!["person network forbidden (AD-7)".into()],
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     /// The global policy IDs of one scope, sorted; baseline permits included.
@@ -666,6 +613,18 @@ pub(crate) fn lexical_parent(path: &str) -> Option<&str> {
         Some(i) => Some(&path[..i]),
         None => None,
     }
+}
+
+/// A lexically canonical absolute path for a policy literal
+/// (security-policy.md, PL2 canonical paths, steps 1 and 2): at most 1,024
+/// bytes and 64 components, absolute, no empty, `.` or `..` component, no
+/// trailing `/`, no control character, and not spelled through the
+/// `/tmp`, `/var` or `/etc` aliases.
+pub fn lexically_canonical_literal(path: &str) -> bool {
+    canonical(path)
+        && path.len() <= 1024
+        && components(path) <= 64
+        && !matches!(path.split('/').nth(1), Some("tmp" | "var" | "etc"))
 }
 
 /// A canonical absolute path (PL1: lexical form only).

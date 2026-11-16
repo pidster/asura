@@ -1,7 +1,7 @@
 //! PL2 cases on the product schema and the built-in sets
 //! (security-policy.md, PL2 validation map): person decisions (PL-I15,
 //! engine part), command intent features (PL-U10, policy part), named
-//! secrets, the AD-7 load check, domains and the new request bounds.
+//! secrets, domains and the new request bounds.
 use super::*;
 
 /// 2026-11-04T12:00:00Z.
@@ -233,30 +233,13 @@ fn pl_i15_named_secret_decisions() {
     assert_eq!(reason(&builtin().decide(&bad)).0, "request_invalid");
 }
 
-/// AD-7 load check: a revision that forbids person network fails to load;
-/// a model network forbid loads.
+/// PL3 replaced the AD-7 load check with the admission proof SP-AQ9 (in
+/// `asura-policy-admission`): an engine now loads a person network forbid,
+/// and evaluation shows the forbid, so only admission keeps it out.
 #[test]
-fn ad7_load_check_refuses_a_person_network_forbid() {
-    for (scope, text) in [
-        (
-            Scope::User,
-            "forbid (principal, action == Asura::Action::\"network.connect\", resource) when { principal.origin == Asura::Origin::\"person_typed\" };",
-        ),
-        (
-            Scope::Installation,
-            "forbid (principal is Asura::Job, action, resource) when { principal.profile == Asura::Profile::\"person-outside-1\" };",
-        ),
-    ] {
-        let extra = format!("\n@id(\"no-net\") @reason(\"no_net\")\n{text}\n");
-        let error = match Engine::build(&with(scope, &extra)) {
-            Ok(_) => panic!("loaded a person network forbid"),
-            Err(error) => error,
-        };
-        assert_eq!(error.scope, Some(scope));
-        assert!(error.messages[0].contains("AD-7"), "{error:?}");
-    }
-    let model = "\n@id(\"no-net\") @reason(\"no_net\")\nforbid (principal, action == Asura::Action::\"network.connect\", resource) when { principal.origin == Asura::Origin::\"model\" };\n";
-    assert!(Engine::build(&with(Scope::User, model)).is_ok());
+fn person_network_forbid_is_left_to_admission() {
+    let text = "\n@id(\"no-net\") @reason(\"no_net\")\nforbid (principal, action == Asura::Action::\"network.connect\", resource) when { principal.origin == Asura::Origin::\"person_typed\" };\n";
+    assert!(Engine::build(&with(Scope::User, text)).is_ok());
 }
 
 /// PL-U10 (policy part): a tighten-only forbid reading the command

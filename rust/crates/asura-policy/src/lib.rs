@@ -23,7 +23,7 @@ pub use compile::{
     ENTRY, JobOutcome, PersonEntry, PersonOutcome, ROOTS, Regions, Root, RootSet, compile_model1,
     decide_model1_job, decide_person_job, model1_principal, person_principal,
 };
-pub use engine::{Engine, LoadError};
+pub use engine::{Engine, LoadError, lexically_canonical_literal, parse_schema};
 pub use request::{
     Action, ActionGroup, Command, Context, Decision, Delivery, ErrorClass, Intent, IntentSource,
     JobPrincipal, MAX_ANCESTORS, MAX_ENTITIES, MAX_REQUEST_BYTES, MAX_SET_ELEMENTS,
@@ -31,7 +31,8 @@ pub use request::{
     Resource, ScopeResult,
 };
 pub use text::{
-    MAX_POLICIES_PER_SCOPE, MAX_SCOPE_TEXT_BYTES, RevisionTexts, Scope, ScopeText, validate_text,
+    MAX_POLICIES_PER_SCOPE, MAX_SCOPE_TEXT_BYTES, RevisionTexts, Scope, ScopeText, TextFault,
+    check_scope_text, validate_text,
 };
 
 use sha2::{Digest, Sha256};

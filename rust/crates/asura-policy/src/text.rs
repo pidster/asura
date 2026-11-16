@@ -134,6 +134,18 @@ fn explain_ok(text: &str) -> bool {
     text.len() <= 200 && text.bytes().all(|b| (0x20..0x7f).contains(&b))
 }
 
+/// The admission step a scope text failed (security-policy.md, admission
+/// steps 1 to 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextFault {
+    /// Step 1: `candidate_too_large`.
+    TooLarge,
+    /// Step 2: `candidate_parse` (parse, templates, annotations).
+    Parse,
+    /// Step 3: `candidate_invalid` (strict validation, warnings refuse).
+    Invalid,
+}
+
 /// Parse, annotate and strictly validate one scope text (bounds,
 /// annotations, A1 strict validation, A2 warnings refuse). Returns every
 /// problem found.
@@ -147,17 +159,35 @@ pub(crate) fn check_text(
     scope: Scope,
     text: &str,
 ) -> Result<PolicySet, Vec<String>> {
+    check_scope_text(schema, scope, text).map_err(|(_, messages)| messages)
+}
+
+/// Steps 1 to 3 of admission for one scope text, with the first failing
+/// step and every problem found in it (the asura-policy-admission crate
+/// and the engine share this one implementation).
+pub fn check_scope_text(
+    schema: &Schema,
+    scope: Scope,
+    text: &str,
+) -> Result<PolicySet, (TextFault, Vec<String>)> {
     let name = scope.as_str();
     if text.len() > MAX_SCOPE_TEXT_BYTES {
-        return Err(vec![format!("{name}: candidate_too_large")]);
+        return Err((
+            TextFault::TooLarge,
+            vec![format!("{name}: candidate_too_large")],
+        ));
     }
-    let set = PolicySet::from_str(text).map_err(|e| vec![format!("{name}: {e}")])?;
+    let set =
+        PolicySet::from_str(text).map_err(|e| (TextFault::Parse, vec![format!("{name}: {e}")]))?;
+    if set.policies().count() > MAX_POLICIES_PER_SCOPE {
+        return Err((
+            TextFault::TooLarge,
+            vec![format!("{name}: candidate_too_large")],
+        ));
+    }
     let mut errors = Vec::new();
     if set.templates().next().is_some() {
         errors.push(format!("{name}: templates are not allowed"));
-    }
-    if set.policies().count() > MAX_POLICIES_PER_SCOPE {
-        errors.push(format!("{name}: candidate_too_large"));
     }
     let mut seen = BTreeSet::new();
     for policy in set.policies() {
@@ -192,6 +222,9 @@ pub(crate) fn check_text(
             }
         }
     }
+    if !errors.is_empty() {
+        return Err((TextFault::Parse, errors));
+    }
     let result = Validator::new(schema.clone()).validate(&set, ValidationMode::Strict);
     errors.extend(
         result
@@ -206,6 +239,6 @@ pub(crate) fn check_text(
     if errors.is_empty() {
         Ok(set)
     } else {
-        Err(errors)
+        Err((TextFault::Invalid, errors))
     }
 }
