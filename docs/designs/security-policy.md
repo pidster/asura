@@ -1116,7 +1116,7 @@ stateDiagram-v2
 Required behavior: [DF1-S1](assurance-and-differentiation.md#df1-s1-envelope-lifecycle)
 and the brief's [envelope rules](security-policy-brief.md#owner-revision-of-2026-11-02-task-envelopes).
 Selected mechanism below. Under AD-27 an envelope is an **effect set**.
-Packet PL8 is blocked until a new task design defines the task entity
+Packet PL8 is blocked until the [task entity design](task-entity.md) (proposed) is ready
 (AD-28, [OQ1](#open-owner-questions)). The task field, the end causes and
 SP-S3 below are proposed until that design; they bind to its task entity.
 
