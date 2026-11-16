@@ -9,6 +9,7 @@ pub use audit_io::{AuditArchive, AuditDirectory, AuditFile, audit_archive_name};
 mod model_process;
 pub mod pacing;
 pub mod payload_io;
+pub mod policy_text_io;
 pub use model_process::{
     HUB_BUNDLE_NAME, ModelProcess, PackageResources, bundle_digest, package_resource_directory,
 };
@@ -41,6 +42,7 @@ pub mod keychain;
 pub mod llamacpp;
 mod runtime;
 pub mod secrets;
+pub mod solver;
 mod startup;
 mod terminal;
 pub use runtime::{

@@ -154,6 +154,19 @@ that directory to `target/debug/` and reads the helper there
 ([design](../../docs/designs/release-signing.md#helper-directory-for-cargo-test-executables)).
 Do not copy the package beside each test executable.
 
+Policy admission tests (packet PL3) use the cvc5 package in the same
+directory, by the same rule
+([PL3 solver source](../../docs/designs/security-policy.md#pl3-solver-source)).
+Copy it once after a `solver/build` run, and build the stalled-solver
+fixture there:
+
+```sh
+ditto DIR/solver target/debug/solver
+cargo build -p asura-platform --features test-support --bin solver_fixture
+```
+
+A test that needs the solver fails when the package is absent.
+
 ## Helper App Sandbox and end-to-end check of the bundle layout
 
 Every `asura-model` list claims the App Sandbox, `network.client` and

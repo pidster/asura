@@ -258,6 +258,8 @@ impl RuntimeDirectory {
                 c"state",
                 // J1 retained exec_cmd output (tool job controller, payload I/O).
                 c"payloads",
+                // PL3 admitted policy texts (security-policy.md, policy text store).
+                c"policy",
             ]
             .contains(&name.as_c_str());
             evidence |= !non_authority && name.as_c_str() != c"config.yaml";

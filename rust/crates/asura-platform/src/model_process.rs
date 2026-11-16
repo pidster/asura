@@ -52,14 +52,14 @@ pub struct PackageResources {
     pub hub_bundle: Option<[u8; 32]>,
 }
 
-struct PinnedCopy {
+pub(crate) struct PinnedCopy {
     directory: OwnedFd,
     name: CString,
-    file: File,
+    pub(crate) file: File,
 }
 impl PinnedCopy {
     /// The retained name still refers to the retained inode, unchanged.
-    fn still_named(&self) -> Result<bool> {
+    pub(crate) fn still_named(&self) -> Result<bool> {
         let named = stat_at(self.directory.as_raw_fd(), &self.name)?;
         let held = self.file.metadata()?;
         Ok(fingerprint(&held)
@@ -127,7 +127,7 @@ fn stat_at(directory: RawFd, name: &CStr) -> Result<libc::stat> {
 }
 
 /// Open one source name read-only without following a final symlink.
-fn open_source(directory: RawFd, name: &CStr) -> Result<File> {
+pub(crate) fn open_source(directory: RawFd, name: &CStr) -> Result<File> {
     // SAFETY: terminated name and no-follow final component; successful FD is newly owned.
     let raw = unsafe {
         libc::openat(
@@ -176,7 +176,7 @@ fn verified_copy(
 /// Copy one validated source into an exclusive new name and return the
 /// SHA-256 of the re-read copy. The source must stay unchanged during the copy.
 #[allow(clippy::too_many_arguments)]
-fn pinned_copy(
+pub(crate) fn pinned_copy(
     directory: OwnedFd,
     name: CString,
     mut source: File,
@@ -258,14 +258,14 @@ fn pinned_copy(
     Ok((pinned, source_digest))
 }
 
-struct PackageDirectory {
+pub(crate) struct PackageDirectory {
     parent: OwnedFd,
     name: CString,
-    directory: OwnedFd,
+    pub(crate) directory: OwnedFd,
 }
 impl PackageDirectory {
     /// Create one exclusive private directory under a retained parent.
-    fn create(parent: OwnedFd, name: CString) -> Result<Self> {
+    pub(crate) fn create(parent: OwnedFd, name: CString) -> Result<Self> {
         // SAFETY: create one exclusive directory under a retained private parent.
         checked(unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) })?;
         // SAFETY: open only the new directory, without following a replacement symlink.
