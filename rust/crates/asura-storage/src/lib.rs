@@ -9,6 +9,7 @@ pub mod logs;
 #[cfg(feature = "embedded-memory")]
 pub mod memory;
 pub mod payload;
+pub mod policy_texts;
 
 pub mod sensors;
 

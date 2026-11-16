@@ -1321,9 +1321,10 @@ fn j2t_03_w_and_x_entries_and_checkpoint_jobs() {
     let job = &unsettled(reopened.state())[0];
     let bytes = canonical(reopened.state());
     // The policy facts follow the jobs: last sequence, no active revision,
-    // no pending model kind 34 and no pending person kind 34 (17 bytes).
-    let tail = &bytes[bytes.len() - 40 - 17 - 52..bytes.len() - 40 - 17];
-    assert_eq!(&bytes[bytes.len() - 40 - 17..bytes.len() - 40], &[0; 17]);
+    // no pending model kind 34 and no pending person kind 34, and (PL3) no
+    // manifest, no recent revision and no open grant (26 bytes).
+    let tail = &bytes[bytes.len() - 40 - 26 - 52..bytes.len() - 40 - 26];
+    assert_eq!(&bytes[bytes.len() - 40 - 26..bytes.len() - 40], &[0; 26]);
     assert_eq!(&tail[..4], &1u32.to_be_bytes());
     assert_eq!(&tail[4..28], &job.intent.encode());
     assert_eq!(&tail[28..52], &job.cancel.unwrap().frame.encode());
@@ -2888,6 +2889,206 @@ fn pl_u13_policy_decision_needs_an_open_started_turn() {
         )),
         Err(Failure::Invalid)
     );
+}
+
+// ----- PL3 kinds 34 to 36 (security-policy.md, replay rules R11 to R14). -----
+
+fn revision35_event(
+    seq: u64,
+    previous_seq: u64,
+    digest: u8,
+    event: PolicyRevisionEvent,
+    user: (u8, &str),
+) -> Record {
+    let Record::PolicyRevision(mut p) = revision35(seq, previous_seq, digest) else {
+        unreachable!()
+    };
+    p.event = event;
+    p.scopes[1].text_digest = [user.0; 32];
+    p.scopes[1].source = user.1.into();
+    Record::PolicyRevision(p)
+}
+fn recheck34(job: Id, seq: u64, digest: u8, outcome: PolicyOutcome) -> Record {
+    let Record::PolicyDecision(mut p) = decision34(id(1), 1, 1, id(2), id(3), seq, digest, outcome)
+    else {
+        unreachable!()
+    };
+    p.subject = PolicySubject::JobRecheck { job };
+    Record::PolicyDecision(p)
+}
+fn grant36(grant: u64, event: PolicyGrantEvent, seq: u64) -> Record {
+    let requested = event == PolicyGrantEvent::Requested;
+    Record::PolicyGrant(Box::new(PolicyGrant {
+        grant: id(grant),
+        kind: PolicyGrantKind::Approval,
+        event,
+        task_conversation: id(40),
+        task_agent: 0,
+        job: id(41),
+        request_digest: requested.then_some([1; 32]),
+        constraint_digest: requested.then_some([2; 32]),
+        intent_digest: None,
+        expiry_ms: None,
+        cause: match event {
+            PolicyGrantEvent::Cancelled | PolicyGrantEvent::Ended => grant_cause::RESTART,
+            _ => 0,
+        },
+        revision_seq: seq,
+    }))
+}
+
+/// PL-U13 (unit, replay, PL3): kind 35 `rejected` and the recent list
+/// (R11, R12), kind 34 subject 3 (R13) and kind 36 (R14), through the real
+/// append path, a roll whose checkpoint holds every fact, and genesis.
+#[test]
+fn pl_u13_pl3_replay_rules_r11_to_r14() {
+    use PolicyGrantEvent as G;
+    use PolicyRevisionEvent as E;
+    let mut h = Harness::new();
+    h.register(1);
+    // R11: a rejection before any activation consumes the sequence and
+    // leaves no active revision.
+    h.append(revision35_event(1, 0, 5, E::Rejected, (20, "person")))
+        .unwrap();
+    assert_eq!(h.state().policy.last_seq, 1);
+    assert_eq!(h.state().policy.active(), None);
+    assert!(h.state().policy.active_manifest().is_none());
+    // R13 and R14 need an active revision.
+    assert_eq!(
+        h.append(recheck34(id(50), 1, 5, PolicyOutcome::Run)),
+        Err(Failure::Invalid)
+    );
+    assert_eq!(
+        h.append(grant36(60, G::Requested, 1)),
+        Err(Failure::Invalid)
+    );
+    h.append(revision35_event(2, 0, 7, E::Activated, (21, "builtin")))
+        .unwrap();
+    // R11: a rejection names the active revision as previous and keeps it.
+    assert_eq!(
+        h.append(revision35_event(3, 0, 8, E::Rejected, (22, "person"))),
+        Err(Failure::Invalid)
+    );
+    h.append(revision35_event(3, 2, 8, E::Rejected, (22, "person")))
+        .unwrap();
+    assert_eq!(h.state().policy.active(), Some((2, [7; 32])));
+    assert_eq!(h.state().policy.active_manifest().unwrap().seq, 2);
+    // R2: `superseded` and `revoked` still wait for their packet.
+    for event in [E::Superseded, E::Revoked] {
+        assert_eq!(
+            h.append(revision35_event(4, 2, 9, event, (22, "person"))),
+            Err(Failure::Invalid)
+        );
+    }
+    // R12: an unknown source, and `builtin` outside installation and user.
+    assert_eq!(
+        h.append(revision35_event(4, 2, 9, E::Activated, (22, "editor"))),
+        Err(Failure::Invalid)
+    );
+    let Record::PolicyRevision(mut lower) = revision35(4, 2, 9) else {
+        unreachable!()
+    };
+    lower.scopes.push(PolicyScopeSet {
+        scope: 3,
+        project: Some(id(70)),
+        text_digest: [23; 32],
+        source: "builtin".into(),
+        policy_ids: Vec::new(),
+    });
+    assert_eq!(
+        h.append(Record::PolicyRevision(lower)),
+        Err(Failure::Invalid)
+    );
+    h.append(revision35_event(4, 2, 9, E::Activated, (24, "person")))
+        .unwrap();
+    let recent = h.state().policy.recent().to_vec();
+    assert_eq!(
+        recent
+            .iter()
+            .map(|r| (r.seq, r.user_text[0], r.user_source.as_str()))
+            .collect::<Vec<_>>(),
+        [(2, 21, "builtin"), (4, 24, "person")]
+    );
+    // R13: a recheck names the active revision and adds no pending entry.
+    assert_eq!(
+        h.append(recheck34(id(50), 2, 7, PolicyOutcome::Run)),
+        Err(Failure::Invalid)
+    );
+    h.append(recheck34(id(50), 4, 9, PolicyOutcome::Run))
+        .unwrap();
+    h.append(recheck34(id(50), 4, 9, PolicyOutcome::Deny))
+        .unwrap();
+    assert!(h.state().policy.pending.is_empty());
+    // R14: requested, granted, ended; the wrong state, kind, revision or job.
+    assert_eq!(h.append(grant36(60, G::Granted, 4)), Err(Failure::Invalid));
+    assert_eq!(
+        h.append(grant36(60, G::Requested, 2)),
+        Err(Failure::Invalid)
+    );
+    let Record::PolicyGrant(mut envelope) = grant36(60, G::Requested, 4) else {
+        unreachable!()
+    };
+    envelope.kind = PolicyGrantKind::Envelope;
+    assert_eq!(
+        h.append(Record::PolicyGrant(envelope)),
+        Err(Failure::Invalid)
+    );
+    h.append(grant36(60, G::Requested, 4)).unwrap();
+    assert_eq!(
+        h.append(grant36(60, G::Requested, 4)),
+        Err(Failure::Invalid)
+    );
+    assert_eq!(h.append(grant36(60, G::Ended, 4)), Err(Failure::Invalid));
+    let Record::PolicyGrant(mut other) = grant36(60, G::Granted, 4) else {
+        unreachable!()
+    };
+    other.job = id(42);
+    assert_eq!(h.append(Record::PolicyGrant(other)), Err(Failure::Invalid));
+    h.append(grant36(60, G::Granted, 4)).unwrap();
+    h.append(grant36(61, G::Requested, 4)).unwrap();
+    h.append(grant36(62, G::Requested, 4)).unwrap();
+    h.append(grant36(62, G::Denied, 4)).unwrap();
+    assert_eq!(
+        h.append(grant36(62, G::Cancelled, 4)),
+        Err(Failure::Invalid)
+    );
+    let open_grants: Vec<(Id, G)> = h
+        .state()
+        .policy
+        .open_grants()
+        .map(|g| (g.grant, g.event))
+        .collect();
+    assert_eq!(open_grants, [(id(60), G::Granted), (id(61), G::Requested)]);
+    // Every fact survives a roll and its checkpoint, and genesis replay.
+    h.journal.roll().unwrap();
+    let files = h.files();
+    let reopened = open(files.clone(), false).unwrap();
+    assert!(reopened.state().base > 0);
+    assert_eq!(reopened.state().policy, h.state().policy);
+    assert_eq!(canonical(&genesis(&files)), canonical(h.state()));
+    // After the roll: a restart cancel and an end close the open grants.
+    h.append(grant36(61, G::Cancelled, 4)).unwrap();
+    h.append(grant36(60, G::Ended, 4)).unwrap();
+    assert_eq!(h.state().policy.open_grants().count(), 0);
+    // The recent list keeps the last 64 activations, oldest first.
+    for seq in 5..=70 {
+        h.append(revision35_event(
+            seq,
+            seq - 1,
+            1,
+            E::Activated,
+            (25, "person"),
+        ))
+        .unwrap();
+    }
+    let recent = h.state().policy.recent();
+    assert_eq!(recent.len(), MAX_RECENT_POLICY_REVISIONS);
+    assert_eq!((recent[0].seq, recent[63].seq), (7, 70));
+    h.journal.roll().unwrap();
+    let files = h.files();
+    let reopened = open(files.clone(), false).unwrap();
+    assert_eq!(reopened.state().policy, h.state().policy);
+    assert_eq!(canonical(&genesis(&files)), canonical(h.state()));
 }
 
 /// A kind 34 for a person input (PL2, subject code 2).

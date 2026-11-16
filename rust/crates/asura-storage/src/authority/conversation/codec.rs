@@ -2130,6 +2130,7 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
         Record::ExecutionPath(p) => super::execution_path::write_execution_path(&mut w, p)?,
         Record::PolicyDecision(p) => super::policy::write_policy_decision(&mut w, p)?,
         Record::PolicyRevision(p) => super::policy::write_policy_revision(&mut w, p)?,
+        Record::PolicyGrant(p) => super::policy::write_policy_grant(&mut w, p)?,
         Record::ResponseText(p) | Record::ThinkingText(p) => {
             require(!p.text.is_empty() || p.offset > 0)?;
             w.bytes(&p.operation);
@@ -2448,6 +2449,12 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
                 return Err(ReplayError::Limit);
             }
             Record::PolicyRevision(Box::new(super::policy::read_policy_revision(&mut r)?))
+        }
+        36 => {
+            if payload.len() > MAX_POLICY_GRANT_PAYLOAD {
+                return Err(ReplayError::Limit);
+            }
+            Record::PolicyGrant(Box::new(super::policy::read_policy_grant(&mut r)?))
         }
 
         _ => return Err(ReplayError::UnsupportedFormat),
@@ -2938,6 +2945,165 @@ mod tests {
         assert_eq!(PolicyOutcome::from_code(4), None);
         assert_eq!(PolicyOutcome::from_code(0), None);
     }
+    /// PL-U13 (PL3): kind 34 subject 3, a job recheck.
+    #[test]
+    fn pl_u13_kind_34_subject_3_rules() {
+        let recheck = |origin, profile, run: bool| {
+            let mut d = if run { decision34() } else { deny34() };
+            d.subject = PolicySubject::JobRecheck { job: [6; 16] };
+            d.origin = origin;
+            d.profile = profile;
+            if run && profile != 1 {
+                d.constraint_digest = None;
+            }
+            d
+        };
+        for (origin, profile, run) in [
+            (1, 1, true),
+            (1, 1, false),
+            (2, 2, true),
+            (2, 3, true),
+            (2, 2, false),
+        ] {
+            let bytes = round34(recheck(origin, profile, run));
+            assert_eq!(&bytes[..17], &[&[3u8][..], &[6; 16]].concat()[..]);
+        }
+        let encode = |p: PolicyDecision| payload(&Record::PolicyDecision(Box::new(p)));
+        let mut cases = vec![
+            recheck(1, 2, true),
+            recheck(2, 1, false),
+            recheck(3, 1, false),
+        ];
+        let mut zero = recheck(1, 1, true);
+        zero.subject = PolicySubject::JobRecheck { job: [0; 16] };
+        cases.push(zero);
+        // A model `run` needs its constraint digest; a person one has none.
+        let mut model = recheck(1, 1, true);
+        model.constraint_digest = None;
+        cases.push(model);
+        let mut person = recheck(2, 2, true);
+        person.constraint_digest = Some([1; 32]);
+        cases.push(person);
+        for case in cases {
+            assert_eq!(encode(case.clone()), Err(ReplayError::Corrupt), "{case:?}");
+        }
+        assert_eq!(recheck(1, 1, true).call(), None);
+    }
+    fn grant36() -> PolicyGrant {
+        PolicyGrant {
+            grant: [1; 16],
+            kind: PolicyGrantKind::Approval,
+            event: PolicyGrantEvent::Requested,
+            task_conversation: [2; 16],
+            task_agent: 0,
+            job: [3; 16],
+            request_digest: Some([4; 32]),
+            constraint_digest: Some([5; 32]),
+            intent_digest: Some([6; 32]),
+            expiry_ms: None,
+            cause: 0,
+            revision_seq: 1,
+        }
+    }
+    fn round36(p: PolicyGrant) -> Vec<u8> {
+        let record = Record::PolicyGrant(Box::new(p));
+        let bytes = payload(&record).unwrap();
+        assert_eq!(decode_record(36, &bytes).unwrap(), record);
+        assert!(bytes.len() <= MAX_POLICY_GRANT_PAYLOAD);
+        bytes
+    }
+    /// PL-U13 (PL3): kind 36 round trips each event's fields and rejects
+    /// each invalid field.
+    #[test]
+    fn pl_u13_kind_36_round_trips_and_rejects_each_invalid_field() {
+        use PolicyGrantEvent as E;
+        round36(grant36());
+        round36(PolicyGrant {
+            constraint_digest: None,
+            intent_digest: None,
+            ..grant36()
+        });
+        let answer = |event, cause, expiry| PolicyGrant {
+            event,
+            request_digest: None,
+            constraint_digest: None,
+            intent_digest: None,
+            expiry_ms: expiry,
+            cause,
+            ..grant36()
+        };
+        round36(answer(E::Granted, 0, None));
+        round36(answer(E::Granted, 0, Some(1_762_000_000_000)));
+        round36(answer(E::Denied, 0, None));
+        for cause in 1..=5 {
+            round36(answer(E::Cancelled, cause, None));
+            round36(answer(E::Ended, cause, None));
+        }
+        // The envelope kind decodes; replay refuses it until PL8 (R14).
+        round36(PolicyGrant {
+            kind: PolicyGrantKind::Envelope,
+            ..grant36()
+        });
+        let encode = |p: PolicyGrant| payload(&Record::PolicyGrant(Box::new(p)));
+        let mut cases = vec![
+            PolicyGrant {
+                grant: [0; 16],
+                ..grant36()
+            },
+            PolicyGrant {
+                task_conversation: [0; 16],
+                ..grant36()
+            },
+            PolicyGrant {
+                job: [0; 16],
+                ..grant36()
+            },
+            PolicyGrant {
+                revision_seq: 0,
+                ..grant36()
+            },
+            PolicyGrant {
+                request_digest: None,
+                ..grant36()
+            },
+            PolicyGrant {
+                expiry_ms: Some(1),
+                ..grant36()
+            },
+            PolicyGrant {
+                cause: 1,
+                ..grant36()
+            },
+            answer(E::Granted, 1, None),
+            answer(E::Denied, 0, Some(1)),
+            answer(E::Denied, 2, None),
+            answer(E::Cancelled, 0, None),
+            answer(E::Ended, 6, None),
+        ];
+        let mut granted = answer(E::Granted, 0, None);
+        granted.request_digest = Some([1; 32]);
+        cases.push(granted);
+        let mut ended = answer(E::Ended, 1, None);
+        ended.intent_digest = Some([1; 32]);
+        cases.push(ended);
+        for case in cases {
+            assert_eq!(encode(case.clone()), Err(ReplayError::Corrupt), "{case:?}");
+        }
+        // Byte-level: unknown kind and event codes, trailing bytes, bound.
+        let base = round36(grant36());
+        for (offset, value) in [(16, 0), (16, 3), (17, 0), (17, 6)] {
+            let mut bytes = base.clone();
+            bytes[offset] = value;
+            assert_eq!(decode_record(36, &bytes), Err(ReplayError::Corrupt));
+        }
+        let mut bytes = base.clone();
+        bytes.push(0);
+        assert_eq!(decode_record(36, &bytes), Err(ReplayError::Corrupt));
+        assert_eq!(
+            decode_record(36, &vec![0; MAX_POLICY_GRANT_PAYLOAD + 1]),
+            Err(ReplayError::Limit)
+        );
+    }
     fn revision35() -> PolicyRevision {
         PolicyRevision {
             seq: 1,
@@ -3052,9 +3218,9 @@ mod tests {
         let mut bytes = base.clone();
         bytes.push(0);
         assert_eq!(decode_record(35, &bytes), Err(ReplayError::Corrupt));
-        // Kind 36 is not yet a record.
+        // Kind 37 is not a record.
         assert_eq!(
-            decode_record(36, &base),
+            decode_record(37, &base),
             Err(ReplayError::UnsupportedFormat)
         );
     }
@@ -5054,8 +5220,9 @@ mod tests {
             }
         }
         // Reasons 0 to 18, then 19 `execution_off` (ESCN), 20
-        // `outside_sandbox_off` (N) and 21 `enforcement_mismatch` (N).
-        assert_eq!(pairs, 2 + 7 * 4 + 3 + 2 * 2 + 1 + 7 + 4 + 1 + 1);
+        // `outside_sandbox_off` (N), 21 `enforcement_mismatch` (N), and
+        // (PL3) 22 `policy_revoked` and 23 `policy_changed` (ESCN).
+        assert_eq!(pairs, 2 + 7 * 4 + 3 + 2 * 2 + 1 + 7 + 4 + 1 + 1 + 2 * 4);
         // Exit and cleanup bounds.
         for (exit_kind, exit_value) in [(1, 0), (1, 255)] {
             round_job(r28(JobSettled {
@@ -5482,12 +5649,14 @@ mod tests {
             "execution_off",
             "outside_sandbox_off",
             "enforcement_mismatch",
+            "policy_revoked",
+            "policy_changed",
         ];
         for (code, name) in names.iter().enumerate() {
             let reason = JobReason::from_code(code as u8).unwrap();
             assert_eq!((reason as u8, reason.as_str()), (code as u8, *name));
         }
-        assert_eq!(JobReason::from_code(22), None);
+        assert_eq!(JobReason::from_code(24), None);
         use JobRequester::*;
         let requesters = [
             None,
@@ -5512,6 +5681,8 @@ mod tests {
             Some(Service),
             None,
             None,
+            Some(Service),
+            Some(Service),
         ];
         assert_eq!(requesters.len(), JobReason::ALL.len());
         for (reason, requester) in JobReason::ALL.into_iter().zip(requesters) {
@@ -5524,9 +5695,9 @@ mod tests {
         assert_eq!(JobRequester::from_code(0), None);
         assert_eq!(JobRequester::from_code(5), None);
         // The outcome column of the reason table: E S C N I.
-        let table: [&str; 21] = [
+        let table: [&str; 24] = [
             "ES", "ESCN", "ESCN", "ESCN", "ESCN", "ESCN", "ESCN", "ESCN", "ESC", "ES", "ES", "I",
-            "N", "N", "N", "N", "N", "N", "N", "ESCN", "N",
+            "N", "N", "N", "N", "N", "N", "N", "ESCN", "N", "N", "ESCN", "ESCN",
         ];
         for (reason, allowed) in JobReason::ALL.into_iter().zip(table) {
             for (outcome, letter) in JobOutcome::ALL.into_iter().zip(['E', 'S', 'C', 'N', 'I']) {

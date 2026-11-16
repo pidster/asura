@@ -378,6 +378,8 @@ pub enum Record {
     PolicyDecision(Box<super::PolicyDecision>),
     /// Kind 35 (PL1): one policy revision event with its manifest.
     PolicyRevision(Box<super::PolicyRevision>),
+    /// Kind 36 (PL3): one approval grant request, answer or end.
+    PolicyGrant(Box<super::PolicyGrant>),
 }
 impl Record {
     pub fn kind(&self) -> u16 {
@@ -410,6 +412,7 @@ impl Record {
             Self::ExecutionPath(_) => 32,
             Self::PolicyDecision(_) => 34,
             Self::PolicyRevision(_) => 35,
+            Self::PolicyGrant(_) => 36,
         }
     }
 }
@@ -1583,9 +1586,16 @@ pub enum JobReason {
     /// (security-policy.md, enforcement evidence in PL1): the command never
     /// started. Only a model-origin job may record it.
     EnforcementMismatch = 21,
+    /// A recheck under a newly activated policy revision denied the job
+    /// (security-policy.md, PL3 activation and fencing): a service
+    /// revocation through the existing path.
+    PolicyRevoked = 22,
+    /// A starting job decided under an older policy revision was cancelled
+    /// when a narrowing revision activated (PL3).
+    PolicyChanged = 23,
 }
 impl JobReason {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 24] = [
         Self::None,
         Self::ModelCancel,
         Self::TurnEnded,
@@ -1608,6 +1618,8 @@ impl JobReason {
         Self::ExecutionOff,
         Self::OutsideSandboxOff,
         Self::EnforcementMismatch,
+        Self::PolicyRevoked,
+        Self::PolicyChanged,
     ];
     pub fn from_code(code: u8) -> Option<Self> {
         Self::ALL.get(usize::from(code)).copied()
@@ -1636,6 +1648,8 @@ impl JobReason {
             Self::ExecutionOff => "execution_off",
             Self::OutsideSandboxOff => "outside_sandbox_off",
             Self::EnforcementMismatch => "enforcement_mismatch",
+            Self::PolicyRevoked => "policy_revoked",
+            Self::PolicyChanged => "policy_changed",
         }
     }
     /// The kind 27 requester of a cancel reason; `None` for a reason that
@@ -1646,9 +1660,8 @@ impl JobReason {
             ModelCancel | TurnEnded => JobRequester::Model,
             ClientCancel => JobRequester::Client,
             PersonStop | PersonKill => JobRequester::Person,
-            IdentityChanged | Shutdown | CaptureFault | Quota | Enospc | ExecutionOff => {
-                JobRequester::Service
-            }
+            IdentityChanged | Shutdown | CaptureFault | Quota | Enospc | ExecutionOff
+            | PolicyRevoked | PolicyChanged => JobRequester::Service,
             None | Restart | CwdUnavailable | ProjectChanged | SandboxUnavailable | SpawnFailed
             | CaptureUnavailable | ProtocolFault | SetupFailed | OutsideSandboxOff
             | EnforcementMismatch => {
@@ -1663,7 +1676,7 @@ impl JobReason {
         match self {
             None => matches!(outcome, O::Exited | O::Signalled),
             ModelCancel | TurnEnded | ClientCancel | PersonStop | PersonKill | IdentityChanged
-            | Shutdown | ExecutionOff => matches!(
+            | Shutdown | ExecutionOff | PolicyRevoked | PolicyChanged => matches!(
                 outcome,
                 O::Exited | O::Signalled | O::Cancelled | O::NotStarted
             ),
@@ -1974,9 +1987,12 @@ pub enum JobBlockReason {
     PendingInstalls = 7,
     Quota = 8,
     DiskSpace = 9,
+    /// Start condition 0b (PL3): the start's decision revision is older
+    /// than the dispatch revision; it waits for its recheck.
+    PolicyRecheck = 10,
 }
 impl JobBlockReason {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Recovering,
         Self::JournalUnavailable,
         Self::JournalHeld,
@@ -1986,6 +2002,7 @@ impl JobBlockReason {
         Self::PendingInstalls,
         Self::Quota,
         Self::DiskSpace,
+        Self::PolicyRecheck,
     ];
     pub fn from_code(code: u8) -> Option<Self> {
         Self::ALL.get(usize::from(code).checked_sub(1)?).copied()
@@ -2001,6 +2018,7 @@ impl JobBlockReason {
             Self::PendingInstalls => "pending_installs",
             Self::Quota => "quota",
             Self::DiskSpace => "disk_space",
+            Self::PolicyRecheck => "policy_recheck",
         }
     }
 }

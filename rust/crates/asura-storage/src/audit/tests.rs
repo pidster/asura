@@ -634,6 +634,7 @@ fn j2t_20_job_enum_names_and_codes() {
         (JobBlockReason::PendingInstalls, "pending_installs"),
         (JobBlockReason::Quota, "quota"),
         (JobBlockReason::DiskSpace, "disk_space"),
+        (JobBlockReason::PolicyRecheck, "policy_recheck"),
     ] {
         assert_eq!(name(serde_json::to_value(reason).unwrap()), text);
     }
@@ -660,6 +661,8 @@ fn j2t_20_job_enum_names_and_codes() {
         (JobReason::ExecutionOff, "execution_off"),
         (JobReason::OutsideSandboxOff, "outside_sandbox_off"),
         (JobReason::EnforcementMismatch, "enforcement_mismatch"),
+        (JobReason::PolicyRevoked, "policy_revoked"),
+        (JobReason::PolicyChanged, "policy_changed"),
     ];
     for (code, (reason, text)) in reasons.iter().enumerate() {
         assert_eq!(*reason as u8, code as u8);
@@ -2317,5 +2320,182 @@ fn ns_u17_secret_reference_refused_event() {
     for extra in [r#","name":"GITHUB_TOKEN""#, r#","command":"x""#] {
         let bad = text.replacen(r#""ordinal":1"#, &[r#""ordinal":1"#, extra].concat(), 1);
         assert!(serde_json::from_str::<Event>(&bad).is_err(), "{bad}");
+    }
+}
+
+/// PL3 audit events (security-policy.md, PL3 audit events): names, field
+/// sets and round trips; reasons 22 and 23 follow the reason table.
+#[test]
+fn pl3_policy_events_and_reasons_22_and_23() {
+    let round = |event: Event| {
+        let record = job_record(event);
+        let line = record.encode().unwrap();
+        assert_eq!(Record::decode(&line).unwrap(), record);
+        String::from_utf8(line).unwrap()
+    };
+    let line = round(Event::PolicyRevisionActivated {
+        seq: 4,
+        scopes: vec![PolicyScope::User],
+        widening: true,
+        solver_digest: Some("ab".repeat(32)),
+    });
+    assert!(
+        line.contains("\"kind\":\"policy.revision_activated\""),
+        "{line}"
+    );
+    assert!(line.contains("\"scopes\":[\"user\"]"), "{line}");
+    round(Event::PolicyRevisionActivated {
+        seq: 1,
+        scopes: vec![PolicyScope::Installation, PolicyScope::User],
+        widening: false,
+        solver_digest: None,
+    });
+    let line = round(Event::PolicyRevisionRejected {
+        scope: PolicyScope::User,
+        reason: "proof_failed".into(),
+    });
+    assert!(line.contains("policy.revision_rejected"));
+    let line = round(Event::PolicyDecisionDenied {
+        action_group: PolicyActionGroup::Process,
+        scope: PolicyScope::None,
+        reason: "cannot_enforce".into(),
+        rule: String::new(),
+        project: [3; 16],
+    });
+    assert!(line.contains("\"action_group\":\"process\""), "{line}");
+    round(Event::PolicyDecisionDenied {
+        action_group: PolicyActionGroup::Secret,
+        scope: PolicyScope::Installation,
+        reason: "model_secret".into(),
+        rule: "installation:s4.model_secret".into(),
+        project: [3; 16],
+    });
+    for cause in [
+        PolicySolverCause::Unavailable,
+        PolicySolverCause::DigestMismatch,
+        PolicySolverCause::MemoryBound,
+        PolicySolverCause::OutputBound,
+    ] {
+        round(Event::PolicySolverFailed { cause });
+    }
+    assert!(
+        round(Event::PolicySolverFailed {
+            cause: PolicySolverCause::InputBound
+        })
+        .contains("\"cause\":\"input_bound\"")
+    );
+    round(Event::PolicyWorkerFailed { worker: 7 });
+    // Policy events are not project records.
+    assert_eq!(Event::PolicyWorkerFailed { worker: 1 }.project(), None);
+    let invalid = |event: Event| assert_eq!(event.validate(), Err(Error::Invalid), "{event:?}");
+    invalid(Event::PolicyRevisionActivated {
+        seq: 0,
+        scopes: vec![PolicyScope::User],
+        widening: false,
+        solver_digest: None,
+    });
+    invalid(Event::PolicyRevisionActivated {
+        seq: 1,
+        scopes: vec![],
+        widening: false,
+        solver_digest: None,
+    });
+    invalid(Event::PolicyRevisionActivated {
+        seq: 1,
+        scopes: vec![PolicyScope::User, PolicyScope::Installation],
+        widening: false,
+        solver_digest: None,
+    });
+    invalid(Event::PolicyRevisionActivated {
+        seq: 1,
+        scopes: vec![PolicyScope::None],
+        widening: false,
+        solver_digest: None,
+    });
+    invalid(Event::PolicyRevisionActivated {
+        seq: 1,
+        scopes: vec![PolicyScope::User],
+        widening: false,
+        solver_digest: Some("AB".repeat(32)),
+    });
+    invalid(Event::PolicyRevisionRejected {
+        scope: PolicyScope::User,
+        reason: "a path /etc/passwd".into(),
+    });
+    invalid(Event::PolicyRevisionRejected {
+        scope: PolicyScope::None,
+        reason: "proof_failed".into(),
+    });
+    invalid(Event::PolicyDecisionDenied {
+        action_group: PolicyActionGroup::File,
+        scope: PolicyScope::User,
+        reason: "no_permit".into(),
+        rule: "not a rule".into(),
+        project: [3; 16],
+    });
+    invalid(Event::PolicyDecisionDenied {
+        action_group: PolicyActionGroup::File,
+        scope: PolicyScope::User,
+        reason: "no_permit".into(),
+        rule: String::new(),
+        project: [0; 16],
+    });
+    invalid(Event::PolicyWorkerFailed { worker: 64 });
+    // Reasons 22 and 23: service cancels; every outcome but interrupted.
+    assert_eq!(
+        (
+            JobReason::PolicyRevoked as u8,
+            JobReason::PolicyChanged as u8
+        ),
+        (22, 23)
+    );
+    for reason in [JobReason::PolicyRevoked, JobReason::PolicyChanged] {
+        for requester in [
+            JobRequester::Model,
+            JobRequester::Client,
+            JobRequester::Person,
+            JobRequester::Service,
+        ] {
+            assert_eq!(
+                cancel_requested(requester, reason, false)
+                    .validate()
+                    .is_ok(),
+                requester == JobRequester::Service
+            );
+        }
+        let not_started = settled(|e| {
+            if let Event::JobSettled {
+                outcome,
+                reason: r,
+                exit_kind,
+                cleanup,
+                escapees,
+                capture_state,
+                stdout_bytes,
+                elapsed_ms,
+                ..
+            } = e
+            {
+                *outcome = JobOutcome::NotStarted;
+                *r = reason;
+                *exit_kind = JobExitKind::Unknown;
+                *cleanup = JobCleanup::None;
+                *escapees = 0;
+                *capture_state = JobCaptureState::NotStarted;
+                *stdout_bytes = 0;
+                *elapsed_ms = 0;
+            }
+        });
+        assert_eq!(not_started.validate(), Ok(()), "{reason:?}");
+        let cancelled = settled(|e| {
+            if let Event::JobSettled {
+                outcome, reason: r, ..
+            } = e
+            {
+                *outcome = JobOutcome::Cancelled;
+                *r = reason;
+            }
+        });
+        assert_eq!(cancelled.validate(), Ok(()), "{reason:?}");
     }
 }
