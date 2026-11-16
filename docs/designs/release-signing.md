@@ -704,6 +704,10 @@ one development package in `target/<profile>/` (`target/debug/` for
   resource directory follows the helper path
   ([resource directory](#resource-directory-inside-the-bundle)), so it is
   also `<profile>/`.
+- Test support that reads or copies the package uses the same directory:
+  `development_package` in `conversation_flow` and in `tui_pty.py`, which
+  copies the helper beside its relocated `asura-fixture`. Each refuses an
+  executable that is not in `<profile>/build/<package>/<hash>/out/`.
 - A relocated copy of a test executable (the SG-V10 relocated-package case
   and `Fixture::use_bundle`) is outside the build directory, so it still
   proves the production rule.
